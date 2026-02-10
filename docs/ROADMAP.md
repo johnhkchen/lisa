@@ -34,28 +34,30 @@ Applied feedback from first manual setup on the moron Rust motion graphics engin
 - Added mid-flight ticket modification guidance (reset to ready if past Design)
 - Added optional `tickets` field to story format for human convenience
 
-### Sprint 5: Workflow Separation (in progress)
+### Sprint 5: Workflow Separation
 - Extract RDSPI workflow from CLAUDE.md into standalone docs/rdspi-workflow.md
 - CLAUDE.md now project-specific only (description, build, layout)
 - Scheduler references both CLAUDE.md and rdspi-workflow.md
 - Setup guide template cut in half — no more workflow boilerplate to copy
+
+### Sprint 6: `lisa init` CLI
+Cargo workspace restructure + CLI implementation.
+- Restructured into 3-crate workspace: lisa-core, lisa-plugin, lisa-cli
+- lisa-core: shared types, ticket parsing, DAG (no zellij deps)
+- lisa-plugin: WASM plugin (scheduler, UI, ZellijPlugin impl)
+- lisa-cli: binary with clap, two subcommands (init, validate)
+- Project type detection: Rust, Node, Go, Python (by marker files)
+- `lisa init`: detect project, scaffold directories, generate CLAUDE.md, copy workflow
+- `lisa validate`: scan tickets, build DAG, check cycles/missing deps/acceptance criteria
+- `--dry-run` mode shows planned actions without executing
+- Never overwrites existing files
+- 84 tests across workspace (43 core + 22 plugin + 19 CLI)
 
 ---
 
 ## Next Sprint Candidates
 
 Prioritized based on first-implementer feedback and design maturity.
-
-### Sprint Candidate: `lisa init` CLI
-Highest-value next step per feedback. Requires a binary target.
-- Project type detection (Cargo.toml, package.json, go.mod, pyproject.toml)
-- Directory scaffolding (active + archive)
-- CLAUDE.md generation (project-specific only, workflow is separate)
-- `.lisa.toml` config file (versionable, replaces zellij plugin config)
-- DAG validation (cycles, missing refs, orphan tickets)
-- Interactive first story/ticket creation
-- `--dry-run` mode
-- Enforce filesystem-safe IDs
 
 ### Sprint Candidate: Plugin Integration Testing
 Test the plugin in a live zellij session.

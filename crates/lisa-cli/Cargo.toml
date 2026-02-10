@@ -1,0 +1,17 @@
+[package]
+name = "lisa-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool for Lisa project scaffolding and validation"
+license = "MIT"
+
+[[bin]]
+name = "lisa"
+path = "src/main.rs"
+
+[dependencies]
+lisa-core = { path = "../lisa-core" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

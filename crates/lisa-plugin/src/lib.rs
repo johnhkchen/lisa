@@ -4,10 +4,7 @@
 //! as a DAG-driven concurrent scheduler. It manages Claude Code sessions for each ticket,
 //! tracks phase progress, and provides a live dashboard.
 
-mod dag;
 mod scheduler;
-mod ticket;
-mod types;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap};
@@ -15,8 +12,9 @@ use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
 
-use crate::dag::Dag;
-use crate::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
+use lisa_core::dag::Dag;
+use lisa_core::ticket;
+use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
 
 /// Main plugin state
 ///
@@ -63,12 +61,6 @@ impl State {
     }
 
     /// Scan tickets directory and rebuild the DAG.
-    ///
-    /// Reads all `.md` ticket files from the configured ticket directory,
-    /// parses their YAML frontmatter, and constructs a dependency graph.
-    /// Errors during scanning or DAG construction are logged as activity
-    /// events rather than propagated, so the plugin remains operational
-    /// even when ticket files are malformed.
     fn rebuild_dag(&mut self) {
         let tickets = match ticket::scan_tickets(&self.config.ticket_dir) {
             Ok(tickets) => tickets,
@@ -96,16 +88,6 @@ impl State {
     }
 
     /// Check which tickets are ready to be scheduled and spawn Claude sessions.
-    ///
-    /// Queries the DAG for tickets whose dependencies are all satisfied,
-    /// filters out tickets that already have active threads, and spawns
-    /// floating command panes running `claude --dangerously-skip-permissions`
-    /// for each ready ticket (up to the configured `max_threads` limit).
-    ///
-    /// The spawned pane's ID is not known until a `PaneUpdate` event arrives,
-    /// so newly spawned threads are tracked with `pane_id: 0` as a placeholder.
-    /// The context BTreeMap passed to `open_command_pane_floating` carries the
-    /// `ticket_id` so that `CommandPaneExited` events can be correlated.
     fn schedule_ready_tickets(&mut self) {
         let ready = self.dag.get_ready_tickets();
 
@@ -113,7 +95,7 @@ impl State {
         let active_count = self
             .threads
             .values()
-            .filter(|t| t.status == types::ThreadStatus::Running)
+            .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
             .count();
         let slots = self.config.max_threads.saturating_sub(active_count);
 
@@ -188,16 +170,8 @@ impl State {
     }
 
     /// Handle filesystem changes (artifact creation, ticket phase changes).
-    ///
-    /// Inspects changed paths to detect:
-    /// - Ticket file changes (inside `ticket_dir`) -- triggers a DAG rebuild
-    ///   on the next update cycle (the caller in `update()` already calls
-    ///   `rebuild_dag` after this method).
-    /// - Artifact creation (inside `work_dir`) -- logs `ArtifactCreated` events
-    ///   and detects phase transitions by matching artifact filenames to phases.
     fn handle_filesystem_update(&mut self, paths: &[PathBuf]) {
-        // Snapshot ticket phases before the DAG is rebuilt so we can detect
-        // phase changes after the rebuild (which happens in the caller).
+        // Snapshot ticket phases before the DAG is rebuilt
         let old_phases: HashMap<TicketId, Phase> = self
             .dag
             .tickets()
@@ -231,20 +205,6 @@ impl State {
             }
         }
 
-        // After the caller rebuilds the DAG, detect phase changes.
-        // We store old_phases so the caller can compare after rebuild_dag().
-        // Since the caller calls rebuild_dag() right after us, we stash the
-        // old phases and check in a post-rebuild step. However, the current
-        // call order in update() is: handle_filesystem_update -> rebuild_dag.
-        // So we detect phase changes by comparing old_phases against the
-        // *current* DAG (which will be the old DAG, before rebuild).
-        // The phase change detection therefore happens on the *next* filesystem
-        // update cycle. To detect it on this cycle, we do the rebuild here
-        // for comparison purposes and let the caller's rebuild be a no-op
-        // (idempotent operation).
-        //
-        // Practical approach: check if any ticket dir paths changed, and if so,
-        // do an early rebuild and compare.
         let ticket_dir_changed = paths
             .iter()
             .any(|p| p.starts_with(&self.config.ticket_dir));
@@ -284,10 +244,6 @@ impl State {
 }
 
 impl ZellijPlugin for State {
-    /// Called once when the plugin is loaded.
-    ///
-    /// Initializes state, subscribes to relevant events, and performs initial
-    /// ticket scan to build the DAG.
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         // Parse configuration
         self.config = PluginConfig::from_config_map(&configuration);
@@ -302,9 +258,6 @@ impl ZellijPlugin for State {
             EventType::Timer,
         ]);
 
-        // Request filesystem watching for ticket and work directories
-        // TODO: Use watch_filesystem when we have the paths configured
-
         // Initial DAG build
         self.rebuild_dag();
 
@@ -315,82 +268,52 @@ impl ZellijPlugin for State {
         self.log_activity(ActivityEvent::PluginStarted);
     }
 
-    /// Called when subscribed events occur.
-    ///
-    /// Handles:
-    /// - FileSystemUpdate: detect artifact creation or ticket phase changes
-    /// - CommandPaneExited: when a Claude session ends
-    /// - PaneUpdate: track which panes are alive
-    /// - Key/Mouse: dashboard interaction
-    /// - Timer: periodic state refresh
     fn update(&mut self, event: Event) -> bool {
         let mut should_render = false;
 
         match event {
             Event::FileSystemUpdate(paths_with_metadata) => {
-                // Extract just the paths from the (PathBuf, Option<FileMetadata>) tuples
                 let paths: Vec<std::path::PathBuf> = paths_with_metadata
                     .iter()
                     .map(|(path, _metadata)| path.clone())
                     .collect();
                 self.handle_filesystem_update(&paths);
-                // Rebuild DAG if tickets changed
                 self.rebuild_dag();
-                // Check if new tickets are ready to schedule
                 self.schedule_ready_tickets();
                 should_render = true;
             }
 
             Event::CommandPaneExited(pane_id, exit_code, _context) => {
-                // Handle command pane exit
                 self.handle_pane_exited(pane_id, exit_code);
-                // A thread finished, maybe others can now run
                 self.schedule_ready_tickets();
                 should_render = true;
             }
 
             Event::PaneUpdate(pane_manifest) => {
-                // Track pane lifecycle
-                // TODO: Update internal pane tracking based on manifest
-                // This helps us know which threads are still alive
-                let _ = pane_manifest; // Placeholder
+                let _ = pane_manifest;
                 should_render = true;
             }
 
             Event::Key(key) => {
-                // Handle keyboard navigation in the dashboard
-                // TODO: Implement key handling for navigation, focusing panes, etc.
-                let _ = key; // Placeholder
+                let _ = key;
                 should_render = true;
             }
 
             Event::Mouse(mouse_event) => {
-                // Handle mouse clicks in the dashboard
-                // TODO: Implement click handling for quick-jump to thread panes
-                let _ = mouse_event; // Placeholder
+                let _ = mouse_event;
                 should_render = true;
             }
 
             Event::Timer(_elapsed) => {
-                // Periodic refresh - useful for updating duration displays
                 should_render = true;
             }
 
-            _ => {
-                // Ignore other events
-            }
+            _ => {}
         }
 
         should_render
     }
 
-    /// Called to render the plugin UI.
-    ///
-    /// Renders the dashboard showing:
-    /// - DAG visualization with dependency edges and status
-    /// - Active threads: ticket, phase, duration
-    /// - Parked threads: waiting for review, artifact path
-    /// - Recent activity log
     fn render(&mut self, rows: usize, cols: usize) {
         if !self.initialized {
             println!("Lisa/Ralph initializing...");
@@ -410,7 +333,6 @@ impl State {
     fn to_ui_state(&self) -> ui::PluginState {
         use std::time::Duration;
 
-        // Convert DAG tickets to UI ticket nodes
         let tickets: Vec<ui::TicketNode> = self
             .dag
             .tickets()
@@ -424,11 +346,10 @@ impl State {
             })
             .collect();
 
-        // Convert active threads
         let active_threads: Vec<ui::ActiveThread> = self
             .threads
             .values()
-            .filter(|t| t.status == types::ThreadStatus::Running)
+            .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
             .map(|t| ui::ActiveThread {
                 ticket_id: t.ticket_id.clone(),
                 phase: phase_to_ui_phase(t.current_phase),
@@ -442,11 +363,10 @@ impl State {
             })
             .collect();
 
-        // Convert parked threads
         let parked_threads: Vec<ui::ParkedThread> = self
             .threads
             .values()
-            .filter(|t| t.status == types::ThreadStatus::Parked)
+            .filter(|t| t.status == lisa_core::types::ThreadStatus::Parked)
             .map(|t| ui::ParkedThread {
                 ticket_id: t.ticket_id.clone(),
                 phase: phase_to_ui_phase(t.current_phase),
@@ -466,7 +386,6 @@ impl State {
             })
             .collect();
 
-        // Convert activity log
         let activity_log: Vec<ui::ActivityEntry> = self
             .activity_log
             .iter()
@@ -490,37 +409,37 @@ impl State {
 }
 
 /// Convert internal Phase to UI Phase
-fn phase_to_ui_phase(phase: types::Phase) -> ui::Phase {
+fn phase_to_ui_phase(phase: Phase) -> ui::Phase {
     match phase {
-        types::Phase::Ready => ui::Phase::Ready,
-        types::Phase::Research => ui::Phase::Research,
-        types::Phase::Design => ui::Phase::Design,
-        types::Phase::Structure => ui::Phase::Structure,
-        types::Phase::Plan => ui::Phase::Plan,
-        types::Phase::Implement => ui::Phase::Implement,
-        types::Phase::Review => ui::Phase::Review,
-        types::Phase::Done => ui::Phase::Done,
+        Phase::Ready => ui::Phase::Ready,
+        Phase::Research => ui::Phase::Research,
+        Phase::Design => ui::Phase::Design,
+        Phase::Structure => ui::Phase::Structure,
+        Phase::Plan => ui::Phase::Plan,
+        Phase::Implement => ui::Phase::Implement,
+        Phase::Review => ui::Phase::Review,
+        Phase::Done => ui::Phase::Done,
     }
 }
 
 /// Convert internal ticket status to UI ticket status
 fn ticket_status_to_ui_status(
-    status: &types::TicketStatus,
-    phase: types::Phase,
+    status: &lisa_core::types::TicketStatus,
+    phase: Phase,
 ) -> ui::TicketStatus {
     match status {
-        types::TicketStatus::Open => {
-            if phase == types::Phase::Ready {
+        lisa_core::types::TicketStatus::Open => {
+            if phase == Phase::Ready {
                 ui::TicketStatus::Ready
             } else {
                 ui::TicketStatus::InProgress
             }
         }
-        types::TicketStatus::InProgress => ui::TicketStatus::InProgress,
-        types::TicketStatus::Blocked => ui::TicketStatus::Blocked,
-        types::TicketStatus::Review => ui::TicketStatus::WaitingReview,
-        types::TicketStatus::Done => ui::TicketStatus::Done,
-        types::TicketStatus::Cancelled => ui::TicketStatus::Done,
+        lisa_core::types::TicketStatus::InProgress => ui::TicketStatus::InProgress,
+        lisa_core::types::TicketStatus::Blocked => ui::TicketStatus::Blocked,
+        lisa_core::types::TicketStatus::Review => ui::TicketStatus::WaitingReview,
+        lisa_core::types::TicketStatus::Done => ui::TicketStatus::Done,
+        lisa_core::types::TicketStatus::Cancelled => ui::TicketStatus::Done,
     }
 }
 
@@ -528,7 +447,6 @@ fn ticket_status_to_ui_status(
 fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry> {
     use std::time::Duration;
 
-    // For now, use zero duration - in a real implementation we'd track timestamps
     let timestamp = Duration::ZERO;
 
     let activity = match event {

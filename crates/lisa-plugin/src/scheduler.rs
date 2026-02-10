@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 
 use zellij_tile::prelude::*;
 
-use crate::dag::Dag;
-use crate::types::{Phase, TicketId, Thread, ThreadStatus};
+use lisa_core::dag::Dag;
+use lisa_core::types::{Phase, TicketId, Thread, ThreadStatus};
 
 // File system operations for commit locking (only available on unix, not in WASM)
 #[cfg(all(unix, not(target_arch = "wasm32")))]

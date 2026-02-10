@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::dag::Dag;
-use crate::types::{self, ActivityEvent, PluginConfig, Thread, TicketId};
+use lisa_core::dag::Dag;
+use lisa_core::types::{self, ActivityEvent, PluginConfig, Thread, TicketId};
 
 /// ANSI color codes for terminal output
 mod colors {

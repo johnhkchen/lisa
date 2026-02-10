@@ -8,22 +8,39 @@ Lisa is a Zellij WASM plugin (Rust) that implements DAG-driven concurrent task s
 
 ```bash
 # Build the WASM plugin
-cargo build --target wasm32-wasi --release
+cargo build -p lisa-plugin --target wasm32-wasip1 --release
+
+# Build the CLI
+cargo build -p lisa-cli --release
 
 # Run tests (native target, not wasm)
-cargo test
+cargo test --workspace
+
+# Quick check (WASM check + tests)
+just check
 ```
 
 ### Source Layout
 
 ```
-src/
-  lib.rs        # Plugin entry point, ZellijPlugin trait impl
-  types.rs      # Core data types (Ticket, Phase, Status, etc.)
-  ticket.rs     # Ticket parsing from markdown frontmatter
-  dag.rs        # DAG computation from ticket dependencies
-  scheduler.rs  # Thread scheduling based on DAG state
-  ui.rs         # Dashboard rendering
+crates/
+  lisa-core/          Shared types, ticket parsing, DAG computation
+    src/
+      lib.rs          Re-exports modules
+      types.rs        Core types (Ticket, Phase, Thread, Config)
+      ticket.rs       Ticket parsing from markdown frontmatter
+      dag.rs          DAG computation from ticket dependencies
+  lisa-plugin/        Zellij WASM plugin
+    src/
+      lib.rs          Plugin entry point, ZellijPlugin trait impl
+      scheduler.rs    Thread scheduling and commit serialization
+      ui.rs           Dashboard rendering
+  lisa-cli/           CLI binary (lisa init, lisa validate)
+    src/
+      main.rs         Clap CLI entry point
+      detect.rs       Project type detection
+      init.rs         Init and validate commands
+      templates.rs    CLAUDE.md generation, embedded RDSPI workflow
 ```
 
 ### Directory Conventions
