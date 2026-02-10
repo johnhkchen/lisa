@@ -1,2 +1,4 @@
 /target
 .DS_Store
+.lisa-layout.kdl
+.ralph-commit.lock

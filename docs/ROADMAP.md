@@ -53,6 +53,14 @@ Cargo workspace restructure + CLI implementation.
 - Never overwrites existing files
 - 84 tests across workspace (43 core + 22 plugin + 19 CLI)
 
+### Sprint 7: `lisa loop` + End-to-End First Run
+Close the loop: `lisa init` → write tickets → `lisa loop` → agents work.
+- WASM embedding: build.rs copies plugin to OUT_DIR, include_bytes! in CLI binary
+- `lisa loop` command: validates prereqs, writes WASM to temp, generates KDL layout, execs zellij
+- Plugin fix: `schedule_ready_tickets()` called on load so pre-existing tickets start immediately
+- `just build-cli` builds plugin first, then CLI with embedded WASM
+- `just release` recipe for full distribution build
+
 ---
 
 ## Next Sprint Candidates

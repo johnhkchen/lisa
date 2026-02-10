@@ -3,6 +3,9 @@ use crate::detect::DetectedProject;
 /// The RDSPI workflow document, embedded at compile time
 pub const RDSPI_WORKFLOW: &str = include_str!("../../../docs/knowledge/rdspi-workflow.md");
 
+/// The compiled WASM plugin, embedded at compile time via build.rs
+pub const PLUGIN_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lisa.wasm"));
+
 /// Generate a project-specific CLAUDE.md
 pub fn generate_claude_md(project: &DetectedProject) -> String {
     let build_section = if project.build_command.is_empty() {

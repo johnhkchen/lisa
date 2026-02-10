@@ -35,12 +35,14 @@ crates/
       lib.rs          Plugin entry point, ZellijPlugin trait impl
       scheduler.rs    Thread scheduling and commit serialization
       ui.rs           Dashboard rendering
-  lisa-cli/           CLI binary (lisa init, lisa validate)
+  lisa-cli/           CLI binary (lisa init, lisa validate, lisa loop)
     src/
       main.rs         Clap CLI entry point
       detect.rs       Project type detection
       init.rs         Init and validate commands
-      templates.rs    CLAUDE.md generation, embedded RDSPI workflow
+      loop_cmd.rs     Loop command: embeds WASM, generates layout, execs zellij
+      templates.rs    CLAUDE.md generation, embedded RDSPI workflow + WASM
+    build.rs          Copies WASM plugin to OUT_DIR for embedding
 ```
 
 ### Directory Conventions

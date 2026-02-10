@@ -6,7 +6,7 @@ Lisa reads ticket files with YAML frontmatter, computes a dependency graph, and 
 
 ## Status
 
-Early development. Core modules (types, ticket parsing, DAG, scheduler, UI) are implemented with tests. The plugin compiles for `wasm32-wasip1`. The `lisa` CLI supports `init` and `validate` commands.
+Early development. Core modules (types, ticket parsing, DAG, scheduler, UI) are implemented with tests. The plugin compiles for `wasm32-wasip1`. The `lisa` CLI supports `init`, `validate`, and `loop` commands.
 
 ## Build
 
@@ -30,15 +30,15 @@ just check
 ## Quick Start
 
 ```bash
-# Install the CLI
-cargo install --path crates/lisa-cli
+# Build (WASM plugin + CLI with embedded plugin)
+just release
 
 # Initialize any project for lisa-loop
 cd your-project
 lisa init
 
-# Validate setup
-lisa validate
+# Write tickets in docs/active/tickets/, then:
+lisa loop
 ```
 
 ## How It Works
@@ -56,7 +56,7 @@ lisa validate
 crates/
   lisa-core/          Shared types, ticket parsing, DAG computation
   lisa-plugin/        Zellij WASM plugin (scheduler, UI, plugin entry)
-  lisa-cli/           CLI binary (lisa init, lisa validate)
+  lisa-cli/           CLI binary (lisa init, lisa validate, lisa loop)
 
 docs/
   knowledge/

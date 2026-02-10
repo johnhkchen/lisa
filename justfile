@@ -11,9 +11,12 @@ build:
 build-dev:
     cargo build -p lisa-plugin --target wasm32-wasip1
 
-# Build the CLI
-build-cli:
+# Build the CLI (builds WASM plugin first so it gets embedded)
+build-cli: build
     cargo build -p lisa-cli --release
+
+# Build everything for distribution
+release: build build-cli
 
 # Run all tests (native target)
 test:

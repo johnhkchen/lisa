@@ -1,5 +1,6 @@
 mod detect;
 mod init;
+mod loop_cmd;
 mod templates;
 
 use clap::{Parser, Subcommand};
@@ -30,6 +31,16 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
+    Loop {
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Maximum concurrent Claude sessions
+        #[arg(long, default_value = "2")]
+        max_threads: usize,
+    },
 }
 
 fn main() {
@@ -46,6 +57,13 @@ fn main() {
         Commands::Validate { path } => {
             let path = resolve_path(&path);
             if let Err(e) = init::run_validate(&path) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Loop { path, max_threads } => {
+            let path = resolve_path(&path);
+            if let Err(e) = loop_cmd::run_loop(&path, max_threads) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

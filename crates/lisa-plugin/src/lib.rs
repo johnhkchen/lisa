@@ -258,8 +258,9 @@ impl ZellijPlugin for State {
             EventType::Timer,
         ]);
 
-        // Initial DAG build
+        // Initial DAG build and schedule any ready tickets
         self.rebuild_dag();
+        self.schedule_ready_tickets();
 
         // Mark as initialized
         self.initialized = true;
