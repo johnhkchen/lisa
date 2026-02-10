@@ -159,6 +159,7 @@ impl State {
                     self.agent_slots.push(AgentSlot {
                         pane_id: pane.id,
                         ticket_id: None,
+                        has_session: false,
                     });
                 }
             }
@@ -218,13 +219,19 @@ impl State {
                     .unwrap_or(&self.config.ticket_dir.to_string_lossy()),
             );
 
-            // Write the claude command to the slot's terminal
-            let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
+            // Write command to the slot's terminal.
+            // First use: launch claude. Reuse: /clear + new prompt.
             let pane_id = self.agent_slots[slot_idx].pane_id;
+            let cmd = if self.agent_slots[slot_idx].has_session {
+                build_reuse_command(&host_ticket_dir, &ticket_id)
+            } else {
+                build_claude_command(&host_ticket_dir, &ticket_id)
+            };
             write_chars_to_pane_id(&cmd, PaneId::Terminal(pane_id));
 
-            // Mark slot as occupied
+            // Mark slot as occupied and session started
             self.agent_slots[slot_idx].ticket_id = Some(ticket_id.clone());
+            self.agent_slots[slot_idx].has_session = true;
 
             // Create thread record with the ticket's current phase
             let mut thread = Thread::new(ticket_id.clone(), pane_id);
