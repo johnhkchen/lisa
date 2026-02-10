@@ -57,8 +57,11 @@ impl Dag {
 
     /// Builds a DAG from a list of tickets.
     ///
-    /// This parses the `depends_on` and `blocks` fields from each ticket's
-    /// frontmatter and constructs the dependency graph. The graph is validated
+    /// This parses the `depends_on` field (and optional `blocks` field) from
+    /// each ticket's frontmatter and constructs the dependency graph. The DAG
+    /// can be fully computed from `depends_on` alone -- reverse edges
+    /// (blocked-by relationships) are derived automatically. If `blocks` is
+    /// present it is also used, but it is not required. The graph is validated
     /// to ensure all referenced dependencies exist.
     ///
     /// # Arguments
@@ -775,6 +778,57 @@ mod tests {
         assert_eq!(ticket_ids.len(), 2);
         assert!(ticket_ids.contains(&"T-001".to_string()));
         assert!(ticket_ids.contains(&"T-002".to_string()));
+    }
+
+    #[test]
+    fn test_dag_from_depends_on_only_no_blocks() {
+        // Build a DAG where no tickets have blocks fields -- only depends_on.
+        // The DAG should correctly compute reverse edges (blocked-by relationships).
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001", "T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+
+        // Verify forward edges (depends_on)
+        let deps_t2 = dag.get_dependencies(&"T-002".to_string());
+        assert_eq!(deps_t2.len(), 1);
+        assert!(deps_t2.contains(&"T-001".to_string()));
+
+        let deps_t3 = dag.get_dependencies(&"T-003".to_string());
+        assert_eq!(deps_t3.len(), 2);
+        assert!(deps_t3.contains(&"T-001".to_string()));
+        assert!(deps_t3.contains(&"T-002".to_string()));
+
+        // Verify reverse edges (blocked-by) are computed from depends_on
+        let blocked_by_t1 = dag.get_blocked_by(&"T-001".to_string());
+        assert_eq!(blocked_by_t1.len(), 2);
+        assert!(blocked_by_t1.contains(&"T-002".to_string()));
+        assert!(blocked_by_t1.contains(&"T-003".to_string()));
+
+        let blocked_by_t2 = dag.get_blocked_by(&"T-002".to_string());
+        assert_eq!(blocked_by_t2.len(), 1);
+        assert!(blocked_by_t2.contains(&"T-003".to_string()));
+
+        let blocked_by_t3 = dag.get_blocked_by(&"T-003".to_string());
+        assert!(blocked_by_t3.is_empty());
+
+        // Verify topological sort works
+        let sorted = dag.topological_sort().unwrap();
+        assert_eq!(sorted.len(), 3);
+        let pos_1 = sorted.iter().position(|id| id == "T-001").unwrap();
+        let pos_2 = sorted.iter().position(|id| id == "T-002").unwrap();
+        let pos_3 = sorted.iter().position(|id| id == "T-003").unwrap();
+        assert!(pos_1 < pos_2);
+        assert!(pos_2 < pos_3);
+
+        // Verify cycle detection works
+        assert_eq!(dag.detect_cycles(), CycleDetectionResult::NoCycle);
+
+        // Verify scheduling: T-001 is done, so T-002 should be ready
+        assert!(dag.can_start(&"T-002".to_string()));
+        // T-002 is not done, so T-003 should not be ready
+        assert!(!dag.can_start(&"T-003".to_string()));
     }
 
     #[test]

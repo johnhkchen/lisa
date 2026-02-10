@@ -110,7 +110,6 @@ status: open
 priority: high
 phase: ready
 depends_on: [T-024-01, T-024-02]
-blocks: [T-024-06]
 ---
 
 ## Context
@@ -131,7 +130,7 @@ Fields:
 - `priority`: `critical` | `high` | `medium` | `low`
 - `phase`: `ready` | `research` | `design` | `structure` | `plan` | `implement` | `review` | `done`
 - `depends_on`: List of ticket IDs that must complete before this ticket starts
-- `blocks`: List of ticket IDs that depend on this ticket
+- `blocks`: *(optional)* List of ticket IDs that depend on this ticket. Lisa computes this automatically from `depends_on`, so you do not need to maintain it by hand
 
 ---
 

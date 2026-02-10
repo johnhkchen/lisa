@@ -75,12 +75,15 @@ impl From<io::Error> for TicketError {
 /// priority: high
 /// phase: research
 /// depends_on: [T-024-01, T-024-02]
-/// blocks: [T-024-06]
 /// ---
 ///
 /// ## Context
 /// ...
 /// ```
+///
+/// The `blocks` field is optional. Lisa computes reverse dependency edges
+/// (blocked-by relationships) from `depends_on` alone. If `blocks` is present
+/// it will be parsed, but it is not required.
 ///
 /// # Arguments
 ///
@@ -704,6 +707,36 @@ Body
         let ticket = parse_ticket_content(content, path).unwrap();
 
         assert_eq!(ticket.story, None);
+    }
+
+    #[test]
+    fn test_parse_ticket_without_blocks_field() {
+        let content = r#"---
+id: T-001
+story: S-001
+title: no-blocks-field
+type: task
+status: open
+priority: high
+phase: ready
+depends_on: [T-000]
+---
+
+## Context
+
+This ticket has no blocks field at all.
+
+## Acceptance Criteria
+
+- Parsing succeeds with an empty blocks vec
+"#;
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+
+        assert_eq!(ticket.id, "T-001");
+        assert_eq!(ticket.title, "no-blocks-field");
+        assert!(ticket.blocks.is_empty(), "blocks should be empty when field is absent");
+        assert_eq!(ticket.depends_on, vec!["T-000".to_string()]);
     }
 
     #[test]

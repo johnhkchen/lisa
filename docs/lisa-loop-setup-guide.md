@@ -223,7 +223,6 @@ status: open
 priority: high
 phase: ready
 depends_on: []
-blocks: []
 ---
 ```
 
@@ -234,11 +233,11 @@ blocks: []
 - `priority` -- `critical`, `high`, `medium`, or `low`
 - `phase` -- start with `ready` for tickets that should be picked up immediately
 - `depends_on` -- list of ticket IDs that must be `done` before this ticket starts
-- `blocks` -- list of ticket IDs that cannot start until this ticket finishes
 
 ### Optional Frontmatter
 
 - `story` -- parent story ID (e.g., `S-001`). Useful for grouping but not required for DAG computation.
+- `blocks` -- list of ticket IDs that cannot start until this ticket finishes. This is computed automatically by lisa from `depends_on` edges, so you do not need to maintain it. If present, it will be parsed, but omitting it is recommended to avoid inconsistency.
 
 ### Body Format
 
@@ -265,17 +264,18 @@ This is the most important part of ticket writing. Get the dependencies right an
 
 **Rule: if two tickets modify the same files, one must depend on the other.**
 
-Think about it this way: two agents working simultaneously on the same file will produce conflicting commits. The `depends_on` / `blocks` edges prevent this.
+Think about it this way: two agents working simultaneously on the same file will produce conflicting commits. The `depends_on` edges prevent this.
+
+Use `depends_on` as the primary mechanism for declaring dependencies. Lisa computes the full DAG -- including reverse edges (which tickets are blocked by a given ticket) -- from `depends_on` alone. You do not need to maintain a `blocks` field; it is optional and computed.
 
 Example of a correct dependency chain:
 
 ```
 T-001-01 (define types)      -- no dependencies
-  blocks: [T-001-02, T-001-03]
+  depends_on: []
 
 T-001-02 (wire plugin state)  -- depends on types being defined
   depends_on: [T-001-01]
-  blocks: [T-001-03]
 
 T-001-03 (end-to-end test)    -- depends on both
   depends_on: [T-001-01, T-001-02]
@@ -286,7 +286,7 @@ Here, T-001-01 runs first. When it finishes, T-001-02 starts. T-001-03 waits for
 **Tips:**
 
 - When in doubt, add a dependency. False parallelism (two agents stepping on each other) is worse than false serialization (one agent waiting when it could have started).
-- `blocks` is the inverse of `depends_on`. Keep both consistent: if A depends on B, then B should list A in its `blocks`. Lisa uses both for DAG computation.
+- You only need `depends_on`. Lisa computes reverse edges (blocked-by) automatically. The `blocks` field is accepted if present but is not required and not recommended -- maintaining both sides of every edge is busywork and a source of inconsistency.
 - A ticket with `depends_on: []` and `phase: ready` will be picked up immediately when lisa starts.
 
 ---
@@ -408,7 +408,7 @@ All configuration is passed through the zellij plugin config map:
 When lisa loads:
 
 1. It scans `ticket_dir` for all `.md` files and parses their frontmatter.
-2. It computes the dependency DAG from `depends_on` / `blocks` fields.
+2. It computes the dependency DAG from `depends_on` fields (and optional `blocks` fields if present).
 3. It identifies tickets where `status: open`, `phase: ready`, and all dependencies are satisfied.
 4. It spawns Claude Code sessions (up to `max_threads`) for those ready tickets.
 5. The dashboard renders showing the DAG, active threads, and parked sessions.
@@ -479,7 +479,7 @@ A `lisa init` command would automate the manual setup described in this guide. H
 These are the things that go wrong when setting up by hand -- and the things `lisa init` should prevent:
 
 - **Forgetting `CLAUDE.md`.** Without it, agents have no workflow definition and produce unstructured output. The init command should refuse to proceed without it.
-- **Mismatched `depends_on` / `blocks`.** If T-001-02 lists `depends_on: [T-001-01]` but T-001-01 does not list `blocks: [T-001-02]`, the DAG still works (lisa computes from `depends_on`) but the ticket files are inconsistent. The init command should auto-populate `blocks` as the inverse of `depends_on`.
+- **Redundant `blocks` fields.** The `blocks` field is no longer required -- lisa computes reverse edges from `depends_on` alone. The init command should not generate `blocks` fields. If existing tickets have `blocks` fields, they are accepted but ignored for DAG computation in favor of the canonical `depends_on` edges.
 - **Circular dependencies.** Easy to create accidentally when writing tickets by hand. The init command should validate the DAG is acyclic.
 - **Tickets with wrong initial phase.** If you write `phase: research` instead of `phase: ready`, the ticket looks like it is already in-progress. Agents get confused. The init command should default new tickets to `phase: ready`.
 - **Missing acceptance criteria.** Vague tickets produce vague implementations. The init command should warn if a ticket body has no `## Acceptance Criteria` section.
