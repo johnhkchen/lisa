@@ -463,7 +463,76 @@ Each artifact is a standalone document. You can read any of them without needing
 
 ---
 
-## 8. Notes for `lisa init` (Future)
+## 8. Archiving Completed Work
+
+When a story is complete -- all its tickets are `done` -- move its files out of the active directory into an archive.
+
+### Archive Directory Structure
+
+```
+docs/archive/
+├── stories/      # Completed story files
+├── tickets/      # Completed ticket files
+└── work/         # Phase artifacts (optional)
+```
+
+Create these directories alongside `docs/active/`:
+
+```bash
+mkdir -p docs/archive/{stories,tickets,work}
+```
+
+### What to Move
+
+Archive per-story, not per-ticket. When a story finishes, move all of its files together:
+
+1. The story file: `docs/active/stories/S-001.md` --> `docs/archive/stories/S-001.md`
+2. All its ticket files: `docs/active/tickets/T-001-*.md` --> `docs/archive/tickets/`
+3. Optionally, work artifacts: `docs/active/work/T-001-*/` --> `docs/archive/work/`
+
+Keep work artifacts if you want historical reference for how decisions were made. Delete them if they are just noise -- the git history has everything if you need it later.
+
+### Why This Matters
+
+Lisa only scans `docs/active/`. Archived files are invisible to the plugin. Moving completed work out of the active directory keeps the DAG small, reduces scan time, and makes the dashboard show only what is in flight.
+
+Do not archive individual tickets while a story is still in progress. A ticket being `done` does not mean it should leave the active directory -- other tickets in the same story may reference it in their `depends_on` fields, and lisa needs to see those done tickets to know the dependency is satisfied.
+
+### Note for `lisa init`
+
+The `lisa init` command should create archive directories alongside active directories: `docs/archive/{stories,tickets,work}`.
+
+---
+
+## 9. Mid-Flight Ticket Modifications
+
+Sometimes requirements change while an agent is working on a ticket. What you do depends on how far the agent has progressed.
+
+### If the Ticket is in Research or Design
+
+Edit freely. The agent re-reads the ticket context at each phase boundary. Changes to acceptance criteria, context, or scope will be picked up when the next phase starts. No special action needed.
+
+### If the Ticket is in Structure, Plan, or Implement
+
+The agent has already committed to an approach based on the earlier phases. Research and Design artifacts reflect the old requirements. Changing the ticket now means the agent is building against stale context.
+
+The right action:
+
+1. **Stop the agent's session.** Close the pane in zellij.
+2. **Update the ticket.** Edit the frontmatter and body with the new requirements.
+3. **Reset the phase.** Set `phase: ready` in the ticket's frontmatter.
+4. **Delete stale work artifacts.** Remove `docs/active/work/{ticket-id}/` -- the research, design, structure, and plan files are based on old requirements.
+5. **Let lisa pick it up.** Lisa will see the ticket as ready and a fresh agent will start from Research.
+
+This is intentionally aggressive. A few minutes of re-running Research and Design is cheaper than an agent implementing against wrong requirements. The early phases are fast. Wrong implementations are expensive.
+
+### Trivial Edits
+
+If the change is small and does not invalidate the design -- fixing a typo in acceptance criteria, adding a minor clarification -- use judgment. You do not need to reset for edits that do not change what the agent is building.
+
+---
+
+## 10. Notes for `lisa init` (Future)
 
 A `lisa init` command would automate the manual setup described in this guide. Here is what it would do and what to watch for.
 
