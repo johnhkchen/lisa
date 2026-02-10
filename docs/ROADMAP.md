@@ -61,19 +61,30 @@ Close the loop: `lisa init` → write tickets → `lisa loop` → agents work.
 - `just build-cli` builds plugin first, then CLI with embedded WASM
 - `just release` recipe for full distribution build
 
+### S-005: Scheduling Observability & Reliability
+Fix scheduling bugs found after running S-001–S-004, add logging.
+- Scheduling decision logging: Info/PollSummary events for scheduling pipeline visibility
+- Fixed phase-change detection: first-seen tickets now detected, slot release unconditional
+- Thread lifecycle cleanup: completed threads removed, stale entries audited
+- Sweep safety nets: `sweep_stale_slots()` and `audit_threads()` catch orphaned state
+- 182 tests (up from 88)
+
+---
+
+## Active
+
+### S-006: Dogfood Integration Testing
+Run lisa on itself. Add diagnostic tooling to make the live run observable.
+- T-006-01: `lisa status` CLI command — offline DAG/ticket inspection
+- T-006-02: Plugin startup diagnostics — log what was loaded on init
+- T-006-03: Session launch command audit — log/verify agent spawn commands
+- T-006-04: Runtime state snapshot — dump full plugin state on keypress
+
 ---
 
 ## Next Sprint Candidates
 
 Prioritized based on first-implementer feedback and design maturity.
-
-### Sprint Candidate: Plugin Integration Testing
-Test the plugin in a live zellij session.
-- Load plugin with example tickets, verify dashboard renders
-- DAG computation matches expected dependency graph
-- Thread spawning with a simple ticket
-- Filesystem watch detects artifact creation
-- Phase transition detection and dashboard updates
 
 ### Sprint Candidate: Review Gating
 Make review behavior configurable.
