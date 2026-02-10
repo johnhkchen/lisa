@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use zellij_tile::prelude::*;
 
 use lisa_core::dag::Dag;
+use lisa_core::diagnostics;
 use lisa_core::ticket;
 use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
 
@@ -36,14 +37,33 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
 /// Build the full shell command to launch Claude Code in a fresh pane.
 fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
-        "claude --dangerously-skip-permissions \"{}\"\r",
+        "claude --dangerously-skip-permissions \"{}\"",
         ticket_prompt(ticket_dir, ticket_id)
     )
 }
 
 /// Build a bare prompt to send into an already-running Claude Code session.
 fn build_claude_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
-    format!("{}\r", ticket_prompt(ticket_dir, ticket_id))
+    ticket_prompt(ticket_dir, ticket_id)
+}
+
+/// Send text to a pane followed by Enter (carriage return as a raw byte).
+///
+/// `write_chars_to_pane_id` sends characters as typed text, but TUI apps like
+/// Claude Code need the Enter key delivered as a raw byte (0x0D) via
+/// `write_to_pane_id`, not as a `\r` character embedded in the text stream.
+fn send_line_to_pane(text: &str, pane_id: PaneId) {
+    write_chars_to_pane_id(text, pane_id);
+    write_to_pane_id(vec![13], pane_id); // Enter key
+}
+
+/// Strip the `/host/` prefix from a WASI sandbox path to get the host-relative path.
+///
+/// Inside the WASI sandbox, the host filesystem is mounted at `/host/`.
+/// Commands sent to agent panes run on the host, so paths must not have this prefix.
+fn strip_host_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    PathBuf::from(s.strip_prefix("/host/").unwrap_or(&s).to_string())
 }
 
 /// An agent pane slot — a pre-created terminal in the stacked layout.
@@ -135,7 +155,7 @@ impl State {
     /// Flush any deferred pane writes (commands queued after `/clear`).
     fn flush_pending_pane_writes(&mut self) {
         for (pane_id, cmd) in self.pending_pane_writes.drain(..) {
-            write_chars_to_pane_id(&cmd, PaneId::Terminal(pane_id));
+            send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
         }
     }
 
@@ -298,26 +318,23 @@ impl State {
             };
 
             // Build the host-relative ticket dir (strip /host/ prefix)
-            let host_ticket_dir = PathBuf::from(
-                self.config
-                    .ticket_dir
-                    .to_string_lossy()
-                    .strip_prefix("/host/")
-                    .unwrap_or(&self.config.ticket_dir.to_string_lossy()),
-            );
+            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
 
             let pane_id = self.agent_slots[slot_idx].pane_id;
 
+            let launch_cmd;
             if self.agent_slots[slot_idx].has_session {
                 // Claude Code is already running — /clear resets the conversation,
                 // then we send just the prompt text.
-                write_chars_to_pane_id("/clear\r", PaneId::Terminal(pane_id));
+                send_line_to_pane("/clear", PaneId::Terminal(pane_id));
                 let cmd = build_claude_prompt(&host_ticket_dir, &ticket_id);
+                launch_cmd = cmd.clone();
                 self.pending_pane_writes.push((pane_id, cmd));
             } else {
                 // Fresh pane — launch Claude Code from the shell.
                 let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
-                write_chars_to_pane_id(&cmd, PaneId::Terminal(pane_id));
+                launch_cmd = cmd.clone();
+                send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
                 self.agent_slots[slot_idx].has_session = true;
             }
 
@@ -330,6 +347,11 @@ impl State {
             }
             self.threads.insert(ticket_id.clone(), thread);
 
+            self.log_activity(ActivityEvent::SessionLaunch {
+                ticket_id: ticket_id.clone(),
+                pane_id,
+                command: launch_cmd,
+            });
             self.log_activity(ActivityEvent::ThreadSpawned {
                 ticket_id,
                 pane_id,
@@ -685,6 +707,243 @@ impl State {
         self.arm_timer(POLL_INTERVAL_SECS);
     }
 
+    /// Format a single ActivityEvent as a one-line string for the state snapshot.
+    fn format_activity_event(event: &ActivityEvent) -> String {
+        match event {
+            ActivityEvent::PluginStarted => "PluginStarted".to_string(),
+            ActivityEvent::ThreadSpawned { ticket_id, pane_id } => {
+                format!("ThreadSpawned: {} pane=#{}", ticket_id, pane_id)
+            }
+            ActivityEvent::PhaseCompleted { ticket_id, phase } => {
+                format!("PhaseCompleted: {} {}", ticket_id, phase)
+            }
+            ActivityEvent::ThreadExited {
+                ticket_id,
+                exit_code,
+            } => {
+                format!("ThreadExited: {} exit_code={:?}", ticket_id, exit_code)
+            }
+            ActivityEvent::TicketStatusChanged {
+                ticket_id,
+                old_status,
+                new_status,
+            } => {
+                format!("TicketStatusChanged: {} {} -> {}", ticket_id, old_status, new_status)
+            }
+            ActivityEvent::TicketPhaseChanged {
+                ticket_id,
+                old_phase,
+                new_phase,
+            } => {
+                format!("TicketPhaseChanged: {} {} -> {}", ticket_id, old_phase, new_phase)
+            }
+            ActivityEvent::ArtifactCreated {
+                ticket_id,
+                phase,
+                path,
+            } => {
+                format!("ArtifactCreated: {} {} {}", ticket_id, phase, path.display())
+            }
+            ActivityEvent::CommitMade {
+                ticket_id,
+                commit_hash,
+            } => {
+                format!("CommitMade: {} {}", ticket_id, commit_hash)
+            }
+            ActivityEvent::Error { message } => format!("Error: {}", message),
+            ActivityEvent::DagRecomputed { ticket_count } => {
+                format!("DagRecomputed: {} tickets", ticket_count)
+            }
+            ActivityEvent::AllTicketsDone => "AllTicketsDone".to_string(),
+            ActivityEvent::HealthStateChanged {
+                ticket_id,
+                old_health,
+                new_health,
+            } => {
+                format!("HealthStateChanged: {} {:?} -> {:?}", ticket_id, old_health, new_health)
+            }
+            ActivityEvent::Warning { message } => format!("Warning: {}", message),
+            ActivityEvent::Info { message } => format!("Info: {}", message),
+            ActivityEvent::PollSummary {
+                ready,
+                running,
+                idle_slots,
+            } => {
+                format!("PollSummary: ready={} running={} idle_slots={}", ready, running, idle_slots)
+            }
+            ActivityEvent::SessionLaunch {
+                ticket_id,
+                pane_id,
+                command,
+            } => {
+                format!("SessionLaunch: {} pane=#{} cmd={}", ticket_id, pane_id, command)
+            }
+        }
+    }
+
+    /// Format the full plugin state as a human-readable text snapshot.
+    fn format_snapshot(&self) -> String {
+        use std::fmt::Write;
+        use std::time::SystemTime;
+
+        let now = SystemTime::now();
+        let epoch_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut out = String::new();
+
+        // Header
+        writeln!(out, "=== Lisa State Snapshot ===").unwrap();
+        writeln!(out, "Timestamp: {} (unix epoch)", epoch_secs).unwrap();
+        writeln!(out).unwrap();
+
+        // Config
+        writeln!(out, "=== Config ===").unwrap();
+        writeln!(out, "ticket_dir:          {}", self.config.ticket_dir.display()).unwrap();
+        writeln!(out, "story_dir:           {}", self.config.story_dir.display()).unwrap();
+        writeln!(out, "work_dir:            {}", self.config.work_dir.display()).unwrap();
+        writeln!(out, "max_threads:         {}", self.config.max_threads).unwrap();
+        writeln!(out, "auto_advance:        {}", self.config.auto_advance).unwrap();
+        writeln!(out, "stuck_threshold_secs: {}", self.config.stuck_threshold_secs).unwrap();
+        writeln!(out).unwrap();
+
+        // Plugin status
+        writeln!(out, "=== Plugin Status ===").unwrap();
+        writeln!(out, "initialized:         {}", self.initialized).unwrap();
+        writeln!(out, "permissions_granted: {}", self.permissions_granted).unwrap();
+        writeln!(out, "slots_discovered:    {}", self.slots_discovered).unwrap();
+        writeln!(out, "terminated:          {}", self.terminated).unwrap();
+        writeln!(out, "pending_timer_count: {}", self.pending_timer_count).unwrap();
+        writeln!(out, "pending_pane_writes: {}", self.pending_pane_writes.len()).unwrap();
+        writeln!(out).unwrap();
+
+        // Tickets
+        writeln!(out, "=== Tickets ===").unwrap();
+        let mut ticket_list: Vec<_> = self.dag.tickets().collect();
+        ticket_list.sort_by(|a, b| a.id.cmp(&b.id));
+        writeln!(out, "{:<14} {:<12} {:<12} {}", "ID", "PHASE", "STATUS", "DEPENDS_ON").unwrap();
+        for t in &ticket_list {
+            let deps = if t.depends_on.is_empty() {
+                "—".to_string()
+            } else {
+                t.depends_on.join(", ")
+            };
+            writeln!(out, "{:<14} {:<12} {:<12} {}", t.id, t.phase, t.status, deps).unwrap();
+        }
+        writeln!(out).unwrap();
+
+        // DAG Edges
+        writeln!(out, "=== DAG Edges ===").unwrap();
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for t in &ticket_list {
+            let deps = self.dag.get_dependencies(&t.id);
+            for dep in deps {
+                edges.push((dep.clone(), t.id.clone()));
+            }
+        }
+        edges.sort();
+        if edges.is_empty() {
+            writeln!(out, "(no edges)").unwrap();
+        } else {
+            for (from, to) in &edges {
+                writeln!(out, "{} -> {}", from, to).unwrap();
+            }
+        }
+        writeln!(out).unwrap();
+
+        // DAG Stats
+        writeln!(out, "=== DAG Stats ===").unwrap();
+        let stats = self.dag.stats();
+        writeln!(out, "total_tickets:       {}", stats.total_tickets).unwrap();
+        writeln!(out, "done_tickets:        {}", stats.done_tickets).unwrap();
+        writeln!(out, "ready_tickets:       {}", stats.ready_tickets).unwrap();
+        writeln!(out, "in_progress_tickets: {}", stats.in_progress_tickets).unwrap();
+        writeln!(out, "blocked_tickets:     {}", stats.blocked_tickets).unwrap();
+        writeln!(out, "critical_path_length: {}", stats.critical_path_length).unwrap();
+        writeln!(out).unwrap();
+
+        // Threads
+        writeln!(out, "=== Threads ===").unwrap();
+        let mut thread_list: Vec<_> = self.threads.iter().collect();
+        thread_list.sort_by(|a, b| a.0.cmp(b.0));
+        if thread_list.is_empty() {
+            writeln!(out, "(no threads)").unwrap();
+        } else {
+            writeln!(
+                out,
+                "{:<14} {:<6} {:<12} {:<10} {:<14} {}",
+                "TICKET", "PANE", "PHASE", "STATUS", "STARTED_AGO", "PHASE_CHG_AGO"
+            )
+            .unwrap();
+            let threshold = std::time::Duration::from_secs(self.config.stuck_threshold_secs);
+            for (tid, thread) in &thread_list {
+                let started_ago = now
+                    .duration_since(thread.started_at)
+                    .unwrap_or_default()
+                    .as_secs();
+                let phase_chg_ago = now
+                    .duration_since(thread.last_phase_change)
+                    .unwrap_or_default()
+                    .as_secs();
+                let health = thread.health(now, threshold);
+                writeln!(
+                    out,
+                    "{:<14} #{:<4} {:<12} {:<10} {:<14} {} [health: {:?}]",
+                    tid,
+                    thread.pane_id,
+                    thread.current_phase,
+                    format!("{:?}", thread.status),
+                    format!("{}s", started_ago),
+                    format!("{}s", phase_chg_ago),
+                    health
+                )
+                .unwrap();
+            }
+        }
+        writeln!(out).unwrap();
+
+        // Agent Slots
+        writeln!(out, "=== Agent Slots ===").unwrap();
+        if self.agent_slots.is_empty() {
+            writeln!(out, "(no slots)").unwrap();
+        } else {
+            writeln!(out, "{:<8} {:<14} {}", "PANE", "TICKET", "HAS_SESSION").unwrap();
+            for slot in &self.agent_slots {
+                let ticket = slot.ticket_id.as_deref().unwrap_or("(idle)");
+                writeln!(out, "#{:<7} {:<14} {}", slot.pane_id, ticket, slot.has_session).unwrap();
+            }
+        }
+        writeln!(out).unwrap();
+
+        // Health Status (last known)
+        writeln!(out, "=== Last Known Health ===").unwrap();
+        let mut health_list: Vec<_> = self.last_health.iter().collect();
+        health_list.sort_by(|a, b| a.0.cmp(b.0));
+        if health_list.is_empty() {
+            writeln!(out, "(no health data)").unwrap();
+        } else {
+            for (tid, health) in &health_list {
+                writeln!(out, "{:<14} {:?}", tid, health).unwrap();
+            }
+        }
+        writeln!(out).unwrap();
+
+        // Activity Log (last 50)
+        writeln!(out, "=== Activity Log (last 50) ===").unwrap();
+        let log_entries: Vec<_> = self.activity_log.iter().rev().take(50).collect();
+        if log_entries.is_empty() {
+            writeln!(out, "(no activity)").unwrap();
+        } else {
+            for (i, event) in log_entries.iter().enumerate() {
+                writeln!(out, "{:>3}. {}", i + 1, Self::format_activity_event(event)).unwrap();
+            }
+        }
+
+        out
+    }
+
     /// Handle keyboard input. Returns true if the UI should re-render.
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
         if self.modal.open {
@@ -716,6 +975,21 @@ impl State {
         // Normal mode: 'd' opens the mark-done modal
         if key.bare_key == BareKey::Char('d') {
             self.open_mark_done_modal();
+            return true;
+        }
+
+        // Normal mode: 'D' (Shift+D) writes a state snapshot dump
+        if key.bare_key == BareKey::Char('D') {
+            let snapshot = self.format_snapshot();
+            if let Err(e) = std::fs::write("/host/.lisa-state-dump.txt", &snapshot) {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Failed to write state snapshot: {}", e),
+                });
+            } else {
+                self.log_activity(ActivityEvent::Info {
+                    message: "State snapshot written to .lisa-state-dump.txt".to_string(),
+                });
+            }
             return true;
         }
 
@@ -841,8 +1115,45 @@ impl ZellijPlugin for State {
             PermissionType::ReadApplicationState,
         ]);
 
-        // Initial DAG build
-        self.rebuild_dag();
+        // Initial DAG build with startup diagnostics
+        let commit_lock_path = PathBuf::from("/host/.ralph-commit.lock");
+        let scan_result = match ticket::scan_tickets_with_diagnostics(&self.config.ticket_dir) {
+            Ok(result) => result,
+            Err(e) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Failed to scan tickets: {}", e),
+                });
+                // Fall through with empty scan so diagnostics can still report config
+                ticket::ScanResult {
+                    tickets: Vec::new(),
+                    errors: Vec::new(),
+                }
+            }
+        };
+
+        let dag_result = Dag::from_tickets(scan_result.tickets.clone());
+
+        // Run startup diagnostics (pure function, no side effects)
+        let diag_events = diagnostics::startup_diagnostics(
+            &self.config,
+            &scan_result,
+            &dag_result,
+            &commit_lock_path,
+        );
+        for event in diag_events {
+            self.log_activity(event);
+        }
+
+        // Store the DAG (or keep default empty DAG on error)
+        match dag_result {
+            Ok(dag) => {
+                self.last_phases = dag.tickets().map(|t| (t.id.clone(), t.phase)).collect();
+                self.dag = dag;
+            }
+            Err(_) => {
+                // DAG errors already logged by diagnostics
+            }
+        }
 
         // Mark as initialized
         self.initialized = true;
@@ -1155,6 +1466,22 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
             message: message.clone(),
         },
         ActivityEvent::PollSummary { .. } => return None,
+        ActivityEvent::Warning { message } => ui::ActivityType::Warning {
+            ticket_id: String::new(),
+            message: message.clone(),
+        },
+        ActivityEvent::SessionLaunch {
+            ticket_id,
+            command,
+            ..
+        } => ui::ActivityType::Info {
+            ticket_id: ticket_id.clone(),
+            message: if command.len() > 120 {
+                format!("Launch: {}...", &command[..120])
+            } else {
+                format!("Launch: {}", command)
+            },
+        },
     };
 
     Some(ui::ActivityEntry {
@@ -1279,7 +1606,7 @@ mod tests {
         assert!(cmd.starts_with("claude --dangerously-skip-permissions"));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
-        assert!(cmd.ends_with('\r'), "should end with carriage return");
+        assert!(!cmd.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");
     }
 
     #[test]
@@ -1290,7 +1617,116 @@ mod tests {
         assert!(!prompt.contains("claude"), "prompt should not contain the claude binary");
         assert!(prompt.contains("docs/active/tickets/T-042-01.md"));
         assert!(prompt.contains("CLAUDE.md"));
-        assert!(prompt.ends_with('\r'), "should end with carriage return");
+        assert!(!prompt.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");
+    }
+
+    #[test]
+    fn test_build_claude_command_includes_rdspi_reference() {
+        let ticket_dir = Path::new("docs/active/tickets");
+        let cmd = build_claude_command(ticket_dir, "T-001");
+
+        assert!(
+            cmd.contains("docs/knowledge/rdspi-workflow.md"),
+            "command should reference RDSPI workflow, got: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_claude_prompt_includes_rdspi_reference() {
+        let ticket_dir = Path::new("docs/active/tickets");
+        let prompt = build_claude_prompt(ticket_dir, "T-001");
+
+        assert!(
+            prompt.contains("docs/knowledge/rdspi-workflow.md"),
+            "prompt should reference RDSPI workflow, got: {}",
+            prompt
+        );
+    }
+
+    #[test]
+    fn test_strip_host_prefix_with_prefix() {
+        let path = Path::new("/host/docs/active/tickets");
+        assert_eq!(strip_host_prefix(path), PathBuf::from("docs/active/tickets"));
+    }
+
+    #[test]
+    fn test_strip_host_prefix_without_prefix() {
+        let path = Path::new("docs/active/tickets");
+        assert_eq!(strip_host_prefix(path), PathBuf::from("docs/active/tickets"));
+    }
+
+    #[test]
+    fn test_strip_host_prefix_just_host() {
+        let path = Path::new("/host/");
+        assert_eq!(strip_host_prefix(path), PathBuf::from(""));
+    }
+
+    #[test]
+    fn test_strip_host_prefix_nested_host() {
+        let path = Path::new("/host/host/nested");
+        assert_eq!(strip_host_prefix(path), PathBuf::from("host/nested"));
+    }
+
+    #[test]
+    fn test_strip_host_prefix_absolute_non_host() {
+        let path = Path::new("/other/docs/active/tickets");
+        assert_eq!(
+            strip_host_prefix(path),
+            PathBuf::from("/other/docs/active/tickets")
+        );
+    }
+
+    #[test]
+    fn test_session_launch_event_to_ui() {
+        let event = ActivityEvent::SessionLaunch {
+            ticket_id: "T-001".to_string(),
+            pane_id: 42,
+            command: "claude --dangerously-skip-permissions \"Read the ticket...\"".to_string(),
+        };
+        let entry = activity_event_to_ui_entry(&event);
+        assert!(entry.is_some(), "SessionLaunch should produce a UI entry");
+        match &entry.unwrap().activity {
+            ui::ActivityType::Info { ticket_id, message } => {
+                assert_eq!(ticket_id, "T-001");
+                assert!(message.contains("Launch:"));
+                assert!(message.contains("claude"));
+            }
+            other => panic!("Expected Info, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_session_launch_event_to_ui_truncates_long_command() {
+        let long_command = "x".repeat(200);
+        let event = ActivityEvent::SessionLaunch {
+            ticket_id: "T-002".to_string(),
+            pane_id: 7,
+            command: long_command,
+        };
+        let entry = activity_event_to_ui_entry(&event).unwrap();
+        match &entry.activity {
+            ui::ActivityType::Info { message, .. } => {
+                assert!(
+                    message.len() < 200,
+                    "Long command should be truncated, got {} chars",
+                    message.len()
+                );
+                assert!(message.ends_with("..."));
+            }
+            other => panic!("Expected Info, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_ticket_prompt_content() {
+        let dir = Path::new("docs/active/tickets");
+        let prompt = ticket_prompt(dir, "T-024-03");
+
+        assert!(prompt.contains("docs/active/tickets/T-024-03.md"));
+        assert!(prompt.contains("CLAUDE.md"));
+        assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(prompt.contains("current phase"));
     }
 
     #[test]
@@ -2460,6 +2896,243 @@ mod tests {
         // Ticket file updated
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
         assert!(content.contains("phase: done"));
+    }
+
+    #[test]
+    fn test_format_snapshot_contains_all_sections() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+
+        // Create tickets: T-001 done, T-002 depends on T-001, T-003 depends on T-002
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: done\n---\n\nDone.\n",
+        ).unwrap();
+        fs::write(
+            tickets_dir.join("T-002.md"),
+            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: research\ndepends_on: [T-001]\n---\n\nActive.\n",
+        ).unwrap();
+        fs::write(
+            tickets_dir.join("T-003.md"),
+            "---\nid: T-003\ntitle: third\ntype: task\nstatus: open\npriority: low\nphase: ready\ndepends_on: [T-002]\n---\n\nBlocked.\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir,
+                ..PluginConfig::new()
+            },
+            initialized: true,
+            permissions_granted: true,
+            ..State::default()
+        };
+
+        // Add threads
+        let mut thread = Thread::new("T-002", 5);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-002".to_string(), thread);
+
+        // Add agent slots
+        state.agent_slots.push(AgentSlot {
+            pane_id: 5,
+            ticket_id: Some("T-002".to_string()),
+            has_session: true,
+        });
+        state.agent_slots.push(AgentSlot {
+            pane_id: 6,
+            ticket_id: None,
+            has_session: false,
+        });
+
+        // Add health data
+        state.last_health.insert("T-002".to_string(), lisa_core::types::HealthStatus::Healthy);
+
+        // Add activity events
+        state.log_activity(ActivityEvent::PluginStarted);
+        state.log_activity(ActivityEvent::Info {
+            message: "test info".to_string(),
+        });
+
+        let snapshot = state.format_snapshot();
+
+        // Check all section headers
+        assert!(snapshot.contains("=== Lisa State Snapshot ==="), "Missing header");
+        assert!(snapshot.contains("=== Config ==="), "Missing config section");
+        assert!(snapshot.contains("=== Plugin Status ==="), "Missing plugin status");
+        assert!(snapshot.contains("=== Tickets ==="), "Missing tickets section");
+        assert!(snapshot.contains("=== DAG Edges ==="), "Missing edges section");
+        assert!(snapshot.contains("=== DAG Stats ==="), "Missing stats section");
+        assert!(snapshot.contains("=== Threads ==="), "Missing threads section");
+        assert!(snapshot.contains("=== Agent Slots ==="), "Missing slots section");
+        assert!(snapshot.contains("=== Last Known Health ==="), "Missing health section");
+        assert!(snapshot.contains("=== Activity Log (last 50) ==="), "Missing activity log");
+    }
+
+    #[test]
+    fn test_format_snapshot_ticket_data() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: done\n---\n\nDone.\n",
+        ).unwrap();
+        fs::write(
+            tickets_dir.join("T-002.md"),
+            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: research\ndepends_on: [T-001]\n---\n\nActive.\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let snapshot = state.format_snapshot();
+
+        // Ticket IDs and phases
+        assert!(snapshot.contains("T-001"), "Missing T-001");
+        assert!(snapshot.contains("T-002"), "Missing T-002");
+        assert!(snapshot.contains("done"), "Missing done phase");
+        assert!(snapshot.contains("research"), "Missing research phase");
+
+        // DAG edge
+        assert!(snapshot.contains("T-001 -> T-002"), "Missing edge T-001 -> T-002");
+
+        // DAG stats
+        assert!(snapshot.contains("total_tickets:       2"), "Wrong total tickets");
+        assert!(snapshot.contains("done_tickets:        1"), "Wrong done tickets");
+    }
+
+    #[test]
+    fn test_format_snapshot_thread_and_slot_data() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nActive.\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Thread
+        let mut thread = Thread::new("T-001", 42);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-001".to_string(), thread);
+
+        // Slots
+        state.agent_slots.push(AgentSlot {
+            pane_id: 42,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+        state.agent_slots.push(AgentSlot {
+            pane_id: 43,
+            ticket_id: None,
+            has_session: false,
+        });
+
+        let snapshot = state.format_snapshot();
+
+        // Thread data
+        assert!(snapshot.contains("T-001"), "Thread ticket_id missing");
+        assert!(snapshot.contains("#42"), "Thread pane_id missing");
+        assert!(snapshot.contains("Running"), "Thread status missing");
+
+        // Slot data
+        assert!(snapshot.contains("(idle)"), "Idle slot missing");
+        assert!(snapshot.contains("true"), "has_session=true missing");
+        assert!(snapshot.contains("false"), "has_session=false missing");
+    }
+
+    #[test]
+    fn test_format_snapshot_activity_log_limit() {
+        let mut state = State::default();
+
+        // Add 100 activity events
+        for i in 0..100 {
+            state.log_activity(ActivityEvent::Info {
+                message: format!("event-{}", i),
+            });
+        }
+
+        let snapshot = state.format_snapshot();
+
+        // Should contain the last 50 events (50-99), not the first 50
+        assert!(snapshot.contains("event-99"), "Latest event missing");
+        assert!(snapshot.contains("event-50"), "Event at boundary missing");
+        assert!(!snapshot.contains("event-49"), "Old event should not appear");
+
+        // Should be numbered 1-50
+        assert!(snapshot.contains("  1. Info: event-99"), "First entry should be event-99");
+    }
+
+    #[test]
+    fn test_format_activity_event_variants() {
+        let cases = vec![
+            (ActivityEvent::PluginStarted, "PluginStarted"),
+            (
+                ActivityEvent::ThreadSpawned {
+                    ticket_id: "T-001".to_string(),
+                    pane_id: 5,
+                },
+                "ThreadSpawned: T-001 pane=#5",
+            ),
+            (
+                ActivityEvent::Error {
+                    message: "bad thing".to_string(),
+                },
+                "Error: bad thing",
+            ),
+            (
+                ActivityEvent::TicketPhaseChanged {
+                    ticket_id: "T-002".to_string(),
+                    old_phase: Phase::Research,
+                    new_phase: Phase::Design,
+                },
+                "TicketPhaseChanged: T-002 research -> design",
+            ),
+        ];
+
+        for (event, expected) in cases {
+            let formatted = State::format_activity_event(&event);
+            assert_eq!(formatted, expected, "Mismatch for {:?}", event);
+        }
     }
 }
 

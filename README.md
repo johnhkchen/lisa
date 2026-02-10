@@ -4,9 +4,22 @@ A Zellij plugin for DAG-driven concurrent task scheduling. An homage to the ralp
 
 Lisa reads ticket files with YAML frontmatter, computes a dependency graph, and spawns concurrent Claude Code sessions that work through the RDSPI workflow (Research, Design, Structure, Plan, Implement). It carries between projects as a single `.wasm` file.
 
-## Status
+## Install
 
-Early development. Core modules (types, ticket parsing, DAG, scheduler, UI) are implemented with tests. The plugin compiles for `wasm32-wasip1`. The `lisa` CLI supports `init`, `validate`, and `loop` commands.
+```bash
+# CLI only (lisa init, lisa validate, lisa status)
+cargo install lisa-cli
+
+# From source (full functionality including lisa loop)
+git clone https://github.com/johnhkchen/lisa
+cd lisa
+rustup target add wasm32-wasip1
+just release
+```
+
+> **Note:** `cargo install` provides the CLI without the embedded Zellij WASM plugin.
+> The `lisa loop` command requires building from source so the plugin can be compiled
+> and embedded into the binary.
 
 ## Build
 

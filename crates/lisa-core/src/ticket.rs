@@ -343,6 +343,48 @@ pub fn scan_tickets<P: AsRef<Path>>(dir: P) -> Result<Vec<Ticket>, TicketError> 
     Ok(tickets)
 }
 
+/// Result of scanning a directory for tickets, preserving per-file errors.
+#[derive(Debug)]
+pub struct ScanResult {
+    /// Successfully parsed tickets.
+    pub tickets: Vec<Ticket>,
+    /// Per-file parse errors (file path, error).
+    pub errors: Vec<(PathBuf, TicketError)>,
+}
+
+/// Scans a directory for ticket files, returning both parsed tickets and per-file errors.
+///
+/// Unlike `scan_tickets`, this function surfaces individual parse errors so callers
+/// can log them as diagnostic events rather than silently skipping them.
+///
+/// # Errors
+///
+/// Returns `TicketError::Io` if the directory itself cannot be read.
+pub fn scan_tickets_with_diagnostics<P: AsRef<Path>>(dir: P) -> Result<ScanResult, TicketError> {
+    let dir = dir.as_ref();
+    let mut tickets = Vec::new();
+    let mut errors = Vec::new();
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        if path.is_dir() {
+            continue;
+        }
+
+        match parse_ticket(&path) {
+            Ok(ticket) => tickets.push(ticket),
+            Err(e) => errors.push((path, e)),
+        }
+    }
+
+    Ok(ScanResult { tickets, errors })
+}
+
 /// Recursively scans a directory tree for all ticket files (*.md).
 ///
 /// # Arguments
@@ -756,5 +798,57 @@ This ticket has no blocks field at all.
             err.to_string(),
             "Invalid value 'bad' for field 'phase': not valid"
         );
+    }
+
+    #[test]
+    fn test_scan_with_diagnostics_clean() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(
+            dir.path().join("T-001.md"),
+            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\nBody\n",
+        ).unwrap();
+        fs::write(
+            dir.path().join("T-002.md"),
+            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: ready\n---\nBody\n",
+        ).unwrap();
+
+        let result = scan_tickets_with_diagnostics(dir.path()).unwrap();
+        assert_eq!(result.tickets.len(), 2);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_scan_with_diagnostics_parse_error() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Valid ticket
+        fs::write(
+            dir.path().join("T-001.md"),
+            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\nBody\n",
+        ).unwrap();
+        // Invalid ticket (missing required fields)
+        fs::write(
+            dir.path().join("T-BAD.md"),
+            "---\nid: T-BAD\ntitle: bad\n---\nNo type/status/priority/phase\n",
+        ).unwrap();
+
+        let result = scan_tickets_with_diagnostics(dir.path()).unwrap();
+        assert_eq!(result.tickets.len(), 1);
+        assert_eq!(result.tickets[0].id, "T-001");
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].0, dir.path().join("T-BAD.md"));
+    }
+
+    #[test]
+    fn test_scan_with_diagnostics_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = scan_tickets_with_diagnostics(dir.path()).unwrap();
+        assert!(result.tickets.is_empty());
+        assert!(result.errors.is_empty());
     }
 }

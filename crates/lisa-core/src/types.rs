@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -39,6 +40,21 @@ pub enum Phase {
     Review,
     /// Work completed
     Done,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Phase::Ready => write!(f, "ready"),
+            Phase::Research => write!(f, "research"),
+            Phase::Design => write!(f, "design"),
+            Phase::Structure => write!(f, "structure"),
+            Phase::Plan => write!(f, "plan"),
+            Phase::Implement => write!(f, "implement"),
+            Phase::Review => write!(f, "review"),
+            Phase::Done => write!(f, "done"),
+        }
+    }
 }
 
 impl Phase {
@@ -148,6 +164,19 @@ pub enum TicketStatus {
     Done,
     /// Ticket has been cancelled
     Cancelled,
+}
+
+impl fmt::Display for TicketStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TicketStatus::Open => write!(f, "open"),
+            TicketStatus::InProgress => write!(f, "in_progress"),
+            TicketStatus::Blocked => write!(f, "blocked"),
+            TicketStatus::Review => write!(f, "review"),
+            TicketStatus::Done => write!(f, "done"),
+            TicketStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
 }
 
 /// Type alias for backward compatibility with code using `Status`.
@@ -561,6 +590,9 @@ pub enum ActivityEvent {
         new_health: HealthStatus,
     },
 
+    /// A warning (not an error, but something the operator should notice)
+    Warning { message: String },
+
     /// Informational log message (not an error or warning)
     Info { message: String },
 
@@ -569,6 +601,13 @@ pub enum ActivityEvent {
         ready: usize,
         running: usize,
         idle_slots: usize,
+    },
+
+    /// A session was launched for a ticket (structured capture of the command)
+    SessionLaunch {
+        ticket_id: TicketId,
+        pane_id: u32,
+        command: String,
     },
 }
 
@@ -807,6 +846,28 @@ mod tests {
             }
             _ => panic!("Expected HealthStateChanged"),
         }
+    }
+
+    #[test]
+    fn test_phase_display() {
+        assert_eq!(Phase::Ready.to_string(), "ready");
+        assert_eq!(Phase::Research.to_string(), "research");
+        assert_eq!(Phase::Design.to_string(), "design");
+        assert_eq!(Phase::Structure.to_string(), "structure");
+        assert_eq!(Phase::Plan.to_string(), "plan");
+        assert_eq!(Phase::Implement.to_string(), "implement");
+        assert_eq!(Phase::Review.to_string(), "review");
+        assert_eq!(Phase::Done.to_string(), "done");
+    }
+
+    #[test]
+    fn test_ticket_status_display() {
+        assert_eq!(TicketStatus::Open.to_string(), "open");
+        assert_eq!(TicketStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(TicketStatus::Blocked.to_string(), "blocked");
+        assert_eq!(TicketStatus::Review.to_string(), "review");
+        assert_eq!(TicketStatus::Done.to_string(), "done");
+        assert_eq!(TicketStatus::Cancelled.to_string(), "cancelled");
     }
 
     #[test]

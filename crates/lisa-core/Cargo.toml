@@ -1,9 +1,14 @@
 [package]
 name = "lisa-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Core types, ticket parsing, and DAG computation for Lisa"
-license = "MIT"
+keywords = ["task-scheduling", "dag", "workflow", "ticket"]
+categories = ["development-tools"]
+readme = "../../README.md"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

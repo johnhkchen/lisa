@@ -1,7 +1,7 @@
 use crate::detect::DetectedProject;
 
 /// The RDSPI workflow document, embedded at compile time
-pub const RDSPI_WORKFLOW: &str = include_str!("../../../docs/knowledge/rdspi-workflow.md");
+pub const RDSPI_WORKFLOW: &str = include_str!("../data/rdspi-workflow.md");
 
 /// The compiled WASM plugin, embedded at compile time via build.rs
 pub const PLUGIN_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lisa.wasm"));

@@ -80,6 +80,13 @@ Run lisa on itself. Add diagnostic tooling to make the live run observable.
 - T-006-03: Session launch command audit — log/verify agent spawn commands
 - T-006-04: Runtime state snapshot — dump full plugin state on keypress
 
+### S-007: Distribution & Onboarding
+Make lisa installable and set-up-able as a normal CLI tool.
+- T-007-01: `lisa setup-guide` — LLM-friendly contextual setup instructions
+- T-007-02: Enhance `lisa validate` — comprehensive pre-loop readiness check
+- T-007-03: crates.io publishing — `cargo install lisa-cli`
+- T-007-04: GitHub release workflow — prebuilt binaries for linux/macos
+
 ---
 
 ## Next Sprint Candidates
@@ -99,10 +106,9 @@ Handle real-world failure modes.
 - Graceful handling of malformed tickets
 - Commit lock timeout and recovery
 
-### Sprint Candidate: Distribution
-- GitHub release workflow for .wasm artifacts
-- Versioning scheme
+### Sprint Candidate: Self-Update
 - `lisa update` self-update mechanism
+- Version checking against latest release
 
 ---
 

@@ -28,8 +28,10 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     // Check the WASM plugin is actually embedded (not a dev placeholder)
     if PLUGIN_WASM.is_empty() {
         return Err(
-            "WASM plugin not embedded. Build the plugin first:\n  \
-             just build && cargo build -p lisa-cli --release"
+            "WASM plugin not embedded in this binary.\n\n  \
+             If installed via `cargo install`, the WASM plugin is not included.\n  \
+             Build from source for full functionality:\n    \
+             git clone https://github.com/johnhkchen/lisa && cd lisa && just release"
                 .to_string(),
         );
     }

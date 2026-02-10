@@ -448,6 +448,59 @@ impl Dag {
             .unwrap_or_default()
     }
 
+    /// Returns the total number of dependency edges in the DAG.
+    pub fn edge_count(&self) -> usize {
+        self.depends_on.values().map(|deps| deps.len()).sum()
+    }
+
+    /// Groups tickets into execution waves (levels of the topological sort).
+    ///
+    /// Wave 0 contains tickets with no dependencies. Wave N contains tickets
+    /// whose maximum dependency wave is N-1. Within each wave, ticket IDs are
+    /// sorted alphabetically for deterministic output.
+    ///
+    /// # Returns
+    ///
+    /// A vector of waves, where each wave is a vector of ticket IDs.
+    /// Returns `Err(DagError::CycleDetected)` if the graph has cycles.
+    pub fn execution_waves(&self) -> Result<Vec<Vec<TicketId>>, DagError> {
+        let topo_order = self.topological_sort()?;
+
+        let mut wave_of: HashMap<&TicketId, usize> = HashMap::new();
+        let mut max_wave: usize = 0;
+
+        for id in &topo_order {
+            let deps = self.depends_on.get(id);
+            let wave = match deps {
+                Some(dep_set) => {
+                    dep_set
+                        .iter()
+                        .map(|dep| wave_of.get(dep).copied().unwrap_or(0))
+                        .max()
+                        .unwrap_or(0)
+                        + 1
+                }
+                None => 0,
+            };
+            wave_of.insert(id, wave);
+            if wave > max_wave {
+                max_wave = wave;
+            }
+        }
+
+        let mut waves: Vec<Vec<TicketId>> = vec![Vec::new(); max_wave + 1];
+        for (id, &wave) in &wave_of {
+            waves[wave].push((*id).clone());
+        }
+
+        // Sort within each wave for deterministic output
+        for wave in &mut waves {
+            wave.sort();
+        }
+
+        Ok(waves)
+    }
+
     /// Returns statistics about the DAG.
     pub fn stats(&self) -> DagStats {
         let total_tickets = self.nodes.len();
@@ -458,7 +511,10 @@ impl Dag {
             .count();
         let ready_tickets = self.get_ready_tickets().len();
         let in_progress_tickets = self.get_in_progress_tickets().len();
-        let blocked_tickets = total_tickets - done_tickets - ready_tickets - in_progress_tickets;
+        let blocked_tickets = total_tickets
+            .saturating_sub(done_tickets)
+            .saturating_sub(ready_tickets)
+            .saturating_sub(in_progress_tickets);
         let critical_path_length = self.critical_path().len();
 
         DagStats {
@@ -926,5 +982,78 @@ mod tests {
 
         // No cycles
         assert_eq!(dag.detect_cycles(), CycleDetectionResult::NoCycle);
+    }
+
+    #[test]
+    fn test_edge_count_empty() {
+        let dag = Dag::from_tickets(vec![]).unwrap();
+        assert_eq!(dag.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_edge_count_chain() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        assert_eq!(dag.edge_count(), 2);
+    }
+
+    #[test]
+    fn test_edge_count_diamond() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001"], vec![]);
+        let t4 = make_ticket("T-004", Phase::Ready, vec!["T-002", "T-003"], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2, t3, t4]).unwrap();
+        assert_eq!(dag.edge_count(), 4);
+    }
+
+    #[test]
+    fn test_execution_waves_no_deps() {
+        let t1 = make_ticket("T-001", Phase::Ready, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec![], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
+        let waves = dag.execution_waves().unwrap();
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0], vec!["T-001", "T-002"]);
+    }
+
+    #[test]
+    fn test_execution_waves_chain() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        let waves = dag.execution_waves().unwrap();
+        assert_eq!(waves.len(), 3);
+        assert_eq!(waves[0], vec!["T-001"]);
+        assert_eq!(waves[1], vec!["T-002"]);
+        assert_eq!(waves[2], vec!["T-003"]);
+    }
+
+    #[test]
+    fn test_execution_waves_diamond() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001"], vec![]);
+        let t4 = make_ticket("T-004", Phase::Ready, vec!["T-002", "T-003"], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2, t3, t4]).unwrap();
+        let waves = dag.execution_waves().unwrap();
+        assert_eq!(waves.len(), 3);
+        assert_eq!(waves[0], vec!["T-001"]);
+        assert_eq!(waves[1], vec!["T-002", "T-003"]);
+        assert_eq!(waves[2], vec!["T-004"]);
+    }
+
+    #[test]
+    fn test_execution_waves_cycle_error() {
+        let t1 = make_ticket("T-001", Phase::Ready, vec!["T-002"], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
+        assert!(matches!(
+            dag.execution_waves(),
+            Err(DagError::CycleDetected(_))
+        ));
     }
 }

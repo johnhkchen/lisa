@@ -2,6 +2,8 @@ mod config;
 mod detect;
 mod init;
 mod loop_cmd;
+mod setup_guide;
+mod status;
 mod templates;
 
 use clap::{Parser, Subcommand};
@@ -28,6 +30,18 @@ enum Commands {
     },
     /// Validate ticket DAG and project setup
     Validate {
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show DAG status: tickets, dependencies, execution waves, scheduling readiness
+    Status {
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Output LLM-friendly setup instructions for this project
+    SetupGuide {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
@@ -62,6 +76,20 @@ fn main() {
         Commands::Validate { path } => {
             let path = resolve_path(&path);
             if let Err(e) = init::run_validate(&path) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Status { path } => {
+            let path = resolve_path(&path);
+            if let Err(e) = status::run_status(&path) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::SetupGuide { path } => {
+            let path = resolve_path(&path);
+            if let Err(e) = setup_guide::run_setup_guide(&path) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
