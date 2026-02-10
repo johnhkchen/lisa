@@ -293,12 +293,13 @@ fn compute_dag_layers(tickets: &[TicketNode]) -> Vec<Vec<usize>> {
     layers
 }
 
-/// Render the DAG as ASCII art
+/// Render the DAG with fixed-width grid layout and properly aligned edges.
 ///
-/// Shows tickets as nodes with their status and phase,
-/// organized in topological layers.
+/// Each node occupies a fixed-width cell. Layers are sorted by ticket ID
+/// for deterministic ordering. Edges are drawn as │ connectors at the
+/// parent node's column center, including pass-through for multi-layer edges.
 fn render_dag(state: &PluginState, output: &mut Vec<String>) {
-    output.push(format!("{}{}=== DAG ==={}", BOLD, CYAN, RESET));
+    output.push(format!("{}{}≡≡ DAG ≡≡{}", BOLD, CYAN, RESET));
     output.push(String::new());
 
     if state.tickets.is_empty() {
@@ -306,60 +307,102 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
         return;
     }
 
-    // Group tickets into layers based on dependency depth
-    let layers = compute_dag_layers(&state.tickets);
+    // Visible character widths
+    // Cell: "{indicator} {id:<8} {status}" = 1+1+8+1+3 = 14, padded to CELL_W
+    const CELL_W: usize = 15;
+    const GAP: usize = 1;
+    const INDENT: usize = 2;
 
-    // Render each layer
-    for (layer_idx, layer) in layers.iter().enumerate() {
-        if layer_idx > 0 {
-            // Draw connector lines between layers
-            let mut connector = String::new();
-            for (i, _) in layer.iter().enumerate() {
-                if i > 0 {
-                    connector.push_str("    ");
+    // Compute layers and sort each by ticket ID for stable ordering
+    let mut layers = compute_dag_layers(&state.tickets);
+    for layer in &mut layers {
+        layer.sort_by(|a, b| state.tickets[*a].id.cmp(&state.tickets[*b].id));
+    }
+
+    // Map ticket_id → (layer_index, center_x in visible chars)
+    let mut center_x: HashMap<&str, usize> = HashMap::new();
+    let mut ticket_layer: HashMap<&str, usize> = HashMap::new();
+    for (li, layer) in layers.iter().enumerate() {
+        for (col, &idx) in layer.iter().enumerate() {
+            let cx = INDENT + col * (CELL_W + GAP) + CELL_W / 2;
+            center_x.insert(&state.tickets[idx].id, cx);
+            ticket_layer.insert(&state.tickets[idx].id, li);
+        }
+    }
+
+    // Collect all edges (parent_id, child_id)
+    let edges: Vec<(&str, &str)> = state
+        .tickets
+        .iter()
+        .flat_map(|t| t.depends_on.iter().map(move |dep| (dep.as_str(), t.id.as_str())))
+        .collect();
+
+    // Render each layer with connector lines above
+    for (li, layer) in layers.iter().enumerate() {
+        // Connector line between previous layer and this one
+        if li > 0 {
+            // Find max width needed across both layers
+            let this_w = INDENT + layer.len() * (CELL_W + GAP);
+            let prev_w = INDENT + layers[li - 1].len() * (CELL_W + GAP);
+            let width = this_w.max(prev_w);
+
+            let mut conn: Vec<char> = vec![' '; width];
+
+            // Draw │ for every edge that crosses this boundary:
+            // parent in layer < li, child in layer >= li
+            for &(parent_id, child_id) in &edges {
+                let pl = ticket_layer.get(parent_id).copied().unwrap_or(0);
+                let cl = ticket_layer.get(child_id).copied().unwrap_or(0);
+                if pl < li && cl >= li {
+                    if let Some(&px) = center_x.get(parent_id) {
+                        if px < conn.len() {
+                            conn[px] = '│';
+                        }
+                    }
                 }
-                connector.push_str(&format!("{}  |  {}", DIM, RESET));
             }
-            if !connector.trim().is_empty() {
-                output.push(format!("    {}", connector));
+
+            let line: String = conn.iter().collect();
+            let trimmed = line.trim_end();
+            if !trimmed.trim().is_empty() {
+                output.push(format!("{}{}{}", DIM, trimmed, RESET));
             }
         }
 
-        // Render tickets in this layer
-        let mut ticket_line = String::from("    ");
-        for (i, &ticket_idx) in layer.iter().enumerate() {
-            if i > 0 {
-                ticket_line.push_str("  ");
+        // Node line
+        let mut line = " ".repeat(INDENT);
+        for (col, &idx) in layer.iter().enumerate() {
+            if col > 0 {
+                line.push_str(&" ".repeat(GAP));
             }
-            let ticket = &state.tickets[ticket_idx];
-            let phase_color = ticket.phase.color_code();
+            let ticket = &state.tickets[idx];
             let indicator = ticket.phase.indicator();
-            let status = status_indicator(&ticket.status);
+            let phase_color = ticket.phase.color_code();
 
-            // Highlight selected ticket
-            let highlight = if state.selected_ticket.as_ref() == Some(&ticket.id) {
-                format!("{}> ", BOLD)
-            } else {
-                String::new()
-            };
-            let highlight_end = if state.selected_ticket.as_ref() == Some(&ticket.id) {
-                format!(" <{}", RESET)
-            } else {
-                String::new()
+            let (status_str, status_color) = match &ticket.status {
+                TicketStatus::Ready => ("RDY", CYAN),
+                TicketStatus::InProgress => ("WRK", GREEN),
+                TicketStatus::WaitingReview => ("REV", BRIGHT_YELLOW),
+                TicketStatus::Blocked => ("BLK", RED),
+                TicketStatus::Done => ("DON", BRIGHT_GREEN),
             };
 
-            ticket_line.push_str(&format!(
-                "{}[{}{}{} {:<10} {}]{}",
-                highlight,
-                phase_color,
-                indicator,
-                RESET,
-                ticket.id,
-                status,
-                highlight_end
+            // Truncate or pad ID to 8 visible chars
+            let id_str: String = ticket.id.chars().take(8).collect();
+
+            // Visible content: indicator(1) + space(1) + id(8) + space(1) + status(3) = 14
+            let content_w = 1 + 1 + 8 + 1 + 3; // 14
+            let pad = CELL_W.saturating_sub(content_w);
+
+            line.push_str(&format!(
+                "{}{}{} {:<8}{}{}{}{} ",
+                phase_color, indicator, RESET,
+                id_str,
+                " ".repeat(pad),
+                status_color, status_str, RESET,
             ));
         }
-        output.push(ticket_line);
+        output.push(line);
     }
 
     // Legend

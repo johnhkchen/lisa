@@ -498,6 +498,7 @@ impl Scheduler {
     pub fn update_thread_phase(&mut self, ticket_id: &TicketId, phase: Phase) {
         if let Some(thread) = self.threads.get_mut(ticket_id) {
             thread.current_phase = phase;
+            thread.last_phase_change = std::time::SystemTime::now();
         }
     }
 

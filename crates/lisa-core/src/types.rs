@@ -264,6 +264,19 @@ pub enum ThreadStatus {
     Failed,
 }
 
+/// Health status of a thread, computed from time-in-phase and thread status.
+///
+/// This is a derived property, not persisted. Call `Thread::health()` to compute it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HealthStatus {
+    /// Thread is making progress (time-in-phase below threshold)
+    Healthy,
+    /// Thread has been in the same phase too long without producing an artifact
+    Stuck,
+    /// Thread exited with an error
+    Failed,
+}
+
 /// A thread representing an active Claude Code session working on a ticket.
 ///
 /// Each thread runs a single ticket through the RDSPI workflow phases.
@@ -283,6 +296,10 @@ pub struct Thread {
     #[serde(with = "system_time_serde")]
     pub started_at: SystemTime,
 
+    /// When the thread last changed phase (used for stuck detection)
+    #[serde(with = "system_time_serde")]
+    pub last_phase_change: SystemTime,
+
     /// Current status of the thread
     #[serde(default)]
     pub status: ThreadStatus,
@@ -291,11 +308,13 @@ pub struct Thread {
 impl Thread {
     /// Creates a new thread for the given ticket.
     pub fn new(ticket_id: impl Into<String>, pane_id: u32) -> Self {
+        let now = SystemTime::now();
         Self {
             ticket_id: ticket_id.into(),
             pane_id,
             current_phase: Phase::Ready,
-            started_at: SystemTime::now(),
+            started_at: now,
+            last_phase_change: now,
             status: ThreadStatus::Running,
         }
     }
@@ -342,12 +361,52 @@ impl Thread {
             None => self.status = ThreadStatus::Failed, // Unknown exit = failure
         }
     }
+
+    /// Compute the health status of this thread.
+    ///
+    /// - `Failed` if the thread status is Failed.
+    /// - `Stuck` if the thread is Running and time-in-phase exceeds the threshold.
+    /// - `Healthy` otherwise (including Parked and Completed threads).
+    pub fn health(
+        &self,
+        now: SystemTime,
+        stuck_threshold: std::time::Duration,
+    ) -> HealthStatus {
+        if self.status == ThreadStatus::Failed {
+            return HealthStatus::Failed;
+        }
+        if self.status != ThreadStatus::Running {
+            return HealthStatus::Healthy;
+        }
+        let elapsed = now
+            .duration_since(self.last_phase_change)
+            .unwrap_or_default();
+        if elapsed >= stuck_threshold {
+            HealthStatus::Stuck
+        } else {
+            HealthStatus::Healthy
+        }
+    }
+
+    /// Returns true if this thread needs human attention.
+    ///
+    /// A thread needs attention if it is stuck, failed, or parked for review.
+    pub fn is_attention_needed(
+        &self,
+        now: SystemTime,
+        stuck_threshold: std::time::Duration,
+    ) -> bool {
+        matches!(
+            self.health(now, stuck_threshold),
+            HealthStatus::Stuck | HealthStatus::Failed
+        ) || self.status == ThreadStatus::Parked
+    }
 }
 
 /// Configuration for the Lisa/Ralph plugin.
 ///
 /// Parsed from the Zellij plugin configuration map.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Directory containing ticket files (default: "docs/active/tickets")
     pub ticket_dir: PathBuf,
@@ -363,6 +422,9 @@ pub struct PluginConfig {
 
     /// Whether to auto-advance certain phases without review (default: false)
     pub auto_advance: bool,
+
+    /// Seconds a thread can stay in one phase before being considered stuck (default: 600)
+    pub stuck_threshold_secs: u64,
 }
 
 impl PluginConfig {
@@ -378,6 +440,9 @@ impl PluginConfig {
     /// Default maximum concurrent threads.
     pub const DEFAULT_MAX_THREADS: usize = 2;
 
+    /// Default stuck threshold in seconds (10 minutes).
+    pub const DEFAULT_STUCK_THRESHOLD_SECS: u64 = 600;
+
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
         Self {
@@ -386,6 +451,7 @@ impl PluginConfig {
             work_dir: PathBuf::from(Self::DEFAULT_WORK_DIR),
             max_threads: Self::DEFAULT_MAX_THREADS,
             auto_advance: false,
+            stuck_threshold_secs: Self::DEFAULT_STUCK_THRESHOLD_SECS,
         }
     }
 
@@ -415,7 +481,19 @@ impl PluginConfig {
             result.auto_advance = auto_advance == "true" || auto_advance == "1";
         }
 
+        if let Some(stuck_threshold) = config.get("stuck_threshold_secs") {
+            if let Ok(n) = stuck_threshold.parse() {
+                result.stuck_threshold_secs = n;
+            }
+        }
+
         result
+    }
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -471,6 +549,9 @@ pub enum ActivityEvent {
 
     /// DAG was recomputed
     DagRecomputed { ticket_count: usize },
+
+    /// All tickets have reached done phase — loop complete
+    AllTicketsDone,
 }
 
 /// Serde helper module for SystemTime serialization.
@@ -569,5 +650,124 @@ mod tests {
 
         let parsed: TicketStatus = serde_json::from_str("\"in_progress\"").unwrap();
         assert_eq!(parsed, TicketStatus::InProgress);
+    }
+
+    #[test]
+    fn test_last_phase_change_initialized() {
+        let before = SystemTime::now();
+        let thread = Thread::new("T-001", 1);
+        let after = SystemTime::now();
+
+        // last_phase_change should be between before and after
+        assert!(thread.last_phase_change >= before);
+        assert!(thread.last_phase_change <= after);
+        // And equal to started_at (both set from same now())
+        assert_eq!(thread.started_at, thread.last_phase_change);
+    }
+
+    #[test]
+    fn test_health_healthy_fresh_thread() {
+        let thread = Thread::new("T-001", 1);
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert_eq!(thread.health(now, threshold), HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_health_stuck_after_threshold() {
+        let mut thread = Thread::new("T-001", 1);
+        // Simulate phase change 10 minutes ago
+        thread.last_phase_change = SystemTime::now() - std::time::Duration::from_secs(700);
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert_eq!(thread.health(now, threshold), HealthStatus::Stuck);
+    }
+
+    #[test]
+    fn test_health_failed_thread() {
+        let mut thread = Thread::new("T-001", 1);
+        thread.fail();
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert_eq!(thread.health(now, threshold), HealthStatus::Failed);
+    }
+
+    #[test]
+    fn test_health_parked_not_stuck() {
+        let mut thread = Thread::new("T-001", 1);
+        thread.last_phase_change = SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.park();
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        // Parked threads are Healthy (not Running, so not Stuck)
+        assert_eq!(thread.health(now, threshold), HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_health_completed_not_stuck() {
+        let mut thread = Thread::new("T-001", 1);
+        thread.last_phase_change = SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.complete();
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert_eq!(thread.health(now, threshold), HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_is_attention_needed_stuck() {
+        let mut thread = Thread::new("T-001", 1);
+        thread.last_phase_change = SystemTime::now() - std::time::Duration::from_secs(700);
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert!(thread.is_attention_needed(now, threshold));
+    }
+
+    #[test]
+    fn test_is_attention_needed_failed() {
+        let mut thread = Thread::new("T-001", 1);
+        thread.fail();
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert!(thread.is_attention_needed(now, threshold));
+    }
+
+    #[test]
+    fn test_is_attention_needed_parked() {
+        let mut thread = Thread::new("T-001", 1);
+        thread.park();
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert!(thread.is_attention_needed(now, threshold));
+    }
+
+    #[test]
+    fn test_is_attention_needed_healthy() {
+        let thread = Thread::new("T-001", 1);
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert!(!thread.is_attention_needed(now, threshold));
+    }
+
+    #[test]
+    fn test_config_stuck_threshold_default() {
+        let config = PluginConfig::new();
+        assert_eq!(config.stuck_threshold_secs, 600);
+    }
+
+    #[test]
+    fn test_config_stuck_threshold_from_map() {
+        let mut map = BTreeMap::new();
+        map.insert("stuck_threshold_secs".to_string(), "300".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.stuck_threshold_secs, 300);
     }
 }

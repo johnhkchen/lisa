@@ -31,18 +31,20 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
 
 /// Build the full shell command to launch a *new* Claude Code session for a ticket.
 /// Used when the pane has a bare shell (first use of the slot).
+/// Uses \r (carriage return) to simulate pressing Enter in the terminal.
 fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
-        "claude --dangerously-skip-permissions \"{}\"\n",
+        "claude --dangerously-skip-permissions \"{}\"\r",
         ticket_prompt(ticket_dir, ticket_id)
     )
 }
 
 /// Build the sequence to reuse an existing Claude Code session:
 /// /clear to reset conversation, then send the new prompt.
+/// Uses \r (carriage return) to simulate pressing Enter in the terminal.
 fn build_reuse_command(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
-        "/clear\n{}\n",
+        "/clear\r{}\r",
         ticket_prompt(ticket_dir, ticket_id)
     )
 }
@@ -86,6 +88,16 @@ pub struct State {
 
     /// Whether agent slots have been discovered from PaneUpdate.
     slots_discovered: bool,
+
+    /// Tick counter (incremented each poll_tick call, ~5s per tick).
+    tick_count: u64,
+
+    /// Tick at which each thread last had a phase change.
+    /// Used for staleness detection.
+    last_activity_tick: HashMap<TicketId, u64>,
+
+    /// Whether the loop has terminated (all tickets done).
+    terminated: bool,
 }
 
 impl State {
@@ -263,6 +275,13 @@ impl State {
             .collect();
 
         for (ticket_id, current_phase) in running {
+            // Skip implement phase — progress.md is a living tracking document,
+            // not a completion signal. The agent sets phase: done in frontmatter
+            // when implement work is complete.
+            if current_phase == Phase::Implement {
+                continue;
+            }
+
             // Only phases with artifacts can be advanced
             let artifact_name = match current_phase.artifact_filename() {
                 Some(name) => name,
@@ -311,6 +330,7 @@ impl State {
             // Update thread phase
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.current_phase = next_phase;
+                thread.last_phase_change = std::time::SystemTime::now();
 
                 // Park if advancing to Review
                 if next_phase == Phase::Review {
@@ -359,7 +379,10 @@ impl State {
             for (tid, thread) in &mut self.threads {
                 if thread.status == lisa_core::types::ThreadStatus::Running {
                     if let Some(ticket) = self.dag.get_ticket(tid) {
-                        thread.current_phase = ticket.phase;
+                        if thread.current_phase != ticket.phase {
+                            thread.current_phase = ticket.phase;
+                            thread.last_phase_change = std::time::SystemTime::now();
+                        }
                     }
                 }
             }
@@ -747,7 +770,20 @@ mod tests {
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("docs/knowledge/rdspi-workflow.md"));
         assert!(cmd.contains("CLAUDE.md"));
-        assert!(cmd.ends_with('\n'));
+        assert!(cmd.ends_with('\r'), "should end with carriage return");
+    }
+
+    #[test]
+    fn test_build_reuse_command() {
+        let ticket_dir = Path::new("docs/active/tickets");
+        let cmd = build_reuse_command(ticket_dir, "T-042-01");
+
+        assert!(cmd.starts_with("/clear\r"), "should start with /clear + CR");
+        assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
+        assert!(cmd.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(cmd.contains("CLAUDE.md"));
+        assert!(!cmd.contains("claude --dangerously-skip-permissions"), "reuse should not re-launch claude");
+        assert!(cmd.ends_with('\r'), "should end with carriage return");
     }
 
     #[test]
