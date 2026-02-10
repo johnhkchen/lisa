@@ -72,14 +72,17 @@ fn main() {
             dry_run,
         } => {
             let path = resolve_path(&path);
-            let lisa_config = match config::load_config(&path) {
-                Ok(c) => c,
+            let validation = match config::load_config(&path) {
+                Ok(v) => v,
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
-            let resolved = config::resolve_config(&lisa_config, max_threads);
+            for w in &validation.warnings {
+                eprintln!("Warning: {}", w);
+            }
+            let resolved = config::resolve_config(&validation.config, max_threads);
             if let Err(e) = loop_cmd::run_loop(&path, &resolved, dry_run) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);

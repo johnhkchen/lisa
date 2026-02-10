@@ -179,7 +179,10 @@ pub fn run_validate(root: &Path) -> Result<(), String> {
     let config_path = root.join(".lisa.toml");
     if config_path.exists() {
         match config::load_config(root) {
-            Ok(_) => {
+            Ok(validation) => {
+                for w in &validation.warnings {
+                    warnings.push(format!(".lisa.toml: {}", w));
+                }
                 println!(".lisa.toml: valid");
             }
             Err(e) => {

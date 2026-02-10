@@ -1578,6 +1578,7 @@ dependencies = [
  "lisa-core",
  "serde",
  "serde_json",
+ "tempfile",
  "zellij-tile",
 ]
 

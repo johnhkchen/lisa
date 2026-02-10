@@ -52,19 +52,22 @@ impl Default for ResolvedConfig {
 
 /// Load .lisa.toml from the project root.
 ///
-/// Returns `Ok(LisaConfig::default())` if the file does not exist.
-/// Returns `Err` if the file exists but cannot be parsed.
-pub fn load_config(root: &Path) -> Result<LisaConfig, String> {
+/// Returns config with empty warnings if the file does not exist.
+/// Returns `Err` if the file exists but cannot be parsed or has invalid values.
+pub fn load_config(root: &Path) -> Result<ConfigValidation, String> {
     let config_path = root.join(".lisa.toml");
     if !config_path.exists() {
-        return Ok(LisaConfig::default());
+        return Ok(ConfigValidation {
+            config: LisaConfig::default(),
+            warnings: vec![],
+        });
     }
 
     let content = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Failed to read {}: {}", config_path.display(), e))?;
 
-    toml::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", config_path.display(), e))
+    validate_config(&content)
+        .map_err(|e| format!("{}: {}", config_path.display(), e))
 }
 
 /// Merge config file values with CLI overrides.
@@ -89,6 +92,65 @@ pub fn resolve_config(config: &LisaConfig, cli_max_threads: Option<usize>) -> Re
             .auto_advance
             .unwrap_or(defaults.auto_advance),
     }
+}
+
+/// Result of config validation, containing the parsed config and any warnings.
+#[derive(Debug)]
+pub struct ConfigValidation {
+    pub config: LisaConfig,
+    pub warnings: Vec<String>,
+}
+
+/// Validate TOML config content: check for unknown keys and semantic constraints.
+///
+/// Returns the parsed config plus any warnings about unknown keys.
+/// Returns `Err` for parse failures or invalid values (e.g. max_threads = 0).
+pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
+    let known_top = &["dirs", "scheduling"];
+    let known_dirs = &["tickets", "stories", "work"];
+    let known_scheduling = &["max_threads", "auto_advance"];
+
+    // Parse as generic Value to detect unknown keys
+    let value: toml::Value = content
+        .parse()
+        .map_err(|e: toml::de::Error| format!("Invalid TOML: {}", e))?;
+
+    let mut warnings = Vec::new();
+
+    if let Some(table) = value.as_table() {
+        for key in table.keys() {
+            if !known_top.contains(&key.as_str()) {
+                warnings.push(format!("Unknown config section: [{}]", key));
+            }
+        }
+
+        if let Some(toml::Value::Table(dirs)) = table.get("dirs") {
+            for key in dirs.keys() {
+                if !known_dirs.contains(&key.as_str()) {
+                    warnings.push(format!("Unknown key in [dirs]: {}", key));
+                }
+            }
+        }
+
+        if let Some(toml::Value::Table(sched)) = table.get("scheduling") {
+            for key in sched.keys() {
+                if !known_scheduling.contains(&key.as_str()) {
+                    warnings.push(format!("Unknown key in [scheduling]: {}", key));
+                }
+            }
+        }
+    }
+
+    // Deserialize into typed struct
+    let config: LisaConfig = toml::from_str(content)
+        .map_err(|e| format!("Invalid config value: {}", e))?;
+
+    // Semantic validation
+    if config.scheduling.max_threads == Some(0) {
+        return Err("max_threads must be at least 1".to_string());
+    }
+
+    Ok(ConfigValidation { config, warnings })
 }
 
 /// Returns the default .lisa.toml content for `lisa init`.
@@ -152,9 +214,10 @@ max_threads = 8
     #[test]
     fn test_load_config_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let config = load_config(dir.path()).unwrap();
-        assert_eq!(config.dirs.tickets, None);
-        assert_eq!(config.scheduling.max_threads, None);
+        let validation = load_config(dir.path()).unwrap();
+        assert_eq!(validation.config.dirs.tickets, None);
+        assert_eq!(validation.config.scheduling.max_threads, None);
+        assert!(validation.warnings.is_empty());
     }
 
     #[test]
@@ -165,8 +228,9 @@ max_threads = 8
             "[scheduling]\nmax_threads = 5\n",
         )
         .unwrap();
-        let config = load_config(dir.path()).unwrap();
-        assert_eq!(config.scheduling.max_threads, Some(5));
+        let validation = load_config(dir.path()).unwrap();
+        assert_eq!(validation.config.scheduling.max_threads, Some(5));
+        assert!(validation.warnings.is_empty());
     }
 
     #[test]
@@ -225,5 +289,86 @@ max_threads = 6
         let config: LisaConfig = toml::from_str(content).unwrap();
         assert_eq!(config.dirs.tickets, Some("docs/active/tickets".to_string()));
         assert_eq!(config.scheduling.max_threads, Some(2));
+    }
+
+    #[test]
+    fn test_validate_unknown_top_level_key() {
+        let result = validate_config("[unknown_section]\nfoo = 1\n").unwrap();
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("unknown_section"));
+    }
+
+    #[test]
+    fn test_validate_unknown_dirs_key() {
+        let result = validate_config("[dirs]\nfoo = \"bar\"\n").unwrap();
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("foo"));
+        assert!(result.warnings[0].contains("[dirs]"));
+    }
+
+    #[test]
+    fn test_validate_unknown_scheduling_key() {
+        let result = validate_config("[scheduling]\nmax_thread = 4\n").unwrap();
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("max_thread"));
+        assert!(result.warnings[0].contains("[scheduling]"));
+    }
+
+    #[test]
+    fn test_validate_max_threads_zero() {
+        let result = validate_config("[scheduling]\nmax_threads = 0\n");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max_threads must be at least 1"));
+    }
+
+    #[test]
+    fn test_validate_negative_max_threads() {
+        let result = validate_config("[scheduling]\nmax_threads = -1\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_valid_config_no_warnings() {
+        let toml_str = r#"
+[dirs]
+tickets = "my/tickets"
+
+[scheduling]
+max_threads = 4
+auto_advance = true
+"#;
+        let result = validate_config(toml_str).unwrap();
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.config.scheduling.max_threads, Some(4));
+    }
+
+    #[test]
+    fn test_validate_multiple_warnings() {
+        let toml_str = r#"
+[dirs]
+tickets = "t"
+bad_key = "x"
+
+[scheduling]
+max_thread = 4
+
+[extra]
+foo = 1
+"#;
+        let result = validate_config(toml_str).unwrap();
+        assert_eq!(result.warnings.len(), 3);
+    }
+
+    #[test]
+    fn test_load_config_with_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".lisa.toml"),
+            "[scheduling]\nmax_thread = 4\n",
+        )
+        .unwrap();
+        let validation = load_config(dir.path()).unwrap();
+        assert_eq!(validation.warnings.len(), 1);
+        assert!(validation.warnings[0].contains("max_thread"));
     }
 }

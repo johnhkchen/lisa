@@ -143,6 +143,17 @@ fn which(name: &str) -> bool {
 }
 
 fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
+    // Pre-create max_threads terminal pane slots in the stacked group.
+    // The first is expanded (visible), the rest are collapsed (thumbable).
+    let mut agent_panes = String::new();
+    for i in 0..config.max_threads {
+        if i == 0 {
+            agent_panes.push_str("            pane expanded=true\n");
+        } else {
+            agent_panes.push_str("            pane\n");
+        }
+    }
+
     format!(
         r#"layout {{
     default_tab_template {{
@@ -153,8 +164,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
     }}
     tab name="lisa" {{
         pane stacked=true size="70%" {{
-            pane expanded=true
-        }}
+{agent_panes}        }}
         pane size="30%" {{
             plugin location="file://{wasm_path}" {{
                 ticket_dir "{ticket_dir}"
@@ -167,6 +177,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
     }}
 }}
 "#,
+        agent_panes = agent_panes,
         wasm_path = wasm_path.display(),
         ticket_dir = config.ticket_dir,
         story_dir = config.story_dir,
