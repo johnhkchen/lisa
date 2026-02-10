@@ -381,11 +381,10 @@ impl Scheduler {
             ("command_id".to_string(), self.command_counter.to_string()),
         ]);
 
-        // Use zellij to open a command pane
-        // The pane will run `claude --dangerously-skip-permissions`
+        // Use zellij to open a command pane via sh -c to set LISA_TICKET_ID
         open_command_pane_floating(
             CommandToRun {
-                path: PathBuf::from(&self.config.claude_binary),
+                path: PathBuf::from("sh"),
                 args: command.args,
                 cwd: Some(self.config.repo_root.clone()),
             },
@@ -406,22 +405,23 @@ impl Scheduler {
     }
 
     /// Build the claude command arguments for a ticket.
+    ///
+    /// Since `CommandToRun` has no `env` field, we spawn via `sh -c` to set
+    /// `LISA_TICKET_ID` so the idle signal hook knows which ticket is running.
     pub(crate) fn build_claude_command(&self, ticket_id: &TicketId) -> ClaudeCommand {
-        // The key insight: "Ralph's role is scheduling and lifecycle, not prompt engineering."
-        // We just open a session with --dangerously-skip-permissions.
-        // The agent reads the ticket file, CLAUDE.md, and docs/rdspi-workflow.md.
         let ticket_path = self.config.tickets_dir.join(format!("{}.md", ticket_id));
+        let prompt = format!(
+            "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/knowledge/rdspi-workflow.md. \
+             Start from the current phase indicated in the ticket frontmatter.",
+            ticket_path.display()
+        );
 
         ClaudeCommand {
             args: vec![
-                "--dangerously-skip-permissions".to_string(),
-                // The agent will need to be told which ticket to work on.
-                // This is done via the prompt, which references the ticket file.
-                "--print".to_string(),
+                "-c".to_string(),
                 format!(
-                    "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/knowledge/rdspi-workflow.md. \
-                     Start from the current phase indicated in the ticket frontmatter.",
-                    ticket_path.display()
+                    "LISA_TICKET_ID={} {} --dangerously-skip-permissions --print \"{}\"",
+                    ticket_id, self.config.claude_binary, prompt
                 ),
             ],
         }
@@ -765,29 +765,34 @@ mod tests {
 
         let cmd = scheduler.build_claude_command(&"T-001".to_string());
 
-        // Should have exactly 3 args: --dangerously-skip-permissions, --print, prompt
-        assert_eq!(cmd.args.len(), 3);
-        assert_eq!(cmd.args[0], "--dangerously-skip-permissions");
-        assert_eq!(cmd.args[1], "--print");
+        // Should have 2 args: -c and the full shell command
+        assert_eq!(cmd.args.len(), 2);
+        assert_eq!(cmd.args[0], "-c");
 
-        let prompt = &cmd.args[2];
+        let shell_cmd = &cmd.args[1];
+        // Sets LISA_TICKET_ID env var
+        assert!(
+            shell_cmd.contains("LISA_TICKET_ID=T-001"),
+            "command should set LISA_TICKET_ID, got: {}",
+            shell_cmd
+        );
         // Correct ticket path
         assert!(
-            prompt.contains("docs/active/tickets/T-001.md"),
-            "prompt should contain ticket path, got: {}",
-            prompt
+            shell_cmd.contains("docs/active/tickets/T-001.md"),
+            "command should contain ticket path, got: {}",
+            shell_cmd
         );
         // Correct RDSPI path
         assert!(
-            prompt.contains("docs/knowledge/rdspi-workflow.md"),
-            "prompt should reference docs/knowledge/rdspi-workflow.md, got: {}",
-            prompt
+            shell_cmd.contains("docs/knowledge/rdspi-workflow.md"),
+            "command should reference docs/knowledge/rdspi-workflow.md, got: {}",
+            shell_cmd
         );
         // References CLAUDE.md
         assert!(
-            prompt.contains("CLAUDE.md"),
-            "prompt should reference CLAUDE.md, got: {}",
-            prompt
+            shell_cmd.contains("CLAUDE.md"),
+            "command should reference CLAUDE.md, got: {}",
+            shell_cmd
         );
     }
 }

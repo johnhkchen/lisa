@@ -161,6 +161,8 @@ pub enum AlertType {
     Failed,
     /// Session has made no progress beyond the stuck threshold.
     Stuck,
+    /// Agent went idle but expected phase artifact is missing.
+    IdleWithoutArtifact,
 }
 
 /// A health alert for the attention banner.
@@ -452,6 +454,7 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
         let (label, color) = match alert.alert_type {
             AlertType::Failed => ("✗ FAILED", RED),
             AlertType::Stuck => ("! STUCK ", YELLOW),
+            AlertType::IdleWithoutArtifact => ("⏸ IDLE  ", YELLOW),
         };
 
         let detail_max = inner_w.saturating_sub(24); // label + space + ticket_id + space

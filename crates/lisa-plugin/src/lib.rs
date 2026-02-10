@@ -35,16 +35,13 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
 }
 
 /// Build the full shell command to launch Claude Code in a fresh pane.
+/// Sets LISA_TICKET_ID env var so the idle signal hook knows which ticket is running.
 fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
-        "claude --dangerously-skip-permissions \"{}\"",
+        "LISA_TICKET_ID={} claude --dangerously-skip-permissions \"{}\"",
+        ticket_id,
         ticket_prompt(ticket_dir, ticket_id)
     )
-}
-
-/// Build a bare prompt to send into an already-running Claude Code session.
-fn build_claude_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
-    ticket_prompt(ticket_dir, ticket_id)
 }
 
 /// Send text to a pane followed by Enter (carriage return as a raw byte).
@@ -134,6 +131,13 @@ pub struct State {
     /// Number of outstanding timers. Used to prevent timer chain duplication
     /// when short flush timers are set alongside the regular poll timer.
     pending_timer_count: u32,
+
+    /// Path to the idle signal directory (`.lisa/signals/` under /host/).
+    signal_dir: PathBuf,
+
+    /// Idle-without-artifact alerts detected during the current poll cycle.
+    /// Cleared and re-populated each cycle by `check_idle_signals()`.
+    idle_alerts: Vec<(TicketId, String)>,
 }
 
 impl State {
@@ -324,10 +328,11 @@ impl State {
 
             let launch_cmd;
             if self.agent_slots[slot_idx].has_session {
-                // Claude Code is already running — /clear resets the conversation,
-                // then we send just the prompt text.
-                send_line_to_pane("/clear", PaneId::Terminal(pane_id));
-                let cmd = build_claude_prompt(&host_ticket_dir, &ticket_id);
+                // Session reuse: exit the current Claude Code session, then
+                // re-launch with the new ticket's env var so LISA_TICKET_ID
+                // is correct for the idle signal hook.
+                send_line_to_pane("/exit", PaneId::Terminal(pane_id));
+                let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
                 launch_cmd = cmd.clone();
                 self.pending_pane_writes.push((pane_id, cmd));
             } else {
@@ -489,6 +494,156 @@ impl State {
         }
     }
 
+    /// Scan for idle signal files and advance ticket phases accordingly.
+    ///
+    /// When a Claude Code session goes idle, the on-idle hook writes a
+    /// `.lisa/signals/{ticket_id}.idle` file. This method reads those signals
+    /// and applies the phase advancement rules:
+    ///
+    /// - **Implement**: idle signal alone advances to Review (parks thread)
+    /// - **Research/Design/Structure/Plan**: idle signal + artifact advances to next phase
+    /// - **Idle without artifact**: generates an alert for the attention banner
+    ///
+    /// Signal files are always deleted after processing to prevent re-triggering.
+    fn check_idle_signals(&mut self) {
+        self.idle_alerts.clear();
+
+        let entries = match std::fs::read_dir(&self.signal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return, // Directory doesn't exist yet — normal on first run
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let filename = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if name.ends_with(".idle") => name.to_string(),
+                _ => continue,
+            };
+
+            let ticket_id: TicketId = filename.trim_end_matches(".idle").to_string();
+
+            // Clean up the signal file immediately (prevents re-trigger on next poll)
+            let _ = std::fs::remove_file(&path);
+
+            // Look up thread — signal only meaningful for running threads
+            let current_phase = match self.threads.get(&ticket_id) {
+                Some(t) if t.status == lisa_core::types::ThreadStatus::Running => {
+                    t.current_phase
+                }
+                _ => continue,
+            };
+
+            match current_phase {
+                Phase::Implement => {
+                    // Idle signal alone is the completion signal for Implement
+                    let file_path = self
+                        .dag
+                        .get_ticket(&ticket_id)
+                        .map(|t| t.file_path.clone());
+                    let file_path = match file_path {
+                        Some(p) if !p.as_os_str().is_empty() => p,
+                        _ => continue,
+                    };
+
+                    if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Review) {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Failed to advance {} via idle signal: {}",
+                                ticket_id, e
+                            ),
+                        });
+                        continue;
+                    }
+
+                    self.log_activity(ActivityEvent::PhaseCompleted {
+                        ticket_id: ticket_id.clone(),
+                        phase: Phase::Implement,
+                    });
+                    self.log_activity(ActivityEvent::TicketPhaseChanged {
+                        ticket_id: ticket_id.clone(),
+                        old_phase: Phase::Implement,
+                        new_phase: Phase::Review,
+                    });
+
+                    if let Some(thread) = self.threads.get_mut(&ticket_id) {
+                        thread.current_phase = Phase::Review;
+                        thread.last_phase_change = std::time::SystemTime::now();
+                        thread.park();
+                    }
+                }
+
+                Phase::Research | Phase::Design | Phase::Structure | Phase::Plan => {
+                    // Need artifact + idle signal for these phases
+                    let artifact_name = match current_phase.artifact_filename() {
+                        Some(name) => name,
+                        None => continue,
+                    };
+                    let artifact_path =
+                        self.config.work_dir.join(&ticket_id).join(artifact_name);
+
+                    if artifact_path.exists() {
+                        let next_phase = match current_phase.next() {
+                            Some(p) => p,
+                            None => continue,
+                        };
+
+                        let file_path = self
+                            .dag
+                            .get_ticket(&ticket_id)
+                            .map(|t| t.file_path.clone());
+                        let file_path = match file_path {
+                            Some(p) if !p.as_os_str().is_empty() => p,
+                            _ => continue,
+                        };
+
+                        if let Err(e) = ticket::update_ticket_phase(&file_path, next_phase) {
+                            self.log_activity(ActivityEvent::Error {
+                                message: format!(
+                                    "Failed to advance {} via idle signal: {}",
+                                    ticket_id, e
+                                ),
+                            });
+                            continue;
+                        }
+
+                        self.log_activity(ActivityEvent::PhaseCompleted {
+                            ticket_id: ticket_id.clone(),
+                            phase: current_phase,
+                        });
+                        self.log_activity(ActivityEvent::TicketPhaseChanged {
+                            ticket_id: ticket_id.clone(),
+                            old_phase: current_phase,
+                            new_phase: next_phase,
+                        });
+
+                        if let Some(thread) = self.threads.get_mut(&ticket_id) {
+                            thread.current_phase = next_phase;
+                            thread.last_phase_change = std::time::SystemTime::now();
+                            if next_phase == Phase::Review {
+                                thread.park();
+                            }
+                        }
+                    } else {
+                        // Idle without artifact — alert
+                        let detail = format!(
+                            "Agent idle in {} phase but {} not found",
+                            current_phase, artifact_name
+                        );
+                        self.idle_alerts
+                            .push((ticket_id.clone(), detail.clone()));
+                        self.log_activity(ActivityEvent::Warning {
+                            message: format!("{}: {}", ticket_id, detail),
+                        });
+                    }
+                }
+
+                _ => {
+                    // Ready, Review, Done — signal already cleaned up, nothing to do
+                }
+            }
+        }
+    }
+
     /// Evaluate health of all running threads and log state changes.
     ///
     /// Uses the configured `stuck_threshold_secs` as the warning threshold.
@@ -619,6 +774,9 @@ impl State {
     fn poll_tick(&mut self) {
         // Check for new artifacts and advance phases before rebuilding DAG
         self.check_artifact_advances();
+
+        // Check for idle signals and advance phases / generate alerts
+        self.check_idle_signals();
 
         // Evaluate health: log transitions (Healthy→Stuck, etc.)
         self.evaluate_health();
@@ -1018,7 +1176,10 @@ impl State {
         ids.sort();
 
         if ids.is_empty() {
-            return; // Nothing to mark done
+            self.log_activity(ActivityEvent::Info {
+                message: "No tickets to mark done (all done or all have active agents)".to_string(),
+            });
+            return;
         }
 
         self.modal = MarkDoneModal {
@@ -1099,6 +1260,9 @@ impl ZellijPlugin for State {
         if !self.config.work_dir.is_absolute() {
             self.config.work_dir = host.join(&self.config.work_dir);
         }
+
+        // Signal directory for idle signal detection
+        self.signal_dir = host.join(".lisa/signals");
 
         // Subscribe to the events we need
         subscribe(&[
@@ -1297,7 +1461,7 @@ impl State {
         // Build health alerts from stuck/failed threads
         let now = std::time::SystemTime::now();
         let threshold = std::time::Duration::from_secs(self.config.stuck_threshold_secs);
-        let alerts: Vec<ui::HealthAlert> = self
+        let mut alerts: Vec<ui::HealthAlert> = self
             .threads
             .values()
             .filter(|t| t.status == lisa_core::types::ThreadStatus::Running || t.status == lisa_core::types::ThreadStatus::Failed)
@@ -1320,6 +1484,19 @@ impl State {
                 }
             })
             .collect();
+
+        // Append idle-without-artifact alerts from signal detection
+        for (ticket_id, detail) in &self.idle_alerts {
+            alerts.push(ui::HealthAlert {
+                ticket_id: ticket_id.clone(),
+                alert_type: ui::AlertType::IdleWithoutArtifact,
+                detail: detail.clone(),
+                suggested_actions: vec![
+                    "Check agent output".to_string(),
+                    "Restart session".to_string(),
+                ],
+            });
+        }
 
         let slots: Vec<ui::SlotInfo> = self
             .agent_slots
@@ -1603,21 +1780,22 @@ mod tests {
         let ticket_dir = Path::new("docs/active/tickets");
         let cmd = build_claude_command(ticket_dir, "T-042-01");
 
-        assert!(cmd.starts_with("claude --dangerously-skip-permissions"));
+        assert!(cmd.starts_with("LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions"));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
         assert!(!cmd.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");
     }
 
     #[test]
-    fn test_build_claude_prompt() {
+    fn test_build_claude_command_includes_env_var() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let prompt = build_claude_prompt(ticket_dir, "T-042-01");
+        let cmd = build_claude_command(ticket_dir, "T-042-01");
 
-        assert!(!prompt.contains("claude"), "prompt should not contain the claude binary");
-        assert!(prompt.contains("docs/active/tickets/T-042-01.md"));
-        assert!(prompt.contains("CLAUDE.md"));
-        assert!(!prompt.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");
+        assert!(
+            cmd.starts_with("LISA_TICKET_ID=T-042-01 "),
+            "command should set LISA_TICKET_ID env var, got: {}",
+            cmd
+        );
     }
 
     #[test]
@@ -1629,18 +1807,6 @@ mod tests {
             cmd.contains("docs/knowledge/rdspi-workflow.md"),
             "command should reference RDSPI workflow, got: {}",
             cmd
-        );
-    }
-
-    #[test]
-    fn test_build_claude_prompt_includes_rdspi_reference() {
-        let ticket_dir = Path::new("docs/active/tickets");
-        let prompt = build_claude_prompt(ticket_dir, "T-001");
-
-        assert!(
-            prompt.contains("docs/knowledge/rdspi-workflow.md"),
-            "prompt should reference RDSPI workflow, got: {}",
-            prompt
         );
     }
 
@@ -3133,6 +3299,332 @@ mod tests {
             let formatted = State::format_activity_event(&event);
             assert_eq!(formatted, expected, "Mismatch for {:?}", event);
         }
+    }
+
+    // =========================================================================
+    // Idle signal tests
+    // =========================================================================
+
+    #[test]
+    fn test_idle_signal_implement_advances_to_review() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create ticket file in implement phase
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        // Create signal directory with idle signal
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        // Build state
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+
+        // Add running thread in implement phase
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        state.threads.insert("T-001".to_string(), thread);
+
+        // Run idle signal check
+        state.check_idle_signals();
+
+        // Verify: thread advanced to Review and parked
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(thread.current_phase, Phase::Review);
+        assert_eq!(thread.status, ThreadStatus::Parked);
+
+        // Verify: signal file deleted
+        assert!(!state.signal_dir.join("T-001.idle").exists());
+
+        // Verify: ticket file updated
+        let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(updated.contains("phase: review"));
+
+        // Verify: activity log
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::PhaseCompleted { ticket_id, phase }
+            if ticket_id == "T-001" && *phase == Phase::Implement
+        )));
+
+        // Verify: no idle alerts
+        assert!(state.idle_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_idle_signal_research_with_artifact_advances() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create ticket file in research phase
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        ).unwrap();
+
+        // Create work dir with research.md artifact
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(work_dir.join("T-001")).unwrap();
+        fs::write(work_dir.join("T-001/research.md"), "# Research done").unwrap();
+
+        // Create signal directory with idle signal
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        // Build state
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+
+        // Add running thread in research phase
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_idle_signals();
+
+        // Verify: advanced to Design, still running
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(thread.current_phase, Phase::Design);
+        assert_eq!(thread.status, ThreadStatus::Running);
+
+        // Verify: signal deleted
+        assert!(!state.signal_dir.join("T-001.idle").exists());
+
+        // Verify: ticket file updated
+        let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(updated.contains("phase: design"));
+
+        // Verify: no idle alerts
+        assert!(state.idle_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_idle_signal_research_without_artifact_alerts() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create ticket file in research phase
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        ).unwrap();
+
+        // No artifact — work dir empty
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        // Create signal directory with idle signal
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_idle_signals();
+
+        // Verify: phase NOT advanced (still research)
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(thread.current_phase, Phase::Research);
+
+        // Verify: signal deleted
+        assert!(!state.signal_dir.join("T-001.idle").exists());
+
+        // Verify: ticket file NOT updated
+        let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(updated.contains("phase: research"));
+
+        // Verify: idle alert generated
+        assert_eq!(state.idle_alerts.len(), 1);
+        assert_eq!(state.idle_alerts[0].0, "T-001");
+        assert!(state.idle_alerts[0].1.contains("research.md not found"));
+
+        // Verify: warning in activity log
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Warning { message }
+            if message.contains("T-001") && message.contains("research.md")
+        )));
+    }
+
+    #[test]
+    fn test_idle_signal_no_thread_ignored() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create ticket file
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        ).unwrap();
+
+        // Create signal for a ticket that has NO thread
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+        // No threads added
+
+        state.check_idle_signals();
+
+        // Signal file should still be cleaned up
+        assert!(!state.signal_dir.join("T-001.idle").exists());
+
+        // No alerts
+        assert!(state.idle_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_idle_signal_nonrunning_thread_ignored() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+
+        // Add a PARKED thread (not running)
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        thread.park();
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_idle_signals();
+
+        // Signal cleaned up
+        assert!(!state.signal_dir.join("T-001.idle").exists());
+
+        // Thread still parked, not advanced
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(
+            thread.status,
+            lisa_core::types::ThreadStatus::Parked
+        );
+    }
+
+    #[test]
+    fn test_idle_signal_missing_dir_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut state = State {
+            signal_dir: dir.path().join("nonexistent/signals"),
+            ..State::default()
+        };
+
+        // Should not panic
+        state.check_idle_signals();
+        assert!(state.idle_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_to_ui_state_includes_idle_alerts() {
+        let mut state = State::default();
+        state.idle_alerts.push((
+            "T-001".to_string(),
+            "Agent idle in research phase but research.md not found".to_string(),
+        ));
+
+        let ui_state = state.to_ui_state();
+
+        assert!(ui_state.alerts.iter().any(|a| {
+            a.ticket_id == "T-001"
+                && a.alert_type == ui::AlertType::IdleWithoutArtifact
+                && a.detail.contains("research.md")
+        }));
     }
 }
 

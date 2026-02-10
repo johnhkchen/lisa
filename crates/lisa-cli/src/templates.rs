@@ -6,6 +6,44 @@ pub const RDSPI_WORKFLOW: &str = include_str!("../data/rdspi-workflow.md");
 /// The compiled WASM plugin, embedded at compile time via build.rs
 pub const PLUGIN_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lisa.wasm"));
 
+/// The on-idle hook script, called by Claude Code's idle_prompt notification.
+/// Writes a signal file so the plugin knows which session finished its work.
+pub const ON_IDLE_HOOK: &str = r#"#!/bin/sh
+# Lisa idle signal hook — called by Claude Code on idle_prompt notification.
+# Writes a signal file so the plugin knows this session finished its work.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_TICKET_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/$LISA_TICKET_ID.idle"
+fi
+"#;
+
+/// Gitignore content for the .lisa/ directory — ignores ephemeral signal files.
+pub const LISA_GITIGNORE: &str = "signals/\n";
+
+/// Generate .claude/settings.local.json with the idle_prompt notification hook.
+pub fn settings_local_json() -> String {
+    r#"{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".lisa/hooks/on-idle.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#
+    .to_string()
+}
+
 /// Generate a project-specific CLAUDE.md
 pub fn generate_claude_md(project: &DetectedProject) -> String {
     let build_section = if project.build_command.is_empty() {
@@ -121,5 +159,27 @@ mod tests {
         assert!(result.contains("mystery"));
         // Should still have directory conventions
         assert!(result.contains("docs/active/tickets/"));
+    }
+
+    #[test]
+    fn test_on_idle_hook_content() {
+        assert!(ON_IDLE_HOOK.starts_with("#!/bin/sh"));
+        assert!(ON_IDLE_HOOK.contains("LISA_TICKET_ID"));
+        assert!(ON_IDLE_HOOK.contains(".lisa/signals"));
+        assert!(ON_IDLE_HOOK.contains(".idle"));
+    }
+
+    #[test]
+    fn test_settings_local_json() {
+        let json = settings_local_json();
+        assert!(json.contains("idle_prompt"));
+        assert!(json.contains("on-idle.sh"));
+        assert!(json.contains("Notification"));
+        assert!(json.contains(r#""type": "command""#));
+    }
+
+    #[test]
+    fn test_lisa_gitignore_content() {
+        assert!(LISA_GITIGNORE.contains("signals/"));
     }
 }
