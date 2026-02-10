@@ -169,7 +169,6 @@ status: open
 priority: high
 phase: ready
 depends_on: [T-024-01, T-024-02]
-blocks: [T-024-06]
 ---
 
 ## Context
@@ -190,7 +189,7 @@ Fields:
 - `priority`: `critical` | `high` | `medium` | `low`
 - `phase`: `ready` | `research` | `design` | `structure` | `plan` | `implement` | `review` | `done`
 - `depends_on`: List of ticket IDs that must complete before this ticket starts
-- `blocks`: List of ticket IDs that depend on this ticket
+- `blocks`: *(optional)* List of ticket IDs that depend on this ticket. Lisa computes this automatically from `depends_on`, so you do not need to maintain it by hand
 
 ---
 
@@ -307,6 +306,7 @@ title: plugin-foundation
 type: story
 status: in_progress
 priority: high
+tickets: [T-001-01, T-001-02, T-001-03]
 ---
 
 ## Plugin Foundation
@@ -333,6 +333,18 @@ title: end-to-end-dashboard
 ```
 
 Stories do not have `depends_on` or `blocks` fields. Dependency ordering is defined entirely at the ticket level. A story is done when all its tickets are done.
+
+### Optional: `tickets` Field
+
+Stories can include a `tickets` field listing their child ticket IDs:
+
+```yaml
+tickets: [T-001-01, T-001-02, T-001-03]
+```
+
+This field is optional and informational -- it is not used for DAG computation. The authoritative link between a ticket and its story is the `story` field on each ticket. The `tickets` field on a story is a convenience for scanning story scope at a glance without grepping the tickets directory.
+
+`lisa init` and future `lisa add-ticket` commands could maintain this field automatically.
 
 Use stories when you have 3+ related tickets that form a logical unit. For one-off tickets, skip the story.
 
