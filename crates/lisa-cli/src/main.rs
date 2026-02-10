@@ -40,6 +40,10 @@ enum Commands {
         /// Maximum concurrent Claude sessions
         #[arg(long, default_value = "2")]
         max_threads: usize,
+
+        /// Show what would be done without launching zellij
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -61,9 +65,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Loop { path, max_threads } => {
+        Commands::Loop { path, max_threads, dry_run } => {
             let path = resolve_path(&path);
-            if let Err(e) = loop_cmd::run_loop(&path, max_threads) {
+            if let Err(e) = loop_cmd::run_loop(&path, max_threads, dry_run) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
