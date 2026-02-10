@@ -231,38 +231,119 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Run validation on the project setup.
-///
-/// When `check_tools` is true, also verifies that `zellij` and `claude` are on PATH.
-pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
+/// Severity of a validation diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Severity {
+    Error,
+    Warning,
+}
+
+/// A single validation finding with structured path, category, and message.
+#[derive(Debug, Clone)]
+struct ValidationDiagnostic {
+    /// Relative file path or logical location
+    path: String,
+    /// Category tag: frontmatter, dependency, structure, config, readiness
+    category: &'static str,
+    /// Human-readable description of the problem
+    message: String,
+    /// Whether this blocks readiness
+    severity: Severity,
+}
+
+impl fmt::Display for ValidationDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.severity {
+            Severity::Error => write!(f, "{}: {}: {}", self.path, self.category, self.message),
+            Severity::Warning => {
+                write!(
+                    f,
+                    "{}: {} (warning): {}",
+                    self.path, self.category, self.message
+                )
+            }
+        }
+    }
+}
+
+/// Result of validation, structured for both display and testing.
+struct ValidationResult {
+    diagnostics: Vec<ValidationDiagnostic>,
+    ticket_count: usize,
+    ready_count: usize,
+}
+
+impl ValidationResult {
+    fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+    }
+
+    fn error_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count()
+    }
+}
+
+/// Collect all validation diagnostics without printing.
+fn validate(root: &Path, check_tools: bool) -> ValidationResult {
+    let mut diagnostics: Vec<ValidationDiagnostic> = Vec::new();
+    let mut ticket_count: usize = 0;
+    let mut ready_count: usize = 0;
 
     // 1. Tool checks (optional)
     if check_tools {
         if !crate::loop_cmd::which("zellij") {
-            errors.push("`zellij` not found on PATH. Install: https://zellij.dev/documentation/installation".to_string());
+            diagnostics.push(ValidationDiagnostic {
+                path: "(tools)".to_string(),
+                category: "config",
+                message: "`zellij` not found on PATH. Install: https://zellij.dev/documentation/installation".to_string(),
+                severity: Severity::Error,
+            });
         }
         if !crate::loop_cmd::which("claude") {
-            errors.push("`claude` not found on PATH. Install: https://docs.anthropic.com/en/docs/claude-code".to_string());
+            diagnostics.push(ValidationDiagnostic {
+                path: "(tools)".to_string(),
+                category: "config",
+                message: "`claude` not found on PATH. Install: https://docs.anthropic.com/en/docs/claude-code".to_string(),
+                severity: Severity::Error,
+            });
         }
     }
 
     // 2. CLAUDE.md exists
     if !root.join("CLAUDE.md").exists() {
-        errors.push("CLAUDE.md not found. Run `lisa init` to create it.".to_string());
+        diagnostics.push(ValidationDiagnostic {
+            path: "CLAUDE.md".to_string(),
+            category: "structure",
+            message: "not found. Run `lisa init` to create it.".to_string(),
+            severity: Severity::Error,
+        });
     }
 
     // 3. docs/rdspi-workflow.md exists (error, not warning)
     if !root.join("docs/rdspi-workflow.md").exists() {
-        errors.push("docs/rdspi-workflow.md not found. Run `lisa init` to create it.".to_string());
+        diagnostics.push(ValidationDiagnostic {
+            path: "docs/rdspi-workflow.md".to_string(),
+            category: "structure",
+            message: "not found. Run `lisa init` to create it.".to_string(),
+            severity: Severity::Error,
+        });
     }
 
     // 4. Validate .lisa.toml if present
     let ticket_dir_rel = match config::load_config(root) {
         Ok(validation) => {
             for w in &validation.warnings {
-                warnings.push(format!(".lisa.toml: {}", w));
+                diagnostics.push(ValidationDiagnostic {
+                    path: ".lisa.toml".to_string(),
+                    category: "config",
+                    message: w.clone(),
+                    severity: Severity::Warning,
+                });
             }
             validation
                 .config
@@ -271,7 +352,12 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
                 .unwrap_or_else(|| "docs/active/tickets".to_string())
         }
         Err(e) => {
-            errors.push(format!(".lisa.toml: {}", e));
+            diagnostics.push(ValidationDiagnostic {
+                path: ".lisa.toml".to_string(),
+                category: "config",
+                message: e,
+                severity: Severity::Error,
+            });
             "docs/active/tickets".to_string()
         }
     };
@@ -279,47 +365,55 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
     // 5. Hook infrastructure
     let settings_path = root.join(".claude/settings.local.json");
     if !settings_path.exists() {
-        errors.push(
-            ".claude/settings.local.json not found. Run `lisa init` to create idle signal hooks."
-                .to_string(),
-        );
+        diagnostics.push(ValidationDiagnostic {
+            path: ".claude/settings.local.json".to_string(),
+            category: "structure",
+            message: "not found. Run `lisa init` to create idle signal hooks.".to_string(),
+            severity: Severity::Error,
+        });
     } else {
-        // Verify the file contains the idle_prompt hook configuration
         match fs::read_to_string(&settings_path) {
             Ok(content) => {
                 if !content.contains("idle_prompt") {
-                    errors.push(
-                        ".claude/settings.local.json exists but does not contain an idle_prompt hook. Run `lisa init` on a fresh project or add the hook manually."
-                            .to_string(),
-                    );
+                    diagnostics.push(ValidationDiagnostic {
+                        path: ".claude/settings.local.json".to_string(),
+                        category: "config",
+                        message: "missing idle_prompt hook configuration".to_string(),
+                        severity: Severity::Error,
+                    });
                 }
             }
             Err(e) => {
-                errors.push(format!(
-                    "Could not read .claude/settings.local.json: {}",
-                    e
-                ));
+                diagnostics.push(ValidationDiagnostic {
+                    path: ".claude/settings.local.json".to_string(),
+                    category: "config",
+                    message: format!("could not read file: {}", e),
+                    severity: Severity::Error,
+                });
             }
         }
     }
 
     let hook_path = root.join(".lisa/hooks/on-idle.sh");
     if !hook_path.exists() {
-        errors.push(
-            ".lisa/hooks/on-idle.sh not found. Run `lisa init` to create idle signal hooks."
-                .to_string(),
-        );
+        diagnostics.push(ValidationDiagnostic {
+            path: ".lisa/hooks/on-idle.sh".to_string(),
+            category: "structure",
+            message: "not found. Run `lisa init` to create idle signal hooks.".to_string(),
+            severity: Severity::Error,
+        });
     } else {
-        // Verify the hook script is executable on unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = fs::metadata(&hook_path) {
                 if meta.permissions().mode() & 0o111 == 0 {
-                    errors.push(
-                        ".lisa/hooks/on-idle.sh is not executable. Run: chmod +x .lisa/hooks/on-idle.sh"
-                            .to_string(),
-                    );
+                    diagnostics.push(ValidationDiagnostic {
+                        path: ".lisa/hooks/on-idle.sh".to_string(),
+                        category: "structure",
+                        message: "not executable. Run: chmod +x .lisa/hooks/on-idle.sh".to_string(),
+                        severity: Severity::Error,
+                    });
                 }
             }
         }
@@ -329,129 +423,193 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
     let optional_dirs = ["docs/active/stories", "docs/active/work"];
     for dir in &optional_dirs {
         if !root.join(dir).exists() {
-            warnings.push(format!(
-                "{} directory not found. Run `lisa init` to create it.",
-                dir
-            ));
+            diagnostics.push(ValidationDiagnostic {
+                path: dir.to_string(),
+                category: "structure",
+                message: "directory not found. Run `lisa init` to create it.".to_string(),
+                severity: Severity::Warning,
+            });
         }
     }
 
-    // 6. Ticket directory must exist
+    // 7. Ticket directory must exist
     let ticket_dir = root.join(&ticket_dir_rel);
     if !ticket_dir.exists() {
-        errors.push(format!(
-            "{} directory not found. Run `lisa init` to create it.",
-            ticket_dir_rel
-        ));
-        // Can't continue ticket/DAG checks without the directory
-        return print_results(&errors, &warnings);
+        diagnostics.push(ValidationDiagnostic {
+            path: ticket_dir_rel.clone(),
+            category: "structure",
+            message: "directory not found. Run `lisa init` to create it.".to_string(),
+            severity: Severity::Error,
+        });
+        return ValidationResult {
+            diagnostics,
+            ticket_count,
+            ready_count,
+        };
     }
 
-    // 7. Scan tickets with diagnostics
+    // 8. Scan tickets with diagnostics
     let scan = match lisa_core::ticket::scan_tickets_with_diagnostics(&ticket_dir) {
         Ok(scan) => scan,
         Err(e) => {
-            errors.push(format!("Could not scan tickets: {}", e));
-            return print_results(&errors, &warnings);
+            diagnostics.push(ValidationDiagnostic {
+                path: ticket_dir_rel.clone(),
+                category: "structure",
+                message: format!("could not scan tickets: {}", e),
+                severity: Severity::Error,
+            });
+            return ValidationResult {
+                diagnostics,
+                ticket_count,
+                ready_count,
+            };
         }
     };
 
     // Surface per-file parse errors
     for (path, err) in &scan.errors {
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
-        errors.push(format!("Failed to parse {}: {}", filename, err));
+        let rel_path = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        diagnostics.push(ValidationDiagnostic {
+            path: rel_path,
+            category: "frontmatter",
+            message: err.to_string(),
+            severity: Severity::Error,
+        });
     }
 
-    // 8. Must have at least one ticket
+    // 9. Must have at least one ticket
     if scan.tickets.is_empty() {
-        errors.push(format!(
-            "No tickets found in {}. Create at least one ticket file.",
-            ticket_dir_rel
-        ));
-        return print_results(&errors, &warnings);
+        diagnostics.push(ValidationDiagnostic {
+            path: format!("{}/", ticket_dir_rel),
+            category: "readiness",
+            message: "no tickets found. Create at least one ticket file.".to_string(),
+            severity: Severity::Error,
+        });
+        return ValidationResult {
+            diagnostics,
+            ticket_count,
+            ready_count,
+        };
     }
 
-    // 9. Acceptance criteria (warning)
+    // 10. Acceptance criteria (warning)
     for ticket in &scan.tickets {
         if !ticket.content.contains("Acceptance Criteria")
             && !ticket.content.contains("acceptance criteria")
         {
-            warnings.push(format!(
-                "Ticket {} is missing an Acceptance Criteria section",
-                ticket.id
-            ));
+            let rel_path = ticket
+                .file_path
+                .strip_prefix(root)
+                .unwrap_or(&ticket.file_path)
+                .display()
+                .to_string();
+            diagnostics.push(ValidationDiagnostic {
+                path: rel_path,
+                category: "frontmatter",
+                message: "missing Acceptance Criteria section".to_string(),
+                severity: Severity::Warning,
+            });
         }
     }
 
-    // 10. Build DAG
+    ticket_count = scan.tickets.len();
+
+    // 11. Build DAG
     match lisa_core::dag::Dag::from_tickets(scan.tickets) {
         Ok(dag) => {
             // Check for cycles
             if let lisa_core::dag::CycleDetectionResult::Cycle(nodes) = dag.detect_cycles() {
-                errors.push(format!(
-                    "Cycle detected involving tickets: {}",
-                    nodes.join(", ")
-                ));
+                diagnostics.push(ValidationDiagnostic {
+                    path: format!("{}/", ticket_dir_rel),
+                    category: "dependency",
+                    message: format!("cycle detected involving tickets: {}", nodes.join(", ")),
+                    severity: Severity::Error,
+                });
             }
 
-            // 11. At least one ready ticket
-            if dag.get_ready_tickets().is_empty() {
-                errors.push(
-                    "No tickets are ready to run. At least one ticket must have phase: ready with all dependencies satisfied."
-                        .to_string(),
-                );
+            let ready = dag.get_ready_tickets();
+            ready_count = ready.len();
+
+            // 12. At least one ready ticket
+            if ready.is_empty() {
+                diagnostics.push(ValidationDiagnostic {
+                    path: format!("{}/", ticket_dir_rel),
+                    category: "readiness",
+                    message: "no tickets with phase 'ready' and all dependencies satisfied".to_string(),
+                    severity: Severity::Error,
+                });
             }
         }
         Err(lisa_core::dag::DagError::MissingDependency {
             ticket_id,
             missing_dep,
         }) => {
-            errors.push(format!(
-                "Ticket {} depends on {} which does not exist",
-                ticket_id, missing_dep
-            ));
+            diagnostics.push(ValidationDiagnostic {
+                path: format!("{}/", ticket_dir_rel),
+                category: "dependency",
+                message: format!(
+                    "ticket {} depends on {} which does not exist",
+                    ticket_id, missing_dep
+                ),
+                severity: Severity::Error,
+            });
         }
         Err(lisa_core::dag::DagError::CycleDetected(nodes)) => {
-            errors.push(format!(
-                "Cycle detected involving tickets: {}",
-                nodes.join(", ")
-            ));
+            diagnostics.push(ValidationDiagnostic {
+                path: format!("{}/", ticket_dir_rel),
+                category: "dependency",
+                message: format!("cycle detected involving tickets: {}", nodes.join(", ")),
+                severity: Severity::Error,
+            });
         }
     }
 
-    print_results(&errors, &warnings)
+    ValidationResult {
+        diagnostics,
+        ticket_count,
+        ready_count,
+    }
 }
 
-/// Print grouped validation results and return appropriate Result.
-fn print_results(errors: &[String], warnings: &[String]) -> Result<(), String> {
-    if !errors.is_empty() {
-        println!("Errors:");
-        for e in errors {
-            println!("  x {}", e);
+/// Run validation on the project setup.
+///
+/// When `check_tools` is true, also verifies that `zellij` and `claude` are on PATH.
+pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
+    let result = validate(root, check_tools);
+    print_diagnostics(&result)
+}
+
+/// Print structured validation diagnostics and return appropriate Result.
+fn print_diagnostics(result: &ValidationResult) -> Result<(), String> {
+    // Print errors first, then warnings
+    for d in &result.diagnostics {
+        if d.severity == Severity::Error {
+            println!("{}", d);
+        }
+    }
+    for d in &result.diagnostics {
+        if d.severity == Severity::Warning {
+            println!("{}", d);
         }
     }
 
-    if !warnings.is_empty() {
-        if !errors.is_empty() {
-            println!();
-        }
-        println!("Warnings:");
-        for w in warnings {
-            println!("  ! {}", w);
-        }
-    }
-
-    println!();
-    if errors.is_empty() {
-        println!("Ready for `lisa loop`.");
-        Ok(())
+    if result.has_errors() {
+        let count = result.error_count();
+        println!(
+            "\n{} error(s) found. Fix and re-run `lisa validate`.",
+            count
+        );
+        Err(format!("{} error(s) found. Fix and re-run `lisa validate`.", count))
     } else {
-        let msg = format!("{} error(s) must be fixed.", errors.len());
-        println!("{}", msg);
-        Err(msg)
+        println!(
+            "All checks passed. {} tickets, {} ready, DAG valid. Run `lisa loop` to start.",
+            result.ticket_count, result.ready_count
+        );
+        Ok(())
     }
 }
 
@@ -1137,5 +1295,186 @@ depends_on: [T-999]
         assert!(claude_md.contains("my-node-project"));
         assert!(claude_md.contains("(Node.js)"));
         assert!(claude_md.contains("npm"));
+    }
+
+    // --- Structured diagnostic tests (call validate() directly) ---
+
+    #[test]
+    fn test_diagnostics_clean_project() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
+        write_ready_ticket(dir.path());
+
+        let result = validate(dir.path(), false);
+        assert!(!result.has_errors());
+        assert_eq!(result.ticket_count, 1);
+        assert_eq!(result.ready_count, 1);
+    }
+
+    #[test]
+    fn test_diagnostics_missing_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = validate(dir.path(), false);
+        let errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.path == "CLAUDE.md")
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, "structure");
+    }
+
+    #[test]
+    fn test_diagnostics_ticket_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
+
+        // Malformed ticket
+        fs::write(
+            dir.path().join("docs/active/tickets/T-BAD.md"),
+            "---\nid: T-BAD\ntitle: bad\n---\nNo type\n",
+        )
+        .unwrap();
+
+        let result = validate(dir.path(), false);
+        let frontmatter_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.category == "frontmatter")
+            .collect();
+        assert_eq!(frontmatter_errors.len(), 1);
+        assert!(frontmatter_errors[0].path.contains("T-BAD.md"));
+    }
+
+    #[test]
+    fn test_diagnostics_missing_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
+
+        fs::write(
+            dir.path().join("docs/active/tickets/T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: medium\nphase: ready\ndepends_on: [T-999]\n---\n\n## Acceptance Criteria\n\n- It works\n",
+        ).unwrap();
+
+        let result = validate(dir.path(), false);
+        let dep_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.category == "dependency")
+            .collect();
+        assert_eq!(dep_errors.len(), 1);
+        assert!(dep_errors[0].message.contains("T-999"));
+    }
+
+    #[test]
+    fn test_diagnostics_no_ready_tickets() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
+
+        // All done
+        fs::write(
+            dir.path().join("docs/active/tickets/T-001.md"),
+            "---\nid: T-001\ntitle: done\ntype: task\nstatus: done\npriority: medium\nphase: done\n---\n\n## Acceptance Criteria\n\n- Done\n",
+        ).unwrap();
+
+        let result = validate(dir.path(), false);
+        let readiness_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.category == "readiness")
+            .collect();
+        assert_eq!(readiness_errors.len(), 1);
+    }
+
+    #[test]
+    fn test_diagnostics_format_error() {
+        let d = ValidationDiagnostic {
+            path: "docs/active/tickets/T-001.md".to_string(),
+            category: "frontmatter",
+            message: "missing required field 'phase'".to_string(),
+            severity: Severity::Error,
+        };
+        assert_eq!(
+            d.to_string(),
+            "docs/active/tickets/T-001.md: frontmatter: missing required field 'phase'"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_format_warning() {
+        let d = ValidationDiagnostic {
+            path: "docs/active/stories".to_string(),
+            category: "structure",
+            message: "directory not found".to_string(),
+            severity: Severity::Warning,
+        };
+        assert_eq!(
+            d.to_string(),
+            "docs/active/stories: structure (warning): directory not found"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_hook_structure_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // No hook infrastructure at all
+        write_ready_ticket(dir.path());
+
+        let result = validate(dir.path(), false);
+        let hook_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error
+                    && (d.path.contains("settings.local.json")
+                        || d.path.contains("on-idle.sh"))
+            })
+            .collect();
+        assert_eq!(hook_errors.len(), 2);
+    }
+
+    #[test]
+    fn test_diagnostics_success_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
+
+        // Two ready tickets, one done
+        write_ready_ticket(dir.path());
+        fs::write(
+            dir.path().join("docs/active/tickets/T-002.md"),
+            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: ready\n---\n\n## Acceptance Criteria\n\n- Done\n",
+        ).unwrap();
+        fs::write(
+            dir.path().join("docs/active/tickets/T-003.md"),
+            "---\nid: T-003\ntitle: third\ntype: task\nstatus: done\npriority: medium\nphase: done\n---\n\n## Acceptance Criteria\n\n- Done\n",
+        ).unwrap();
+
+        let result = validate(dir.path(), false);
+        assert!(!result.has_errors());
+        assert_eq!(result.ticket_count, 3);
+        assert_eq!(result.ready_count, 2);
     }
 }
