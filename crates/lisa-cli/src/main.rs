@@ -33,6 +33,10 @@ enum Commands {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
+
+        /// Also check that zellij and claude are on PATH
+        #[arg(long)]
+        check_tools: bool,
     },
     /// Show DAG status: tickets, dependencies, execution waves, scheduling readiness
     Status {
@@ -73,9 +77,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Validate { path } => {
+        Commands::Validate { path, check_tools } => {
             let path = resolve_path(&path);
-            if let Err(e) = init::run_validate(&path) {
+            if let Err(e) = init::run_validate(&path, check_tools) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

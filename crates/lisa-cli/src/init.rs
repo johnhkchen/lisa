@@ -155,146 +155,187 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
 
     println!("Initialization complete.");
     println!();
+    println!("Next steps:");
+    println!("  1. Create tickets in docs/active/tickets/");
+    println!("  2. Run `lisa validate` to check readiness");
+    println!("  3. Run `lisa loop` to start scheduling");
 
-    // Step 6: Run validation
-    run_validate(root)
+    Ok(())
 }
 
-/// Run validation on the project setup
-pub fn run_validate(root: &Path) -> Result<(), String> {
+/// Run validation on the project setup.
+///
+/// When `check_tools` is true, also verifies that `zellij` and `claude` are on PATH.
+pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // Check CLAUDE.md exists
+    // 1. Tool checks (optional)
+    if check_tools {
+        if !crate::loop_cmd::which("zellij") {
+            errors.push("`zellij` not found on PATH. Install: https://zellij.dev/documentation/installation".to_string());
+        }
+        if !crate::loop_cmd::which("claude") {
+            errors.push("`claude` not found on PATH. Install: https://docs.anthropic.com/en/docs/claude-code".to_string());
+        }
+    }
+
+    // 2. CLAUDE.md exists
     if !root.join("CLAUDE.md").exists() {
         errors.push("CLAUDE.md not found. Run `lisa init` to create it.".to_string());
     }
 
-    // Check workflow file exists
+    // 3. docs/rdspi-workflow.md exists (error, not warning)
     if !root.join("docs/rdspi-workflow.md").exists() {
-        warnings.push("docs/rdspi-workflow.md not found. Run `lisa init` to create it.".to_string());
+        errors.push("docs/rdspi-workflow.md not found. Run `lisa init` to create it.".to_string());
     }
 
-    // Validate .lisa.toml if present
-    let config_path = root.join(".lisa.toml");
-    if config_path.exists() {
-        match config::load_config(root) {
-            Ok(validation) => {
-                for w in &validation.warnings {
-                    warnings.push(format!(".lisa.toml: {}", w));
-                }
-                println!(".lisa.toml: valid");
+    // 4. Validate .lisa.toml if present
+    let ticket_dir_rel = match config::load_config(root) {
+        Ok(validation) => {
+            for w in &validation.warnings {
+                warnings.push(format!(".lisa.toml: {}", w));
             }
-            Err(e) => {
-                errors.push(format!(".lisa.toml: {}", e));
-            }
+            validation
+                .config
+                .dirs
+                .tickets
+                .unwrap_or_else(|| "docs/active/tickets".to_string())
         }
-    }
+        Err(e) => {
+            errors.push(format!(".lisa.toml: {}", e));
+            "docs/active/tickets".to_string()
+        }
+    };
 
-    // Check directory structure
-    let required_dirs = ["docs/active/tickets", "docs/active/stories", "docs/active/work"];
-    for dir in &required_dirs {
+    // 5. Check directory structure
+    let optional_dirs = ["docs/active/stories", "docs/active/work"];
+    for dir in &optional_dirs {
         if !root.join(dir).exists() {
-            warnings.push(format!("{} directory not found. Run `lisa init` to create it.", dir));
+            warnings.push(format!(
+                "{} directory not found. Run `lisa init` to create it.",
+                dir
+            ));
         }
     }
 
-    // Scan and validate tickets if the directory exists
-    let ticket_dir = root.join("docs/active/tickets");
-    if ticket_dir.exists() {
-        match lisa_core::ticket::scan_tickets(&ticket_dir) {
-            Ok(tickets) => {
-                if tickets.is_empty() {
-                    println!("No tickets found in docs/active/tickets/");
-                } else {
-                    println!("Found {} ticket(s)", tickets.len());
+    // 6. Ticket directory must exist
+    let ticket_dir = root.join(&ticket_dir_rel);
+    if !ticket_dir.exists() {
+        errors.push(format!(
+            "{} directory not found. Run `lisa init` to create it.",
+            ticket_dir_rel
+        ));
+        // Can't continue ticket/DAG checks without the directory
+        return print_results(&errors, &warnings);
+    }
 
-                    // Check for acceptance criteria
-                    for ticket in &tickets {
-                        if !ticket.content.contains("Acceptance Criteria")
-                            && !ticket.content.contains("acceptance criteria")
-                        {
-                            warnings.push(format!(
-                                "Ticket {} is missing acceptance criteria",
-                                ticket.id
-                            ));
-                        }
-                    }
+    // 7. Scan tickets with diagnostics
+    let scan = match lisa_core::ticket::scan_tickets_with_diagnostics(&ticket_dir) {
+        Ok(scan) => scan,
+        Err(e) => {
+            errors.push(format!("Could not scan tickets: {}", e));
+            return print_results(&errors, &warnings);
+        }
+    };
 
-                    // Build DAG and check for issues
-                    match lisa_core::dag::Dag::from_tickets(tickets) {
-                        Ok(dag) => {
-                            // Check for cycles
-                            match dag.detect_cycles() {
-                                lisa_core::dag::CycleDetectionResult::NoCycle => {
-                                    println!("DAG validation: no cycles detected");
-                                }
-                                lisa_core::dag::CycleDetectionResult::Cycle(nodes) => {
-                                    errors.push(format!(
-                                        "Cycle detected involving tickets: {}",
-                                        nodes.join(", ")
-                                    ));
-                                }
-                            }
+    // Surface per-file parse errors
+    for (path, err) in &scan.errors {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
+        errors.push(format!("Failed to parse {}: {}", filename, err));
+    }
 
-                            // Show DAG stats
-                            let stats = dag.stats();
-                            println!(
-                                "DAG stats: {} total, {} ready, {} in progress, {} done",
-                                stats.total_tickets,
-                                stats.ready_tickets,
-                                stats.in_progress_tickets,
-                                stats.done_tickets,
-                            );
-                            if stats.critical_path_length > 0 {
-                                println!("Critical path length: {}", stats.critical_path_length);
-                            }
-                        }
-                        Err(lisa_core::dag::DagError::MissingDependency {
-                            ticket_id,
-                            missing_dep,
-                        }) => {
-                            errors.push(format!(
-                                "Ticket {} depends on {} which does not exist",
-                                ticket_id, missing_dep
-                            ));
-                        }
-                        Err(lisa_core::dag::DagError::CycleDetected(nodes)) => {
-                            errors.push(format!(
-                                "Cycle detected involving tickets: {}",
-                                nodes.join(", ")
-                            ));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warnings.push(format!("Could not scan tickets: {}", e));
-            }
+    // 8. Must have at least one ticket
+    if scan.tickets.is_empty() {
+        errors.push(format!(
+            "No tickets found in {}. Create at least one ticket file.",
+            ticket_dir_rel
+        ));
+        return print_results(&errors, &warnings);
+    }
+
+    // 9. Acceptance criteria (warning)
+    for ticket in &scan.tickets {
+        if !ticket.content.contains("Acceptance Criteria")
+            && !ticket.content.contains("acceptance criteria")
+        {
+            warnings.push(format!(
+                "Ticket {} is missing an Acceptance Criteria section",
+                ticket.id
+            ));
         }
     }
 
-    // Print results
+    // 10. Build DAG
+    match lisa_core::dag::Dag::from_tickets(scan.tickets) {
+        Ok(dag) => {
+            // Check for cycles
+            if let lisa_core::dag::CycleDetectionResult::Cycle(nodes) = dag.detect_cycles() {
+                errors.push(format!(
+                    "Cycle detected involving tickets: {}",
+                    nodes.join(", ")
+                ));
+            }
+
+            // 11. At least one ready ticket
+            if dag.get_ready_tickets().is_empty() {
+                errors.push(
+                    "No tickets are ready to run. At least one ticket must have phase: ready with all dependencies satisfied."
+                        .to_string(),
+                );
+            }
+        }
+        Err(lisa_core::dag::DagError::MissingDependency {
+            ticket_id,
+            missing_dep,
+        }) => {
+            errors.push(format!(
+                "Ticket {} depends on {} which does not exist",
+                ticket_id, missing_dep
+            ));
+        }
+        Err(lisa_core::dag::DagError::CycleDetected(nodes)) => {
+            errors.push(format!(
+                "Cycle detected involving tickets: {}",
+                nodes.join(", ")
+            ));
+        }
+    }
+
+    print_results(&errors, &warnings)
+}
+
+/// Print grouped validation results and return appropriate Result.
+fn print_results(errors: &[String], warnings: &[String]) -> Result<(), String> {
+    if !errors.is_empty() {
+        println!("Errors:");
+        for e in errors {
+            println!("  x {}", e);
+        }
+    }
+
     if !warnings.is_empty() {
-        println!();
+        if !errors.is_empty() {
+            println!();
+        }
         println!("Warnings:");
-        for w in &warnings {
+        for w in warnings {
             println!("  ! {}", w);
         }
     }
 
-    if !errors.is_empty() {
-        println!();
-        println!("Errors:");
-        for e in &errors {
-            println!("  x {}", e);
-        }
-        return Err(format!("{} error(s) found", errors.len()));
-    }
-
     println!();
-    println!("Validation passed.");
-    Ok(())
+    if errors.is_empty() {
+        println!("Ready for `lisa loop`.");
+        Ok(())
+    } else {
+        let msg = format!("{} error(s) must be fixed.", errors.len());
+        println!("{}", msg);
+        Err(msg)
+    }
 }
 
 #[cfg(test)]
@@ -430,8 +471,16 @@ mod tests {
     #[test]
     fn test_validate_missing_claude_md() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_validate(dir.path());
+        let result = run_validate(dir.path(), false);
         assert!(result.is_err());
+    }
+
+    /// Helper to create a minimal ready ticket in the given project root.
+    fn write_ready_ticket(root: &Path) {
+        fs::write(
+            root.join("docs/active/tickets/T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: medium\nphase: ready\n---\n\n## Acceptance Criteria\n\n- It works\n",
+        ).unwrap();
     }
 
     #[test]
@@ -444,8 +493,9 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_ready_ticket(dir.path());
 
-        let result = run_validate(dir.path());
+        let result = run_validate(dir.path(), false);
         assert!(result.is_ok());
     }
 
@@ -463,8 +513,9 @@ mod tests {
             "[scheduling]\nmax_threads = 4\n",
         )
         .unwrap();
+        write_ready_ticket(dir.path());
 
-        let result = run_validate(dir.path());
+        let result = run_validate(dir.path(), false);
         assert!(result.is_ok());
     }
 
@@ -479,7 +530,7 @@ mod tests {
         fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
         fs::write(dir.path().join(".lisa.toml"), "not valid toml {{{").unwrap();
 
-        let result = run_validate(dir.path());
+        let result = run_validate(dir.path(), false);
         assert!(result.is_err());
     }
 
@@ -516,7 +567,7 @@ Test ticket.
         )
         .unwrap();
 
-        let result = run_validate(dir.path());
+        let result = run_validate(dir.path(), false);
         assert!(result.is_ok());
     }
 
@@ -548,7 +599,119 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        let result = run_validate(dir.path());
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_missing_rdspi_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        write_ready_ticket(dir.path());
+        // No docs/rdspi-workflow.md
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("error"));
+    }
+
+    #[test]
+    fn test_validate_empty_ticket_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // No ticket files
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("error"));
+    }
+
+    #[test]
+    fn test_validate_no_ready_tickets() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+
+        // All tickets are done — no ready tickets
+        fs::write(
+            dir.path().join("docs/active/tickets/T-001.md"),
+            "---\nid: T-001\ntitle: done-ticket\ntype: task\nstatus: done\npriority: medium\nphase: done\n---\n\n## Acceptance Criteria\n\n- Done\n",
+        ).unwrap();
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("error"));
+    }
+
+    #[test]
+    fn test_validate_ticket_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+
+        // Malformed ticket (missing required fields)
+        fs::write(
+            dir.path().join("docs/active/tickets/T-BAD.md"),
+            "---\nid: T-BAD\ntitle: bad\n---\nNo type/status/priority/phase\n",
+        )
+        .unwrap();
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_acceptance_criteria_warning() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+
+        // Ticket without Acceptance Criteria section
+        fs::write(
+            dir.path().join("docs/active/tickets/T-001.md"),
+            "---\nid: T-001\ntitle: no-ac\ntype: task\nstatus: open\npriority: medium\nphase: ready\n---\n\nNo AC section here.\n",
+        ).unwrap();
+
+        // Should still pass (warning, not error) because there's a ready ticket
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_check_tools_false() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_ready_ticket(dir.path());
+
+        // check_tools=false should not fail even if tools are missing
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_ticket_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // No docs/active/tickets directory
+
+        let result = run_validate(dir.path(), false);
         assert!(result.is_err());
     }
 }

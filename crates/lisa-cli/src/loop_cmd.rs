@@ -134,7 +134,7 @@ fn check_binary(name: &str, install_hint: &str) -> Result<(), String> {
     }
 }
 
-fn which(name: &str) -> bool {
+pub(crate) fn which(name: &str) -> bool {
     std::process::Command::new("which")
         .arg(name)
         .stdout(std::process::Stdio::null())
