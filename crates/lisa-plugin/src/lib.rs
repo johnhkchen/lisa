@@ -37,7 +37,7 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
 /// Sets LISA_TICKET_ID env var so the idle signal hook knows which ticket is running.
 fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
-        "LISA_TICKET_ID={} claude --dangerously-skip-permissions -p \"{}\"",
+        "LISA_TICKET_ID={} claude --dangerously-skip-permissions \"{}\"",
         ticket_id,
         ticket_prompt(ticket_dir, ticket_id)
     )
@@ -1778,7 +1778,7 @@ mod tests {
         let ticket_dir = Path::new("docs/active/tickets");
         let cmd = build_claude_command(ticket_dir, "T-042-01");
 
-        assert!(cmd.starts_with("LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions -p"));
+        assert!(cmd.starts_with("LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
         assert!(!cmd.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");
