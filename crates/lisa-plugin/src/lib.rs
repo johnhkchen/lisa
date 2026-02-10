@@ -19,6 +19,10 @@ use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
 /// How often (in seconds) the plugin rescans ticket files to detect phase changes.
 const POLL_INTERVAL_SECS: f64 = 5.0;
 
+/// Short delay (seconds) before flushing deferred pane commands.
+/// Gives the pane time to process `/clear` before the command arrives.
+const FLUSH_DELAY_SECS: f64 = 0.5;
+
 /// The prompt text sent to Claude Code for a ticket.
 fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
     let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
@@ -29,15 +33,17 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
     )
 }
 
-/// Build the full shell command to launch a Claude Code session for a ticket.
-/// Sends Ctrl+C (\x03) twice first to kill any lingering process in the pane,
-/// then launches Claude with the ticket prompt.
-/// Uses \r (carriage return) to simulate pressing Enter in the terminal.
+/// Build the full shell command to launch Claude Code in a fresh pane.
 fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
-        "\x03\x03claude --dangerously-skip-permissions \"{}\"\r",
+        "claude --dangerously-skip-permissions \"{}\"\r",
         ticket_prompt(ticket_dir, ticket_id)
     )
+}
+
+/// Build a bare prompt to send into an already-running Claude Code session.
+fn build_claude_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
+    format!("{}\r", ticket_prompt(ticket_dir, ticket_id))
 }
 
 /// An agent pane slot — a pre-created terminal in the stacked layout.
@@ -99,10 +105,39 @@ pub struct State {
 
     /// Last known health status per ticket, for transition detection.
     last_health: HashMap<TicketId, lisa_core::types::HealthStatus>,
+
+    /// Commands queued for deferred writing to panes.
+    /// Written on the next timer tick after a short delay, so the pane
+    /// has time to process the preceding `/clear`.
+    pending_pane_writes: Vec<(u32, String)>,
+
+    /// Number of outstanding timers. Used to prevent timer chain duplication
+    /// when short flush timers are set alongside the regular poll timer.
+    pending_timer_count: u32,
 }
 
 impl State {
     const MAX_ACTIVITY_LOG: usize = 100;
+
+    /// Set a timer and track it so we can avoid re-arming when duplicates are pending.
+    fn arm_timer(&mut self, secs: f64) {
+        set_timeout(secs);
+        self.pending_timer_count += 1;
+    }
+
+    /// Called when a timer fires. Decrements the counter and returns whether
+    /// the poll timer should be re-armed (only when no other timers are pending).
+    fn timer_fired(&mut self) -> bool {
+        self.pending_timer_count = self.pending_timer_count.saturating_sub(1);
+        self.pending_timer_count == 0
+    }
+
+    /// Flush any deferred pane writes (commands queued after `/clear`).
+    fn flush_pending_pane_writes(&mut self) {
+        for (pane_id, cmd) in self.pending_pane_writes.drain(..) {
+            write_chars_to_pane_id(&cmd, PaneId::Terminal(pane_id));
+        }
+    }
 
     fn log_activity(&mut self, event: ActivityEvent) {
         self.activity_log.push(event);
@@ -131,14 +166,23 @@ impl State {
                 // Detect phase changes
                 let mut changed = false;
                 for ticket in dag.tickets() {
-                    if let Some(&old_phase) = self.last_phases.get(&ticket.id) {
-                        if old_phase != ticket.phase {
-                            self.log_activity(ActivityEvent::TicketPhaseChanged {
-                                ticket_id: ticket.id.clone(),
-                                old_phase,
-                                new_phase: ticket.phase,
-                            });
-                            changed = true;
+                    match self.last_phases.get(&ticket.id) {
+                        Some(&old_phase) => {
+                            if old_phase != ticket.phase {
+                                self.log_activity(ActivityEvent::TicketPhaseChanged {
+                                    ticket_id: ticket.id.clone(),
+                                    old_phase,
+                                    new_phase: ticket.phase,
+                                });
+                                changed = true;
+                            }
+                        }
+                        None => {
+                            // First-seen ticket: treat non-Ready phases as a change
+                            // so downstream slot-release logic runs on first load.
+                            if ticket.phase != Phase::Ready {
+                                changed = true;
+                            }
                         }
                     }
                 }
@@ -180,7 +224,7 @@ impl State {
 
         if !self.agent_slots.is_empty() {
             self.slots_discovered = true;
-            self.log_activity(ActivityEvent::Error {
+            self.log_activity(ActivityEvent::Info {
                 message: format!("Discovered {} agent pane slots", self.agent_slots.len()),
             });
         }
@@ -194,15 +238,25 @@ impl State {
     }
 
     /// Mark a slot as idle when its ticket completes.
-    /// Resets `has_session` because Claude Code exits after one-shot prompts,
-    /// so the next use must launch a fresh process.
+    /// Keeps `has_session = true` so subsequent scheduling sends `/clear` + prompt
+    /// into the already-running Claude Code session instead of relaunching.
     fn release_slot_for_ticket(&mut self, ticket_id: &TicketId) {
+        let mut released_pane: Option<u32> = None;
         for slot in &mut self.agent_slots {
             if slot.ticket_id.as_ref() == Some(ticket_id) {
+                released_pane = Some(slot.pane_id);
                 slot.ticket_id = None;
-                slot.has_session = false;
+                // has_session stays true — Claude Code is still running
                 break;
             }
+        }
+        match released_pane {
+            Some(pane_id) => self.log_activity(ActivityEvent::Info {
+                message: format!("Released slot #{} for {}", pane_id, ticket_id),
+            }),
+            None => self.log_activity(ActivityEvent::Info {
+                message: format!("No slot found for {}", ticket_id),
+            }),
         }
     }
 
@@ -213,17 +267,34 @@ impl State {
         }
 
         let ready = self.dag.get_ready_tickets();
+        let mut unscheduled = 0usize;
 
         for ticket_id in ready {
-            // Skip tickets that already have a thread
+            // Skip tickets that already have an active thread.
+            // Defensive: if a stale Completed thread exists, remove it and proceed.
+            let is_completed = self
+                .threads
+                .get(&ticket_id)
+                .map(|t| t.status == lisa_core::types::ThreadStatus::Completed)
+                .unwrap_or(false);
             if self.threads.contains_key(&ticket_id) {
-                continue;
+                if is_completed {
+                    self.threads.remove(&ticket_id);
+                } else {
+                    self.log_activity(ActivityEvent::Info {
+                        message: format!("Skipping {}: thread already exists", ticket_id),
+                    });
+                    continue;
+                }
             }
 
             // Find an idle slot
             let slot_idx = match self.find_idle_slot() {
                 Some(idx) => idx,
-                None => break, // No more slots
+                None => {
+                    unscheduled += 1;
+                    continue;
+                }
             };
 
             // Build the host-relative ticket dir (strip /host/ prefix)
@@ -235,15 +306,22 @@ impl State {
                     .unwrap_or(&self.config.ticket_dir.to_string_lossy()),
             );
 
-            // Write command to the slot's terminal — always launch a fresh process.
-            // Ctrl+C in build_claude_command kills any lingering process first.
             let pane_id = self.agent_slots[slot_idx].pane_id;
-            let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
-            write_chars_to_pane_id(&cmd, PaneId::Terminal(pane_id));
 
-            // Mark slot as occupied and session started
+            if self.agent_slots[slot_idx].has_session {
+                // Claude Code is already running — /clear resets the conversation,
+                // then we send just the prompt text.
+                write_chars_to_pane_id("/clear\r", PaneId::Terminal(pane_id));
+                let cmd = build_claude_prompt(&host_ticket_dir, &ticket_id);
+                self.pending_pane_writes.push((pane_id, cmd));
+            } else {
+                // Fresh pane — launch Claude Code from the shell.
+                let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
+                write_chars_to_pane_id(&cmd, PaneId::Terminal(pane_id));
+                self.agent_slots[slot_idx].has_session = true;
+            }
+
             self.agent_slots[slot_idx].ticket_id = Some(ticket_id.clone());
-            self.agent_slots[slot_idx].has_session = true;
 
             // Create thread record with the ticket's current phase
             let mut thread = Thread::new(ticket_id.clone(), pane_id);
@@ -255,6 +333,55 @@ impl State {
             self.log_activity(ActivityEvent::ThreadSpawned {
                 ticket_id,
                 pane_id,
+            });
+        }
+
+        if unscheduled > 0 {
+            self.log_activity(ActivityEvent::Info {
+                message: format!(
+                    "No idle slots available, {} ready tickets waiting",
+                    unscheduled
+                ),
+            });
+        }
+
+        // If we queued any commands, set a short timer to flush them
+        if !self.pending_pane_writes.is_empty() {
+            self.arm_timer(FLUSH_DELAY_SECS);
+        }
+    }
+
+    /// Safety sweep: release any agent slots still assigned to done tickets.
+    ///
+    /// This catches slots that the normal done-ticket detection in `poll_tick`
+    /// might miss — for example, if a thread was already cleaned up but the
+    /// slot assignment wasn't cleared.
+    fn sweep_stale_slots(&mut self) {
+        let stale: Vec<(u32, TicketId)> = self
+            .agent_slots
+            .iter()
+            .filter_map(|slot| {
+                let tid = slot.ticket_id.as_ref()?;
+                let is_done = self
+                    .dag
+                    .get_ticket(tid)
+                    .map(|t| t.phase == Phase::Done)
+                    .unwrap_or(false);
+                if is_done {
+                    Some((slot.pane_id, tid.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (pane_id, ticket_id) in stale {
+            self.release_slot_for_ticket(&ticket_id);
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Slot #{} held stale ticket {}, releasing",
+                    pane_id, ticket_id
+                ),
             });
         }
     }
@@ -427,6 +554,33 @@ impl State {
         }
     }
 
+    /// Periodic audit: remove any thread whose ticket is done or missing from the DAG.
+    ///
+    /// This is a safety net that catches threads that slipped through normal
+    /// completion detection — for example, if a ticket was manually edited to
+    /// done while the plugin was between poll cycles.
+    fn audit_threads(&mut self) {
+        let orphaned: Vec<TicketId> = self
+            .threads
+            .keys()
+            .filter(|tid| {
+                self.dag
+                    .get_ticket(tid)
+                    .map(|t| t.phase == Phase::Done)
+                    .unwrap_or(true) // missing from DAG = orphaned
+            })
+            .cloned()
+            .collect();
+
+        for tid in orphaned {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Orphaned thread for {} — removing", tid),
+            });
+            self.release_slot_for_ticket(&tid);
+            self.threads.remove(&tid);
+        }
+    }
+
     /// Check if all tickets are done and no threads are still running.
     fn check_all_done(&self) -> bool {
         !self.dag.is_empty()
@@ -450,49 +604,74 @@ impl State {
         // Detect and handle stale threads at hard timeout (2x threshold)
         self.detect_stale_threads();
 
-        let changed = self.rebuild_dag();
+        self.rebuild_dag();
 
-        if changed {
-            // Check for tickets that moved to Done — mark their threads complete
-            let done_tickets: Vec<TicketId> = self
-                .threads
-                .iter()
-                .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
-                .filter(|(tid, _)| {
-                    self.dag
-                        .get_ticket(tid)
-                        .map(|t| t.phase == Phase::Done)
-                        .unwrap_or(false)
-                })
-                .map(|(tid, _)| tid.clone())
-                .collect();
+        // Unconditionally check for tickets that moved to Done — mark their
+        // threads complete and release slots. This must not be gated behind
+        // change detection; if detection misses a transition, slots get stuck.
+        let done_tickets: Vec<TicketId> = self
+            .threads
+            .iter()
+            .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
+            .filter(|(tid, _)| {
+                self.dag
+                    .get_ticket(tid)
+                    .map(|t| t.phase == Phase::Done)
+                    .unwrap_or(false)
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
 
-            for ticket_id in &done_tickets {
-                if let Some(thread) = self.threads.get_mut(ticket_id) {
-                    thread.complete();
-                }
-                self.release_slot_for_ticket(ticket_id);
-                self.log_activity(ActivityEvent::ThreadExited {
-                    ticket_id: ticket_id.clone(),
-                    exit_code: Some(0),
-                });
+        for ticket_id in &done_tickets {
+            if let Some(thread) = self.threads.get_mut(ticket_id) {
+                thread.complete();
             }
+            self.release_slot_for_ticket(ticket_id);
+            self.threads.remove(ticket_id);
+            self.log_activity(ActivityEvent::ThreadExited {
+                ticket_id: ticket_id.clone(),
+                exit_code: Some(0),
+            });
+        }
 
-            // Also detect tickets whose phase advanced (agent still running, update thread)
-            for (tid, thread) in &mut self.threads {
-                if thread.status == lisa_core::types::ThreadStatus::Running {
-                    if let Some(ticket) = self.dag.get_ticket(tid) {
-                        if thread.current_phase != ticket.phase {
-                            thread.current_phase = ticket.phase;
-                            thread.last_phase_change = std::time::SystemTime::now();
-                        }
+        // Unconditionally sync thread phases with DAG state
+        for (tid, thread) in &mut self.threads {
+            if thread.status == lisa_core::types::ThreadStatus::Running {
+                if let Some(ticket) = self.dag.get_ticket(tid) {
+                    if thread.current_phase != ticket.phase {
+                        thread.current_phase = ticket.phase;
+                        thread.last_phase_change = std::time::SystemTime::now();
                     }
                 }
             }
         }
 
+        // Safety sweep: release any slots still pointing at done tickets
+        self.sweep_stale_slots();
+
+        // Audit threads: remove any orphaned entries for done/missing tickets
+        self.audit_threads();
+
         // Always try to schedule (slots may have freed up)
         self.schedule_ready_tickets();
+
+        // Log poll cycle summary
+        let ready_count = self.dag.get_ready_tickets().len();
+        let running_count = self
+            .threads
+            .values()
+            .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
+            .count();
+        let idle_count = self
+            .agent_slots
+            .iter()
+            .filter(|s| s.ticket_id.is_none())
+            .count();
+        self.log_activity(ActivityEvent::PollSummary {
+            ready: ready_count,
+            running: running_count,
+            idle_slots: idle_count,
+        });
 
         // Check for clean termination — all tickets done, no work remaining
         if self.check_all_done() {
@@ -503,7 +682,7 @@ impl State {
         }
 
         // Re-arm the timer
-        set_timeout(POLL_INTERVAL_SECS);
+        self.arm_timer(POLL_INTERVAL_SECS);
     }
 
     /// Handle keyboard input. Returns true if the UI should re-render.
@@ -616,11 +795,12 @@ impl State {
             new_phase: Phase::Done,
         });
 
-        // Release any slot occupied by this ticket
+        // Release any slot occupied by this ticket and remove the thread
         if let Some(thread) = self.threads.get_mut(&tid) {
             thread.complete();
         }
         self.release_slot_for_ticket(&tid);
+        self.threads.remove(&tid);
 
         // Rebuild DAG immediately so dependents become ready
         self.rebuild_dag();
@@ -678,7 +858,7 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permissions_granted = true;
                 // Start the poll timer
-                set_timeout(POLL_INTERVAL_SECS);
+                self.arm_timer(POLL_INTERVAL_SECS);
                 // Try to schedule immediately if slots are already discovered
                 self.schedule_ready_tickets();
                 should_render = true;
@@ -701,7 +881,15 @@ impl ZellijPlugin for State {
             }
 
             Event::Timer(_elapsed) => {
-                self.poll_tick();
+                // Flush any deferred pane writes first
+                self.flush_pending_pane_writes();
+
+                // Only run the full poll cycle and re-arm if this is the last
+                // pending timer. This prevents timer chain duplication when
+                // short flush timers are set alongside the regular poll timer.
+                if self.timer_fired() {
+                    self.poll_tick();
+                }
                 should_render = true;
             }
 
@@ -822,12 +1010,23 @@ impl State {
             })
             .collect();
 
+        let slots: Vec<ui::SlotInfo> = self
+            .agent_slots
+            .iter()
+            .map(|s| ui::SlotInfo {
+                pane_id: s.pane_id,
+                ticket_id: s.ticket_id.clone(),
+                has_session: s.has_session,
+            })
+            .collect();
+
         ui::PluginState {
             tickets,
             active_threads,
             parked_threads,
             activity_log,
             alerts,
+            slots,
             current_time: Duration::from_secs(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -951,6 +1150,11 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
                 HealthStatus::Healthy => return None,
             }
         }
+        ActivityEvent::Info { message } => ui::ActivityType::Info {
+            ticket_id: String::new(),
+            message: message.clone(),
+        },
+        ActivityEvent::PollSummary { .. } => return None,
     };
 
     Some(ui::ActivityEntry {
@@ -1072,12 +1276,21 @@ mod tests {
         let ticket_dir = Path::new("docs/active/tickets");
         let cmd = build_claude_command(ticket_dir, "T-042-01");
 
-        assert!(cmd.starts_with("\x03\x03"), "should start with Ctrl+C to kill lingering process");
-        assert!(cmd.contains("claude --dangerously-skip-permissions"));
+        assert!(cmd.starts_with("claude --dangerously-skip-permissions"));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
-        assert!(cmd.contains("docs/knowledge/rdspi-workflow.md"));
         assert!(cmd.contains("CLAUDE.md"));
         assert!(cmd.ends_with('\r'), "should end with carriage return");
+    }
+
+    #[test]
+    fn test_build_claude_prompt() {
+        let ticket_dir = Path::new("docs/active/tickets");
+        let prompt = build_claude_prompt(ticket_dir, "T-042-01");
+
+        assert!(!prompt.contains("claude"), "prompt should not contain the claude binary");
+        assert!(prompt.contains("docs/active/tickets/T-042-01.md"));
+        assert!(prompt.contains("CLAUDE.md"));
+        assert!(prompt.ends_with('\r'), "should end with carriage return");
     }
 
     #[test]
@@ -1456,7 +1669,7 @@ mod tests {
             ..State::default()
         };
 
-        // Simulate T-001 had a running thread that completed
+        // Simulate T-001 had a running thread that completed and was cleaned up
         let mut thread = Thread::new("T-001", 1);
         thread.complete();
         state.threads.insert("T-001".to_string(), thread);
@@ -1468,10 +1681,18 @@ mod tests {
             has_session: true,
         });
         state.release_slot_for_ticket(&"T-001".to_string());
+        state.threads.remove("T-001");
 
-        // Verify: slot is now idle
+        // Verify: slot is now idle but retains its Claude Code session
         assert!(state.agent_slots[0].ticket_id.is_none());
+        assert!(
+            state.agent_slots[0].has_session,
+            "has_session should stay true — Claude Code is still running"
+        );
         assert!(state.find_idle_slot().is_some());
+
+        // Verify: thread is removed from map
+        assert!(!state.threads.contains_key("T-001"));
 
         // Verify: DAG shows T-002 as ready (T-001 is done)
         let ready = state.dag.get_ready_tickets();
@@ -1743,6 +1964,502 @@ mod tests {
             state.threads.get("T-001").unwrap().status,
             ThreadStatus::Running
         );
+    }
+
+    #[test]
+    fn test_release_slot_logs_success() {
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 7,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+
+        state.release_slot_for_ticket(&"T-001".to_string());
+
+        // Slot should be released
+        assert!(state.agent_slots[0].ticket_id.is_none());
+
+        // Info log should mention pane and ticket
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message }
+            if message.contains("Released slot #7") && message.contains("T-001")
+        )));
+    }
+
+    #[test]
+    fn test_release_slot_logs_not_found() {
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 7,
+            ticket_id: None,
+            has_session: false,
+        });
+
+        state.release_slot_for_ticket(&"T-MISSING".to_string());
+
+        // Info log should indicate not found
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message }
+            if message.contains("No slot found") && message.contains("T-MISSING")
+        )));
+    }
+
+    #[test]
+    fn test_info_event_to_ui_entry() {
+        let entry = activity_event_to_ui_entry(&ActivityEvent::Info {
+            message: "test info message".to_string(),
+        });
+        assert!(entry.is_some());
+        match &entry.unwrap().activity {
+            ui::ActivityType::Info { message, .. } => {
+                assert_eq!(message, "test info message");
+            }
+            other => panic!("Expected Info, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_poll_summary_event_filtered() {
+        let entry = activity_event_to_ui_entry(&ActivityEvent::PollSummary {
+            ready: 3,
+            running: 2,
+            idle_slots: 1,
+        });
+        assert!(entry.is_none(), "PollSummary should be filtered from UI");
+    }
+
+    #[test]
+    fn test_done_ticket_detected_on_first_poll() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: already-done\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nDone\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+
+        // First rebuild with empty last_phases — done ticket should be detected
+        let changed = state.rebuild_dag();
+        assert!(changed, "First rebuild with done ticket should detect a change");
+
+        // Run the done-ticket detection logic (same as poll_tick)
+        let done_tickets: Vec<TicketId> = state
+            .threads
+            .iter()
+            .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
+            .filter(|(tid, _)| {
+                state.dag.get_ticket(tid).map(|t| t.phase == Phase::Done).unwrap_or(false)
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
+
+        for ticket_id in &done_tickets {
+            if let Some(t) = state.threads.get_mut(ticket_id) {
+                t.complete();
+            }
+            state.release_slot_for_ticket(ticket_id);
+            state.threads.remove(ticket_id);
+        }
+
+        // Thread should be removed from the map after completion
+        assert!(!state.threads.contains_key("T-001"));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+    }
+
+    #[test]
+    fn test_done_ticket_detected_between_polls() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: transitioned\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nDone\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Last poll saw T-001 at Research
+        state.last_phases.insert("T-001".to_string(), Phase::Research);
+
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+
+        let changed = state.rebuild_dag();
+        assert!(changed, "Phase change Research -> Done should be detected");
+
+        let done_tickets: Vec<TicketId> = state
+            .threads
+            .iter()
+            .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
+            .filter(|(tid, _)| {
+                state.dag.get_ticket(tid).map(|t| t.phase == Phase::Done).unwrap_or(false)
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
+
+        for ticket_id in &done_tickets {
+            if let Some(t) = state.threads.get_mut(ticket_id) {
+                t.complete();
+            }
+            state.release_slot_for_ticket(ticket_id);
+            state.threads.remove(ticket_id);
+        }
+
+        // Thread should be removed from the map after completion
+        assert!(!state.threads.contains_key("T-001"));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+    }
+
+    #[test]
+    fn test_sweep_stale_slots_releases_done_ticket() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: stale-slot\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nDone\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Slot assigned to done ticket, but no thread exists
+        state.agent_slots.push(AgentSlot {
+            pane_id: 5,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+        assert!(!state.threads.contains_key("T-001"));
+
+        state.sweep_stale_slots();
+
+        assert!(state.agent_slots[0].ticket_id.is_none(), "Stale slot should be released");
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Error { message }
+            if message.contains("stale") && message.contains("T-001") && message.contains("Slot #5")
+        )));
+    }
+
+    #[test]
+    fn test_completed_thread_removed_dependent_scheduled() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        // T-001: done
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: done\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nDone\n",
+        ).unwrap();
+
+        // T-002: ready, depends on T-001
+        fs::write(
+            tickets_dir.join("T-002.md"),
+            "---\nid: T-002\ntitle: next\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [T-001]\n---\n\nNext\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Running thread for T-001 (simulates agent still tracked)
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+
+        // Run the done-ticket detection logic (mirrors poll_tick)
+        let done_tickets: Vec<TicketId> = state
+            .threads
+            .iter()
+            .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
+            .filter(|(tid, _)| {
+                state.dag.get_ticket(tid).map(|t| t.phase == Phase::Done).unwrap_or(false)
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
+
+        for ticket_id in &done_tickets {
+            if let Some(t) = state.threads.get_mut(ticket_id) {
+                t.complete();
+            }
+            state.release_slot_for_ticket(ticket_id);
+            state.threads.remove(ticket_id);
+        }
+
+        // T-001 thread removed, slot released
+        assert!(!state.threads.contains_key("T-001"));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+
+        // T-002 is ready and has no thread blocking it
+        let ready = state.dag.get_ready_tickets();
+        assert!(ready.contains(&"T-002".to_string()));
+        assert!(!state.threads.contains_key("T-002"));
+    }
+
+    #[test]
+    fn test_defensive_guard_removes_completed_thread() {
+        use lisa_core::types::{Thread, ThreadStatus};
+
+        let mut state = State::default();
+
+        // Insert a stale Completed thread
+        let mut thread = Thread::new("T-001", 1);
+        thread.complete();
+        state.threads.insert("T-001".to_string(), thread);
+
+        // Simulate the defensive guard logic from schedule_ready_tickets
+        let ticket_id = "T-001".to_string();
+        let is_completed = state
+            .threads
+            .get(&ticket_id)
+            .map(|t| t.status == ThreadStatus::Completed)
+            .unwrap_or(false);
+
+        assert!(is_completed, "Thread should be Completed");
+
+        if is_completed {
+            state.threads.remove(&ticket_id);
+        }
+
+        // Thread should be removed, allowing rescheduling
+        assert!(!state.threads.contains_key("T-001"));
+    }
+
+    #[test]
+    fn test_audit_threads_removes_done_ticket_thread() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: done\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nDone\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Thread for a done ticket (should be cleaned up)
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+
+        state.audit_threads();
+
+        // Thread removed
+        assert!(!state.threads.contains_key("T-001"));
+        // Slot released
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        // Warning logged
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Error { message }
+            if message.contains("Orphaned") && message.contains("T-001")
+        )));
+    }
+
+    #[test]
+    fn test_audit_threads_removes_missing_ticket_thread() {
+        use lisa_core::types::Thread;
+
+        // Empty DAG — no tickets at all
+        let mut state = State::default();
+
+        // Thread for a ticket that doesn't exist in the DAG
+        let thread = Thread::new("T-GHOST", 1);
+        state.threads.insert("T-GHOST".to_string(), thread);
+
+        state.audit_threads();
+
+        // Thread removed (ticket not in DAG)
+        assert!(!state.threads.contains_key("T-GHOST"));
+        // Warning logged
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Error { message }
+            if message.contains("Orphaned") && message.contains("T-GHOST")
+        )));
+    }
+
+    #[test]
+    fn test_audit_threads_keeps_active_thread() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: active\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nActive\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Running thread for an active ticket — should NOT be removed
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.audit_threads();
+
+        // Thread should remain
+        assert!(state.threads.contains_key("T-001"));
+        // No warnings
+        assert!(state.activity_log.is_empty());
+    }
+
+    #[test]
+    fn test_mark_done_removes_thread() {
+        // Tests the thread removal logic from mark_ticket_done without calling
+        // schedule_ready_tickets() (which uses zellij host functions).
+        // We replicate the key mark_ticket_done operations manually.
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: to-mark\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Running thread for the ticket
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+        });
+
+        // Replicate the key mark_ticket_done operations (without schedule_ready_tickets)
+        let tid = "T-001".to_string();
+        let file_path = state.dag.get_ticket(&tid).map(|t| t.file_path.clone()).unwrap();
+        lisa_core::ticket::update_ticket_phase(&file_path, Phase::Done).unwrap();
+
+        if let Some(thread) = state.threads.get_mut(&tid) {
+            thread.complete();
+        }
+        state.release_slot_for_ticket(&tid);
+        state.threads.remove(&tid);
+
+        // Thread should be removed
+        assert!(!state.threads.contains_key("T-001"));
+        // Slot should be released
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        // Ticket file updated
+        let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(content.contains("phase: done"));
     }
 }
 

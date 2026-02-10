@@ -560,6 +560,16 @@ pub enum ActivityEvent {
         old_health: HealthStatus,
         new_health: HealthStatus,
     },
+
+    /// Informational log message (not an error or warning)
+    Info { message: String },
+
+    /// Poll cycle summary (filtered from UI to avoid noise)
+    PollSummary {
+        ready: usize,
+        running: usize,
+        idle_slots: usize,
+    },
 }
 
 /// Serde helper module for SystemTime serialization.

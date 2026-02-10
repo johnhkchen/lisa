@@ -172,6 +172,14 @@ pub struct HealthAlert {
     pub suggested_actions: Vec<String>,
 }
 
+/// Information about an agent pane slot for dashboard display.
+#[derive(Debug, Clone)]
+pub struct SlotInfo {
+    pub pane_id: u32,
+    pub ticket_id: Option<String>,
+    pub has_session: bool,
+}
+
 /// Activity log entry types
 #[derive(Debug, Clone)]
 pub enum ActivityType {
@@ -181,6 +189,7 @@ pub enum ActivityType {
     Warning { ticket_id: String, message: String },
     ThreadStarted { ticket_id: String, phase: Phase },
     ThreadParked { ticket_id: String, phase: Phase },
+    Info { ticket_id: String, message: String },
 }
 
 /// A single activity log entry
@@ -209,6 +218,7 @@ pub struct PluginState {
     pub parked_threads: Vec<ParkedThread>,
     pub activity_log: Vec<ActivityEntry>,
     pub alerts: Vec<HealthAlert>,
+    pub slots: Vec<SlotInfo>,
     pub current_time: Duration,
     pub selected_ticket: Option<String>,
     pub modal: ModalState,
@@ -222,6 +232,7 @@ impl Default for PluginState {
             parked_threads: Vec::new(),
             activity_log: Vec::new(),
             alerts: Vec::new(),
+            slots: Vec::new(),
             current_time: Duration::ZERO,
             selected_ticket: None,
             modal: ModalState::default(),
@@ -269,6 +280,73 @@ fn status_indicator(status: &TicketStatus) -> String {
 /// Render a horizontal separator line
 fn render_separator(width: usize) -> String {
     format!("{}{}{}", DIM, "─".repeat(width.min(80)), RESET)
+}
+
+// =============================================================================
+// Slot Status
+// =============================================================================
+
+/// Render the slot status section showing agent pane slot utilization.
+fn render_slots(state: &PluginState, output: &mut Vec<String>) {
+    if state.slots.is_empty() {
+        output.push(format!("{}(no agent slots){}", DIM, RESET));
+        return;
+    }
+
+    let total = state.slots.len();
+    let occupied: Vec<&SlotInfo> = state.slots.iter().filter(|s| s.ticket_id.is_some()).collect();
+    let idle = total - occupied.len();
+
+    // Header
+    if occupied.is_empty() {
+        output.push(format!(
+            "{}{}=== Slots: {} total, {} idle ==={}",
+            BOLD, CYAN, total, idle, RESET
+        ));
+    } else {
+        output.push(format!(
+            "{}{}=== Slots: {} total, {} idle, {} occupied ==={}",
+            BOLD, CYAN, total, idle, occupied.len(), RESET
+        ));
+    }
+    output.push(String::new());
+
+    // Occupied slot details
+    for slot in &occupied {
+        let tid = slot.ticket_id.as_deref().unwrap_or("?");
+        // Look up phase from active threads
+        let phase_str = state
+            .active_threads
+            .iter()
+            .find(|t| t.ticket_id == tid)
+            .map(|t| t.phase.short_name())
+            .unwrap_or("---");
+        output.push(format!(
+            "  {}#{:<4}{} {:<12} [{}]",
+            DIM, slot.pane_id, RESET, tid, phase_str
+        ));
+    }
+
+    // Warning: all occupied and ready tickets waiting
+    if idle == 0 {
+        let active_ticket_ids: std::collections::HashSet<&str> = state
+            .active_threads
+            .iter()
+            .map(|t| t.ticket_id.as_str())
+            .collect();
+        let waiting: usize = state
+            .tickets
+            .iter()
+            .filter(|t| t.status == TicketStatus::Ready)
+            .filter(|t| !active_ticket_ids.contains(t.id.as_str()))
+            .count();
+        if waiting > 0 {
+            output.push(format!(
+                "{}⚠ {} tickets waiting for slots{}",
+                YELLOW, waiting, RESET
+            ));
+        }
+    }
 }
 
 // =============================================================================
@@ -772,6 +850,19 @@ fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec
                 };
                 ("⚠", BRIGHT_YELLOW, format!("{}warn: {}", prefix, msg))
             }
+            ActivityType::Info { ticket_id, message } => {
+                let msg = if message.len() > 40 {
+                    format!("{}...", &message[..37])
+                } else {
+                    message.clone()
+                };
+                let prefix = if ticket_id.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", ticket_id)
+                };
+                ("ℹ", CYAN, format!("{}{}", prefix, msg))
+            }
         };
 
         output.push(format!(
@@ -831,6 +922,8 @@ fn render_quick_jump(state: &PluginState, output: &mut Vec<String>) {
 
 /// Render a compact status line for the title bar
 fn render_status_line(state: &PluginState) -> String {
+    let slot_total = state.slots.len();
+    let slot_occupied = state.slots.iter().filter(|s| s.ticket_id.is_some()).count();
     let active = state.active_threads.len();
     let parked = state.parked_threads.len();
     let done = state
@@ -840,6 +933,12 @@ fn render_status_line(state: &PluginState) -> String {
         .count();
     let total = state.tickets.len();
 
+    let slot_str = if slot_total > 0 {
+        format!("Slots: {}/{} | ", slot_occupied, slot_total)
+    } else {
+        String::new()
+    };
+
     let alert_count = state.alerts.len();
     let alert_str = if alert_count > 0 {
         format!(" | {}Alerts: {}{}", RED, alert_count, RESET)
@@ -848,8 +947,8 @@ fn render_status_line(state: &PluginState) -> String {
     };
 
     format!(
-        "Active: {} | Parked: {} | Done: {}/{}{}  {}[d] mark done{}",
-        active, parked, done, total, alert_str, DIM, RESET
+        "{}Active: {} | Parked: {} | Done: {}/{}{}  {}[d] mark done{}",
+        slot_str, active, parked, done, total, alert_str, DIM, RESET
     )
 }
 
@@ -868,6 +967,10 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
         BOLD, BG_BLUE, RESET, DIM, status
     ));
     output.push(render_separator(width));
+    output.push(String::new());
+
+    // Slot status
+    render_slots(state, &mut output);
     output.push(String::new());
 
     // Attention banner (review gate alerts)
@@ -1054,6 +1157,7 @@ mod tests {
                 },
             ],
             alerts: Vec::new(),
+            slots: Vec::new(),
             current_time: Duration::from_secs(120),
             selected_ticket: None,
             modal: ModalState::default(),
@@ -1286,6 +1390,7 @@ mod tests {
                 },
             ],
             alerts: Vec::new(),
+            slots: Vec::new(),
             current_time: Duration::from_secs(200),
             selected_ticket: None,
             modal: ModalState::default(),
@@ -1574,5 +1679,199 @@ mod tests {
         assert!(full.contains("T-005"), "Review ticket missing");
         assert!(full.contains("FAILED"), "Failed indicator missing");
         assert!(full.contains("design.md"), "Review artifact missing");
+    }
+
+    #[test]
+    fn test_render_slots_all_idle() {
+        let state = PluginState {
+            slots: vec![
+                SlotInfo { pane_id: 1, ticket_id: None, has_session: false },
+                SlotInfo { pane_id: 2, ticket_id: None, has_session: false },
+            ],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_slots(&state, &mut output);
+        let full = output.join("\n");
+
+        assert!(full.contains("2 total"), "Total count missing");
+        assert!(full.contains("2 idle"), "Idle count missing");
+        assert!(!full.contains("occupied"), "Should not show occupied when all idle");
+    }
+
+    #[test]
+    fn test_render_slots_all_occupied() {
+        let state = PluginState {
+            slots: vec![
+                SlotInfo { pane_id: 5, ticket_id: Some("T-003-01".to_string()), has_session: true },
+                SlotInfo { pane_id: 6, ticket_id: Some("T-003-02".to_string()), has_session: true },
+            ],
+            active_threads: vec![
+                ActiveThread {
+                    ticket_id: "T-003-01".to_string(),
+                    phase: Phase::Implement,
+                    started_at: Duration::from_secs(100),
+                    pane_id: 5,
+                },
+                ActiveThread {
+                    ticket_id: "T-003-02".to_string(),
+                    phase: Phase::Research,
+                    started_at: Duration::from_secs(100),
+                    pane_id: 6,
+                },
+            ],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_slots(&state, &mut output);
+        let full = output.join("\n");
+
+        assert!(full.contains("2 total"), "Total count missing");
+        assert!(full.contains("0 idle"), "Idle count missing");
+        assert!(full.contains("2 occupied"), "Occupied count missing");
+        assert!(full.contains("T-003-01"), "Occupied ticket missing");
+        assert!(full.contains("T-003-02"), "Occupied ticket missing");
+        assert!(full.contains("IMP"), "Phase shortname missing");
+        assert!(full.contains("RES"), "Phase shortname missing");
+    }
+
+    #[test]
+    fn test_render_slots_mixed() {
+        let state = PluginState {
+            slots: vec![
+                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()), has_session: true },
+                SlotInfo { pane_id: 6, ticket_id: None, has_session: true },
+                SlotInfo { pane_id: 7, ticket_id: None, has_session: false },
+            ],
+            active_threads: vec![ActiveThread {
+                ticket_id: "T-001".to_string(),
+                phase: Phase::Design,
+                started_at: Duration::from_secs(50),
+                pane_id: 5,
+            }],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_slots(&state, &mut output);
+        let full = output.join("\n");
+
+        assert!(full.contains("3 total"), "Total count missing");
+        assert!(full.contains("2 idle"), "Idle count missing");
+        assert!(full.contains("1 occupied"), "Occupied count missing");
+        assert!(full.contains("T-001"), "Occupied ticket missing");
+        assert!(full.contains("DES"), "Phase shortname missing");
+    }
+
+    #[test]
+    fn test_render_slots_no_slots() {
+        let state = PluginState::default();
+
+        let mut output = Vec::new();
+        render_slots(&state, &mut output);
+        let full = output.join("\n");
+
+        assert!(full.contains("no agent slots"), "Empty message missing");
+    }
+
+    #[test]
+    fn test_render_slots_warning_tickets_waiting() {
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-001".to_string(),
+                    title: "occupied".to_string(),
+                    phase: Phase::Implement,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec![],
+                    blocks: vec![],
+                },
+                TicketNode {
+                    id: "T-002".to_string(),
+                    title: "waiting".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Ready,
+                    depends_on: vec![],
+                    blocks: vec![],
+                },
+                TicketNode {
+                    id: "T-003".to_string(),
+                    title: "also-waiting".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Ready,
+                    depends_on: vec![],
+                    blocks: vec![],
+                },
+            ],
+            slots: vec![
+                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()), has_session: true },
+            ],
+            active_threads: vec![ActiveThread {
+                ticket_id: "T-001".to_string(),
+                phase: Phase::Implement,
+                started_at: Duration::from_secs(100),
+                pane_id: 5,
+            }],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_slots(&state, &mut output);
+        let full = output.join("\n");
+
+        assert!(full.contains("2 tickets waiting for slots"), "Warning missing");
+    }
+
+    #[test]
+    fn test_status_line_with_slots() {
+        let state = PluginState {
+            slots: vec![
+                SlotInfo { pane_id: 1, ticket_id: Some("T-001".to_string()), has_session: true },
+                SlotInfo { pane_id: 2, ticket_id: None, has_session: false },
+            ],
+            ..PluginState::default()
+        };
+
+        let status = render_status_line(&state);
+        assert!(status.contains("Slots: 1/2"), "Slot count missing from status line");
+        assert!(status.contains("Active: 0"), "Active count missing");
+    }
+
+    #[test]
+    fn test_slots_in_full_dashboard() {
+        let state = PluginState {
+            tickets: vec![TicketNode {
+                id: "T-001".to_string(),
+                title: "test".to_string(),
+                phase: Phase::Implement,
+                status: TicketStatus::InProgress,
+                depends_on: vec![],
+                blocks: vec![],
+            }],
+            slots: vec![
+                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()), has_session: true },
+                SlotInfo { pane_id: 6, ticket_id: None, has_session: false },
+            ],
+            active_threads: vec![ActiveThread {
+                ticket_id: "T-001".to_string(),
+                phase: Phase::Implement,
+                started_at: Duration::from_secs(50),
+                pane_id: 5,
+            }],
+            ..PluginState::default()
+        };
+
+        let lines = render_dashboard_lines(&state, 80, 50);
+        let full = lines.join("\n");
+
+        // Slots section should appear
+        assert!(full.contains("Slots:"), "Slots section missing from dashboard");
+
+        // Slots should appear before DAG
+        let slots_pos = full.find("Slots:").unwrap();
+        let dag_pos = full.find("DAG").unwrap();
+        assert!(slots_pos < dag_pos, "Slots section should appear before DAG");
     }
 }
