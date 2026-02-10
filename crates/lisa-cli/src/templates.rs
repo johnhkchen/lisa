@@ -46,6 +46,16 @@ pub fn settings_local_json() -> String {
 
 /// Generate a project-specific CLAUDE.md
 pub fn generate_claude_md(project: &DetectedProject) -> String {
+    use crate::detect::ProjectType;
+
+    let type_label = match project.project_type {
+        ProjectType::Rust => "Rust",
+        ProjectType::Node => "Node.js",
+        ProjectType::Go => "Go",
+        ProjectType::Python => "Python",
+        ProjectType::Unknown => "unknown type",
+    };
+
     let build_section = if project.build_command.is_empty() {
         String::new()
     } else {
@@ -86,7 +96,7 @@ pub fn generate_claude_md(project: &DetectedProject) -> String {
 
 ## Project
 
-{name} — TODO: add a one-line project description here.
+{name} ({type_label}) — TODO: add a one-line project description here.
 
 {build_section}
 {source_layout_section}
@@ -103,6 +113,7 @@ docs/active/work/       # Work artifacts, one subdirectory per ticket ID
 The RDSPI workflow definition is in docs/rdspi-workflow.md and is injected into agent context by lisa automatically.
 "#,
         name = project.name,
+        type_label = type_label,
         build_section = build_section,
         source_layout_section = source_layout_section,
     )
@@ -137,11 +148,30 @@ mod tests {
         let result = generate_claude_md(&project);
         assert!(result.contains("# CLAUDE.md"));
         assert!(result.contains("my-app"));
+        assert!(result.contains("(Rust)"));
         assert!(result.contains("cargo build"));
         assert!(result.contains("cargo test"));
         assert!(result.contains("lib.rs"));
         assert!(result.contains("docs/active/tickets/"));
         assert!(result.contains("docs/rdspi-workflow.md"));
+    }
+
+    #[test]
+    fn test_generate_claude_md_node() {
+        let project = DetectedProject {
+            project_type: ProjectType::Node,
+            name: "my-node-app".to_string(),
+            build_command: "npm run build".to_string(),
+            test_command: "npm test".to_string(),
+            lint_command: "npm run lint".to_string(),
+            source_layout: "src:\n  index.ts".to_string(),
+        };
+
+        let result = generate_claude_md(&project);
+        assert!(result.contains("my-node-app"));
+        assert!(result.contains("(Node.js)"));
+        assert!(result.contains("npm run build"));
+        assert!(result.contains("npm test"));
     }
 
     #[test]
@@ -157,6 +187,7 @@ mod tests {
 
         let result = generate_claude_md(&project);
         assert!(result.contains("mystery"));
+        assert!(result.contains("(unknown type)"));
         // Should still have directory conventions
         assert!(result.contains("docs/active/tickets/"));
     }

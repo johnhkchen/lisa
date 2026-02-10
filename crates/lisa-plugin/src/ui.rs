@@ -28,7 +28,6 @@ mod colors {
     pub const BRIGHT_GREEN: &str = "\x1b[92m";
     pub const BRIGHT_YELLOW: &str = "\x1b[93m";
     pub const BG_BLUE: &str = "\x1b[44m";
-    pub const BG_RED: &str = "\x1b[41m";
     pub const BG_YELLOW: &str = "\x1b[43m";
 }
 
@@ -132,7 +131,6 @@ pub struct TicketNode {
     pub phase: Phase,
     pub status: TicketStatus,
     pub depends_on: Vec<String>,
-    pub blocks: Vec<String>,
 }
 
 /// Represents an active thread working on a ticket
@@ -179,7 +177,6 @@ pub struct HealthAlert {
 pub struct SlotInfo {
     pub pane_id: u32,
     pub ticket_id: Option<String>,
-    pub has_session: bool,
 }
 
 /// Activity log entry types
@@ -190,7 +187,6 @@ pub enum ActivityType {
     Error { ticket_id: String, message: String },
     Warning { ticket_id: String, message: String },
     ThreadStarted { ticket_id: String, phase: Phase },
-    ThreadParked { ticket_id: String, phase: Phase },
     Info { ticket_id: String, message: String },
 }
 
@@ -222,7 +218,6 @@ pub struct PluginState {
     pub alerts: Vec<HealthAlert>,
     pub slots: Vec<SlotInfo>,
     pub current_time: Duration,
-    pub selected_ticket: Option<String>,
     pub modal: ModalState,
 }
 
@@ -236,7 +231,6 @@ impl Default for PluginState {
             alerts: Vec::new(),
             slots: Vec::new(),
             current_time: Duration::ZERO,
-            selected_ticket: None,
             modal: ModalState::default(),
         }
     }
@@ -266,17 +260,6 @@ fn format_duration(duration: Duration) -> String {
 fn format_time_since(timestamp: Duration, current_time: Duration) -> String {
     let elapsed = current_time.saturating_sub(timestamp);
     format_duration(elapsed)
-}
-
-/// Get status indicator with color for ticket status
-fn status_indicator(status: &TicketStatus) -> String {
-    match status {
-        TicketStatus::Ready => format!("{}[RDY]{}", CYAN, RESET),
-        TicketStatus::InProgress => format!("{}[WRK]{}", GREEN, RESET),
-        TicketStatus::WaitingReview => format!("{}[REV]{}", BRIGHT_YELLOW, RESET),
-        TicketStatus::Blocked => format!("{}[BLK]{}", RED, RESET),
-        TicketStatus::Done => format!("{}[DON]{}", BRIGHT_GREEN, RESET),
-    }
 }
 
 /// Render a horizontal separator line
@@ -848,11 +831,6 @@ fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec
                 GREEN,
                 format!("{} started {}", ticket_id, phase.full_name()),
             ),
-            ActivityType::ThreadParked { ticket_id, phase } => (
-                "⏸",
-                YELLOW,
-                format!("{} parked at {}", ticket_id, phase.full_name()),
-            ),
             ActivityType::Warning { ticket_id, message } => {
                 let msg = if message.len() > 40 {
                     format!("{}...", &message[..37])
@@ -1130,7 +1108,6 @@ mod tests {
                     phase: Phase::Done,
                     status: TicketStatus::Done,
                     depends_on: vec![],
-                    blocks: vec!["T-002".to_string()],
                 },
                 TicketNode {
                     id: "T-002".to_string(),
@@ -1138,7 +1115,6 @@ mod tests {
                     phase: Phase::Design,
                     status: TicketStatus::InProgress,
                     depends_on: vec!["T-001".to_string()],
-                    blocks: vec!["T-003".to_string()],
                 },
                 TicketNode {
                     id: "T-003".to_string(),
@@ -1146,7 +1122,7 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Blocked,
                     depends_on: vec!["T-002".to_string()],
-                    blocks: vec![],
+
                 },
             ],
             active_threads: vec![ActiveThread {
@@ -1175,7 +1151,7 @@ mod tests {
             alerts: Vec::new(),
             slots: Vec::new(),
             current_time: Duration::from_secs(120),
-            selected_ticket: None,
+
             modal: ModalState::default(),
         }
     }
@@ -1342,7 +1318,6 @@ mod tests {
                     phase: Phase::Done,
                     status: TicketStatus::Done,
                     depends_on: vec![],
-                    blocks: vec!["T-002".to_string(), "T-003".to_string()],
                 },
                 TicketNode {
                     id: "T-002".to_string(),
@@ -1350,7 +1325,6 @@ mod tests {
                     phase: Phase::Design,
                     status: TicketStatus::InProgress,
                     depends_on: vec!["T-001".to_string()],
-                    blocks: vec!["T-004".to_string()],
                 },
                 TicketNode {
                     id: "T-003".to_string(),
@@ -1358,7 +1332,6 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Ready,
                     depends_on: vec!["T-001".to_string()],
-                    blocks: vec!["T-004".to_string()],
                 },
                 TicketNode {
                     id: "T-004".to_string(),
@@ -1366,7 +1339,7 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Blocked,
                     depends_on: vec!["T-002".to_string(), "T-003".to_string()],
-                    blocks: vec![],
+
                 },
             ],
             active_threads: vec![ActiveThread {
@@ -1408,7 +1381,7 @@ mod tests {
             alerts: Vec::new(),
             slots: Vec::new(),
             current_time: Duration::from_secs(200),
-            selected_ticket: None,
+
             modal: ModalState::default(),
         };
 
@@ -1464,7 +1437,7 @@ mod tests {
                 phase: Phase::Review,
                 status: TicketStatus::WaitingReview,
                 depends_on: vec![],
-                blocks: vec![],
+
             }],
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-005".to_string(),
@@ -1501,7 +1474,7 @@ mod tests {
                 phase: Phase::Implement,
                 status: TicketStatus::InProgress,
                 depends_on: vec![],
-                blocks: vec![],
+
             }],
             ..PluginState::default()
         };
@@ -1521,7 +1494,7 @@ mod tests {
                 phase: Phase::Review,
                 status: TicketStatus::WaitingReview,
                 depends_on: vec![],
-                blocks: vec![],
+
             }],
             parked_threads: vec![], // No matching parked thread
             current_time: Duration::from_secs(100),
@@ -1547,7 +1520,7 @@ mod tests {
                     phase: Phase::Done,
                     status: TicketStatus::Done,
                     depends_on: vec![],
-                    blocks: vec![],
+
                 },
                 TicketNode {
                     id: "T-002".to_string(),
@@ -1555,7 +1528,7 @@ mod tests {
                     phase: Phase::Review,
                     status: TicketStatus::WaitingReview,
                     depends_on: vec!["T-001".to_string()],
-                    blocks: vec![],
+
                 },
             ],
             parked_threads: vec![ParkedThread {
@@ -1667,7 +1640,7 @@ mod tests {
                 phase: Phase::Review,
                 status: TicketStatus::WaitingReview,
                 depends_on: vec![],
-                blocks: vec![],
+
             }],
             alerts: vec![HealthAlert {
                 ticket_id: "T-010".to_string(),
@@ -1701,8 +1674,8 @@ mod tests {
     fn test_render_slots_all_idle() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 1, ticket_id: None, has_session: false },
-                SlotInfo { pane_id: 2, ticket_id: None, has_session: false },
+                SlotInfo { pane_id: 1, ticket_id: None },
+                SlotInfo { pane_id: 2, ticket_id: None },
             ],
             ..PluginState::default()
         };
@@ -1720,8 +1693,8 @@ mod tests {
     fn test_render_slots_all_occupied() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-003-01".to_string()), has_session: true },
-                SlotInfo { pane_id: 6, ticket_id: Some("T-003-02".to_string()), has_session: true },
+                SlotInfo { pane_id: 5, ticket_id: Some("T-003-01".to_string()) },
+                SlotInfo { pane_id: 6, ticket_id: Some("T-003-02".to_string()) },
             ],
             active_threads: vec![
                 ActiveThread {
@@ -1757,9 +1730,9 @@ mod tests {
     fn test_render_slots_mixed() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()), has_session: true },
-                SlotInfo { pane_id: 6, ticket_id: None, has_session: true },
-                SlotInfo { pane_id: 7, ticket_id: None, has_session: false },
+                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()) },
+                SlotInfo { pane_id: 6, ticket_id: None },
+                SlotInfo { pane_id: 7, ticket_id: None },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
@@ -1802,7 +1775,7 @@ mod tests {
                     phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec![],
-                    blocks: vec![],
+
                 },
                 TicketNode {
                     id: "T-002".to_string(),
@@ -1810,7 +1783,7 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Ready,
                     depends_on: vec![],
-                    blocks: vec![],
+
                 },
                 TicketNode {
                     id: "T-003".to_string(),
@@ -1818,11 +1791,11 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Ready,
                     depends_on: vec![],
-                    blocks: vec![],
+
                 },
             ],
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()), has_session: true },
+                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()) },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
@@ -1844,8 +1817,8 @@ mod tests {
     fn test_status_line_with_slots() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 1, ticket_id: Some("T-001".to_string()), has_session: true },
-                SlotInfo { pane_id: 2, ticket_id: None, has_session: false },
+                SlotInfo { pane_id: 1, ticket_id: Some("T-001".to_string()) },
+                SlotInfo { pane_id: 2, ticket_id: None },
             ],
             ..PluginState::default()
         };
@@ -1864,11 +1837,11 @@ mod tests {
                 phase: Phase::Implement,
                 status: TicketStatus::InProgress,
                 depends_on: vec![],
-                blocks: vec![],
+
             }],
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()), has_session: true },
-                SlotInfo { pane_id: 6, ticket_id: None, has_session: false },
+                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()) },
+                SlotInfo { pane_id: 6, ticket_id: None },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),

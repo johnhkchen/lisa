@@ -4,7 +4,6 @@
 //! as a DAG-driven concurrent scheduler. It manages Claude Code sessions for each ticket,
 //! tracks phase progress, and provides a live dashboard.
 
-mod scheduler;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap};
@@ -38,7 +37,7 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
 /// Sets LISA_TICKET_ID env var so the idle signal hook knows which ticket is running.
 fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
-        "LISA_TICKET_ID={} claude --dangerously-skip-permissions \"{}\"",
+        "LISA_TICKET_ID={} claude --dangerously-skip-permissions -p \"{}\"",
         ticket_id,
         ticket_prompt(ticket_dir, ticket_id)
     )
@@ -814,7 +813,9 @@ impl State {
             });
         }
 
-        // Unconditionally sync thread phases with DAG state
+        // Defensive reconciliation: catch phase changes from external edits or
+        // missed transitions. Normally a no-op because check_artifact_advances()
+        // and check_idle_signals() already update thread.current_phase to match.
         for (tid, thread) in &mut self.threads {
             if thread.status == lisa_core::types::ThreadStatus::Running {
                 if let Some(ticket) = self.dag.get_ticket(tid) {
@@ -1408,7 +1409,6 @@ impl State {
                 phase: phase_to_ui_phase(t.phase),
                 status: ticket_status_to_ui_status(&t.status, t.phase),
                 depends_on: t.depends_on.iter().cloned().collect(),
-                blocks: t.blocks.iter().cloned().collect(),
             })
             .collect();
 
@@ -1504,7 +1504,6 @@ impl State {
             .map(|s| ui::SlotInfo {
                 pane_id: s.pane_id,
                 ticket_id: s.ticket_id.clone(),
-                has_session: s.has_session,
             })
             .collect();
 
@@ -1521,7 +1520,6 @@ impl State {
                     .unwrap_or_default()
                     .as_secs(),
             ),
-            selected_ticket: None,
             modal: ui::ModalState {
                 open: self.modal.open,
                 ticket_ids: self.modal.ticket_ids.clone(),
@@ -1780,7 +1778,7 @@ mod tests {
         let ticket_dir = Path::new("docs/active/tickets");
         let cmd = build_claude_command(ticket_dir, "T-042-01");
 
-        assert!(cmd.starts_with("LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions"));
+        assert!(cmd.starts_with("LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions -p"));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
         assert!(!cmd.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");

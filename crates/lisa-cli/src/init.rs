@@ -277,17 +277,52 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
     };
 
     // 5. Hook infrastructure
-    if !root.join(".claude/settings.local.json").exists() {
-        warnings.push(
+    let settings_path = root.join(".claude/settings.local.json");
+    if !settings_path.exists() {
+        errors.push(
             ".claude/settings.local.json not found. Run `lisa init` to create idle signal hooks."
                 .to_string(),
         );
+    } else {
+        // Verify the file contains the idle_prompt hook configuration
+        match fs::read_to_string(&settings_path) {
+            Ok(content) => {
+                if !content.contains("idle_prompt") {
+                    errors.push(
+                        ".claude/settings.local.json exists but does not contain an idle_prompt hook. Run `lisa init` on a fresh project or add the hook manually."
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                errors.push(format!(
+                    "Could not read .claude/settings.local.json: {}",
+                    e
+                ));
+            }
+        }
     }
-    if !root.join(".lisa/hooks/on-idle.sh").exists() {
-        warnings.push(
+
+    let hook_path = root.join(".lisa/hooks/on-idle.sh");
+    if !hook_path.exists() {
+        errors.push(
             ".lisa/hooks/on-idle.sh not found. Run `lisa init` to create idle signal hooks."
                 .to_string(),
         );
+    } else {
+        // Verify the hook script is executable on unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(&hook_path) {
+                if meta.permissions().mode() & 0o111 == 0 {
+                    errors.push(
+                        ".lisa/hooks/on-idle.sh is not executable. Run: chmod +x .lisa/hooks/on-idle.sh"
+                            .to_string(),
+                    );
+                }
+            }
+        }
     }
 
     // 6. Check directory structure
@@ -588,6 +623,28 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Helper to create hook infrastructure required by validate.
+    fn write_hook_infrastructure(root: &Path) {
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(
+            root.join(".claude/settings.local.json"),
+            templates::settings_local_json(),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".lisa/hooks")).unwrap();
+        fs::write(
+            root.join(".lisa/hooks/on-idle.sh"),
+            templates::ON_IDLE_HOOK,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(root.join(".lisa/hooks/on-idle.sh"), perms).unwrap();
+        }
+    }
+
     /// Helper to create a minimal ready ticket in the given project root.
     fn write_ready_ticket(root: &Path) {
         fs::write(
@@ -606,6 +663,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
         write_ready_ticket(dir.path());
 
         let result = run_validate(dir.path(), false);
@@ -626,6 +684,7 @@ mod tests {
             "[scheduling]\nmax_threads = 4\n",
         )
         .unwrap();
+        write_hook_infrastructure(dir.path());
         write_ready_ticket(dir.path());
 
         let result = run_validate(dir.path(), false);
@@ -656,6 +715,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
 
         // Create a valid ticket
         fs::write(
@@ -789,6 +849,7 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
 
         // Ticket without Acceptance Criteria section
         fs::write(
@@ -808,6 +869,7 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
         write_ready_ticket(dir.path());
 
         // check_tools=false should not fail even if tools are missing
@@ -880,5 +942,200 @@ depends_on: [T-999]
             .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("settings.local.json")))
             .collect();
         assert_eq!(skipped_settings.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_missing_settings_json() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // Create on-idle.sh but NOT settings.local.json
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join(".lisa/hooks/on-idle.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        write_ready_ticket(dir.path());
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_settings_json_without_idle_hook() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // settings.local.json exists but without idle_prompt
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join(".lisa/hooks/on-idle.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        write_ready_ticket(dir.path());
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_missing_idle_hook_script() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // settings.local.json exists with idle_prompt, but NO on-idle.sh
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude/settings.local.json"),
+            templates::settings_local_json(),
+        )
+        .unwrap();
+        write_ready_ticket(dir.path());
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_idle_hook_not_executable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude/settings.local.json"),
+            templates::settings_local_json(),
+        )
+        .unwrap();
+        // on-idle.sh exists but NOT executable
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join(".lisa/hooks/on-idle.sh"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        write_ready_ticket(dir.path());
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_invalid_ticket_type_value() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
+
+        // Ticket with invalid type: "ticket" instead of task/bug/feature/spike/chore
+        fs::write(
+            dir.path().join("docs/active/tickets/T-001.md"),
+            "---\nid: T-001\ntitle: bad-type\ntype: ticket\nstatus: open\npriority: medium\nphase: ready\n---\n\n## Acceptance Criteria\n\n- It works\n",
+        ).unwrap();
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_invalid_phase_value() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        write_hook_infrastructure(dir.path());
+
+        // Ticket with invalid phase: "coding" instead of valid values
+        fs::write(
+            dir.path().join("docs/active/tickets/T-001.md"),
+            "---\nid: T-001\ntitle: bad-phase\ntype: task\nstatus: open\npriority: medium\nphase: coding\n---\n\n## Acceptance Criteria\n\n- It works\n",
+        ).unwrap();
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_init_then_validate_roundtrip_rust() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-rust-project\"\n",
+        )
+        .unwrap();
+
+        // Run init
+        let init_result = run_init(dir.path(), false);
+        assert!(init_result.is_ok());
+
+        // Add a ready ticket
+        write_ready_ticket(dir.path());
+
+        // Validate should pass
+        let validate_result = run_validate(dir.path(), false);
+        assert!(validate_result.is_ok());
+
+        // Verify CLAUDE.md contains project type
+        let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains("my-rust-project"));
+        assert!(claude_md.contains("(Rust)"));
+        assert!(claude_md.contains("cargo build"));
+    }
+
+    #[test]
+    fn test_init_then_validate_roundtrip_node() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            "{\n  \"name\": \"my-node-project\",\n  \"version\": \"1.0.0\"\n}\n",
+        )
+        .unwrap();
+
+        // Run init
+        let init_result = run_init(dir.path(), false);
+        assert!(init_result.is_ok());
+
+        // Add a ready ticket
+        write_ready_ticket(dir.path());
+
+        // Validate should pass
+        let validate_result = run_validate(dir.path(), false);
+        assert!(validate_result.is_ok());
+
+        // Verify CLAUDE.md contains project type
+        let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains("my-node-project"));
+        assert!(claude_md.contains("(Node.js)"));
+        assert!(claude_md.contains("npm"));
     }
 }
