@@ -69,23 +69,40 @@ Fix scheduling bugs found after running S-001–S-004, add logging.
 - Sweep safety nets: `sweep_stale_slots()` and `audit_threads()` catch orphaned state
 - 182 tests (up from 88)
 
+### S-006: Dogfood Integration Testing
+Run lisa on itself. Add diagnostic tooling to make the live run observable.
+- `lisa status` CLI command — offline DAG/ticket inspection
+- Plugin startup diagnostics — log what was loaded on init
+- Session launch command audit — log/verify agent spawn commands
+- Runtime state snapshot — dump full plugin state on keypress (Shift+D)
+
+### S-007: Distribution & Onboarding
+Make lisa installable and set-up-able as a normal CLI tool.
+- `lisa setup-guide` — LLM-friendly contextual setup instructions
+- Enhanced `lisa validate` — comprehensive pre-loop readiness check
+- crates.io publishing prep — `cargo install lisa-cli`
+- GitHub CI and release workflows — prebuilt binaries for linux/macos
+
+### S-008: Idle-Signal Phase Transitions
+Use Claude Code's `idle_prompt` notification hook to detect agent idle state.
+- Hook infrastructure: `.claude/settings.local.json` + `.lisa/hooks/on-idle.sh`
+- `LISA_TICKET_ID` env var injection via `sh -c` wrapper
+- Plugin scans `.lisa/signals/*.idle` files during poll_tick
+- Implement → Review auto-advances on idle signal
+- Earlier phases advance on idle + artifact present
+- IdleWithoutArtifact alert type for missing artifacts
+- Mark-done modal feedback when no candidates available
+
 ---
 
 ## Active
 
-### S-006: Dogfood Integration Testing
-Run lisa on itself. Add diagnostic tooling to make the live run observable.
-- T-006-01: `lisa status` CLI command — offline DAG/ticket inspection
-- T-006-02: Plugin startup diagnostics — log what was loaded on init
-- T-006-03: Session launch command audit — log/verify agent spawn commands
-- T-006-04: Runtime state snapshot — dump full plugin state on keypress
-
-### S-007: Distribution & Onboarding
-Make lisa installable and set-up-able as a normal CLI tool.
-- T-007-01: `lisa setup-guide` — LLM-friendly contextual setup instructions
-- T-007-02: Enhance `lisa validate` — comprehensive pre-loop readiness check
-- T-007-03: crates.io publishing — `cargo install lisa-cli`
-- T-007-04: GitHub release workflow — prebuilt binaries for linux/macos
+### S-009: First-User Readiness
+Fix bugs surfaced in dogfood runs, harden init/validate for external projects.
+- T-009-01: Bug sweep — remove `--print`, fix double state transitions, dead code cleanup
+- T-009-02: Init hardening — verify generated files, improve validate coverage
+- T-009-03: External project dogfood — full pipeline test on a non-lisa project
+- T-009-04: LLM-driven validate loop — make validate output machine-actionable
 
 ---
 
