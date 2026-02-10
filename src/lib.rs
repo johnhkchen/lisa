@@ -95,12 +95,79 @@ impl State {
         }
     }
 
-    /// Check which tickets are ready to be scheduled
+    /// Check which tickets are ready to be scheduled and spawn Claude sessions.
+    ///
+    /// Queries the DAG for tickets whose dependencies are all satisfied,
+    /// filters out tickets that already have active threads, and spawns
+    /// floating command panes running `claude --dangerously-skip-permissions`
+    /// for each ready ticket (up to the configured `max_threads` limit).
+    ///
+    /// The spawned pane's ID is not known until a `PaneUpdate` event arrives,
+    /// so newly spawned threads are tracked with `pane_id: 0` as a placeholder.
+    /// The context BTreeMap passed to `open_command_pane_floating` carries the
+    /// `ticket_id` so that `CommandPaneExited` events can be correlated.
     fn schedule_ready_tickets(&mut self) {
-        // TODO: Implement scheduling logic
-        // 1. Query DAG for tickets with satisfied dependencies
-        // 2. Filter out tickets that already have active threads
-        // 3. Spawn new threads for ready tickets
+        let ready = self.dag.get_ready_tickets();
+
+        // How many more threads can we spawn?
+        let active_count = self
+            .threads
+            .values()
+            .filter(|t| t.status == types::ThreadStatus::Running)
+            .count();
+        let slots = self.config.max_threads.saturating_sub(active_count);
+
+        if slots == 0 {
+            return;
+        }
+
+        let mut spawned = 0;
+        for ticket_id in ready {
+            if spawned >= slots {
+                break;
+            }
+
+            // Skip tickets that already have a thread (running, parked, etc.)
+            if self.threads.contains_key(&ticket_id) {
+                continue;
+            }
+
+            // Build the ticket file path for the prompt
+            let ticket_path = self.config.ticket_dir.join(format!("{}.md", &ticket_id));
+
+            // Context for correlating pane events back to this ticket
+            let context = BTreeMap::from([("ticket_id".to_string(), ticket_id.clone())]);
+
+            // Spawn a floating command pane running claude
+            open_command_pane_floating(
+                CommandToRun {
+                    path: PathBuf::from("claude"),
+                    args: vec![
+                        "--dangerously-skip-permissions".to_string(),
+                        "--print".to_string(),
+                        format!(
+                            "Read the ticket at {} and follow the RDSPI workflow defined in CLAUDE.md. \
+                             Start from the current phase indicated in the ticket frontmatter.",
+                            ticket_path.display()
+                        ),
+                    ],
+                    cwd: None,
+                },
+                Some(FloatingPaneCoordinates::default()),
+                context,
+            );
+
+            // Create a thread record (pane_id will be updated via PaneUpdate)
+            let thread = Thread::new(ticket_id.clone(), 0);
+            self.threads.insert(ticket_id.clone(), thread);
+
+            self.log_activity(ActivityEvent::ThreadSpawned {
+                ticket_id,
+                pane_id: 0,
+            });
+
+            spawned += 1;
+        }
     }
 
     /// Handle a pane exiting (Claude session ended)
