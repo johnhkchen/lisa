@@ -1,0 +1,32 @@
+[package]
+name = "lisa"
+version = "0.1.0"
+edition = "2021"
+description = "A Zellij plugin for managing tasks from markdown files"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Zellij plugin API
+zellij-tile = "0.43"
+
+# Serialization/deserialization framework
+serde = { version = "1.0", features = ["derive"] }
+
+# YAML parsing for frontmatter (serde_yaml_ng is the maintained fork of deprecated serde_yaml)
+serde_yaml_ng = "0.9"
+
+# JSON support (often useful for plugin state and zellij communication)
+serde_json = "1.0"
+
+# Unix system calls for file locking (commit serialization)
+# Only used on unix targets, not in WASM
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+# Optimize for size - important for WASM plugins
+opt-level = "s"
+lto = true
