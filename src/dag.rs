@@ -1,0 +1,793 @@
+//! DAG computation module for Lisa/Ralph Zellij plugin.
+//!
+//! This module provides on-demand DAG computation from ticket frontmatter.
+//! The DAG is computed dynamically - there is no DAG file. This is a core
+//! design principle: agents cannot corrupt what doesn't exist.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use crate::types::{Phase, Ticket, TicketId};
+
+/// Represents the dependency graph computed from ticket frontmatter.
+///
+/// The DAG is computed on-demand from ticket files. It holds:
+/// - All tickets indexed by their ID
+/// - Forward edges (depends_on): what a ticket depends on
+/// - Reverse edges (blocks): what tickets are blocked by a given ticket
+#[derive(Debug, Clone)]
+pub struct Dag {
+    /// All tickets in the DAG, indexed by ticket ID
+    nodes: HashMap<TicketId, Ticket>,
+    /// Forward edges: ticket_id -> set of ticket IDs it depends on
+    depends_on: HashMap<TicketId, HashSet<TicketId>>,
+    /// Reverse edges: ticket_id -> set of ticket IDs it blocks
+    blocks: HashMap<TicketId, HashSet<TicketId>>,
+}
+
+/// Result of cycle detection
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CycleDetectionResult {
+    /// No cycles detected in the graph
+    NoCycle,
+    /// A cycle was detected, contains the IDs of tickets in the cycle
+    Cycle(Vec<TicketId>),
+}
+
+/// Errors that can occur during DAG operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DagError {
+    /// A ticket references a dependency that doesn't exist
+    MissingDependency {
+        ticket_id: TicketId,
+        missing_dep: TicketId,
+    },
+    /// The graph contains a cycle
+    CycleDetected(Vec<TicketId>),
+}
+
+impl Dag {
+    /// Creates a new empty DAG.
+    pub fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+            depends_on: HashMap::new(),
+            blocks: HashMap::new(),
+        }
+    }
+
+    /// Builds a DAG from a list of tickets.
+    ///
+    /// This parses the `depends_on` and `blocks` fields from each ticket's
+    /// frontmatter and constructs the dependency graph. The graph is validated
+    /// to ensure all referenced dependencies exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `tickets` - An iterator of tickets to build the DAG from
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the constructed DAG or an error if validation fails.
+    pub fn from_tickets<I>(tickets: I) -> Result<Self, DagError>
+    where
+        I: IntoIterator<Item = Ticket>,
+    {
+        let mut dag = Self::new();
+
+        // First pass: add all nodes
+        for ticket in tickets {
+            dag.nodes.insert(ticket.id.clone(), ticket);
+        }
+
+        // Second pass: build edges
+        for ticket in dag.nodes.values() {
+            let ticket_id = &ticket.id;
+
+            // Process depends_on relationships
+            for dep_id in &ticket.depends_on {
+                // Validate that the dependency exists
+                if !dag.nodes.contains_key(dep_id) {
+                    return Err(DagError::MissingDependency {
+                        ticket_id: ticket_id.clone(),
+                        missing_dep: dep_id.clone(),
+                    });
+                }
+
+                // Add forward edge: this ticket depends on dep_id
+                dag.depends_on
+                    .entry(ticket_id.clone())
+                    .or_default()
+                    .insert(dep_id.clone());
+
+                // Add reverse edge: dep_id blocks this ticket
+                dag.blocks
+                    .entry(dep_id.clone())
+                    .or_default()
+                    .insert(ticket_id.clone());
+            }
+
+            // Process blocks relationships (the inverse of depends_on)
+            for blocked_id in &ticket.blocks {
+                // Validate that the blocked ticket exists
+                if !dag.nodes.contains_key(blocked_id) {
+                    return Err(DagError::MissingDependency {
+                        ticket_id: ticket_id.clone(),
+                        missing_dep: blocked_id.clone(),
+                    });
+                }
+
+                // Add forward edge: blocked_id depends on this ticket
+                dag.depends_on
+                    .entry(blocked_id.clone())
+                    .or_default()
+                    .insert(ticket_id.clone());
+
+                // Add reverse edge: this ticket blocks blocked_id
+                dag.blocks
+                    .entry(ticket_id.clone())
+                    .or_default()
+                    .insert(blocked_id.clone());
+            }
+        }
+
+        Ok(dag)
+    }
+
+    /// Returns a reference to the ticket with the given ID, if it exists.
+    pub fn get_ticket(&self, id: &TicketId) -> Option<&Ticket> {
+        self.nodes.get(id)
+    }
+
+    /// Returns an iterator over all tickets in the DAG.
+    pub fn tickets(&self) -> impl Iterator<Item = &Ticket> {
+        self.nodes.values()
+    }
+
+    /// Returns the number of tickets in the DAG.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns true if the DAG contains no tickets.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Gets all tickets that the given ticket depends on.
+    pub fn get_dependencies(&self, ticket_id: &TicketId) -> HashSet<TicketId> {
+        self.depends_on.get(ticket_id).cloned().unwrap_or_default()
+    }
+
+    /// Gets all tickets that are blocked by the given ticket.
+    ///
+    /// These are tickets that cannot start until the given ticket is done.
+    pub fn get_blocked_by(&self, ticket_id: &TicketId) -> HashSet<TicketId> {
+        self.blocks.get(ticket_id).cloned().unwrap_or_default()
+    }
+
+    /// Determines if a ticket can start work.
+    ///
+    /// A ticket can start if:
+    /// 1. All tickets in its `depends_on` list are in the "done" phase
+    /// 2. The ticket itself is in the "ready" phase (or appropriate starting phase)
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket_id` - The ID of the ticket to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the ticket can start, `false` otherwise.
+    /// Returns `false` if the ticket doesn't exist.
+    pub fn can_start(&self, ticket_id: &TicketId) -> bool {
+        let ticket = match self.nodes.get(ticket_id) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        // Check if the ticket is in a startable phase
+        if !ticket.phase.is_startable() {
+            return false;
+        }
+
+        // Check if all dependencies are done
+        self.all_dependencies_done(ticket_id)
+    }
+
+    /// Checks if all dependencies of a ticket are in the "done" phase.
+    pub fn all_dependencies_done(&self, ticket_id: &TicketId) -> bool {
+        let deps = match self.depends_on.get(ticket_id) {
+            Some(deps) => deps,
+            None => return true, // No dependencies means all are satisfied
+        };
+
+        for dep_id in deps {
+            if let Some(dep_ticket) = self.nodes.get(dep_id) {
+                if dep_ticket.phase != Phase::Done {
+                    return false;
+                }
+            } else {
+                // Dependency doesn't exist in the DAG - shouldn't happen if
+                // DAG was built correctly, but be defensive
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Gets all tickets that are ready to run.
+    ///
+    /// A ticket is ready to run if:
+    /// - It has no unmet dependencies (all depends_on tickets are "done")
+    /// - Its phase allows it to start (is in "ready" phase)
+    /// - Its status allows work (is "open")
+    ///
+    /// # Returns
+    ///
+    /// A vector of ticket IDs that are ready to run.
+    pub fn get_ready_tickets(&self) -> Vec<TicketId> {
+        self.nodes
+            .keys()
+            .filter(|id| self.can_start(id))
+            .cloned()
+            .collect()
+    }
+
+    /// Gets all tickets currently in progress (active phases).
+    ///
+    /// This includes tickets in Research, Design, Structure, Plan, Implement,
+    /// or Review phases.
+    pub fn get_in_progress_tickets(&self) -> Vec<TicketId> {
+        self.nodes
+            .values()
+            .filter(|t| t.phase.is_active())
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Detects cycles in the dependency graph.
+    ///
+    /// Uses Kahn's algorithm (topological sort) to detect cycles.
+    /// If the algorithm cannot process all nodes, a cycle exists.
+    ///
+    /// # Returns
+    ///
+    /// `CycleDetectionResult::NoCycle` if no cycles exist, or
+    /// `CycleDetectionResult::Cycle` with the IDs of tickets involved.
+    pub fn detect_cycles(&self) -> CycleDetectionResult {
+        if self.nodes.is_empty() {
+            return CycleDetectionResult::NoCycle;
+        }
+
+        // Calculate in-degree for each node
+        let mut in_degree: HashMap<&TicketId, usize> = HashMap::new();
+        for id in self.nodes.keys() {
+            in_degree.insert(id, 0);
+        }
+
+        // For each ticket and its dependencies, the ticket has incoming edges
+        // from its dependencies
+        for (ticket_id, deps) in &self.depends_on {
+            // ticket_id depends on deps, so there are edges from each dep to ticket_id
+            // This means ticket_id's in-degree increases by the number of deps
+            if let Some(count) = in_degree.get_mut(ticket_id) {
+                *count = deps.len();
+            }
+        }
+
+        // Queue of nodes with no incoming edges
+        let mut queue: VecDeque<&TicketId> = VecDeque::new();
+        for (id, &degree) in &in_degree {
+            if degree == 0 {
+                queue.push_back(id);
+            }
+        }
+
+        let mut processed = 0;
+        let mut sorted: Vec<&TicketId> = Vec::new();
+
+        while let Some(id) = queue.pop_front() {
+            processed += 1;
+            sorted.push(id);
+
+            // For each ticket that this ticket blocks (reverse edges)
+            if let Some(blocked) = self.blocks.get(id) {
+                for blocked_id in blocked {
+                    if let Some(count) = in_degree.get_mut(blocked_id) {
+                        *count -= 1;
+                        if *count == 0 {
+                            queue.push_back(blocked_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if processed == self.nodes.len() {
+            CycleDetectionResult::NoCycle
+        } else {
+            // Find nodes that weren't processed - they're in cycles
+            let cycle_nodes: Vec<TicketId> = self
+                .nodes
+                .keys()
+                .filter(|id| !sorted.contains(id))
+                .cloned()
+                .collect();
+            CycleDetectionResult::Cycle(cycle_nodes)
+        }
+    }
+
+    /// Performs a topological sort of all tickets.
+    ///
+    /// Returns tickets in an order where all dependencies come before
+    /// the tickets that depend on them.
+    ///
+    /// # Returns
+    ///
+    /// `Ok` with a vector of ticket IDs in topological order, or
+    /// `Err` with a `DagError::CycleDetected` if the graph has cycles.
+    pub fn topological_sort(&self) -> Result<Vec<TicketId>, DagError> {
+        if self.nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Calculate in-degree for each node
+        let mut in_degree: HashMap<&TicketId, usize> = HashMap::new();
+        for id in self.nodes.keys() {
+            in_degree.insert(id, 0);
+        }
+
+        for (ticket_id, deps) in &self.depends_on {
+            if let Some(count) = in_degree.get_mut(ticket_id) {
+                *count = deps.len();
+            }
+        }
+
+        // Queue of nodes with no incoming edges
+        let mut queue: VecDeque<&TicketId> = VecDeque::new();
+        for (id, &degree) in &in_degree {
+            if degree == 0 {
+                queue.push_back(id);
+            }
+        }
+
+        let mut result: Vec<TicketId> = Vec::new();
+
+        while let Some(id) = queue.pop_front() {
+            result.push(id.clone());
+
+            // For each ticket that this ticket blocks
+            if let Some(blocked) = self.blocks.get(id) {
+                for blocked_id in blocked {
+                    if let Some(count) = in_degree.get_mut(blocked_id) {
+                        *count -= 1;
+                        if *count == 0 {
+                            queue.push_back(blocked_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if result.len() == self.nodes.len() {
+            Ok(result)
+        } else {
+            // Find nodes that weren't processed - they're in cycles
+            let cycle_nodes: Vec<TicketId> = self
+                .nodes
+                .keys()
+                .filter(|id| !result.contains(id))
+                .cloned()
+                .collect();
+            Err(DagError::CycleDetected(cycle_nodes))
+        }
+    }
+
+    /// Gets the tickets that can be run concurrently at the current state.
+    ///
+    /// This returns all tickets that:
+    /// 1. Have all dependencies satisfied (in "done" phase)
+    /// 2. Are in a startable phase themselves
+    ///
+    /// These are the tickets that Ralph can spawn threads for simultaneously.
+    pub fn get_runnable_tickets(&self) -> Vec<&Ticket> {
+        self.nodes
+            .values()
+            .filter(|t| self.can_start(&t.id))
+            .collect()
+    }
+
+    /// Computes the critical path through the DAG.
+    ///
+    /// The critical path is the longest chain of dependencies.
+    /// This is useful for estimating minimum completion time.
+    ///
+    /// # Returns
+    ///
+    /// A vector of ticket IDs representing the longest dependency chain.
+    pub fn critical_path(&self) -> Vec<TicketId> {
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+
+        // Get topological order (or return empty if there's a cycle)
+        let topo_order = match self.topological_sort() {
+            Ok(order) => order,
+            Err(_) => return Vec::new(),
+        };
+
+        // For each node, compute the longest path ending at that node
+        let mut longest_path: HashMap<&TicketId, Vec<TicketId>> = HashMap::new();
+
+        for id in &topo_order {
+            // Get the longest path among all dependencies
+            let deps = self.depends_on.get(id);
+            let best_prefix: Vec<TicketId> = deps
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(|dep| longest_path.get(dep))
+                        .max_by_key(|path| path.len())
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+
+            let mut path = best_prefix;
+            path.push(id.clone());
+            longest_path.insert(id, path);
+        }
+
+        // Find the overall longest path
+        longest_path
+            .into_values()
+            .max_by_key(|path| path.len())
+            .unwrap_or_default()
+    }
+
+    /// Returns statistics about the DAG.
+    pub fn stats(&self) -> DagStats {
+        let total_tickets = self.nodes.len();
+        let done_tickets = self
+            .nodes
+            .values()
+            .filter(|t| t.phase == Phase::Done)
+            .count();
+        let ready_tickets = self.get_ready_tickets().len();
+        let in_progress_tickets = self.get_in_progress_tickets().len();
+        let blocked_tickets = total_tickets - done_tickets - ready_tickets - in_progress_tickets;
+        let critical_path_length = self.critical_path().len();
+
+        DagStats {
+            total_tickets,
+            done_tickets,
+            ready_tickets,
+            in_progress_tickets,
+            blocked_tickets,
+            critical_path_length,
+        }
+    }
+}
+
+impl Default for Dag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Statistics about the DAG state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagStats {
+    /// Total number of tickets in the DAG
+    pub total_tickets: usize,
+    /// Number of tickets in the "done" phase
+    pub done_tickets: usize,
+    /// Number of tickets ready to start
+    pub ready_tickets: usize,
+    /// Number of tickets currently in progress
+    pub in_progress_tickets: usize,
+    /// Number of tickets blocked by dependencies
+    pub blocked_tickets: usize,
+    /// Length of the critical path
+    pub critical_path_length: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Priority, TicketStatus, TicketType};
+    use std::path::PathBuf;
+
+    fn make_ticket(id: &str, phase: Phase, depends_on: Vec<&str>, blocks: Vec<&str>) -> Ticket {
+        Ticket {
+            id: id.to_string(),
+            story: None,
+            title: format!("Test ticket {}", id),
+            ticket_type: TicketType::Task,
+            status: TicketStatus::Open,
+            priority: Priority::Medium,
+            phase,
+            depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
+            blocks: blocks.into_iter().map(|s| s.to_string()).collect(),
+            file_path: PathBuf::new(),
+            content: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_empty_dag() {
+        let dag = Dag::from_tickets(vec![]).unwrap();
+        assert!(dag.is_empty());
+        assert_eq!(dag.len(), 0);
+        assert!(dag.get_ready_tickets().is_empty());
+    }
+
+    #[test]
+    fn test_single_ticket_ready() {
+        let ticket = make_ticket("T-001", Phase::Ready, vec![], vec![]);
+        let dag = Dag::from_tickets(vec![ticket]).unwrap();
+
+        assert_eq!(dag.len(), 1);
+        assert!(dag.can_start(&"T-001".to_string()));
+
+        let ready = dag.get_ready_tickets();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0], "T-001");
+    }
+
+    #[test]
+    fn test_single_ticket_not_ready_phase() {
+        let ticket = make_ticket("T-001", Phase::Research, vec![], vec![]);
+        let dag = Dag::from_tickets(vec![ticket]).unwrap();
+
+        // Research phase is active, not startable
+        assert!(!dag.can_start(&"T-001".to_string()));
+        assert!(dag.get_ready_tickets().is_empty());
+    }
+
+    #[test]
+    fn test_dependency_chain() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec!["T-003"]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+
+        // T-001 is done, so T-002 should be ready
+        assert!(dag.can_start(&"T-002".to_string()));
+        // T-002 is not done, so T-003 should not be ready
+        assert!(!dag.can_start(&"T-003".to_string()));
+
+        let ready = dag.get_ready_tickets();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0], "T-002");
+    }
+
+    #[test]
+    fn test_multiple_dependencies() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Done, vec![], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001", "T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+
+        // Both dependencies are done, so T-003 should be ready
+        assert!(dag.can_start(&"T-003".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_dependencies_partial() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Research, vec![], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001", "T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+
+        // T-002 is not done, so T-003 should not be ready
+        assert!(!dag.can_start(&"T-003".to_string()));
+    }
+
+    #[test]
+    fn test_missing_dependency_error() {
+        let t1 = make_ticket("T-001", Phase::Ready, vec!["T-999"], vec![]);
+
+        let result = Dag::from_tickets(vec![t1]);
+        assert!(matches!(result, Err(DagError::MissingDependency { .. })));
+    }
+
+    #[test]
+    fn test_get_blocked_by() {
+        let t1 = make_ticket("T-001", Phase::Research, vec![], vec!["T-002", "T-003"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+
+        let blocked = dag.get_blocked_by(&"T-001".to_string());
+        assert_eq!(blocked.len(), 2);
+        assert!(blocked.contains(&"T-002".to_string()));
+        assert!(blocked.contains(&"T-003".to_string()));
+    }
+
+    #[test]
+    fn test_no_cycle() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec!["T-003"]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        assert_eq!(dag.detect_cycles(), CycleDetectionResult::NoCycle);
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        // Create a cycle: T-001 -> T-002 -> T-003 -> T-001
+        let t1 = make_ticket("T-001", Phase::Ready, vec!["T-003"], vec!["T-002"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec!["T-003"]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec!["T-001"]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        let result = dag.detect_cycles();
+
+        match result {
+            CycleDetectionResult::Cycle(nodes) => {
+                assert_eq!(nodes.len(), 3);
+            }
+            CycleDetectionResult::NoCycle => panic!("Expected cycle to be detected"),
+        }
+    }
+
+    #[test]
+    fn test_topological_sort_linear() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec!["T-003"]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        let sorted = dag.topological_sort().unwrap();
+
+        assert_eq!(sorted.len(), 3);
+        // T-001 must come before T-002, T-002 before T-003
+        let pos_1 = sorted.iter().position(|id| id == "T-001").unwrap();
+        let pos_2 = sorted.iter().position(|id| id == "T-002").unwrap();
+        let pos_3 = sorted.iter().position(|id| id == "T-003").unwrap();
+        assert!(pos_1 < pos_2);
+        assert!(pos_2 < pos_3);
+    }
+
+    #[test]
+    fn test_topological_sort_diamond() {
+        //     T-001
+        //     /   \
+        //  T-002  T-003
+        //     \   /
+        //     T-004
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002", "T-003"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec!["T-004"]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001"], vec!["T-004"]);
+        let t4 = make_ticket("T-004", Phase::Ready, vec!["T-002", "T-003"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3, t4]).unwrap();
+        let sorted = dag.topological_sort().unwrap();
+
+        assert_eq!(sorted.len(), 4);
+        // T-001 must come first, T-004 must come last
+        let pos_1 = sorted.iter().position(|id| id == "T-001").unwrap();
+        let pos_2 = sorted.iter().position(|id| id == "T-002").unwrap();
+        let pos_3 = sorted.iter().position(|id| id == "T-003").unwrap();
+        let pos_4 = sorted.iter().position(|id| id == "T-004").unwrap();
+        assert!(pos_1 < pos_2);
+        assert!(pos_1 < pos_3);
+        assert!(pos_2 < pos_4);
+        assert!(pos_3 < pos_4);
+    }
+
+    #[test]
+    fn test_topological_sort_with_cycle() {
+        let t1 = make_ticket("T-001", Phase::Ready, vec!["T-002"], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
+        let result = dag.topological_sort();
+
+        assert!(matches!(result, Err(DagError::CycleDetected(_))));
+    }
+
+    #[test]
+    fn test_critical_path() {
+        // Linear chain: T-001 -> T-002 -> T-003
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec!["T-003"]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        let path = dag.critical_path();
+
+        assert_eq!(path.len(), 3);
+    }
+
+    #[test]
+    fn test_stats() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
+        let t2 = make_ticket("T-002", Phase::Research, vec!["T-001"], vec!["T-003"]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        let stats = dag.stats();
+
+        assert_eq!(stats.total_tickets, 3);
+        assert_eq!(stats.done_tickets, 1);
+        assert_eq!(stats.in_progress_tickets, 1); // T-002 is in Research
+        assert_eq!(stats.critical_path_length, 3);
+    }
+
+    #[test]
+    fn test_concurrent_ready_tickets() {
+        // T-001 is done, T-002 and T-003 can run in parallel
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002", "T-003"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        let ready = dag.get_ready_tickets();
+
+        assert_eq!(ready.len(), 2);
+    }
+
+    #[test]
+    fn test_get_ticket() {
+        let t1 = make_ticket("T-001", Phase::Ready, vec![], vec![]);
+        let dag = Dag::from_tickets(vec![t1]).unwrap();
+
+        let ticket = dag.get_ticket(&"T-001".to_string());
+        assert!(ticket.is_some());
+        assert_eq!(ticket.unwrap().id, "T-001");
+
+        let missing = dag.get_ticket(&"T-999".to_string());
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_get_dependencies() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Done, vec![], vec![]);
+        let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001", "T-002"], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+
+        let deps = dag.get_dependencies(&"T-003".to_string());
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&"T-001".to_string()));
+        assert!(deps.contains(&"T-002".to_string()));
+
+        let no_deps = dag.get_dependencies(&"T-001".to_string());
+        assert!(no_deps.is_empty());
+    }
+
+    #[test]
+    fn test_tickets_iterator() {
+        let t1 = make_ticket("T-001", Phase::Ready, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec![], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
+
+        let ticket_ids: Vec<_> = dag.tickets().map(|t| t.id.clone()).collect();
+        assert_eq!(ticket_ids.len(), 2);
+        assert!(ticket_ids.contains(&"T-001".to_string()));
+        assert!(ticket_ids.contains(&"T-002".to_string()));
+    }
+
+    #[test]
+    fn test_runnable_tickets() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let t3 = make_ticket("T-003", Phase::Research, vec![], vec![]);
+
+        let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
+        let runnable = dag.get_runnable_tickets();
+
+        // Only T-002 is runnable (T-001 is done, T-003 is in progress)
+        assert_eq!(runnable.len(), 1);
+        assert_eq!(runnable[0].id, "T-002");
+    }
+}
