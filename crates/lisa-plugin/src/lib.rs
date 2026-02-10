@@ -27,7 +27,7 @@ const FLUSH_DELAY_SECS: f64 = 0.5;
 fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
     let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
     format!(
-        "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/knowledge/rdspi-workflow.md. \
+        "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/rdspi-workflow.md. \
          Start from the current phase indicated in the ticket frontmatter.",
         ticket_path.display()
     )
@@ -1802,7 +1802,7 @@ mod tests {
         let cmd = build_claude_command(ticket_dir, "T-001");
 
         assert!(
-            cmd.contains("docs/knowledge/rdspi-workflow.md"),
+            cmd.contains("docs/rdspi-workflow.md"),
             "command should reference RDSPI workflow, got: {}",
             cmd
         );
@@ -1889,7 +1889,7 @@ mod tests {
 
         assert!(prompt.contains("docs/active/tickets/T-024-03.md"));
         assert!(prompt.contains("CLAUDE.md"));
-        assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(prompt.contains("docs/rdspi-workflow.md"));
         assert!(prompt.contains("current phase"));
     }
 
