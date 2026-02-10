@@ -31,7 +31,7 @@ Create the following directories in your project root:
 
 ```
 your-project/
-├── CLAUDE.md              # Workflow definition (required)
+├── CLAUDE.md              # Project-specific context (required)
 ├── docs/active/
 │   ├── tickets/           # Ticket markdown files
 │   ├── stories/           # Story markdown files (optional)
@@ -50,7 +50,7 @@ The `work/` directory gets populated automatically. Each ticket gets a subdirect
 
 ## 3. CLAUDE.md Template
 
-Create a `CLAUDE.md` in your project root. This is the file every Claude Code agent reads to understand how to work. It has two sections: project-specific context, and the RDSPI workflow definition.
+Create a `CLAUDE.md` in your project root. This file contains **only project-specific context** -- the RDSPI workflow definition ships with lisa in `docs/rdspi-workflow.md` and is injected into agent context automatically when sessions are spawned. You do not need to copy the workflow into every project.
 
 Copy this template and fill in the project-specific parts:
 
@@ -95,112 +95,10 @@ docs/active/work/       # Work artifacts, one subdirectory per ticket ID
 
 ---
 
-## RDSPI Workflow
-
-Every ticket passes through five phases in order. No phases are skipped regardless of ticket size.
-
-### Research
-
-Map the codebase. Produce `research.md` (~200 lines).
-
-Descriptive, not prescriptive. What exists, where, how it connects. Identify the files, modules, patterns, and boundaries relevant to the ticket. Surface assumptions and constraints. Do not propose solutions.
-
-Artifact: `docs/active/work/{ticket-id}/research.md`
-
-### Design
-
-Explore options, evaluate tradeoffs, decide with rationale. Produce `design.md` (~200 lines).
-
-Enumerate viable approaches. Assess each against the codebase reality from Research. Choose one and explain why. Document what was rejected and why. The decision must be grounded in the research, not assumptions.
-
-Artifact: `docs/active/work/{ticket-id}/design.md`
-
-### Structure
-
-Define file-level changes, architecture, and component boundaries. Produce `structure.md` (~200 lines).
-
-Specify which files are created, modified, or deleted. Define module boundaries, public interfaces, and internal organization. Establish the ordering of changes where it matters. This is the blueprint -- not code, but the shape of the code.
-
-Artifact: `docs/active/work/{ticket-id}/structure.md`
-
-### Plan
-
-Sequence the implementation steps. Produce `plan.md` (~200 lines).
-
-Break the work into ordered steps that can be executed and verified independently where possible. Define the testing strategy: what gets unit tests, what needs integration tests, what the verification criteria are. Each step should be small enough to commit atomically.
-
-Artifact: `docs/active/work/{ticket-id}/plan.md`
-
-### Implement
-
-Execute the plan. Track progress in `progress.md`. Commit incrementally.
-
-Follow the plan step by step. After each meaningful unit of work, commit. Update `progress.md` with what has been completed, what remains, and any deviations from the plan. If the plan needs adjustment, document the deviation and rationale before proceeding.
-
-Artifact: `docs/active/work/{ticket-id}/progress.md`
-
----
-
-## Phase Rules
-
-1. **All five phases always run.** Research, Design, Structure, Plan, Implement. Each phase is cheap (~200 lines, a few minutes). Skipping phases based on ticket size is how context degrades.
-
-2. **~200 lines per artifact.** This is not a hard limit but a forcing function for structured thinking. Enough to be thorough, short enough to review quickly.
-
-3. **Phase transitions.** When a phase completes, update the ticket's `phase` field in its YAML frontmatter. Lisa watches for these changes to update scheduling.
-
-4. **Review points.** Research and Design are high-leverage review points. Reviewing ~200 lines of research or design catches problems before they become thousands of lines of wrong code. Structure and Plan may auto-advance depending on project configuration.
-
-5. **Artifacts are insurance.** If a session crashes or hits limits, the latest artifact plus the ticket is enough to seed a new session at the correct phase.
-
----
-
-## Ticket Format
-
-Tickets live in `docs/active/tickets/`. Each ticket is a markdown file with YAML frontmatter:
-
-\`\`\`yaml
----
-id: T-024-03
-story: S-024
-title: migrate-climate-calls
-type: task
-status: open
-priority: high
-phase: ready
-depends_on: [T-024-01, T-024-02]
----
-
-## Context
-
-Description of the work and why it matters.
-
-## Acceptance Criteria
-
-- Concrete, verifiable conditions for done.
-\`\`\`
-
-Fields:
-- `id`: Unique ticket identifier (e.g., `T-024-03`)
-- `story`: Parent story ID
-- `title`: Kebab-case short name
-- `type`: `task` | `bug` | `spike`
-- `status`: `open` | `in-progress` | `review` | `done` | `blocked`
-- `priority`: `critical` | `high` | `medium` | `low`
-- `phase`: `ready` | `research` | `design` | `structure` | `plan` | `implement` | `review` | `done`
-- `depends_on`: List of ticket IDs that must complete before this ticket starts
-- `blocks`: *(optional)* List of ticket IDs that depend on this ticket. Lisa computes this automatically from `depends_on`, so you do not need to maintain it by hand
-
----
-
-## Concurrency
-
-Lisa computes the DAG from ticket dependencies and spawns threads for all tickets whose dependencies are satisfied. Multiple threads work on the same branch. Commit serialization is handled via file locking -- agents do not need to coordinate with each other.
-
-If two tickets modify the same files, that is a missing dependency edge in the DAG. The lock is a safety net, not a substitute for correct dependency modeling.
+The RDSPI workflow definition is in docs/rdspi-workflow.md and is injected into agent context by lisa automatically.
 ```
 
-The RDSPI Workflow section and everything below it can be copied verbatim. The Project section at the top is what you customize per project. Be specific about build commands, test commands, and source layout -- agents read this to orient themselves.
+Be specific about build commands, test commands, and source layout -- agents read this to orient themselves. The workflow phases, phase rules, ticket format, and concurrency model are all defined in `docs/rdspi-workflow.md` which lisa references when spawning each Claude session.
 
 ---
 
@@ -426,7 +324,7 @@ When lisa starts, it reads every ticket file and builds the dependency graph. Ti
 Each Claude Code session follows this lifecycle:
 
 1. **Session opens.** Lisa runs `claude --dangerously-skip-permissions` in a new zellij pane, pointed at the ticket.
-2. **Agent reads context.** The agent reads the ticket file and `CLAUDE.md`. The ticket tells it what to do. CLAUDE.md tells it how (the RDSPI phases, artifact format, build commands).
+2. **Agent reads context.** The agent reads the ticket file, `CLAUDE.md`, and `docs/rdspi-workflow.md`. The ticket tells it what to do. CLAUDE.md provides project-specific context (build commands, source layout). The workflow file defines the RDSPI phases and artifact format.
 3. **Agent works through phases.** Starting from the ticket's current `phase`, the agent produces the artifact for each phase, updates the ticket's `phase` field in its frontmatter, and proceeds.
 4. **Review points.** After Research and Design (by default), the agent parks -- it has produced its artifact and waits for human review. Lisa detects this and marks the thread as parked on the dashboard.
 5. **Human reviews.** You read the artifact (`docs/active/work/T-XXX-XX/research.md` or `design.md`). If it looks good, advance the ticket's phase in its frontmatter and the agent continues. If it needs changes, leave feedback in the session.
@@ -539,7 +437,7 @@ A `lisa init` command would automate the manual setup described in this guide. H
 ### What `lisa init` Would Automate
 
 1. **Create directory structure.** `mkdir -p docs/active/{tickets,stories,work}`.
-2. **Generate CLAUDE.md template.** Scaffold the file with project-specific placeholders and the full RDSPI workflow definition. Detect language/framework from the repo (presence of `Cargo.toml`, `package.json`, `go.mod`, etc.) to pre-fill build commands.
+2. **Generate CLAUDE.md template.** Scaffold the file with project-specific placeholders (the RDSPI workflow ships separately in `docs/rdspi-workflow.md`). Detect language/framework from the repo (presence of `Cargo.toml`, `package.json`, `go.mod`, etc.) to pre-fill build commands.
 3. **Create initial story and tickets from user input.** Interactive prompt: "Describe what you want to build." Parse the response into a story and 2-5 tickets with dependency edges.
 4. **Validate setup.** Check that `CLAUDE.md` exists, ticket directory has at least one ticket, all `depends_on` references resolve to real ticket IDs, no circular dependencies in the DAG, and `claude` and `zellij` are on PATH.
 
@@ -547,7 +445,7 @@ A `lisa init` command would automate the manual setup described in this guide. H
 
 These are the things that go wrong when setting up by hand -- and the things `lisa init` should prevent:
 
-- **Forgetting `CLAUDE.md`.** Without it, agents have no workflow definition and produce unstructured output. The init command should refuse to proceed without it.
+- **Forgetting `CLAUDE.md`.** Without it, agents have no project context (build commands, source layout) and produce disoriented output. The init command should refuse to proceed without it.
 - **Redundant `blocks` fields.** The `blocks` field is no longer required -- lisa computes reverse edges from `depends_on` alone. The init command should not generate `blocks` fields. If existing tickets have `blocks` fields, they are accepted but ignored for DAG computation in favor of the canonical `depends_on` edges.
 - **Circular dependencies.** Easy to create accidentally when writing tickets by hand. The init command should validate the DAG is acyclic.
 - **Tickets with wrong initial phase.** If you write `phase: research` instead of `phase: ready`, the ticket looks like it is already in-progress. Agents get confused. The init command should default new tickets to `phase: ready`.

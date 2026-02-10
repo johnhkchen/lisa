@@ -2,8 +2,8 @@
 //!
 //! This module manages thread lifecycle for concurrent ticket processing.
 //! "Ralph's role is scheduling and lifecycle, not prompt engineering."
-//! The plugin spawns Claude Code sessions, but the agent reads the ticket
-//! and CLAUDE.md workflow definition itself.
+//! The plugin spawns Claude Code sessions, but the agent reads the ticket,
+//! CLAUDE.md project context, and docs/rdspi-workflow.md workflow definition itself.
 //!
 //! ## Commit Serialization
 //!
@@ -318,7 +318,8 @@ impl Scheduler {
     /// Spawn a new thread for a ticket.
     ///
     /// Opens a Claude Code session via zellij's `open_command_pane`.
-    /// The agent reads the ticket file and CLAUDE.md for workflow instructions.
+    /// The agent reads the ticket file, CLAUDE.md for project context,
+    /// and docs/rdspi-workflow.md for the workflow definition.
     ///
     /// Returns the spawn result for tracking, or None if at capacity.
     pub fn spawn_thread(&mut self, ticket_id: TicketId, pane_id: u32) -> Option<SpawnResult> {
@@ -350,7 +351,8 @@ impl Scheduler {
     /// Spawn a Claude Code session for a ticket via zellij.
     ///
     /// Uses zellij's `open_command_pane_floating` to run `claude --dangerously-skip-permissions`.
-    /// The agent reads the ticket file and CLAUDE.md for workflow instructions.
+    /// The agent reads the ticket file, CLAUDE.md for project context,
+    /// and docs/rdspi-workflow.md for the workflow definition.
     ///
     /// Note: The actual pane_id will be received via PaneUpdate events and should be
     /// associated with the ticket using `register_pane`.
@@ -407,7 +409,7 @@ impl Scheduler {
     fn build_claude_command(&self, ticket_id: &TicketId) -> ClaudeCommand {
         // The key insight: "Ralph's role is scheduling and lifecycle, not prompt engineering."
         // We just open a session with --dangerously-skip-permissions.
-        // The agent reads the ticket file and CLAUDE.md for workflow instructions.
+        // The agent reads the ticket file, CLAUDE.md, and docs/rdspi-workflow.md.
         let ticket_path = self.config.tickets_dir.join(format!("{}.md", ticket_id));
 
         ClaudeCommand {
@@ -417,7 +419,7 @@ impl Scheduler {
                 // This is done via the prompt, which references the ticket file.
                 "--print".to_string(),
                 format!(
-                    "Read the ticket at {} and follow the RDSPI workflow defined in CLAUDE.md. \
+                    "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/rdspi-workflow.md. \
                      Start from the current phase indicated in the ticket frontmatter.",
                     ticket_path.display()
                 ),

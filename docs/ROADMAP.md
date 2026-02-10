@@ -26,56 +26,69 @@
 - CLAUDE.md template for project adoption
 - Notes for future `lisa init` command
 
+### Sprint 4: First-Implementer Feedback (moron project)
+Applied feedback from first manual setup on the moron Rust motion graphics engine:
+- Fixed doc inconsistencies: phase example, max_threads default (4 → 2), filesystem-safe ID note
+- Made `blocks` optional — DAG fully computed from `depends_on` alone (65 tests)
+- Added archiving section to setup guide (docs/archive/ convention)
+- Added mid-flight ticket modification guidance (reset to ready if past Design)
+- Added optional `tickets` field to story format for human convenience
+
+### Sprint 5: Workflow Separation (in progress)
+- Extract RDSPI workflow from CLAUDE.md into standalone docs/rdspi-workflow.md
+- CLAUDE.md now project-specific only (description, build, layout)
+- Scheduler references both CLAUDE.md and rdspi-workflow.md
+- Setup guide template cut in half — no more workflow boilerplate to copy
+
 ---
 
-## Next: Awaiting Feedback
+## Next Sprint Candidates
 
-The following sprint candidates are ready to plan once initial feedback comes in from using the setup guide and running the plugin against a real project.
+Prioritized based on first-implementer feedback and design maturity.
 
-### Sprint Candidate: Plugin Testing (Integration)
-Test the plugin in a live zellij session with real tickets.
+### Sprint Candidate: `lisa init` CLI
+Highest-value next step per feedback. Requires a binary target.
+- Project type detection (Cargo.toml, package.json, go.mod, pyproject.toml)
+- Directory scaffolding (active + archive)
+- CLAUDE.md generation (project-specific only, workflow is separate)
+- `.lisa.toml` config file (versionable, replaces zellij plugin config)
+- DAG validation (cycles, missing refs, orphan tickets)
+- Interactive first story/ticket creation
+- `--dry-run` mode
+- Enforce filesystem-safe IDs
+
+### Sprint Candidate: Plugin Integration Testing
+Test the plugin in a live zellij session.
 - Load plugin with example tickets, verify dashboard renders
-- Verify DAG computation matches expected dependency graph
-- Test thread spawning with a simple ticket
-- Verify filesystem watch detects artifact creation
-- Test phase transition detection and dashboard updates
-
-### Sprint Candidate: `lisa init` Command
-Build the initialization tool based on setup guide pain points.
-- Scaffold directory structure
-- Generate CLAUDE.md from project detection (Cargo.toml, package.json, go.mod, etc.)
-- Interactive ticket creation from user description
-- DAG validation (cycle detection, missing refs, orphan tickets)
-- Setup validation (CLAUDE.md exists, claude/zellij on PATH)
+- DAG computation matches expected dependency graph
+- Thread spawning with a simple ticket
+- Filesystem watch detects artifact creation
+- Phase transition detection and dashboard updates
 
 ### Sprint Candidate: Review Gating
-Make review behavior configurable and robust.
+Make review behavior configurable.
 - Per-phase review gating configuration
 - Auto-advance for Structure/Plan when configured
-- Notification system for parked threads (which artifact to review, how long waiting)
-- Review approval mechanism (update frontmatter vs plugin command)
+- Notification system for parked threads
+- Review approval mechanism
 
 ### Sprint Candidate: Robustness
 Handle real-world failure modes.
-- Session crash recovery (detect incomplete phase, restart from last artifact)
-- Graceful handling of malformed tickets (don't crash the plugin)
+- Session crash recovery (restart from last artifact)
+- Graceful handling of malformed tickets
 - Commit lock timeout and recovery
-- Agent teams support for Research/Design phases (experimental)
 
 ### Sprint Candidate: Distribution
-Make the plugin easy to install and update.
 - GitHub release workflow for .wasm artifacts
 - Versioning scheme
-- Zellij plugin registry (when available)
 - `lisa update` self-update mechanism
 
 ---
 
-## Open Questions (Carry Forward)
-
-From the design document, still to be validated empirically:
+## Open Questions
 
 1. **Context limits**: Does a full RDSPI cycle fit in 1M tokens for real tickets?
-2. **Parallelism limits**: Is 4 concurrent threads on one branch safe in practice?
+2. **Parallelism limits**: Is 2 concurrent threads safe? When to go higher?
 3. **Agent teams ROI**: Do Research/Design swarms improve quality or just burn tokens?
 4. **Worktree integration**: Should lisa manage worktrees for cross-story parallelism?
+5. **Ticket ID scheme**: Global sequential IDs (T-001, T-002) vs story-prefixed (T-001-01)? Feedback suggests decoupling from stories.

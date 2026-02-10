@@ -146,7 +146,7 @@ impl State {
                         "--dangerously-skip-permissions".to_string(),
                         "--print".to_string(),
                         format!(
-                            "Read the ticket at {} and follow the RDSPI workflow defined in CLAUDE.md. \
+                            "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/rdspi-workflow.md. \
                              Start from the current phase indicated in the ticket frontmatter.",
                             ticket_path.display()
                         ),
