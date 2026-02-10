@@ -108,7 +108,7 @@ title: migrate-climate-calls
 type: task
 status: open
 priority: high
-phase: research
+phase: ready
 depends_on: [T-024-01, T-024-02]
 blocks: [T-024-06]
 ---

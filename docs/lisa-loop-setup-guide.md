@@ -167,7 +167,7 @@ title: migrate-climate-calls
 type: task
 status: open
 priority: high
-phase: research
+phase: ready
 depends_on: [T-024-01, T-024-02]
 blocks: [T-024-06]
 ---
@@ -228,7 +228,7 @@ blocks: []
 ---
 ```
 
-- `id` -- must be unique across all tickets
+- `id` -- must be unique across all tickets. Use only alphanumeric characters and hyphens (the ID is used as a directory name for work artifacts)
 - `title` -- kebab-case, descriptive, short
 - `type` -- what kind of work: `task`, `bug`, `spike`, `feature`, `chore`
 - `status` -- start with `open`
@@ -356,7 +356,7 @@ layout {
             ticket_dir "docs/active/tickets"
             story_dir  "docs/active/stories"
             work_dir   "docs/active/work"
-            max_threads "4"
+            max_threads "2"
             auto_advance "false"
         }
     }
@@ -384,7 +384,7 @@ All configuration is passed through the zellij plugin config map:
 | `ticket_dir` | `docs/active/tickets` | Directory containing ticket markdown files |
 | `story_dir` | `docs/active/stories` | Directory containing story markdown files |
 | `work_dir` | `docs/active/work` | Directory for phase artifacts |
-| `max_threads` | `4` | Maximum concurrent Claude Code sessions |
+| `max_threads` | `2` | Maximum concurrent Claude Code sessions |
 | `auto_advance` | `false` | Whether to auto-advance phases without human review |
 
 **On `max_threads`:** Start with 2. Four concurrent agents on one branch works but creates more file churn. Go higher only after you have confidence your dependency graph is correct.

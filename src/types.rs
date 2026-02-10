@@ -373,7 +373,7 @@ impl PluginConfig {
     pub const DEFAULT_WORK_DIR: &'static str = "docs/active/work";
 
     /// Default maximum concurrent threads.
-    pub const DEFAULT_MAX_THREADS: usize = 4;
+    pub const DEFAULT_MAX_THREADS: usize = 2;
 
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
