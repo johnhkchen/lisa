@@ -28,6 +28,8 @@ mod colors {
     pub const BRIGHT_GREEN: &str = "\x1b[92m";
     pub const BRIGHT_YELLOW: &str = "\x1b[93m";
     pub const BG_BLUE: &str = "\x1b[44m";
+    pub const BG_RED: &str = "\x1b[41m";
+    pub const BG_YELLOW: &str = "\x1b[43m";
 }
 
 use colors::*;
@@ -152,12 +154,31 @@ pub struct ParkedThread {
     pub pane_id: u32,
 }
 
+/// Type of health alert for the attention banner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlertType {
+    /// Session exited with a non-zero exit code.
+    Failed,
+    /// Session has made no progress beyond the stuck threshold.
+    Stuck,
+}
+
+/// A health alert for the attention banner.
+#[derive(Debug, Clone)]
+pub struct HealthAlert {
+    pub ticket_id: String,
+    pub alert_type: AlertType,
+    pub detail: String,
+    pub suggested_actions: Vec<String>,
+}
+
 /// Activity log entry types
 #[derive(Debug, Clone)]
 pub enum ActivityType {
     PhaseCompleted { ticket_id: String, phase: Phase },
     Commit { ticket_id: String, message: String },
     Error { ticket_id: String, message: String },
+    Warning { ticket_id: String, message: String },
     ThreadStarted { ticket_id: String, phase: Phase },
     ThreadParked { ticket_id: String, phase: Phase },
 }
@@ -169,6 +190,17 @@ pub struct ActivityEntry {
     pub activity: ActivityType,
 }
 
+/// State for the mark-done modal overlay (UI representation).
+#[derive(Debug, Clone, Default)]
+pub struct ModalState {
+    /// Whether the modal is visible.
+    pub open: bool,
+    /// Ticket IDs shown in the list.
+    pub ticket_ids: Vec<String>,
+    /// Currently highlighted index.
+    pub cursor: usize,
+}
+
 /// The complete plugin state for rendering
 #[derive(Debug, Clone)]
 pub struct PluginState {
@@ -176,8 +208,10 @@ pub struct PluginState {
     pub active_threads: Vec<ActiveThread>,
     pub parked_threads: Vec<ParkedThread>,
     pub activity_log: Vec<ActivityEntry>,
+    pub alerts: Vec<HealthAlert>,
     pub current_time: Duration,
     pub selected_ticket: Option<String>,
+    pub modal: ModalState,
 }
 
 impl Default for PluginState {
@@ -187,8 +221,10 @@ impl Default for PluginState {
             active_threads: Vec::new(),
             parked_threads: Vec::new(),
             activity_log: Vec::new(),
+            alerts: Vec::new(),
             current_time: Duration::ZERO,
             selected_ticket: None,
+            modal: ModalState::default(),
         }
     }
 }
@@ -233,6 +269,169 @@ fn status_indicator(status: &TicketStatus) -> String {
 /// Render a horizontal separator line
 fn render_separator(width: usize) -> String {
     format!("{}{}{}", DIM, "─".repeat(width.min(80)), RESET)
+}
+
+// =============================================================================
+// Attention Banner
+// =============================================================================
+
+/// Render the "ATTENTION NEEDED" banner for tickets needing human action.
+///
+/// Shows a prominent bordered box listing:
+/// 1. Tickets in review phase (with ID, title, artifact path, time waiting)
+/// 2. Health alerts for stuck/failed sessions
+///
+/// Appends nothing when no tickets need attention.
+fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<String>) {
+    // Collect tickets in review phase
+    let review_tickets: Vec<&TicketNode> = state
+        .tickets
+        .iter()
+        .filter(|t| t.phase == Phase::Review)
+        .collect();
+
+    let has_reviews = !review_tickets.is_empty();
+    let has_alerts = !state.alerts.is_empty();
+
+    if !has_reviews && !has_alerts {
+        return;
+    }
+
+    // Build lookup for parked thread data (artifact path, wait time)
+    let parked_by_ticket: HashMap<&str, &ParkedThread> = state
+        .parked_threads
+        .iter()
+        .map(|pt| (pt.ticket_id.as_str(), pt))
+        .collect();
+
+    let box_w = width.min(64);
+    let inner_w = box_w.saturating_sub(4); // account for "║ " and " ║"
+
+    // Top border
+    output.push(format!(
+        "{}{}╔{}╗{}",
+        BOLD, BRIGHT_YELLOW, "═".repeat(box_w.saturating_sub(2)), RESET
+    ));
+
+    // Header line
+    let header = "⚠ ATTENTION NEEDED";
+    let header_pad = inner_w.saturating_sub(header.chars().count());
+    output.push(format!(
+        "{}{}║ {}{}{}{}{}║{}",
+        BOLD, BRIGHT_YELLOW,
+        BG_YELLOW, WHITE, header, RESET,
+        format!("{}{} ", " ".repeat(header_pad), format!("{}{}", BOLD, BRIGHT_YELLOW)),
+        RESET
+    ));
+
+    // Review ticket rows
+    for ticket in &review_tickets {
+        let parked = parked_by_ticket.get(ticket.id.as_str());
+
+        // Truncate title to 20 chars
+        let title: String = if ticket.title.chars().count() > 20 {
+            format!("{}..", ticket.title.chars().take(18).collect::<String>())
+        } else {
+            ticket.title.clone()
+        };
+
+        // Artifact: extract filename from path
+        let artifact = match parked {
+            Some(pt) => pt
+                .artifact_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&pt.artifact_path)
+                .to_string(),
+            None => "—".to_string(),
+        };
+
+        // Wait time
+        let wait_time = match parked {
+            Some(pt) => format_time_since(pt.parked_at, state.current_time),
+            None => "—".to_string(),
+        };
+
+        let content = format!(
+            "{:<10} {:<20} {:<14} {:>8}",
+            ticket.id, title, artifact, wait_time
+        );
+        let content_visible_len = content.chars().count();
+        let row_pad = inner_w.saturating_sub(content_visible_len);
+
+        output.push(format!(
+            "{}{}║{} {}{}{} {}║{}",
+            BOLD, BRIGHT_YELLOW,
+            RESET,
+            YELLOW, content, RESET,
+            format!("{}{}{}", " ".repeat(row_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+            RESET
+        ));
+    }
+
+    // Health alert rows (stuck/failed sessions)
+    for alert in state.alerts.iter().take(5) {
+        let (label, color) = match alert.alert_type {
+            AlertType::Failed => ("✗ FAILED", RED),
+            AlertType::Stuck => ("! STUCK ", YELLOW),
+        };
+
+        let detail_max = inner_w.saturating_sub(24); // label + space + ticket_id + space
+        let detail: String = if alert.detail.chars().count() > detail_max {
+            format!("{}..", alert.detail.chars().take(detail_max.saturating_sub(2)).collect::<String>())
+        } else {
+            alert.detail.clone()
+        };
+
+        let content = format!("{} {:<12} {}", label, alert.ticket_id, detail);
+        let content_visible_len = content.chars().count();
+        let row_pad = inner_w.saturating_sub(content_visible_len);
+
+        output.push(format!(
+            "{}{}║{} {}{}{} {}║{}",
+            BOLD, BRIGHT_YELLOW,
+            RESET,
+            color, content, RESET,
+            format!("{}{}{}", " ".repeat(row_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+            RESET
+        ));
+
+        // Suggested actions
+        if !alert.suggested_actions.is_empty() {
+            let actions = format!("  {}", alert.suggested_actions.join(" | "));
+            let actions_len = actions.chars().count();
+            let actions_pad = inner_w.saturating_sub(actions_len);
+            output.push(format!(
+                "{}{}║{} {}{}{} {}║{}",
+                BOLD, BRIGHT_YELLOW,
+                RESET,
+                DIM, actions, RESET,
+                format!("{}{}{}", " ".repeat(actions_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+                RESET
+            ));
+        }
+    }
+
+    if state.alerts.len() > 5 {
+        let more = format!("... and {} more alerts", state.alerts.len() - 5);
+        let pad = inner_w.saturating_sub(more.len());
+        output.push(format!(
+            "{}{}║{} {}{}{} {}║{}",
+            BOLD, BRIGHT_YELLOW,
+            RESET,
+            DIM, more, RESET,
+            format!("{}{}{}", " ".repeat(pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+            RESET
+        ));
+    }
+
+    // Bottom border
+    output.push(format!(
+        "{}{}╚{}╝{}",
+        BOLD, BRIGHT_YELLOW, "═".repeat(box_w.saturating_sub(2)), RESET
+    ));
+
+    output.push(String::new());
 }
 
 // =============================================================================
@@ -560,6 +759,19 @@ fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec
                 YELLOW,
                 format!("{} parked at {}", ticket_id, phase.full_name()),
             ),
+            ActivityType::Warning { ticket_id, message } => {
+                let msg = if message.len() > 40 {
+                    format!("{}...", &message[..37])
+                } else {
+                    message.clone()
+                };
+                let prefix = if ticket_id.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", ticket_id)
+                };
+                ("⚠", BRIGHT_YELLOW, format!("{}warn: {}", prefix, msg))
+            }
         };
 
         output.push(format!(
@@ -628,9 +840,16 @@ fn render_status_line(state: &PluginState) -> String {
         .count();
     let total = state.tickets.len();
 
+    let alert_count = state.alerts.len();
+    let alert_str = if alert_count > 0 {
+        format!(" | {}Alerts: {}{}", RED, alert_count, RESET)
+    } else {
+        String::new()
+    };
+
     format!(
-        "Active: {} | Parked: {} | Done: {}/{}",
-        active, parked, done, total
+        "Active: {} | Parked: {} | Done: {}/{}{}  {}[d] mark done{}",
+        active, parked, done, total, alert_str, DIM, RESET
     )
 }
 
@@ -650,6 +869,9 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
     ));
     output.push(render_separator(width));
     output.push(String::new());
+
+    // Attention banner (review gate alerts)
+    render_attention_banner(state, width, &mut output);
 
     // DAG section
     render_dag(state, &mut output);
@@ -683,11 +905,88 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
     output
 }
 
+/// Render the mark-done modal as an overlay.
+fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> {
+    let mut output = Vec::new();
+
+    let box_w = width.min(50);
+    let list_h = modal.ticket_ids.len().min(height.saturating_sub(6));
+    let box_h = list_h + 4; // title + separator + list + footer
+    let pad_top = height.saturating_sub(box_h) / 2;
+
+    let border_h = "─".repeat(box_w.saturating_sub(2));
+
+    // Top padding
+    for _ in 0..pad_top {
+        output.push(String::new());
+    }
+
+    // Top border
+    output.push(format!("┌{}┐", border_h));
+
+    // Title
+    let title = " Mark Ticket Done ";
+    let title_pad = box_w.saturating_sub(2).saturating_sub(title.len());
+    let left_pad = title_pad / 2;
+    let right_pad = title_pad - left_pad;
+    output.push(format!(
+        "│{}{}{}{}{}│",
+        " ".repeat(left_pad),
+        BOLD, title, RESET,
+        " ".repeat(right_pad),
+    ));
+
+    // Separator
+    output.push(format!("├{}┤", border_h));
+
+    // Ticket list
+    for (i, tid) in modal.ticket_ids.iter().enumerate().take(list_h) {
+        let selected = i == modal.cursor;
+        let prefix = if selected { "▸ " } else { "  " };
+        let (color_start, color_end) = if selected {
+            (format!("{}{}", BOLD, CYAN), RESET.to_string())
+        } else {
+            (String::new(), String::new())
+        };
+
+        let entry = format!("{}{}{}{}", prefix, color_start, tid, color_end);
+        // Pad to fill the box (accounting for ANSI codes in visible width)
+        let visible_len = prefix.len() + tid.len();
+        let inner_pad = box_w.saturating_sub(2).saturating_sub(visible_len);
+        output.push(format!("│{}{}│", entry, " ".repeat(inner_pad)));
+    }
+
+    // Footer
+    output.push(format!("├{}┤", border_h));
+    let footer = " Enter=confirm  Esc=cancel ";
+    let footer_pad = box_w.saturating_sub(2).saturating_sub(footer.len());
+    let fl = footer_pad / 2;
+    let fr = footer_pad - fl;
+    output.push(format!(
+        "│{}{}{}{}{}│",
+        " ".repeat(fl),
+        DIM, footer, RESET,
+        " ".repeat(fr),
+    ));
+    // Bottom border
+    output.push(format!("└{}┘", border_h));
+
+    output
+}
+
 /// Print the dashboard to the Zellij pane
 ///
 /// This function is the main entry point called from the plugin's render() implementation.
 /// It takes a pre-converted PluginState structure.
 pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize) {
+    if state.modal.open {
+        let lines = render_modal(&state.modal, cols.min(60), rows);
+        for line in lines.iter().take(rows) {
+            println!("{}", line);
+        }
+        return;
+    }
+
     let lines = render_dashboard_lines(state, cols.min(100), rows);
 
     for line in lines.iter().take(rows) {
@@ -754,8 +1053,10 @@ mod tests {
                     },
                 },
             ],
+            alerts: Vec::new(),
             current_time: Duration::from_secs(120),
             selected_ticket: None,
+            modal: ModalState::default(),
         }
     }
 
@@ -984,8 +1285,10 @@ mod tests {
                     },
                 },
             ],
+            alerts: Vec::new(),
             current_time: Duration::from_secs(200),
             selected_ticket: None,
+            modal: ModalState::default(),
         };
 
         let lines = render_dashboard_lines(&state, 80, 50);
@@ -1029,5 +1332,247 @@ mod tests {
             "T-002 and T-003 not in second layer"
         );
         assert!(layers[2].contains(&3), "T-004 not in third layer");
+    }
+
+    #[test]
+    fn test_render_attention_banner_with_review_tickets() {
+        let state = PluginState {
+            tickets: vec![TicketNode {
+                id: "T-005".to_string(),
+                title: "review-ticket".to_string(),
+                phase: Phase::Review,
+                status: TicketStatus::WaitingReview,
+                depends_on: vec![],
+                blocks: vec![],
+            }],
+            parked_threads: vec![ParkedThread {
+                ticket_id: "T-005".to_string(),
+                phase: Phase::Review,
+                artifact_path: "docs/active/work/T-005/design.md".to_string(),
+                parked_at: Duration::from_secs(50),
+                pane_id: 3,
+            }],
+            current_time: Duration::from_secs(200),
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_attention_banner(&state, 80, &mut output);
+
+        let full = output.join("\n");
+        assert!(full.contains("ATTENTION NEEDED"), "Banner header missing");
+        assert!(full.contains("T-005"), "Ticket ID missing from banner");
+        assert!(full.contains("review-ticket"), "Ticket title missing from banner");
+        assert!(full.contains("design.md"), "Artifact path missing from banner");
+        // Wait time: 200 - 50 = 150s = 2m 30s
+        assert!(full.contains("2m 30s"), "Wait time missing from banner");
+        // Box drawing characters
+        assert!(full.contains("╔"), "Top border missing");
+        assert!(full.contains("╚"), "Bottom border missing");
+    }
+
+    #[test]
+    fn test_render_attention_banner_empty() {
+        let state = PluginState {
+            tickets: vec![TicketNode {
+                id: "T-001".to_string(),
+                title: "not-in-review".to_string(),
+                phase: Phase::Implement,
+                status: TicketStatus::InProgress,
+                depends_on: vec![],
+                blocks: vec![],
+            }],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_attention_banner(&state, 80, &mut output);
+
+        assert!(output.is_empty(), "Banner should not render when no review tickets");
+    }
+
+    #[test]
+    fn test_render_attention_banner_no_parked_thread() {
+        let state = PluginState {
+            tickets: vec![TicketNode {
+                id: "T-006".to_string(),
+                title: "orphan-review".to_string(),
+                phase: Phase::Review,
+                status: TicketStatus::WaitingReview,
+                depends_on: vec![],
+                blocks: vec![],
+            }],
+            parked_threads: vec![], // No matching parked thread
+            current_time: Duration::from_secs(100),
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_attention_banner(&state, 80, &mut output);
+
+        let full = output.join("\n");
+        assert!(full.contains("ATTENTION NEEDED"), "Banner should still render");
+        assert!(full.contains("T-006"), "Ticket ID should appear");
+        assert!(full.contains("—"), "Dash placeholder should appear for missing data");
+    }
+
+    #[test]
+    fn test_attention_banner_in_full_dashboard() {
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-001".to_string(),
+                    title: "done-ticket".to_string(),
+                    phase: Phase::Done,
+                    status: TicketStatus::Done,
+                    depends_on: vec![],
+                    blocks: vec![],
+                },
+                TicketNode {
+                    id: "T-002".to_string(),
+                    title: "in-review".to_string(),
+                    phase: Phase::Review,
+                    status: TicketStatus::WaitingReview,
+                    depends_on: vec!["T-001".to_string()],
+                    blocks: vec![],
+                },
+            ],
+            parked_threads: vec![ParkedThread {
+                ticket_id: "T-002".to_string(),
+                phase: Phase::Review,
+                artifact_path: "docs/active/work/T-002/plan.md".to_string(),
+                parked_at: Duration::from_secs(10),
+                pane_id: 1,
+            }],
+            current_time: Duration::from_secs(100),
+            ..PluginState::default()
+        };
+
+        let lines = render_dashboard_lines(&state, 80, 50);
+        let full = lines.join("\n");
+
+        // Banner should appear
+        assert!(full.contains("ATTENTION NEEDED"), "Banner missing from full dashboard");
+
+        // Banner should appear BEFORE DAG
+        let banner_pos = full.find("ATTENTION NEEDED").unwrap();
+        let dag_pos = full.find("DAG").unwrap();
+        assert!(banner_pos < dag_pos, "Banner should appear before DAG section");
+    }
+
+    #[test]
+    fn test_render_attention_banner_with_health_alerts() {
+        let state = PluginState {
+            alerts: vec![
+                HealthAlert {
+                    ticket_id: "T-010".to_string(),
+                    alert_type: AlertType::Failed,
+                    detail: "Exit code: 1".to_string(),
+                    suggested_actions: vec!["Check logs".to_string(), "Retry".to_string()],
+                },
+                HealthAlert {
+                    ticket_id: "T-011".to_string(),
+                    alert_type: AlertType::Stuck,
+                    detail: "No progress for 15+ min".to_string(),
+                    suggested_actions: vec!["Check pane".to_string()],
+                },
+            ],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_attention_banner(&state, 80, &mut output);
+
+        let full = output.join("\n");
+        assert!(full.contains("ATTENTION NEEDED"), "Banner header missing");
+        assert!(full.contains("T-010"), "Failed ticket missing");
+        assert!(full.contains("FAILED"), "FAILED indicator missing");
+        assert!(full.contains("T-011"), "Stuck ticket missing");
+        assert!(full.contains("STUCK"), "STUCK indicator missing");
+        assert!(full.contains("Check logs"), "Suggested action missing");
+        assert!(full.contains("Exit code: 1"), "Detail missing");
+    }
+
+    #[test]
+    fn test_render_attention_banner_alerts_only_no_reviews() {
+        let state = PluginState {
+            alerts: vec![HealthAlert {
+                ticket_id: "T-099".to_string(),
+                alert_type: AlertType::Stuck,
+                detail: "No progress for 20+ min".to_string(),
+                suggested_actions: vec![],
+            }],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_attention_banner(&state, 80, &mut output);
+
+        let full = output.join("\n");
+        assert!(full.contains("ATTENTION NEEDED"));
+        assert!(full.contains("T-099"));
+        assert!(full.contains("STUCK"));
+    }
+
+    #[test]
+    fn test_status_line_with_alerts() {
+        let state = PluginState {
+            alerts: vec![HealthAlert {
+                ticket_id: "T-001".to_string(),
+                alert_type: AlertType::Failed,
+                detail: "test".to_string(),
+                suggested_actions: vec![],
+            }],
+            ..PluginState::default()
+        };
+
+        let status = render_status_line(&state);
+        assert!(status.contains("Alerts: 1"), "Alert count missing from status line");
+    }
+
+    #[test]
+    fn test_status_line_no_alerts() {
+        let state = PluginState::default();
+        let status = render_status_line(&state);
+        assert!(!status.contains("Alerts"), "Alerts should not appear when count is 0");
+    }
+
+    #[test]
+    fn test_render_attention_banner_mixed_alerts_and_reviews() {
+        let state = PluginState {
+            tickets: vec![TicketNode {
+                id: "T-005".to_string(),
+                title: "review-ticket".to_string(),
+                phase: Phase::Review,
+                status: TicketStatus::WaitingReview,
+                depends_on: vec![],
+                blocks: vec![],
+            }],
+            alerts: vec![HealthAlert {
+                ticket_id: "T-010".to_string(),
+                alert_type: AlertType::Failed,
+                detail: "Session crashed".to_string(),
+                suggested_actions: vec!["Retry".to_string()],
+            }],
+            parked_threads: vec![ParkedThread {
+                ticket_id: "T-005".to_string(),
+                phase: Phase::Review,
+                artifact_path: "docs/active/work/T-005/design.md".to_string(),
+                parked_at: Duration::from_secs(50),
+                pane_id: 3,
+            }],
+            current_time: Duration::from_secs(200),
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_attention_banner(&state, 80, &mut output);
+
+        let full = output.join("\n");
+        // Both health alert and review ticket should appear
+        assert!(full.contains("T-010"), "Health alert ticket missing");
+        assert!(full.contains("T-005"), "Review ticket missing");
+        assert!(full.contains("FAILED"), "Failed indicator missing");
+        assert!(full.contains("design.md"), "Review artifact missing");
     }
 }

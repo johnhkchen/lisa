@@ -267,7 +267,8 @@ pub enum ThreadStatus {
 /// Health status of a thread, computed from time-in-phase and thread status.
 ///
 /// This is a derived property, not persisted. Call `Thread::health()` to compute it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HealthStatus {
     /// Thread is making progress (time-in-phase below threshold)
     Healthy,
@@ -552,6 +553,13 @@ pub enum ActivityEvent {
 
     /// All tickets have reached done phase — loop complete
     AllTicketsDone,
+
+    /// A thread's health status changed (e.g., Healthy → Stuck)
+    HealthStateChanged {
+        ticket_id: TicketId,
+        old_health: HealthStatus,
+        new_health: HealthStatus,
+    },
 }
 
 /// Serde helper module for SystemTime serialization.
@@ -755,6 +763,40 @@ mod tests {
         let threshold = std::time::Duration::from_secs(600);
 
         assert!(!thread.is_attention_needed(now, threshold));
+    }
+
+    #[test]
+    fn test_health_status_serde() {
+        let stuck = HealthStatus::Stuck;
+        let json = serde_json::to_string(&stuck).unwrap();
+        assert_eq!(json, "\"stuck\"");
+
+        let parsed: HealthStatus = serde_json::from_str("\"failed\"").unwrap();
+        assert_eq!(parsed, HealthStatus::Failed);
+
+        let healthy: HealthStatus = serde_json::from_str("\"healthy\"").unwrap();
+        assert_eq!(healthy, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_health_state_changed_event() {
+        let event = ActivityEvent::HealthStateChanged {
+            ticket_id: "T-001".to_string(),
+            old_health: HealthStatus::Healthy,
+            new_health: HealthStatus::Stuck,
+        };
+        match &event {
+            ActivityEvent::HealthStateChanged {
+                ticket_id,
+                old_health,
+                new_health,
+            } => {
+                assert_eq!(ticket_id, "T-001");
+                assert_eq!(*old_health, HealthStatus::Healthy);
+                assert_eq!(*new_health, HealthStatus::Stuck);
+            }
+            _ => panic!("Expected HealthStateChanged"),
+        }
     }
 
     #[test]
