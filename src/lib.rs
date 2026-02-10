@@ -11,11 +11,12 @@ mod types;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
 
 use crate::dag::Dag;
-use crate::types::{ActivityEvent, PluginConfig, Thread, TicketId};
+use crate::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
 
 /// Main plugin state
 ///
@@ -61,13 +62,37 @@ impl State {
         }
     }
 
-    /// Scan tickets directory and rebuild the DAG
+    /// Scan tickets directory and rebuild the DAG.
+    ///
+    /// Reads all `.md` ticket files from the configured ticket directory,
+    /// parses their YAML frontmatter, and constructs a dependency graph.
+    /// Errors during scanning or DAG construction are logged as activity
+    /// events rather than propagated, so the plugin remains operational
+    /// even when ticket files are malformed.
     fn rebuild_dag(&mut self) {
-        // TODO: Implement ticket scanning and DAG construction
-        // 1. Read all .md files from config.ticket_dir
-        // 2. Parse frontmatter to extract dependencies
-        // 3. Build DAG from depends_on/blocks relationships
-        self.dag = Dag::default();
+        let tickets = match ticket::scan_tickets(&self.config.ticket_dir) {
+            Ok(tickets) => tickets,
+            Err(e) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Failed to scan tickets: {}", e),
+                });
+                return;
+            }
+        };
+
+        let ticket_count = tickets.len();
+
+        match Dag::from_tickets(tickets) {
+            Ok(dag) => {
+                self.dag = dag;
+                self.log_activity(ActivityEvent::DagRecomputed { ticket_count });
+            }
+            Err(e) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Failed to build DAG: {:?}", e),
+                });
+            }
+        }
     }
 
     /// Check which tickets are ready to be scheduled
@@ -95,14 +120,98 @@ impl State {
         }
     }
 
-    /// Handle filesystem changes (artifact creation, ticket phase changes)
-    fn handle_filesystem_update(&mut self, paths: &[std::path::PathBuf]) {
-        // TODO: Implement filesystem change handling
-        // 1. Check if any paths are in the ticket directory -> rebuild DAG
-        // 2. Check if any paths are artifacts -> update thread state
-        // 3. Check if ticket phase changed -> log activity, maybe schedule more work
-        for _path in paths {
-            // Placeholder: will parse paths and update state accordingly
+    /// Handle filesystem changes (artifact creation, ticket phase changes).
+    ///
+    /// Inspects changed paths to detect:
+    /// - Ticket file changes (inside `ticket_dir`) -- triggers a DAG rebuild
+    ///   on the next update cycle (the caller in `update()` already calls
+    ///   `rebuild_dag` after this method).
+    /// - Artifact creation (inside `work_dir`) -- logs `ArtifactCreated` events
+    ///   and detects phase transitions by matching artifact filenames to phases.
+    fn handle_filesystem_update(&mut self, paths: &[PathBuf]) {
+        // Snapshot ticket phases before the DAG is rebuilt so we can detect
+        // phase changes after the rebuild (which happens in the caller).
+        let old_phases: HashMap<TicketId, Phase> = self
+            .dag
+            .tickets()
+            .map(|t| (t.id.clone(), t.phase))
+            .collect();
+
+        for path in paths {
+            // Check for artifact creation inside the work directory
+            if let Ok(rel) = path.strip_prefix(&self.config.work_dir) {
+                // work_dir layout: {ticket_id}/{artifact_filename}
+                let components: Vec<_> = rel.components().collect();
+                if components.len() >= 2 {
+                    let ticket_id = components[0].as_os_str().to_string_lossy().to_string();
+                    let filename = components[1].as_os_str().to_string_lossy().to_string();
+
+                    // Check if the filename corresponds to a known phase artifact
+                    let artifact_phase = Phase::all().iter().find(|p| {
+                        p.artifact_filename()
+                            .map(|f| f == filename)
+                            .unwrap_or(false)
+                    });
+
+                    if let Some(&phase) = artifact_phase {
+                        self.log_activity(ActivityEvent::ArtifactCreated {
+                            ticket_id: ticket_id.clone(),
+                            phase,
+                            path: path.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // After the caller rebuilds the DAG, detect phase changes.
+        // We store old_phases so the caller can compare after rebuild_dag().
+        // Since the caller calls rebuild_dag() right after us, we stash the
+        // old phases and check in a post-rebuild step. However, the current
+        // call order in update() is: handle_filesystem_update -> rebuild_dag.
+        // So we detect phase changes by comparing old_phases against the
+        // *current* DAG (which will be the old DAG, before rebuild).
+        // The phase change detection therefore happens on the *next* filesystem
+        // update cycle. To detect it on this cycle, we do the rebuild here
+        // for comparison purposes and let the caller's rebuild be a no-op
+        // (idempotent operation).
+        //
+        // Practical approach: check if any ticket dir paths changed, and if so,
+        // do an early rebuild and compare.
+        let ticket_dir_changed = paths
+            .iter()
+            .any(|p| p.starts_with(&self.config.ticket_dir));
+
+        if ticket_dir_changed {
+            // Rebuild the DAG now so we can compare phases
+            let tickets = match ticket::scan_tickets(&self.config.ticket_dir) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let ticket_count = tickets.len();
+            match Dag::from_tickets(tickets) {
+                Ok(new_dag) => {
+                    // Compare phases between old and new
+                    for ticket in new_dag.tickets() {
+                        if let Some(&old_phase) = old_phases.get(&ticket.id) {
+                            if old_phase != ticket.phase {
+                                self.log_activity(ActivityEvent::TicketPhaseChanged {
+                                    ticket_id: ticket.id.clone(),
+                                    old_phase,
+                                    new_phase: ticket.phase,
+                                });
+                            }
+                        }
+                    }
+                    self.dag = new_dag;
+                    self.log_activity(ActivityEvent::DagRecomputed { ticket_count });
+                }
+                Err(e) => {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!("Failed to build DAG: {:?}", e),
+                    });
+                }
+            }
         }
     }
 }
