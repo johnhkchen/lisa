@@ -1,12 +1,13 @@
 use std::path::Path;
 
+use crate::config::ResolvedConfig;
 use crate::templates::PLUGIN_WASM;
 
 /// Run the lisa loop: write embedded WASM, generate layout, exec zellij.
 ///
 /// In dry-run mode, scans tickets, builds the DAG, and prints what would happen
 /// without writing files or launching zellij.
-pub fn run_loop(root: &Path, max_threads: usize, dry_run: bool) -> Result<(), String> {
+pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(), String> {
     if !dry_run {
         // Validate prerequisites (skip in dry-run — user may not have them installed)
         check_binary("zellij", "Install zellij: https://zellij.dev/documentation/installation")?;
@@ -16,12 +17,12 @@ pub fn run_loop(root: &Path, max_threads: usize, dry_run: bool) -> Result<(), St
     if !root.join("CLAUDE.md").exists() {
         return Err("No CLAUDE.md found. Run `lisa init` first.".to_string());
     }
-    if !root.join("docs/active/tickets").exists() {
-        return Err("No docs/active/tickets/ directory. Run `lisa init` first.".to_string());
+    if !root.join(&config.ticket_dir).exists() {
+        return Err(format!("No {}/ directory. Run `lisa init` first.", config.ticket_dir));
     }
 
     if dry_run {
-        return run_dry(root, max_threads);
+        return run_dry(root, config);
     }
 
     // Check the WASM plugin is actually embedded (not a dev placeholder)
@@ -39,7 +40,7 @@ pub fn run_loop(root: &Path, max_threads: usize, dry_run: bool) -> Result<(), St
         .map_err(|e| format!("Failed to write WASM plugin to {}: {}", wasm_path.display(), e))?;
 
     // Generate KDL layout
-    let layout = generate_layout(&wasm_path, max_threads);
+    let layout = generate_layout(&wasm_path, config);
     let layout_path = root.join(".lisa-layout.kdl");
     std::fs::write(&layout_path, &layout)
         .map_err(|e| format!("Failed to write layout to {}: {}", layout_path.display(), e))?;
@@ -47,7 +48,7 @@ pub fn run_loop(root: &Path, max_threads: usize, dry_run: bool) -> Result<(), St
     println!("Lisa loop starting...");
     println!("  WASM plugin: {}", wasm_path.display());
     println!("  Layout: {}", layout_path.display());
-    println!("  Max threads: {}", max_threads);
+    println!("  Max threads: {}", config.max_threads);
     println!();
 
     // Exec zellij (replaces this process)
@@ -55,8 +56,8 @@ pub fn run_loop(root: &Path, max_threads: usize, dry_run: bool) -> Result<(), St
 }
 
 /// Dry-run mode: scan tickets, build DAG, print summary.
-fn run_dry(root: &Path, max_threads: usize) -> Result<(), String> {
-    let ticket_dir = root.join("docs/active/tickets");
+fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
+    let ticket_dir = root.join(&config.ticket_dir);
     let tickets = lisa_core::ticket::scan_tickets(&ticket_dir)
         .map_err(|e| format!("Failed to scan tickets: {}", e))?;
 
@@ -82,7 +83,7 @@ fn run_dry(root: &Path, max_threads: usize) -> Result<(), String> {
         stats.blocked_tickets,
     );
     println!("Critical path length: {}", stats.critical_path_length);
-    println!("Max threads: {}", max_threads);
+    println!("Max threads: {}", config.max_threads);
     println!();
 
     // Show execution order (topological sort of non-done tickets)
@@ -116,7 +117,7 @@ fn run_dry(root: &Path, max_threads: usize) -> Result<(), String> {
 
     // Show generated layout (using a placeholder WASM path)
     let wasm_path = std::env::temp_dir().join("lisa-plugin.wasm");
-    let layout = generate_layout(&wasm_path, max_threads);
+    let layout = generate_layout(&wasm_path, config);
     println!();
     println!("Generated layout:");
     println!("{}", layout);
@@ -141,22 +142,37 @@ fn which(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn generate_layout(wasm_path: &Path, max_threads: usize) -> String {
+fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
     format!(
         r#"layout {{
-    pane
-    pane {{
-        plugin location="file://{wasm_path}" {{
-            ticket_dir "docs/active/tickets"
-            story_dir  "docs/active/stories"
-            work_dir   "docs/active/work"
-            max_threads "{max_threads}"
+    default_tab_template {{
+        children
+        pane size=1 borderless=true {{
+            plugin location="compact-bar"
+        }}
+    }}
+    tab name="lisa" {{
+        pane stacked=true size="70%" {{
+            pane expanded=true
+        }}
+        pane size="30%" {{
+            plugin location="file://{wasm_path}" {{
+                ticket_dir "{ticket_dir}"
+                story_dir  "{story_dir}"
+                work_dir   "{work_dir}"
+                max_threads "{max_threads}"
+                auto_advance "{auto_advance}"
+            }}
         }}
     }}
 }}
 "#,
         wasm_path = wasm_path.display(),
-        max_threads = max_threads,
+        ticket_dir = config.ticket_dir,
+        story_dir = config.story_dir,
+        work_dir = config.work_dir,
+        max_threads = config.max_threads,
+        auto_advance = config.auto_advance,
     )
 }
 
@@ -195,29 +211,54 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn default_config() -> ResolvedConfig {
+        ResolvedConfig::default()
+    }
+
     #[test]
     fn test_generate_layout() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
-        let layout = generate_layout(&wasm_path, 3);
+        let mut config = default_config();
+        config.max_threads = 3;
+        let layout = generate_layout(&wasm_path, &config);
 
         assert!(layout.contains("file:///tmp/lisa-plugin.wasm"));
         assert!(layout.contains("ticket_dir \"docs/active/tickets\""));
         assert!(layout.contains("story_dir  \"docs/active/stories\""));
         assert!(layout.contains("work_dir   \"docs/active/work\""));
         assert!(layout.contains("max_threads \"3\""));
+        assert!(layout.contains("auto_advance \"false\""));
+        assert!(layout.contains("compact-bar"), "layout should include status bar");
     }
 
     #[test]
     fn test_generate_layout_default_threads() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
-        let layout = generate_layout(&wasm_path, 2);
+        let config = default_config();
+        let layout = generate_layout(&wasm_path, &config);
         assert!(layout.contains("max_threads \"2\""));
+    }
+
+    #[test]
+    fn test_generate_layout_custom_dirs() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let config = ResolvedConfig {
+            ticket_dir: "custom/tickets".to_string(),
+            story_dir: "custom/stories".to_string(),
+            work_dir: "custom/work".to_string(),
+            ..default_config()
+        };
+        let layout = generate_layout(&wasm_path, &config);
+        assert!(layout.contains("ticket_dir \"custom/tickets\""));
+        assert!(layout.contains("story_dir  \"custom/stories\""));
+        assert!(layout.contains("work_dir   \"custom/work\""));
     }
 
     #[test]
     fn test_run_loop_missing_claude_md() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_loop(dir.path(), 2, false);
+        let config = default_config();
+        let result = run_loop(dir.path(), &config, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("CLAUDE.md"));
     }
@@ -226,7 +267,8 @@ mod tests {
     fn test_run_loop_missing_tickets_dir() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "# test").unwrap();
-        let result = run_loop(dir.path(), 2, false);
+        let config = default_config();
+        let result = run_loop(dir.path(), &config, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("tickets"));
     }
@@ -234,7 +276,8 @@ mod tests {
     #[test]
     fn test_dry_run_missing_claude_md() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_loop(dir.path(), 2, true);
+        let config = default_config();
+        let result = run_loop(dir.path(), &config, true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("CLAUDE.md"));
     }
@@ -244,7 +287,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "# test").unwrap();
         std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
-        let result = run_loop(dir.path(), 2, true);
+        let config = default_config();
+        let result = run_loop(dir.path(), &config, true);
         assert!(result.is_ok());
     }
 
@@ -284,7 +328,8 @@ depends_on: [T-001]
 Child ticket.
 ").unwrap();
 
-        let result = run_loop(dir.path(), 2, true);
+        let config = default_config();
+        let result = run_loop(dir.path(), &config, true);
         assert!(result.is_ok());
     }
 }

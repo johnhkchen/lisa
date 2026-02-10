@@ -539,13 +539,34 @@ mod tests {
     }
 
     #[test]
-    fn test_single_ticket_not_ready_phase() {
-        let ticket = make_ticket("T-001", Phase::Research, vec![], vec![]);
+    fn test_done_ticket_not_startable() {
+        let ticket = make_ticket("T-001", Phase::Done, vec![], vec![]);
         let dag = Dag::from_tickets(vec![ticket]).unwrap();
 
-        // Research phase is active, not startable
         assert!(!dag.can_start(&"T-001".to_string()));
         assert!(dag.get_ready_tickets().is_empty());
+    }
+
+    #[test]
+    fn test_active_phase_tickets_are_startable() {
+        // All non-done phases are schedulable (agents can start or resume)
+        for phase in &[
+            Phase::Ready,
+            Phase::Research,
+            Phase::Design,
+            Phase::Structure,
+            Phase::Plan,
+            Phase::Implement,
+            Phase::Review,
+        ] {
+            let ticket = make_ticket("T-001", *phase, vec![], vec![]);
+            let dag = Dag::from_tickets(vec![ticket]).unwrap();
+            assert!(
+                dag.can_start(&"T-001".to_string()),
+                "Phase {:?} should be startable",
+                phase
+            );
+        }
     }
 
     #[test]
@@ -838,10 +859,72 @@ mod tests {
         let t3 = make_ticket("T-003", Phase::Research, vec![], vec![]);
 
         let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
-        let runnable = dag.get_runnable_tickets();
+        let mut runnable = dag.get_runnable_tickets();
+        runnable.sort_by_key(|t| t.id.clone());
 
-        // Only T-002 is runnable (T-001 is done, T-003 is in progress)
-        assert_eq!(runnable.len(), 1);
+        // T-002 (ready, deps done) and T-003 (research, no deps) are both runnable
+        // T-001 is done so it's not runnable
+        assert_eq!(runnable.len(), 2);
         assert_eq!(runnable[0].id, "T-002");
+        assert_eq!(runnable[1].id, "T-003");
+    }
+
+    #[test]
+    fn test_end_to_end_scan_to_dag() {
+        use crate::ticket::scan_tickets;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // T-001: Done, no deps
+        fs::write(
+            dir.path().join("T-001.md"),
+            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: done\n---\n\nDone ticket.\n",
+        ).unwrap();
+
+        // T-002: Ready, depends on T-001
+        fs::write(
+            dir.path().join("T-002.md"),
+            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: ready\ndepends_on: [T-001]\n---\n\nReady ticket.\n",
+        ).unwrap();
+
+        // T-003: Ready, depends on T-001 and T-002
+        fs::write(
+            dir.path().join("T-003.md"),
+            "---\nid: T-003\ntitle: third\ntype: task\nstatus: open\npriority: low\nphase: ready\ndepends_on: [T-001, T-002]\n---\n\nBlocked ticket.\n",
+        ).unwrap();
+
+        // Parse tickets from disk
+        let tickets = scan_tickets(dir.path()).unwrap();
+        assert_eq!(tickets.len(), 3);
+
+        // Build DAG
+        let dag = Dag::from_tickets(tickets).unwrap();
+        assert_eq!(dag.len(), 3);
+
+        // T-001 is done, so T-002 should be ready (its only dep is done)
+        let ready = dag.get_ready_tickets();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0], "T-002");
+
+        // T-003 depends on T-002 which is not done, so it should NOT be ready
+        assert!(!dag.can_start(&"T-003".to_string()));
+
+        // Verify dependency edges
+        let deps_t3 = dag.get_dependencies(&"T-003".to_string());
+        assert_eq!(deps_t3.len(), 2);
+        assert!(deps_t3.contains(&"T-001".to_string()));
+        assert!(deps_t3.contains(&"T-002".to_string()));
+
+        // Topological sort should have T-001 first
+        let sorted = dag.topological_sort().unwrap();
+        let pos_1 = sorted.iter().position(|id| id == "T-001").unwrap();
+        let pos_2 = sorted.iter().position(|id| id == "T-002").unwrap();
+        let pos_3 = sorted.iter().position(|id| id == "T-003").unwrap();
+        assert!(pos_1 < pos_2);
+        assert!(pos_2 < pos_3);
+
+        // No cycles
+        assert_eq!(dag.detect_cycles(), CycleDetectionResult::NoCycle);
     }
 }

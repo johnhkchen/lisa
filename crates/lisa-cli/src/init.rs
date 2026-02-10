@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config;
 use crate::detect::{detect_project, DetectedProject};
 use crate::templates;
 
@@ -76,6 +77,20 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         actions.push(InitAction::CreateFile {
             path: workflow_path,
             content: templates::RDSPI_WORKFLOW.to_string(),
+        });
+    }
+
+    // .lisa.toml
+    let config_path = root.join(".lisa.toml");
+    if config_path.exists() {
+        actions.push(InitAction::Skip {
+            path: config_path,
+            reason: "already exists".to_string(),
+        });
+    } else {
+        actions.push(InitAction::CreateFile {
+            path: config_path,
+            content: config::default_config_toml().to_string(),
         });
     }
 
@@ -158,6 +173,19 @@ pub fn run_validate(root: &Path) -> Result<(), String> {
     // Check workflow file exists
     if !root.join("docs/rdspi-workflow.md").exists() {
         warnings.push("docs/rdspi-workflow.md not found. Run `lisa init` to create it.".to_string());
+    }
+
+    // Validate .lisa.toml if present
+    let config_path = root.join(".lisa.toml");
+    if config_path.exists() {
+        match config::load_config(root) {
+            Ok(_) => {
+                println!(".lisa.toml: valid");
+            }
+            Err(e) => {
+                errors.push(format!(".lisa.toml: {}", e));
+            }
+        }
     }
 
     // Check directory structure
@@ -277,12 +305,12 @@ mod tests {
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        // Should plan to create 6 directories + 2 files
+        // Should plan to create 6 directories + 3 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| !matches!(a, InitAction::Skip { .. }))
             .collect();
-        assert_eq!(creates.len(), 8);
+        assert_eq!(creates.len(), 9);
     }
 
     #[test]
@@ -302,6 +330,22 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_init_actions_existing_lisa_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "[scheduling]\nmax_threads = 4\n").unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        // .lisa.toml should be skipped
+        let skipped: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with(".lisa.toml")))
+            .collect();
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
     fn test_run_init_dry_run() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -316,6 +360,7 @@ mod tests {
         // Dry run should not create any files
         assert!(!dir.path().join("CLAUDE.md").exists());
         assert!(!dir.path().join("docs/active/tickets").exists());
+        assert!(!dir.path().join(".lisa.toml").exists());
     }
 
     #[test]
@@ -333,6 +378,7 @@ mod tests {
         // Should create all directories and files
         assert!(dir.path().join("CLAUDE.md").exists());
         assert!(dir.path().join("docs/rdspi-workflow.md").exists());
+        assert!(dir.path().join(".lisa.toml").exists());
         assert!(dir.path().join("docs/active/tickets").exists());
         assert!(dir.path().join("docs/active/stories").exists());
         assert!(dir.path().join("docs/active/work").exists());
@@ -344,6 +390,11 @@ mod tests {
         let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(claude_md.contains("test-project"));
         assert!(claude_md.contains("cargo build"));
+
+        // Check .lisa.toml content
+        let lisa_toml = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
+        assert!(lisa_toml.contains("max_threads"));
+        assert!(lisa_toml.contains("docs/active/tickets"));
     }
 
     #[test]
@@ -358,12 +409,19 @@ mod tests {
         // Create CLAUDE.md with custom content
         fs::write(dir.path().join("CLAUDE.md"), "my custom content").unwrap();
 
+        // Create .lisa.toml with custom content
+        fs::write(dir.path().join(".lisa.toml"), "# my config").unwrap();
+
         let result = run_init(dir.path(), false);
         assert!(result.is_ok());
 
         // Original CLAUDE.md should be preserved
         let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert_eq!(claude_md, "my custom content");
+
+        // Original .lisa.toml should be preserved
+        let lisa_toml = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
+        assert_eq!(lisa_toml, "# my config");
     }
 
     #[test]
@@ -386,6 +444,40 @@ mod tests {
 
         let result = run_validate(dir.path());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_valid_lisa_toml() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            "[scheduling]\nmax_threads = 4\n",
+        )
+        .unwrap();
+
+        let result = run_validate(dir.path());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_lisa_toml() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "not valid toml {{{").unwrap();
+
+        let result = run_validate(dir.path());
+        assert!(result.is_err());
     }
 
     #[test]

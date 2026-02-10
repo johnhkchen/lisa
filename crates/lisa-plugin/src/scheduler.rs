@@ -406,7 +406,7 @@ impl Scheduler {
     }
 
     /// Build the claude command arguments for a ticket.
-    fn build_claude_command(&self, ticket_id: &TicketId) -> ClaudeCommand {
+    pub(crate) fn build_claude_command(&self, ticket_id: &TicketId) -> ClaudeCommand {
         // The key insight: "Ralph's role is scheduling and lifecycle, not prompt engineering."
         // We just open a session with --dangerously-skip-permissions.
         // The agent reads the ticket file, CLAUDE.md, and docs/rdspi-workflow.md.
@@ -419,7 +419,7 @@ impl Scheduler {
                 // This is done via the prompt, which references the ticket file.
                 "--print".to_string(),
                 format!(
-                    "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/rdspi-workflow.md. \
+                    "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/knowledge/rdspi-workflow.md. \
                      Start from the current phase indicated in the ticket frontmatter.",
                     ticket_path.display()
                 ),
@@ -618,8 +618,8 @@ pub struct SpawnResult {
 }
 
 /// Internal command structure for claude invocation.
-struct ClaudeCommand {
-    args: Vec<String>,
+pub(crate) struct ClaudeCommand {
+    pub(crate) args: Vec<String>,
 }
 
 #[cfg(test)]
@@ -751,5 +751,42 @@ mod tests {
 
         // Artifact should not exist for nonexistent path
         assert!(!scheduler.phase_artifact_exists(&"T-001".to_string(), &Phase::Research));
+    }
+
+    #[test]
+    fn test_build_claude_command() {
+        let config = SchedulerConfig {
+            tickets_dir: PathBuf::from("docs/active/tickets"),
+            repo_root: PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let scheduler = Scheduler::new(config);
+
+        let cmd = scheduler.build_claude_command(&"T-001".to_string());
+
+        // Should have exactly 3 args: --dangerously-skip-permissions, --print, prompt
+        assert_eq!(cmd.args.len(), 3);
+        assert_eq!(cmd.args[0], "--dangerously-skip-permissions");
+        assert_eq!(cmd.args[1], "--print");
+
+        let prompt = &cmd.args[2];
+        // Correct ticket path
+        assert!(
+            prompt.contains("docs/active/tickets/T-001.md"),
+            "prompt should contain ticket path, got: {}",
+            prompt
+        );
+        // Correct RDSPI path
+        assert!(
+            prompt.contains("docs/knowledge/rdspi-workflow.md"),
+            "prompt should reference docs/knowledge/rdspi-workflow.md, got: {}",
+            prompt
+        );
+        // References CLAUDE.md
+        assert!(
+            prompt.contains("CLAUDE.md"),
+            "prompt should reference CLAUDE.md, got: {}",
+            prompt
+        );
     }
 }

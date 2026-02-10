@@ -1,3 +1,4 @@
+mod config;
 mod detect;
 mod init;
 mod loop_cmd;
@@ -37,9 +38,9 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
-        /// Maximum concurrent Claude sessions
-        #[arg(long, default_value = "2")]
-        max_threads: usize,
+        /// Maximum concurrent Claude sessions (overrides .lisa.toml)
+        #[arg(long)]
+        max_threads: Option<usize>,
 
         /// Show what would be done without launching zellij
         #[arg(long)]
@@ -65,9 +66,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Loop { path, max_threads, dry_run } => {
+        Commands::Loop {
+            path,
+            max_threads,
+            dry_run,
+        } => {
             let path = resolve_path(&path);
-            if let Err(e) = loop_cmd::run_loop(&path, max_threads, dry_run) {
+            let lisa_config = match config::load_config(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let resolved = config::resolve_config(&lisa_config, max_threads);
+            if let Err(e) = loop_cmd::run_loop(&path, &resolved, dry_run) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

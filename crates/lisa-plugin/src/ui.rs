@@ -12,8 +12,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use lisa_core::dag::Dag;
-use lisa_core::types::{self, ActivityEvent, PluginConfig, Thread, TicketId};
 
 /// ANSI color codes for terminal output
 mod colors {
@@ -642,188 +640,6 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
     output
 }
 
-/// Bridge function that accepts decomposed plugin state from lib.rs and renders the dashboard.
-///
-/// This converts the internal types (dag::Dag, types::Thread, etc.) into UI-local types
-/// (PluginState, TicketNode, etc.) and delegates to print_dashboard.
-pub fn render_dashboard(
-    rows: usize,
-    cols: usize,
-    dag: &Dag,
-    threads: &HashMap<TicketId, Thread>,
-    activity_log: &[ActivityEvent],
-    config: &PluginConfig,
-) {
-    let state = build_plugin_state(dag, threads, activity_log, config);
-    print_dashboard(&state, rows, cols);
-}
-
-/// Convert decomposed plugin state into a UI PluginState.
-fn build_plugin_state(
-    dag: &Dag,
-    threads: &HashMap<TicketId, Thread>,
-    activity_log: &[ActivityEvent],
-    config: &PluginConfig,
-) -> PluginState {
-    // Convert DAG tickets to UI ticket nodes
-    let tickets: Vec<TicketNode> = dag
-        .tickets()
-        .map(|t| TicketNode {
-            id: t.id.clone(),
-            title: t.title.clone(),
-            phase: convert_phase(t.phase),
-            status: convert_ticket_status(&t.status, t.phase),
-            depends_on: t.depends_on.iter().cloned().collect(),
-            blocks: t.blocks.iter().cloned().collect(),
-        })
-        .collect();
-
-    // Convert active threads
-    let active_threads: Vec<ActiveThread> = threads
-        .values()
-        .filter(|t| t.status == types::ThreadStatus::Running)
-        .map(|t| ActiveThread {
-            ticket_id: t.ticket_id.clone(),
-            phase: convert_phase(t.current_phase),
-            started_at: Duration::from_secs(
-                t.started_at
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            pane_id: t.pane_id,
-        })
-        .collect();
-
-    // Convert parked threads
-    let parked_threads: Vec<ParkedThread> = threads
-        .values()
-        .filter(|t| t.status == types::ThreadStatus::Parked)
-        .map(|t| ParkedThread {
-            ticket_id: t.ticket_id.clone(),
-            phase: convert_phase(t.current_phase),
-            artifact_path: format!(
-                "{}/{}/{}",
-                config.work_dir.display(),
-                t.ticket_id,
-                t.current_phase.artifact_filename().unwrap_or("artifact.md")
-            ),
-            parked_at: Duration::from_secs(
-                t.started_at
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            pane_id: t.pane_id,
-        })
-        .collect();
-
-    // Convert activity log
-    let activity_entries: Vec<ActivityEntry> = activity_log
-        .iter()
-        .filter_map(|e| convert_activity_event(e))
-        .collect();
-
-    PluginState {
-        tickets,
-        active_threads,
-        parked_threads,
-        activity_log: activity_entries,
-        current_time: Duration::from_secs(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ),
-        selected_ticket: None,
-    }
-}
-
-/// Convert types::Phase to ui::Phase
-fn convert_phase(phase: types::Phase) -> Phase {
-    match phase {
-        types::Phase::Ready => Phase::Ready,
-        types::Phase::Research => Phase::Research,
-        types::Phase::Design => Phase::Design,
-        types::Phase::Structure => Phase::Structure,
-        types::Phase::Plan => Phase::Plan,
-        types::Phase::Implement => Phase::Implement,
-        types::Phase::Review => Phase::Review,
-        types::Phase::Done => Phase::Done,
-    }
-}
-
-/// Convert types::TicketStatus to ui::TicketStatus
-fn convert_ticket_status(status: &types::TicketStatus, phase: types::Phase) -> TicketStatus {
-    match status {
-        types::TicketStatus::Open => {
-            if phase == types::Phase::Ready {
-                TicketStatus::Ready
-            } else {
-                TicketStatus::InProgress
-            }
-        }
-        types::TicketStatus::InProgress => TicketStatus::InProgress,
-        types::TicketStatus::Blocked => TicketStatus::Blocked,
-        types::TicketStatus::Review => TicketStatus::WaitingReview,
-        types::TicketStatus::Done => TicketStatus::Done,
-        types::TicketStatus::Cancelled => TicketStatus::Done,
-    }
-}
-
-/// Convert types::ActivityEvent to ui::ActivityEntry
-fn convert_activity_event(event: &ActivityEvent) -> Option<ActivityEntry> {
-    let timestamp = Duration::ZERO;
-
-    let activity = match event {
-        ActivityEvent::PluginStarted => return None,
-        ActivityEvent::ThreadSpawned { ticket_id, .. } => ActivityType::ThreadStarted {
-            ticket_id: ticket_id.clone(),
-            phase: Phase::Ready,
-        },
-        ActivityEvent::ThreadExited { ticket_id, .. } => ActivityType::PhaseCompleted {
-            ticket_id: ticket_id.clone(),
-            phase: Phase::Done,
-        },
-        ActivityEvent::PhaseCompleted { ticket_id, phase } => ActivityType::PhaseCompleted {
-            ticket_id: ticket_id.clone(),
-            phase: convert_phase(*phase),
-        },
-        ActivityEvent::TicketPhaseChanged {
-            ticket_id,
-            new_phase,
-            ..
-        } => ActivityType::PhaseCompleted {
-            ticket_id: ticket_id.clone(),
-            phase: convert_phase(*new_phase),
-        },
-        ActivityEvent::TicketStatusChanged { .. } => return None,
-        ActivityEvent::ArtifactCreated {
-            ticket_id, path, ..
-        } => ActivityType::Commit {
-            ticket_id: ticket_id.clone(),
-            message: format!("Created {}", path.display()),
-        },
-        ActivityEvent::CommitMade {
-            ticket_id,
-            commit_hash,
-        } => ActivityType::Commit {
-            ticket_id: ticket_id.clone(),
-            message: format!("Commit {}", commit_hash),
-        },
-        ActivityEvent::DagRecomputed { .. } => return None,
-        ActivityEvent::Error { message } => ActivityType::Error {
-            ticket_id: String::new(),
-            message: message.clone(),
-        },
-    };
-
-    Some(ActivityEntry {
-        timestamp,
-        activity,
-    })
-}
-
 /// Print the dashboard to the Zellij pane
 ///
 /// This function is the main entry point called from the plugin's render() implementation.
@@ -1049,5 +865,126 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Parked")));
         assert!(lines.iter().any(|l| l.contains("Activity")));
         assert!(lines.iter().any(|l| l.contains("Quick Jump")));
+    }
+
+    #[test]
+    fn test_pipeline_dag_to_dashboard() {
+        // Diamond DAG: T-001 -> {T-002, T-003} -> T-004
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-001".to_string(),
+                    title: "root".to_string(),
+                    phase: Phase::Done,
+                    status: TicketStatus::Done,
+                    depends_on: vec![],
+                    blocks: vec!["T-002".to_string(), "T-003".to_string()],
+                },
+                TicketNode {
+                    id: "T-002".to_string(),
+                    title: "left".to_string(),
+                    phase: Phase::Design,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec!["T-001".to_string()],
+                    blocks: vec!["T-004".to_string()],
+                },
+                TicketNode {
+                    id: "T-003".to_string(),
+                    title: "right".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Ready,
+                    depends_on: vec!["T-001".to_string()],
+                    blocks: vec!["T-004".to_string()],
+                },
+                TicketNode {
+                    id: "T-004".to_string(),
+                    title: "leaf".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-002".to_string(), "T-003".to_string()],
+                    blocks: vec![],
+                },
+            ],
+            active_threads: vec![ActiveThread {
+                ticket_id: "T-002".to_string(),
+                phase: Phase::Design,
+                started_at: Duration::from_secs(100),
+                pane_id: 5,
+            }],
+            parked_threads: vec![ParkedThread {
+                ticket_id: "T-003".to_string(),
+                phase: Phase::Research,
+                artifact_path: "docs/active/work/T-003/research.md".to_string(),
+                parked_at: Duration::from_secs(80),
+                pane_id: 6,
+            }],
+            activity_log: vec![
+                ActivityEntry {
+                    timestamp: Duration::from_secs(50),
+                    activity: ActivityType::PhaseCompleted {
+                        ticket_id: "T-001".to_string(),
+                        phase: Phase::Implement,
+                    },
+                },
+                ActivityEntry {
+                    timestamp: Duration::from_secs(100),
+                    activity: ActivityType::ThreadStarted {
+                        ticket_id: "T-002".to_string(),
+                        phase: Phase::Design,
+                    },
+                },
+                ActivityEntry {
+                    timestamp: Duration::from_secs(120),
+                    activity: ActivityType::Error {
+                        ticket_id: "T-003".to_string(),
+                        message: "test error".to_string(),
+                    },
+                },
+            ],
+            current_time: Duration::from_secs(200),
+            selected_ticket: None,
+        };
+
+        let lines = render_dashboard_lines(&state, 80, 50);
+        let full_output = lines.join("\n");
+
+        // All ticket IDs appear
+        assert!(full_output.contains("T-001"), "T-001 missing from dashboard");
+        assert!(full_output.contains("T-002"), "T-002 missing from dashboard");
+        assert!(full_output.contains("T-003"), "T-003 missing from dashboard");
+        assert!(full_output.contains("T-004"), "T-004 missing from dashboard");
+
+        // Dashboard header
+        assert!(full_output.contains("Dashboard"), "Dashboard header missing");
+
+        // Active thread section shows T-002 with Design phase
+        assert!(full_output.contains("Design"), "Active thread phase missing");
+
+        // Parked thread section shows T-003 with artifact
+        assert!(
+            full_output.contains("research.md"),
+            "Parked thread artifact missing"
+        );
+
+        // Activity log has entries
+        assert!(
+            full_output.contains("test error"),
+            "Error activity missing"
+        );
+
+        // Status line: Active: 1, Parked: 1, Done: 1/4
+        assert!(full_output.contains("Active: 1"), "Active count wrong");
+        assert!(full_output.contains("Parked: 1"), "Parked count wrong");
+        assert!(full_output.contains("Done: 1/4"), "Done count wrong");
+
+        // DAG layers: T-001 should be in first layer, T-002/T-003 in second, T-004 in third
+        let layers = compute_dag_layers(&state.tickets);
+        assert_eq!(layers.len(), 3, "Expected 3 DAG layers for diamond");
+        assert!(layers[0].contains(&0), "T-001 not in first layer");
+        assert!(
+            layers[1].contains(&1) && layers[1].contains(&2),
+            "T-002 and T-003 not in second layer"
+        );
+        assert!(layers[2].contains(&3), "T-004 not in third layer");
     }
 }

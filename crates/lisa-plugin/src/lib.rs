@@ -7,14 +7,28 @@
 mod scheduler;
 mod ui;
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use zellij_tile::prelude::*;
 
 use lisa_core::dag::Dag;
 use lisa_core::ticket;
 use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
+
+/// Build the full shell command to launch a Claude session for a ticket.
+///
+/// The ticket_dir should be the host-relative path (no /host/ prefix) since
+/// the terminal runs on the host, not inside WASI.
+fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
+    let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
+    format!(
+        "claude --dangerously-skip-permissions \
+         \"Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/knowledge/rdspi-workflow.md. \
+         Start from the current phase indicated in the ticket frontmatter.\"\n",
+        ticket_path.display()
+    )
+}
 
 /// Main plugin state
 ///
@@ -43,6 +57,13 @@ pub struct State {
     /// Tracks which pane IDs correspond to which threads.
     /// Used to correlate PaneUpdate and CommandPaneExited events.
     pane_to_ticket: HashMap<u32, TicketId>,
+
+    /// Ticket IDs waiting for a terminal pane to appear.
+    /// We open a terminal, then write the claude command to it once we see it in PaneUpdate.
+    pending_spawns: Vec<TicketId>,
+
+    /// Set of known terminal pane IDs (to detect newly opened ones).
+    known_pane_ids: HashSet<u32>,
 
     /// Whether initial loading has completed.
     initialized: bool,
@@ -114,34 +135,16 @@ impl State {
                 continue;
             }
 
-            // Build the ticket file path for the prompt
-            let ticket_path = self.config.ticket_dir.join(format!("{}.md", &ticket_id));
+            // Skip tickets already pending spawn
+            if self.pending_spawns.contains(&ticket_id) {
+                continue;
+            }
 
-            // Context for correlating pane events back to this ticket
-            let context = BTreeMap::from([("ticket_id".to_string(), ticket_id.clone())]);
+            // Open a terminal pane near the plugin (same tab, joins the stacked layout).
+            // The claude command will be written to stdin once we detect the pane in PaneUpdate.
+            open_terminal_near_plugin(PathBuf::from("/host"));
 
-            // Spawn a floating command pane running claude
-            open_command_pane_floating(
-                CommandToRun {
-                    path: PathBuf::from("claude"),
-                    args: vec![
-                        "--dangerously-skip-permissions".to_string(),
-                        "--print".to_string(),
-                        format!(
-                            "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/rdspi-workflow.md. \
-                             Start from the current phase indicated in the ticket frontmatter.",
-                            ticket_path.display()
-                        ),
-                    ],
-                    cwd: None,
-                },
-                Some(FloatingPaneCoordinates::default()),
-                context,
-            );
-
-            // Create a thread record (pane_id will be updated via PaneUpdate)
-            let thread = Thread::new(ticket_id.clone(), 0);
-            self.threads.insert(ticket_id.clone(), thread);
+            self.pending_spawns.push(ticket_id.clone());
 
             self.log_activity(ActivityEvent::ThreadSpawned {
                 ticket_id,
@@ -152,11 +155,72 @@ impl State {
         }
     }
 
-    /// Handle a pane exiting (Claude session ended)
-    fn handle_pane_exited(&mut self, pane_id: u32, exit_code: Option<i32>) {
-        if let Some(ticket_id) = self.pane_to_ticket.remove(&pane_id) {
+    /// Called on PaneUpdate to detect newly opened terminals and write the claude command.
+    fn handle_pane_update(&mut self, pane_manifest: &PaneManifest) {
+        // Collect all current terminal pane IDs across all tabs
+        let mut current_terminal_ids: HashSet<u32> = HashSet::new();
+        for panes in pane_manifest.panes.values() {
+            for pane in panes {
+                if !pane.is_plugin {
+                    current_terminal_ids.insert(pane.id);
+                }
+            }
+        }
+
+        // Find new pane IDs that weren't in our known set
+        let new_ids: Vec<u32> = current_terminal_ids
+            .difference(&self.known_pane_ids)
+            .copied()
+            .collect();
+
+        // For each new pane, if we have a pending spawn, wire it up
+        for new_pane_id in new_ids {
+            if let Some(ticket_id) = self.pending_spawns.pop() {
+                // Build the host-relative ticket dir (strip /host/ prefix)
+                let host_ticket_dir = PathBuf::from(
+                    self.config
+                        .ticket_dir
+                        .to_string_lossy()
+                        .strip_prefix("/host/")
+                        .unwrap_or(&self.config.ticket_dir.to_string_lossy()),
+                );
+
+                // Write the claude command to the new terminal's stdin
+                let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
+                write_chars_to_pane_id(&cmd, PaneId::Terminal(new_pane_id));
+
+                // Create thread record with the ticket's current phase
+                let mut thread = Thread::new(ticket_id.clone(), new_pane_id);
+                if let Some(ticket) = self.dag.get_ticket(&ticket_id) {
+                    thread.current_phase = ticket.phase;
+                }
+                self.threads.insert(ticket_id.clone(), thread);
+                self.pane_to_ticket.insert(new_pane_id, ticket_id);
+            }
+        }
+
+        // Update known set
+        self.known_pane_ids = current_terminal_ids;
+    }
+
+    /// Handle a pane exiting (Claude session ended).
+    ///
+    /// Uses the context BTreeMap echoed back from `open_command_pane` to identify
+    /// which ticket the pane belongs to. Falls back to the `pane_to_ticket` map.
+    fn handle_pane_exited(
+        &mut self,
+        pane_id: u32,
+        exit_code: Option<i32>,
+        context: BTreeMap<String, String>,
+    ) {
+        // Prefer context-based lookup (set at spawn time), fall back to pane_to_ticket
+        let ticket_id = context
+            .get("ticket_id")
+            .cloned()
+            .or_else(|| self.pane_to_ticket.remove(&pane_id));
+
+        if let Some(ticket_id) = ticket_id {
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
-                // Mark thread as completed or failed based on exit code
                 match exit_code {
                     Some(0) | None => thread.complete(),
                     Some(_) => thread.fail(),
@@ -248,19 +312,40 @@ impl ZellijPlugin for State {
         // Parse configuration
         self.config = PluginConfig::from_config_map(&configuration);
 
+        // Inside zellij's WASI sandbox, the host filesystem is mounted at /host.
+        // Prefix relative config paths so std::fs can reach the project files.
+        let host = PathBuf::from("/host");
+        if !self.config.ticket_dir.is_absolute() {
+            self.config.ticket_dir = host.join(&self.config.ticket_dir);
+        }
+        if !self.config.story_dir.is_absolute() {
+            self.config.story_dir = host.join(&self.config.story_dir);
+        }
+        if !self.config.work_dir.is_absolute() {
+            self.config.work_dir = host.join(&self.config.work_dir);
+        }
+
         // Subscribe to the events we need
         subscribe(&[
             EventType::PaneUpdate,
             EventType::FileSystemUpdate,
             EventType::CommandPaneExited,
+            EventType::PermissionRequestResult,
             EventType::Key,
             EventType::Mouse,
             EventType::Timer,
         ]);
 
-        // Initial DAG build and schedule any ready tickets
+        // Request permissions needed to spawn Claude sessions and write to their stdin
+        request_permission(&[
+            PermissionType::OpenTerminalsOrPlugins,
+            PermissionType::WriteToStdin,
+            PermissionType::ChangeApplicationState,
+            PermissionType::ReadApplicationState,
+        ]);
+
+        // Initial DAG build (scheduling deferred until permissions are granted)
         self.rebuild_dag();
-        self.schedule_ready_tickets();
 
         // Mark as initialized
         self.initialized = true;
@@ -284,14 +369,27 @@ impl ZellijPlugin for State {
                 should_render = true;
             }
 
-            Event::CommandPaneExited(pane_id, exit_code, _context) => {
-                self.handle_pane_exited(pane_id, exit_code);
+            Event::CommandPaneExited(pane_id, exit_code, context) => {
+                self.handle_pane_exited(pane_id, exit_code, context);
                 self.schedule_ready_tickets();
                 should_render = true;
             }
 
+            Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                // Permissions granted — now we can spawn Claude sessions
+                self.schedule_ready_tickets();
+                should_render = true;
+            }
+
+            Event::PermissionRequestResult(PermissionStatus::Denied) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: "Permissions denied — cannot spawn Claude sessions".to_string(),
+                });
+                should_render = true;
+            }
+
             Event::PaneUpdate(pane_manifest) => {
-                let _ = pane_manifest;
+                self.handle_pane_update(&pane_manifest);
                 should_render = true;
             }
 
@@ -501,3 +599,217 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
 
 // Register the plugin with Zellij
 register_plugin!(State);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
+
+    #[test]
+    fn test_phase_to_ui_phase() {
+        assert_eq!(phase_to_ui_phase(Phase::Ready), ui::Phase::Ready);
+        assert_eq!(phase_to_ui_phase(Phase::Research), ui::Phase::Research);
+        assert_eq!(phase_to_ui_phase(Phase::Design), ui::Phase::Design);
+        assert_eq!(phase_to_ui_phase(Phase::Structure), ui::Phase::Structure);
+        assert_eq!(phase_to_ui_phase(Phase::Plan), ui::Phase::Plan);
+        assert_eq!(phase_to_ui_phase(Phase::Implement), ui::Phase::Implement);
+        assert_eq!(phase_to_ui_phase(Phase::Review), ui::Phase::Review);
+        assert_eq!(phase_to_ui_phase(Phase::Done), ui::Phase::Done);
+    }
+
+    #[test]
+    fn test_ticket_status_to_ui_status() {
+        // Open + Ready = Ready
+        assert_eq!(
+            ticket_status_to_ui_status(&TicketStatus::Open, Phase::Ready),
+            ui::TicketStatus::Ready
+        );
+        // Open + active phase = InProgress
+        assert_eq!(
+            ticket_status_to_ui_status(&TicketStatus::Open, Phase::Research),
+            ui::TicketStatus::InProgress
+        );
+        assert_eq!(
+            ticket_status_to_ui_status(&TicketStatus::InProgress, Phase::Implement),
+            ui::TicketStatus::InProgress
+        );
+        assert_eq!(
+            ticket_status_to_ui_status(&TicketStatus::Blocked, Phase::Ready),
+            ui::TicketStatus::Blocked
+        );
+        assert_eq!(
+            ticket_status_to_ui_status(&TicketStatus::Review, Phase::Review),
+            ui::TicketStatus::WaitingReview
+        );
+        assert_eq!(
+            ticket_status_to_ui_status(&TicketStatus::Done, Phase::Done),
+            ui::TicketStatus::Done
+        );
+        assert_eq!(
+            ticket_status_to_ui_status(&TicketStatus::Cancelled, Phase::Done),
+            ui::TicketStatus::Done
+        );
+    }
+
+    #[test]
+    fn test_activity_event_to_ui_entry() {
+        // PluginStarted returns None
+        assert!(activity_event_to_ui_entry(&ActivityEvent::PluginStarted).is_none());
+
+        // DagRecomputed returns None
+        assert!(
+            activity_event_to_ui_entry(&ActivityEvent::DagRecomputed { ticket_count: 5 }).is_none()
+        );
+
+        // TicketStatusChanged returns None
+        assert!(activity_event_to_ui_entry(&ActivityEvent::TicketStatusChanged {
+            ticket_id: "T-001".to_string(),
+            old_status: TicketStatus::Open,
+            new_status: TicketStatus::InProgress,
+        })
+        .is_none());
+
+        // ThreadSpawned returns ThreadStarted
+        let entry = activity_event_to_ui_entry(&ActivityEvent::ThreadSpawned {
+            ticket_id: "T-001".to_string(),
+            pane_id: 42,
+        });
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        match &entry.activity {
+            ui::ActivityType::ThreadStarted { ticket_id, .. } => {
+                assert_eq!(ticket_id, "T-001");
+            }
+            other => panic!("Expected ThreadStarted, got {:?}", other),
+        }
+
+        // PhaseCompleted maps correctly
+        let entry = activity_event_to_ui_entry(&ActivityEvent::PhaseCompleted {
+            ticket_id: "T-002".to_string(),
+            phase: Phase::Design,
+        });
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        match &entry.activity {
+            ui::ActivityType::PhaseCompleted { ticket_id, phase } => {
+                assert_eq!(ticket_id, "T-002");
+                assert_eq!(*phase, ui::Phase::Design);
+            }
+            other => panic!("Expected PhaseCompleted, got {:?}", other),
+        }
+
+        // Error maps correctly
+        let entry = activity_event_to_ui_entry(&ActivityEvent::Error {
+            message: "something broke".to_string(),
+        });
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        match &entry.activity {
+            ui::ActivityType::Error { message, .. } => {
+                assert_eq!(message, "something broke");
+            }
+            other => panic!("Expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_claude_command() {
+        let ticket_dir = Path::new("docs/active/tickets");
+        let cmd = build_claude_command(ticket_dir, "T-042-01");
+
+        assert!(cmd.contains("claude --dangerously-skip-permissions"));
+        assert!(
+            cmd.contains("docs/active/tickets/T-042-01.md"),
+            "command should contain ticket path, got: {}",
+            cmd
+        );
+        assert!(
+            cmd.contains("docs/knowledge/rdspi-workflow.md"),
+            "command should reference docs/knowledge/rdspi-workflow.md, got: {}",
+            cmd
+        );
+        assert!(
+            cmd.contains("CLAUDE.md"),
+            "command should reference CLAUDE.md, got: {}",
+            cmd
+        );
+        assert!(cmd.ends_with('\n'), "command should end with newline");
+    }
+
+    #[test]
+    fn test_handle_pane_exited_with_context() {
+        use lisa_core::types::{Thread, ThreadStatus};
+
+        let mut state = State::default();
+
+        // Register a thread for T-001
+        let thread = Thread::new("T-001".to_string(), 0);
+        state.threads.insert("T-001".to_string(), thread);
+
+        // Simulate CommandPaneExited with context containing ticket_id
+        let context = BTreeMap::from([("ticket_id".to_string(), "T-001".to_string())]);
+        state.handle_pane_exited(42, Some(0), context);
+
+        // Thread should be marked completed
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(thread.status, ThreadStatus::Completed);
+
+        // Activity log should have an exit event
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::ThreadExited {
+                ticket_id,
+                exit_code: Some(0),
+            } if ticket_id == "T-001"
+        )));
+    }
+
+    #[test]
+    fn test_handle_pane_exited_failure() {
+        use lisa_core::types::{Thread, ThreadStatus};
+
+        let mut state = State::default();
+
+        let thread = Thread::new("T-002".to_string(), 0);
+        state.threads.insert("T-002".to_string(), thread);
+
+        let context = BTreeMap::from([("ticket_id".to_string(), "T-002".to_string())]);
+        state.handle_pane_exited(99, Some(1), context);
+
+        let thread = state.threads.get("T-002").unwrap();
+        assert_eq!(thread.status, ThreadStatus::Failed);
+    }
+
+    #[test]
+    fn test_handle_pane_exited_no_context_fallback() {
+        use lisa_core::types::{Thread, ThreadStatus};
+
+        let mut state = State::default();
+
+        let thread = Thread::new("T-003".to_string(), 55);
+        state.threads.insert("T-003".to_string(), thread);
+        state.pane_to_ticket.insert(55, "T-003".to_string());
+
+        // Empty context — should fall back to pane_to_ticket
+        let context = BTreeMap::new();
+        state.handle_pane_exited(55, Some(0), context);
+
+        let thread = state.threads.get("T-003").unwrap();
+        assert_eq!(thread.status, ThreadStatus::Completed);
+    }
+}
+
+// wasm32-wasip1 + cdylib produces a reactor module (no entry point).
+// Zellij expects a command-style _start export to initialize the WASM instance.
+// We must call __wasm_call_ctors to run WASI/Rust initialization (allocator, etc.)
+// before any std:: functions (like std::fs) can be used.
+extern "C" {
+    fn __wasm_call_ctors();
+}
+
+#[no_mangle]
+pub extern "C" fn _start() {
+    unsafe {
+        __wasm_call_ctors();
+    }
+}
