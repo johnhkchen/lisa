@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_active_phase_tickets_are_startable() {
-        // All non-done phases are schedulable (agents can start or resume)
+        // Ready through Implement are schedulable
         for phase in &[
             Phase::Ready,
             Phase::Research,
@@ -613,7 +613,6 @@ mod tests {
             Phase::Structure,
             Phase::Plan,
             Phase::Implement,
-            Phase::Review,
         ] {
             let ticket = make_ticket("T-001", *phase, vec![], vec![]);
             let dag = Dag::from_tickets(vec![ticket]).unwrap();
@@ -623,6 +622,14 @@ mod tests {
                 phase
             );
         }
+    }
+
+    #[test]
+    fn test_review_phase_not_startable() {
+        // Review is parked — waiting for human, not schedulable
+        let ticket = make_ticket("T-001", Phase::Review, vec![], vec![]);
+        let dag = Dag::from_tickets(vec![ticket]).unwrap();
+        assert!(!dag.can_start(&"T-001".to_string()));
     }
 
     #[test]

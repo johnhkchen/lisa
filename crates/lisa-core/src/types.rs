@@ -100,12 +100,10 @@ impl Phase {
 
     /// Returns true if this phase indicates the ticket can be scheduled.
     ///
-    /// All phases except Done are schedulable — an agent can start fresh
-    /// (ready), resume interrupted work (research..implement), or perform
-    /// an LLM-assisted review. Human review happens at the story/sprint
-    /// level, not per-ticket.
+    /// Ready through Implement are schedulable. Review and Done are not —
+    /// Review is parked waiting for human action, Done is terminal.
     pub fn is_startable(&self) -> bool {
-        !matches!(self, Phase::Done)
+        !matches!(self, Phase::Review | Phase::Done)
     }
 
     /// Returns true if this phase indicates active work is happening.
