@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build-wasm:
+    name: Build WASM plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Version: $TAG_VERSION"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: wasm-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: wasm-cargo-
+
+      - name: Build WASM plugin
+        run: cargo build -p lisa-plugin --target wasm32-wasip1 --release
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lisa-wasm
+          path: target/wasm32-wasip1/release/lisa.wasm
+          retention-days: 1
+
+  build-cli:
+    name: Build CLI (${{ matrix.target }})
+    needs: build-wasm
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: lisa-x86_64-linux
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: lisa-aarch64-linux
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact_name: lisa-x86_64-macos
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: lisa-aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lisa-wasm
+          path: target/wasm32-wasip1/release/
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build -p lisa-cli --release --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build -p lisa-cli --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Linux)
+        if: contains(matrix.target, 'linux') && !matrix.use_cross
+        run: strip target/${{ matrix.target }}/release/lisa
+
+      - name: Strip binary (macOS)
+        if: contains(matrix.target, 'apple')
+        run: strip target/${{ matrix.target }}/release/lisa
+
+      - name: Package binary
+        run: tar czf ${{ matrix.artifact_name }}.tar.gz -C target/${{ matrix.target }}/release lisa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.tar.gz
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build-cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: lisa-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            artifacts/*.tar.gz \
+            artifacts/sha256sums.txt

@@ -6,20 +6,47 @@ Lisa reads ticket files with YAML frontmatter, computes a dependency graph, and 
 
 ## Install
 
-```bash
-# CLI only (lisa init, lisa validate, lisa status)
-cargo install lisa-cli
+### Prebuilt binaries (recommended)
 
-# From source (full functionality including lisa loop)
+Download the latest release for your platform:
+
+```bash
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-aarch64-macos.tar.gz | tar xz
+sudo mv lisa /usr/local/bin/
+
+# macOS (Intel)
+curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-x86_64-macos.tar.gz | tar xz
+sudo mv lisa /usr/local/bin/
+
+# Linux (x86_64)
+curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-x86_64-linux.tar.gz | tar xz
+sudo mv lisa /usr/local/bin/
+
+# Linux (ARM64)
+curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-aarch64-linux.tar.gz | tar xz
+sudo mv lisa /usr/local/bin/
+```
+
+Or download from the [releases page](https://github.com/johnhkchen/lisa/releases).
+
+### From crates.io
+
+```bash
+cargo install lisa-cli
+```
+
+> **Note:** `cargo install` provides the CLI without the embedded Zellij WASM plugin.
+> The `lisa loop` command requires building from source or using a prebuilt binary.
+
+### From source
+
+```bash
 git clone https://github.com/johnhkchen/lisa
 cd lisa
 rustup target add wasm32-wasip1
 just release
 ```
-
-> **Note:** `cargo install` provides the CLI without the embedded Zellij WASM plugin.
-> The `lisa loop` command requires building from source so the plugin can be compiled
-> and embedded into the binary.
 
 ## Build
 

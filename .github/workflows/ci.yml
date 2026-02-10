@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (lisa-core)
+        run: cargo clippy -p lisa-core -- -D warnings
+
+      - name: Clippy (lisa-cli)
+        run: cargo clippy -p lisa-cli -- -D warnings
+
+      - name: Clippy (lisa-plugin, WASM)
+        run: cargo clippy -p lisa-plugin --target wasm32-wasip1 -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Check WASM plugin builds
+        run: cargo check -p lisa-plugin --target wasm32-wasip1

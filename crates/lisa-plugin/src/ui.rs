@@ -503,6 +503,19 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
         ));
     }
 
+    // Hint row
+    let hint = "Press [d] to mark done";
+    let hint_len = hint.chars().count();
+    let hint_pad = inner_w.saturating_sub(hint_len);
+    output.push(format!(
+        "{}{}║{} {}{}{} {}║{}",
+        BOLD, BRIGHT_YELLOW,
+        RESET,
+        DIM, hint, RESET,
+        format!("{}{}{}", " ".repeat(hint_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+        RESET
+    ));
+
     // Bottom border
     output.push(format!(
         "{}{}╚{}╝{}",
