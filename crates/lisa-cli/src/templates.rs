@@ -15,18 +15,67 @@ pub const ON_IDLE_HOOK: &str = r#"#!/bin/sh
 SIGNAL_DIR=".lisa/signals"
 mkdir -p "$SIGNAL_DIR"
 
-if [ -n "$LISA_TICKET_ID" ]; then
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/$LISA_TICKET_ID.idle"
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.idle"
+fi
+"#;
+
+/// The on-stop hook script, called by Claude Code's Stop event.
+/// Fires when Claude finishes responding (ready for input).
+pub const ON_STOP_HOOK: &str = r#"#!/bin/sh
+# Lisa stop signal hook — called by Claude Code when it finishes responding.
+# Writes a signal file so the plugin knows the pane is ready for input.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
+fi
+"#;
+
+/// The on-clear hook script, called by Claude Code's SessionStart[clear] event.
+/// Fires after /clear is processed (context cleared).
+pub const ON_CLEAR_HOOK: &str = r#"#!/bin/sh
+# Lisa clear signal hook — called by Claude Code after /clear is processed.
+# Writes a signal file so the plugin knows context has been cleared.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.cleared"
 fi
 "#;
 
 /// Gitignore content for the .lisa/ directory — ignores ephemeral signal files.
 pub const LISA_GITIGNORE: &str = "signals/\n";
 
-/// Generate .claude/settings.local.json with the idle_prompt notification hook.
+/// Generate .claude/settings.local.json with Stop, SessionStart, and Notification hooks.
 pub fn settings_local_json() -> String {
     r#"{
   "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".lisa/hooks/on-stop.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".lisa/hooks/on-clear.sh"
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "matcher": "idle_prompt",
@@ -42,6 +91,91 @@ pub fn settings_local_json() -> String {
 }
 "#
     .to_string()
+}
+
+/// Ensure a single hook entry exists in the hooks object.
+/// For hooks with a matcher (SessionStart, Notification), deduplication checks the matcher value.
+/// For hooks without a matcher (Stop), deduplication checks the command path.
+fn ensure_hook(
+    hooks_obj: &mut serde_json::Map<String, serde_json::Value>,
+    event_type: &str,
+    matcher: Option<&str>,
+    command: &str,
+) {
+    let entries = hooks_obj
+        .entry(event_type)
+        .or_insert_with(|| serde_json::json!([]));
+    let arr = match entries.as_array_mut() {
+        Some(a) => a,
+        None => return,
+    };
+
+    let already_exists = match matcher {
+        Some(m) => arr
+            .iter()
+            .any(|entry| entry.get("matcher").and_then(|v| v.as_str()) == Some(m)),
+        None => arr.iter().any(|entry| {
+            entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map_or(false, |hooks| {
+                    hooks
+                        .iter()
+                        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command))
+                })
+        }),
+    };
+
+    if !already_exists {
+        let mut entry = serde_json::Map::new();
+        if let Some(m) = matcher {
+            entry.insert("matcher".to_string(), serde_json::json!(m));
+        }
+        entry.insert(
+            "hooks".to_string(),
+            serde_json::json!([{
+                "type": "command",
+                "command": command
+            }]),
+        );
+        arr.push(serde_json::Value::Object(entry));
+    }
+}
+
+/// Merge all Lisa hooks (Stop, SessionStart[clear], Notification[idle_prompt]) into
+/// an existing settings.local.json. Returns the updated JSON string, or an error if
+/// the JSON is malformed.
+pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
+    let mut root: serde_json::Value = serde_json::from_str(existing_json)
+        .map_err(|e| format!("invalid JSON in settings.local.json: {}", e))?;
+
+    let obj = root
+        .as_object_mut()
+        .ok_or("settings.local.json root is not an object")?;
+
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or("settings.local.json 'hooks' is not an object")?;
+
+    ensure_hook(hooks_obj, "Stop", None, ".lisa/hooks/on-stop.sh");
+    ensure_hook(
+        hooks_obj,
+        "SessionStart",
+        Some("clear"),
+        ".lisa/hooks/on-clear.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "Notification",
+        Some("idle_prompt"),
+        ".lisa/hooks/on-idle.sh",
+    );
+
+    serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("failed to serialize JSON: {}", e))
 }
 
 /// Generate a project-specific CLAUDE.md
@@ -195,22 +329,97 @@ mod tests {
     #[test]
     fn test_on_idle_hook_content() {
         assert!(ON_IDLE_HOOK.starts_with("#!/bin/sh"));
-        assert!(ON_IDLE_HOOK.contains("LISA_TICKET_ID"));
+        assert!(ON_IDLE_HOOK.contains("LISA_PANE_ID"));
         assert!(ON_IDLE_HOOK.contains(".lisa/signals"));
         assert!(ON_IDLE_HOOK.contains(".idle"));
     }
 
     #[test]
+    fn test_on_stop_hook_content() {
+        assert!(ON_STOP_HOOK.starts_with("#!/bin/sh"));
+        assert!(ON_STOP_HOOK.contains("LISA_PANE_ID"));
+        assert!(ON_STOP_HOOK.contains(".lisa/signals"));
+        assert!(ON_STOP_HOOK.contains(".stopped"));
+    }
+
+    #[test]
+    fn test_on_clear_hook_content() {
+        assert!(ON_CLEAR_HOOK.starts_with("#!/bin/sh"));
+        assert!(ON_CLEAR_HOOK.contains("LISA_PANE_ID"));
+        assert!(ON_CLEAR_HOOK.contains(".lisa/signals"));
+        assert!(ON_CLEAR_HOOK.contains(".cleared"));
+    }
+
+    #[test]
     fn test_settings_local_json() {
         let json = settings_local_json();
-        assert!(json.contains("idle_prompt"));
+        // All three hook types present
+        assert!(json.contains("\"Stop\""));
+        assert!(json.contains("\"SessionStart\""));
+        assert!(json.contains("\"Notification\""));
+        // Hook commands
+        assert!(json.contains("on-stop.sh"));
+        assert!(json.contains("on-clear.sh"));
         assert!(json.contains("on-idle.sh"));
-        assert!(json.contains("Notification"));
+        // Matchers
+        assert!(json.contains("\"clear\""));
+        assert!(json.contains("idle_prompt"));
         assert!(json.contains(r#""type": "command""#));
     }
 
     #[test]
     fn test_lisa_gitignore_content() {
         assert!(LISA_GITIGNORE.contains("signals/"));
+    }
+
+    #[test]
+    fn test_merge_hooks_empty_object() {
+        let result = merge_hooks("{}").unwrap();
+        assert!(result.contains("\"Stop\""));
+        assert!(result.contains("on-stop.sh"));
+        assert!(result.contains("\"SessionStart\""));
+        assert!(result.contains("on-clear.sh"));
+        assert!(result.contains("\"Notification\""));
+        assert!(result.contains("idle_prompt"));
+        assert!(result.contains("on-idle.sh"));
+    }
+
+    #[test]
+    fn test_merge_hooks_with_existing_idle_only() {
+        // Start with only idle_prompt — should add Stop + SessionStart
+        let input = r#"{"hooks":{"Notification":[{"matcher":"idle_prompt","hooks":[{"type":"command","command":".lisa/hooks/on-idle.sh"}]}]}}"#;
+        let result = merge_hooks(input).unwrap();
+        assert!(result.contains("\"Stop\""));
+        assert!(result.contains("on-stop.sh"));
+        assert!(result.contains("\"SessionStart\""));
+        assert!(result.contains("on-clear.sh"));
+        // idle_prompt should not be duplicated
+        assert_eq!(result.matches("idle_prompt").count(), 1);
+    }
+
+    #[test]
+    fn test_merge_hooks_already_complete() {
+        let input = settings_local_json();
+        let result = merge_hooks(&input).unwrap();
+        // No duplicates
+        assert_eq!(result.matches("on-stop.sh").count(), 1);
+        assert_eq!(result.matches("on-clear.sh").count(), 1);
+        assert_eq!(result.matches("idle_prompt").count(), 1);
+    }
+
+    #[test]
+    fn test_merge_hooks_preserves_permissions() {
+        let input = r#"{"permissions":{"allow":["Bash(cargo test:*)"]}}"#;
+        let result = merge_hooks(input).unwrap();
+        assert!(result.contains("cargo test"));
+        assert!(result.contains("on-stop.sh"));
+        assert!(result.contains("on-clear.sh"));
+        assert!(result.contains("idle_prompt"));
+    }
+
+    #[test]
+    fn test_merge_hooks_invalid_json() {
+        let result = merge_hooks("not json");
+        assert!(result.is_err());
     }
 }

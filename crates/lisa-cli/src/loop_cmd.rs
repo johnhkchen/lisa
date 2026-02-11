@@ -36,8 +36,18 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         );
     }
 
-    // Write WASM to a stable temp path
-    let wasm_path = std::env::temp_dir().join("lisa-plugin.wasm");
+    // Write WASM to a content-hashed temp path so Zellij's plugin cache is
+    // busted whenever the plugin binary changes.
+    let hash = {
+        // Simple FNV-1a hash of the WASM bytes — fast, no extra deps
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &byte in PLUGIN_WASM {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    };
+    let wasm_path = std::env::temp_dir().join(format!("lisa-plugin-{:016x}.wasm", hash));
     std::fs::write(&wasm_path, PLUGIN_WASM)
         .map_err(|e| format!("Failed to write WASM plugin to {}: {}", wasm_path.display(), e))?;
 

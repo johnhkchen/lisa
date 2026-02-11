@@ -13,6 +13,7 @@ build-dev:
 
 # Build the CLI (builds WASM plugin first so it gets embedded)
 build-cli: build
+    touch target/wasm32-wasip1/release/lisa.wasm
     cargo build -p lisa-cli --release
 
 # Build everything for distribution
@@ -43,8 +44,13 @@ clean:
 watch:
     cargo watch -x 'check -p lisa-plugin --target wasm32-wasip1' -x 'test --workspace'
 
-# Copy built plugin to a target project
-install PATH:
+# Build WASM + install CLI to CARGO_HOME/bin (replaces cargo install)
+install: build
+    touch target/wasm32-wasip1/release/lisa.wasm
+    cargo install --path crates/lisa-cli --force
+
+# Copy built plugin WASM to a target project
+install-wasm PATH:
     cargo build -p lisa-plugin --target wasm32-wasip1 --release
     cp target/wasm32-wasip1/release/lisa.wasm {{PATH}}
 

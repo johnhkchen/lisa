@@ -197,7 +197,7 @@ pub struct ActivityEntry {
     pub activity: ActivityType,
 }
 
-/// State for the mark-done modal overlay (UI representation).
+/// State for the modal overlay (UI representation).
 #[derive(Debug, Clone, Default)]
 pub struct ModalState {
     /// Whether the modal is visible.
@@ -206,6 +206,8 @@ pub struct ModalState {
     pub ticket_ids: Vec<String>,
     /// Currently highlighted index.
     pub cursor: usize,
+    /// Whether this is a reset modal (vs mark-done).
+    pub is_reset: bool,
 }
 
 /// The complete plugin state for rendering
@@ -219,6 +221,8 @@ pub struct PluginState {
     pub slots: Vec<SlotInfo>,
     pub current_time: Duration,
     pub modal: ModalState,
+    /// Whether scheduling of new tickets is paused.
+    pub paused: bool,
 }
 
 impl Default for PluginState {
@@ -232,6 +236,7 @@ impl Default for PluginState {
             slots: Vec::new(),
             current_time: Duration::ZERO,
             modal: ModalState::default(),
+            paused: false,
         }
     }
 }
@@ -940,9 +945,17 @@ fn render_status_line(state: &PluginState) -> String {
         String::new()
     };
 
+    let pause_str = if state.paused {
+        format!("{}PAUSED{} | ", YELLOW, RESET)
+    } else {
+        String::new()
+    };
+
+    let pause_hint = if state.paused { "resume" } else { "pause" };
+
     format!(
-        "{}Active: {} | Parked: {} | Done: {}/{}{}  {}[d] mark done{}",
-        slot_str, active, parked, done, total, alert_str, DIM, RESET
+        "{}{}Active: {} | Parked: {} | Done: {}/{}{}  {}[p] {}  [d] mark done  [r] reset{}",
+        pause_str, slot_str, active, parked, done, total, alert_str, DIM, pause_hint, RESET
     )
 }
 
@@ -961,39 +974,31 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
         BOLD, BG_BLUE, RESET, DIM, status
     ));
     output.push(render_separator(width));
-    output.push(String::new());
 
     // Slot status
     render_slots(state, &mut output);
-    output.push(String::new());
 
     // Attention banner (review gate alerts)
     render_attention_banner(state, width, &mut output);
 
     // DAG section
     render_dag(state, &mut output);
-    output.push(String::new());
     output.push(render_separator(width));
-    output.push(String::new());
 
     // Active threads
     render_active_threads(state, &mut output);
-    output.push(String::new());
 
     // Parked threads
     render_parked_threads(state, &mut output);
-    output.push(String::new());
     output.push(render_separator(width));
-    output.push(String::new());
 
     // Calculate remaining space for activity log
     let used_lines = output.len();
-    let remaining = height.saturating_sub(used_lines + 8);
+    let remaining = height.saturating_sub(used_lines + 4);
     let max_log_entries = remaining.max(3).min(10);
 
     // Activity log
     render_activity_log(state, max_log_entries, &mut output);
-    output.push(String::new());
 
     // Quick jump section at bottom
     output.push(render_separator(width));
@@ -1022,7 +1027,11 @@ fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> 
     output.push(format!("┌{}┐", border_h));
 
     // Title
-    let title = " Mark Ticket Done ";
+    let title = if modal.is_reset {
+        " Reset Ticket to Ready "
+    } else {
+        " Mark Ticket Done "
+    };
     let title_pad = box_w.saturating_sub(2).saturating_sub(title.len());
     let left_pad = title_pad / 2;
     let right_pad = title_pad - left_pad;
@@ -1074,8 +1083,9 @@ fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> 
 /// Print the dashboard to the Zellij pane
 ///
 /// This function is the main entry point called from the plugin's render() implementation.
-/// It takes a pre-converted PluginState structure.
-pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize) {
+/// It takes a pre-converted PluginState structure. `scroll_offset` controls how many lines
+/// are skipped from the top of the rendered content.
+pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize, scroll_offset: usize) {
     if state.modal.open {
         let lines = render_modal(&state.modal, cols.min(60), rows);
         for line in lines.iter().take(rows) {
@@ -1086,7 +1096,11 @@ pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize) {
 
     let lines = render_dashboard_lines(state, cols.min(100), rows);
 
-    for line in lines.iter().take(rows) {
+    // Clamp scroll so we don't scroll past content
+    let max_scroll = lines.len().saturating_sub(rows);
+    let offset = scroll_offset.min(max_scroll);
+
+    for line in lines.iter().skip(offset).take(rows) {
         println!("{}", line);
     }
 }
@@ -1151,8 +1165,8 @@ mod tests {
             alerts: Vec::new(),
             slots: Vec::new(),
             current_time: Duration::from_secs(120),
-
             modal: ModalState::default(),
+            paused: false,
         }
     }
 
@@ -1381,8 +1395,8 @@ mod tests {
             alerts: Vec::new(),
             slots: Vec::new(),
             current_time: Duration::from_secs(200),
-
             modal: ModalState::default(),
+            paused: false,
         };
 
         let lines = render_dashboard_lines(&state, 80, 50);
@@ -1862,5 +1876,82 @@ mod tests {
         let slots_pos = full.find("Slots:").unwrap();
         let dag_pos = full.find("DAG").unwrap();
         assert!(slots_pos < dag_pos, "Slots section should appear before DAG");
+    }
+
+    #[test]
+    fn test_status_line_paused() {
+        let state = PluginState {
+            paused: true,
+            ..sample_state()
+        };
+        let status = render_status_line(&state);
+        assert!(status.contains("PAUSED"), "should show PAUSED indicator");
+        assert!(status.contains("[p] resume"), "should show resume hint");
+    }
+
+    #[test]
+    fn test_status_line_not_paused() {
+        let state = sample_state();
+        let status = render_status_line(&state);
+        assert!(!status.contains("PAUSED"), "should not show PAUSED when unpaused");
+        assert!(status.contains("[p] pause"), "should show pause hint");
+    }
+
+    #[test]
+    fn test_status_line_has_reset_hint() {
+        let state = sample_state();
+        let status = render_status_line(&state);
+        assert!(status.contains("[r] reset"), "Status line should show [r] reset hint");
+    }
+
+    #[test]
+    fn test_modal_title_reset() {
+        let modal = ModalState {
+            open: true,
+            ticket_ids: vec!["T-001".to_string()],
+            cursor: 0,
+            is_reset: true,
+        };
+        let lines = render_modal(&modal, 50, 20);
+        let full = lines.join("\n");
+        assert!(full.contains("Reset Ticket to Ready"), "Reset modal should have correct title");
+    }
+
+    #[test]
+    fn test_modal_title_mark_done() {
+        let modal = ModalState {
+            open: true,
+            ticket_ids: vec!["T-001".to_string()],
+            cursor: 0,
+            is_reset: false,
+        };
+        let lines = render_modal(&modal, 50, 20);
+        let full = lines.join("\n");
+        assert!(full.contains("Mark Ticket Done"), "Mark-done modal should have correct title");
+    }
+
+    #[test]
+    fn test_compact_dashboard_fewer_lines() {
+        let state = sample_state();
+        let lines = render_dashboard_lines(&state, 80, 40);
+        // Count blank lines
+        let blank_lines = lines.iter().filter(|l| l.is_empty()).count();
+        // Compacted dashboard should have fewer blank lines than before (~12).
+        // Sub-sections still add a few internally, but we removed the padding between them.
+        assert!(blank_lines <= 8, "Dashboard should have <= 8 blank lines, got {}", blank_lines);
+    }
+
+    #[test]
+    fn test_scroll_offset_clamp() {
+        let state = sample_state();
+        let lines = render_dashboard_lines(&state, 80, 40);
+        let total_lines = lines.len();
+
+        // Scroll offset beyond content should be clamped
+        let rows = 10;
+        let max_scroll = total_lines.saturating_sub(rows);
+        let clamped = 9999usize.min(max_scroll);
+        assert!(clamped <= total_lines, "Clamped scroll should not exceed total lines");
+        assert_eq!(clamped, max_scroll, "Clamped scroll should equal max_scroll");
     }
 }

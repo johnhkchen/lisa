@@ -1,5 +1,6 @@
 /target
 .DS_Store
 .lisa-layout.kdl
+.lisa-state-dump.txt
 .ralph-commit.lock
 .obsidian/

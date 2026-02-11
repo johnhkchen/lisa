@@ -11,6 +11,7 @@ use crate::templates;
 pub enum InitAction {
     CreateDir(PathBuf),
     CreateFile { path: PathBuf, content: String },
+    UpdateFile { path: PathBuf, content: String },
     Skip { path: PathBuf, reason: String },
 }
 
@@ -19,6 +20,7 @@ impl fmt::Display for InitAction {
         match self {
             InitAction::CreateDir(path) => write!(f, "  create  {}/", path.display()),
             InitAction::CreateFile { path, .. } => write!(f, "  create  {}", path.display()),
+            InitAction::UpdateFile { path, .. } => write!(f, "  update  {}", path.display()),
             InitAction::Skip { path, reason } => {
                 write!(f, "  skip    {} ({})", path.display(), reason)
             }
@@ -108,18 +110,25 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         }
     }
 
-    // Hook script
-    let hook_path = root.join(".lisa/hooks/on-idle.sh");
-    if hook_path.exists() {
-        actions.push(InitAction::Skip {
-            path: hook_path,
-            reason: "already exists".to_string(),
-        });
-    } else {
-        actions.push(InitAction::CreateFile {
-            path: hook_path,
-            content: templates::ON_IDLE_HOOK.to_string(),
-        });
+    // Hook scripts
+    let hook_scripts: &[(&str, &str)] = &[
+        ("on-idle.sh", templates::ON_IDLE_HOOK),
+        ("on-stop.sh", templates::ON_STOP_HOOK),
+        ("on-clear.sh", templates::ON_CLEAR_HOOK),
+    ];
+    for (name, content) in hook_scripts {
+        let hook_path = root.join(format!(".lisa/hooks/{}", name));
+        if hook_path.exists() {
+            actions.push(InitAction::Skip {
+                path: hook_path,
+                reason: "already exists".to_string(),
+            });
+        } else {
+            actions.push(InitAction::CreateFile {
+                path: hook_path,
+                content: content.to_string(),
+            });
+        }
     }
 
     // .lisa/.gitignore (ignores ephemeral signal files)
@@ -136,13 +145,45 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         });
     }
 
-    // .claude/settings.local.json (idle_prompt notification hook)
+    // .claude/settings.local.json (Stop, SessionStart, Notification hooks)
     let settings_path = root.join(".claude/settings.local.json");
     if settings_path.exists() {
-        actions.push(InitAction::Skip {
-            path: settings_path,
-            reason: "already exists — verify hooks config".to_string(),
-        });
+        match fs::read_to_string(&settings_path) {
+            Ok(content)
+                if content.contains("idle_prompt")
+                    && content.contains("\"Stop\"")
+                    && content.contains("\"SessionStart\"") =>
+            {
+                actions.push(InitAction::Skip {
+                    path: settings_path,
+                    reason: "already has all hooks".to_string(),
+                });
+            }
+            Ok(content) => {
+                // Merge missing hooks into existing settings
+                match templates::merge_hooks(&content) {
+                    Ok(merged) => {
+                        actions.push(InitAction::UpdateFile {
+                            path: settings_path,
+                            content: merged,
+                        });
+                    }
+                    Err(_) => {
+                        actions.push(InitAction::Skip {
+                            path: settings_path,
+                            reason: "exists but JSON is malformed — add hooks manually"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            Err(_) => {
+                actions.push(InitAction::Skip {
+                    path: settings_path,
+                    reason: "exists but unreadable — check permissions".to_string(),
+                });
+            }
+        }
     } else {
         actions.push(InitAction::CreateFile {
             path: settings_path,
@@ -205,6 +246,10 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
                 fs::write(path, content)
                     .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
             }
+            InitAction::UpdateFile { path, content } => {
+                fs::write(path, content)
+                    .map_err(|e| format!("Failed to update {}: {}", path.display(), e))?;
+            }
             InitAction::Skip { .. } => {}
         }
     }
@@ -212,12 +257,14 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
     // Make hook scripts executable on Unix
     #[cfg(unix)]
     {
-        let hook_path = root.join(".lisa/hooks/on-idle.sh");
-        if hook_path.exists() {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&hook_path, perms)
-                .map_err(|e| format!("Failed to set permissions on {}: {}", hook_path.display(), e))?;
+        use std::os::unix::fs::PermissionsExt;
+        for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh"] {
+            let hook_path = root.join(format!(".lisa/hooks/{}", script));
+            if hook_path.exists() {
+                let perms = fs::Permissions::from_mode(0o755);
+                fs::set_permissions(&hook_path, perms)
+                    .map_err(|e| format!("Failed to set permissions on {}: {}", hook_path.display(), e))?;
+            }
         }
     }
 
@@ -362,25 +409,31 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         }
     };
 
-    // 5. Hook infrastructure
+    // 5. Hook infrastructure — settings.local.json
     let settings_path = root.join(".claude/settings.local.json");
     if !settings_path.exists() {
         diagnostics.push(ValidationDiagnostic {
             path: ".claude/settings.local.json".to_string(),
             category: "structure",
-            message: "not found. Run `lisa init` to create idle signal hooks.".to_string(),
+            message: "not found. Run `lisa init` to create hooks.".to_string(),
             severity: Severity::Error,
         });
     } else {
         match fs::read_to_string(&settings_path) {
             Ok(content) => {
-                if !content.contains("idle_prompt") {
-                    diagnostics.push(ValidationDiagnostic {
-                        path: ".claude/settings.local.json".to_string(),
-                        category: "config",
-                        message: "missing idle_prompt hook configuration".to_string(),
-                        severity: Severity::Error,
-                    });
+                for (key, label) in [
+                    ("idle_prompt", "Notification[idle_prompt]"),
+                    ("\"Stop\"", "Stop"),
+                    ("\"SessionStart\"", "SessionStart[clear]"),
+                ] {
+                    if !content.contains(key) {
+                        diagnostics.push(ValidationDiagnostic {
+                            path: ".claude/settings.local.json".to_string(),
+                            category: "config",
+                            message: format!("missing {} hook configuration", label),
+                            severity: Severity::Error,
+                        });
+                    }
                 }
             }
             Err(e) => {
@@ -394,26 +447,32 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         }
     }
 
-    let hook_path = root.join(".lisa/hooks/on-idle.sh");
-    if !hook_path.exists() {
-        diagnostics.push(ValidationDiagnostic {
-            path: ".lisa/hooks/on-idle.sh".to_string(),
-            category: "structure",
-            message: "not found. Run `lisa init` to create idle signal hooks.".to_string(),
-            severity: Severity::Error,
-        });
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = fs::metadata(&hook_path) {
-                if meta.permissions().mode() & 0o111 == 0 {
-                    diagnostics.push(ValidationDiagnostic {
-                        path: ".lisa/hooks/on-idle.sh".to_string(),
-                        category: "structure",
-                        message: "not executable. Run: chmod +x .lisa/hooks/on-idle.sh".to_string(),
-                        severity: Severity::Error,
-                    });
+    // Hook scripts — on-idle.sh, on-stop.sh, on-clear.sh
+    for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh"] {
+        let hook_path = root.join(format!(".lisa/hooks/{}", script));
+        if !hook_path.exists() {
+            diagnostics.push(ValidationDiagnostic {
+                path: format!(".lisa/hooks/{}", script),
+                category: "structure",
+                message: "not found. Run `lisa init` to create hooks.".to_string(),
+                severity: Severity::Error,
+            });
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&hook_path) {
+                    if meta.permissions().mode() & 0o111 == 0 {
+                        diagnostics.push(ValidationDiagnostic {
+                            path: format!(".lisa/hooks/{}", script),
+                            category: "structure",
+                            message: format!(
+                                "not executable. Run: chmod +x .lisa/hooks/{}",
+                                script
+                            ),
+                            severity: Severity::Error,
+                        });
+                    }
                 }
             }
         }
@@ -626,12 +685,12 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   6 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, .lisa/.gitignore, settings.local.json)
+        //   8 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, .lisa/.gitignore, settings.local.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| !matches!(a, InitAction::Skip { .. }))
             .collect();
-        assert_eq!(creates.len(), 14);
+        assert_eq!(creates.len(), 16);
     }
 
     #[test]
@@ -719,28 +778,35 @@ mod tests {
 
         // Check hook infrastructure
         assert!(dir.path().join(".lisa/hooks/on-idle.sh").exists());
+        assert!(dir.path().join(".lisa/hooks/on-stop.sh").exists());
+        assert!(dir.path().join(".lisa/hooks/on-clear.sh").exists());
         assert!(dir.path().join(".lisa/signals").exists());
         assert!(dir.path().join(".lisa/.gitignore").exists());
         assert!(dir.path().join(".claude/settings.local.json").exists());
 
         // Check hook script content
-        let hook = fs::read_to_string(dir.path().join(".lisa/hooks/on-idle.sh")).unwrap();
-        assert!(hook.starts_with("#!/bin/sh"));
-        assert!(hook.contains("LISA_TICKET_ID"));
+        for (name, ext) in &[("on-idle.sh", ".idle"), ("on-stop.sh", ".stopped"), ("on-clear.sh", ".cleared")] {
+            let hook = fs::read_to_string(dir.path().join(format!(".lisa/hooks/{}", name))).unwrap();
+            assert!(hook.starts_with("#!/bin/sh"), "{} should start with shebang", name);
+            assert!(hook.contains("LISA_PANE_ID"), "{} should reference LISA_PANE_ID", name);
+            assert!(hook.contains(ext), "{} should write {} signal", name, ext);
 
-        // Check hook script is executable on unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::metadata(dir.path().join(".lisa/hooks/on-idle.sh"))
-                .unwrap()
-                .permissions();
-            assert!(perms.mode() & 0o111 != 0, "hook script should be executable");
+            // Check hook script is executable on unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = fs::metadata(dir.path().join(format!(".lisa/hooks/{}", name)))
+                    .unwrap()
+                    .permissions();
+                assert!(perms.mode() & 0o111 != 0, "{} should be executable", name);
+            }
         }
 
         // Check settings.local.json content
         let settings = fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap();
         assert!(settings.contains("idle_prompt"));
+        assert!(settings.contains("\"Stop\""));
+        assert!(settings.contains("\"SessionStart\""));
 
         // Check .lisa/.gitignore content
         let gitignore = fs::read_to_string(dir.path().join(".lisa/.gitignore")).unwrap();
@@ -790,16 +856,19 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(root.join(".lisa/hooks")).unwrap();
-        fs::write(
-            root.join(".lisa/hooks/on-idle.sh"),
-            templates::ON_IDLE_HOOK,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(root.join(".lisa/hooks/on-idle.sh"), perms).unwrap();
+        let hooks: &[(&str, &str)] = &[
+            ("on-idle.sh", templates::ON_IDLE_HOOK),
+            ("on-stop.sh", templates::ON_STOP_HOOK),
+            ("on-clear.sh", templates::ON_CLEAR_HOOK),
+        ];
+        for (name, content) in hooks {
+            fs::write(root.join(format!(".lisa/hooks/{}", name)), content).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = fs::Permissions::from_mode(0o755);
+                fs::set_permissions(root.join(format!(".lisa/hooks/{}", name)), perms).unwrap();
+            }
         }
     }
 
@@ -1070,11 +1139,17 @@ depends_on: [T-999]
         let result = run_init(dir.path(), false);
         assert!(result.is_ok());
 
-        // Original files should be preserved
+        // on-idle.sh should be preserved (never overwritten)
         let hook = fs::read_to_string(dir.path().join(".lisa/hooks/on-idle.sh")).unwrap();
         assert_eq!(hook, "custom hook");
+        // New hook scripts should be created
+        assert!(dir.path().join(".lisa/hooks/on-stop.sh").exists());
+        assert!(dir.path().join(".lisa/hooks/on-clear.sh").exists());
+        // settings.local.json should be updated to include all hooks
         let settings = fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap();
-        assert_eq!(settings, "{}");
+        assert!(settings.contains("idle_prompt"));
+        assert!(settings.contains("\"Stop\""));
+        assert!(settings.contains("\"SessionStart\""));
     }
 
     #[test]
@@ -1083,17 +1158,42 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "existing").unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        // settings.local.json without idle_prompt → should plan UpdateFile
         fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        // Hook-related files should be skipped
+        // on-idle.sh should be skipped (never overwritten)
         let skipped_hook: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("on-idle.sh")))
             .collect();
         assert_eq!(skipped_hook.len(), 1);
+
+        // settings.local.json should be updated (not skipped) since it lacks idle_prompt
+        let updated_settings: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with("settings.local.json")))
+            .collect();
+        assert_eq!(updated_settings.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_init_actions_existing_hooks_with_all_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "existing").unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        // settings.local.json WITH all hooks → should skip
+        fs::write(
+            dir.path().join(".claude/settings.local.json"),
+            templates::settings_local_json(),
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
 
         let skipped_settings: Vec<_> = actions
             .iter()
@@ -1172,6 +1272,48 @@ depends_on: [T-999]
 
         let result = run_validate(dir.path(), false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_missing_stop_hook() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // Full hook infra except on-stop.sh
+        write_hook_infrastructure(dir.path());
+        fs::remove_file(dir.path().join(".lisa/hooks/on-stop.sh")).unwrap();
+        write_ready_ticket(dir.path());
+
+        let result = validate(dir.path(), false);
+        let stop_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.path.contains("on-stop.sh"))
+            .collect();
+        assert_eq!(stop_errors.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_missing_clear_hook() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::write(dir.path().join("docs/rdspi-workflow.md"), "# RDSPI").unwrap();
+        // Full hook infra except on-clear.sh
+        write_hook_infrastructure(dir.path());
+        fs::remove_file(dir.path().join(".lisa/hooks/on-clear.sh")).unwrap();
+        write_ready_ticket(dir.path());
+
+        let result = validate(dir.path(), false);
+        let clear_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.path.contains("on-clear.sh"))
+            .collect();
+        assert_eq!(clear_errors.len(), 1);
     }
 
     #[cfg(unix)]
@@ -1445,10 +1587,13 @@ depends_on: [T-999]
             .filter(|d| {
                 d.severity == Severity::Error
                     && (d.path.contains("settings.local.json")
-                        || d.path.contains("on-idle.sh"))
+                        || d.path.contains("on-idle.sh")
+                        || d.path.contains("on-stop.sh")
+                        || d.path.contains("on-clear.sh"))
             })
             .collect();
-        assert_eq!(hook_errors.len(), 2);
+        // 1 settings.local.json missing + 3 hook scripts missing = 4
+        assert_eq!(hook_errors.len(), 4);
     }
 
     #[test]

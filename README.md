@@ -45,8 +45,19 @@ cargo install lisa-cli
 git clone https://github.com/johnhkchen/lisa
 cd lisa
 rustup target add wasm32-wasip1
-just release
+
+# Build + install the `lisa` CLI to ~/.cargo/bin
+just install
 ```
+
+This builds the WASM plugin, embeds it in the CLI binary, and installs it via `cargo install`. Make sure `~/.cargo/bin` is on your `PATH`.
+
+#### Prerequisites
+
+- Rust toolchain (`rustup`)
+- `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
+- [just](https://github.com/casey/just) command runner
+- [Zellij](https://zellij.dev/) terminal multiplexer (for `lisa loop`)
 
 ## Build
 
@@ -54,11 +65,14 @@ just release
 # Prerequisites
 rustup target add wasm32-wasip1
 
-# Build the plugin
+# Build the WASM plugin
 just build
 
-# Build the CLI
+# Build the CLI (with embedded WASM plugin)
 just build-cli
+
+# Build + install to ~/.cargo/bin
+just install
 
 # Run tests
 just test

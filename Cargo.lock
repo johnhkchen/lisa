@@ -1556,6 +1556,7 @@ dependencies = [
  "clap 4.5.57",
  "lisa-core",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

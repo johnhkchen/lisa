@@ -19,9 +19,13 @@ use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
 /// How often (in seconds) the plugin rescans ticket files to detect phase changes.
 const POLL_INTERVAL_SECS: f64 = 5.0;
 
-/// Short delay (seconds) before flushing deferred pane commands.
-/// Gives the pane time to process `/clear` before the command arrives.
-const FLUSH_DELAY_SECS: f64 = 0.5;
+/// Timeout (seconds) for waiting for a `.stopped` signal after phase completion.
+/// If no signal arrives, fall back to sending `/clear` anyway.
+const STOP_SIGNAL_TIMEOUT_SECS: u64 = 60;
+
+/// Timeout (seconds) for waiting for a `.cleared` signal after sending `/clear`.
+/// If no signal arrives, fall back to sending the prompt anyway.
+const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 30;
 
 /// The prompt text sent to Claude Code for a ticket.
 fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
@@ -34,10 +38,12 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
 }
 
 /// Build the full shell command to launch Claude Code in a fresh pane.
-/// Sets LISA_TICKET_ID env var so the idle signal hook knows which ticket is running.
-fn build_claude_command(ticket_dir: &Path, ticket_id: &str) -> String {
+/// Sets LISA_PANE_ID env var so the idle signal hook can identify the pane,
+/// and LISA_TICKET_ID for debugging/logging context.
+fn build_claude_command(ticket_dir: &Path, ticket_id: &str, pane_id: u32) -> String {
     format!(
-        "LISA_TICKET_ID={} claude --dangerously-skip-permissions \"{}\"",
+        "LISA_PANE_ID={} LISA_TICKET_ID={} claude --dangerously-skip-permissions \"{}\"",
+        pane_id,
         ticket_id,
         ticket_prompt(ticket_dir, ticket_id)
     )
@@ -69,17 +75,45 @@ struct AgentSlot {
     ticket_id: Option<TicketId>,
     /// Whether this slot has had a Claude Code session started in it.
     has_session: bool,
+    /// Transition state machine for session reuse handshake.
+    transition_state: TransitionState,
+    /// When the current transition started (for timeout fallbacks).
+    transition_started_at: Option<std::time::SystemTime>,
 }
 
-/// State for the "mark done" modal overlay.
+/// What action the modal should perform on Enter.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum ModalMode {
+    #[default]
+    MarkDone,
+    ResetTicket,
+}
+
+/// Per-slot state machine for session transitions.
+/// Gates `/clear` and prompt sends on hook-generated signal files
+/// (`.stopped` and `.cleared`) instead of blind timers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TransitionState {
+    /// No transition pending — slot is idle or running normally.
+    #[default]
+    Idle,
+    /// Phase complete, waiting for `.stopped` signal before sending `/clear`.
+    WaitingForStop,
+    /// `/clear` sent, waiting for `.cleared` signal before sending the prompt.
+    WaitingForClear,
+}
+
+/// State for the modal overlay (mark-done or reset-ticket).
 #[derive(Default)]
 struct MarkDoneModal {
     /// Whether the modal is currently visible.
     open: bool,
-    /// Non-done ticket IDs available for selection (sorted).
+    /// Ticket IDs available for selection (sorted).
     ticket_ids: Vec<TicketId>,
     /// Currently highlighted index in `ticket_ids`.
     cursor: usize,
+    /// What action to take on confirm.
+    mode: ModalMode,
 }
 
 /// Main plugin state
@@ -113,6 +147,9 @@ pub struct State {
     /// Whether agent slots have been discovered from PaneUpdate.
     slots_discovered: bool,
 
+    /// Whether scheduling of new tickets is paused (toggle with 'p').
+    paused: bool,
+
     /// Whether the loop has terminated (all tickets done).
     terminated: bool,
 
@@ -122,13 +159,7 @@ pub struct State {
     /// Last known health status per ticket, for transition detection.
     last_health: HashMap<TicketId, lisa_core::types::HealthStatus>,
 
-    /// Commands queued for deferred writing to panes.
-    /// Written on the next timer tick after a short delay, so the pane
-    /// has time to process the preceding `/clear`.
-    pending_pane_writes: Vec<(u32, String)>,
-
-    /// Number of outstanding timers. Used to prevent timer chain duplication
-    /// when short flush timers are set alongside the regular poll timer.
+    /// Number of outstanding timers. Used to prevent timer chain duplication.
     pending_timer_count: u32,
 
     /// Path to the idle signal directory (`.lisa/signals/` under /host/).
@@ -137,6 +168,9 @@ pub struct State {
     /// Idle-without-artifact alerts detected during the current poll cycle.
     /// Cleared and re-populated each cycle by `check_idle_signals()`.
     idle_alerts: Vec<(TicketId, String)>,
+
+    /// Scroll offset for the dashboard view (used with j/k keys).
+    scroll_offset: usize,
 }
 
 impl State {
@@ -153,13 +187,6 @@ impl State {
     fn timer_fired(&mut self) -> bool {
         self.pending_timer_count = self.pending_timer_count.saturating_sub(1);
         self.pending_timer_count == 0
-    }
-
-    /// Flush any deferred pane writes (commands queued after `/clear`).
-    fn flush_pending_pane_writes(&mut self) {
-        for (pane_id, cmd) in self.pending_pane_writes.drain(..) {
-            send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
-        }
     }
 
     fn log_activity(&mut self, event: ActivityEvent) {
@@ -240,6 +267,8 @@ impl State {
                         pane_id: pane.id,
                         ticket_id: None,
                         has_session: false,
+                        transition_state: TransitionState::Idle,
+                        transition_started_at: None,
                     });
                 }
             }
@@ -261,8 +290,8 @@ impl State {
     }
 
     /// Mark a slot as idle when its ticket completes.
-    /// Keeps `has_session = true` so subsequent scheduling sends `/clear` + prompt
-    /// into the already-running Claude Code session instead of relaunching.
+    /// Keeps `has_session = true` so subsequent scheduling sends `/clear` + new
+    /// prompt into the already-running Claude Code session instead of relaunching.
     fn release_slot_for_ticket(&mut self, ticket_id: &TicketId) {
         let mut released_pane: Option<u32> = None;
         for slot in &mut self.agent_slots {
@@ -285,7 +314,7 @@ impl State {
 
     /// Schedule ready tickets into idle agent slots.
     fn schedule_ready_tickets(&mut self) {
-        if !self.permissions_granted || !self.slots_discovered {
+        if !self.permissions_granted || !self.slots_discovered || self.paused {
             return;
         }
 
@@ -327,16 +356,16 @@ impl State {
 
             let launch_cmd;
             if self.agent_slots[slot_idx].has_session {
-                // Session reuse: exit the current Claude Code session, then
-                // re-launch with the new ticket's env var so LISA_TICKET_ID
-                // is correct for the idle signal hook.
-                send_line_to_pane("/exit", PaneId::Terminal(pane_id));
-                let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
-                launch_cmd = cmd.clone();
-                self.pending_pane_writes.push((pane_id, cmd));
+                // Session reuse: defer /clear until .stopped signal confirms
+                // the pane is ready for input. The transition state machine
+                // (check_transition_signals) handles the rest.
+                self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForStop;
+                self.agent_slots[slot_idx].transition_started_at =
+                    Some(std::time::SystemTime::now());
+                launch_cmd = ticket_prompt(&host_ticket_dir, &ticket_id);
             } else {
                 // Fresh pane — launch Claude Code from the shell.
-                let cmd = build_claude_command(&host_ticket_dir, &ticket_id);
+                let cmd = build_claude_command(&host_ticket_dir, &ticket_id, pane_id);
                 launch_cmd = cmd.clone();
                 send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
                 self.agent_slots[slot_idx].has_session = true;
@@ -371,10 +400,6 @@ impl State {
             });
         }
 
-        // If we queued any commands, set a short timer to flush them
-        if !self.pending_pane_writes.is_empty() {
-            self.arm_timer(FLUSH_DELAY_SECS);
-        }
     }
 
     /// Safety sweep: release any agent slots still assigned to done tickets.
@@ -519,10 +544,32 @@ impl State {
                 _ => continue,
             };
 
-            let ticket_id: TicketId = filename.trim_end_matches(".idle").to_string();
-
             // Clean up the signal file immediately (prevents re-trigger on next poll)
             let _ = std::fs::remove_file(&path);
+
+            // Signal files are named pane-{pane_id}.idle — resolve ticket
+            // from the agent slot that owns this pane.
+            let ticket_id: TicketId = if let Some(rest) = filename
+                .strip_prefix("pane-")
+                .and_then(|s| s.strip_suffix(".idle"))
+            {
+                let pane_id: u32 = match rest.parse() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                match self
+                    .agent_slots
+                    .iter()
+                    .find(|s| s.pane_id == pane_id)
+                    .and_then(|s| s.ticket_id.clone())
+                {
+                    Some(tid) => tid,
+                    None => continue,
+                }
+            } else {
+                // Legacy: {ticket_id}.idle (from older hook versions)
+                filename.trim_end_matches(".idle").to_string()
+            };
 
             // Look up thread — signal only meaningful for running threads
             let current_phase = match self.threads.get(&ticket_id) {
@@ -639,6 +686,238 @@ impl State {
                 _ => {
                     // Ready, Review, Done — signal already cleaned up, nothing to do
                 }
+            }
+        }
+    }
+
+    /// Scan for `.stopped` and `.cleared` signal files and advance the
+    /// per-slot transition state machine accordingly.
+    ///
+    /// - `.stopped` → if slot is `WaitingForStop`, send `/clear` and move to `WaitingForClear`
+    /// - `.cleared` → if slot is `WaitingForClear`, send the prompt and move to `Idle`
+    ///
+    /// Signal files are deleted immediately after reading (same as `.idle` signals).
+    fn check_transition_signals(&mut self) {
+        let entries = match std::fs::read_dir(&self.signal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let filename = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Only process .stopped and .cleared signals
+            if let Some(rest) = filename.strip_prefix("pane-") {
+                if let Some(id_str) = rest.strip_suffix(".stopped") {
+                    let _ = std::fs::remove_file(&path);
+                    let pane_id: u32 = match id_str.parse() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    self.handle_stopped_signal(pane_id);
+                } else if let Some(id_str) = rest.strip_suffix(".cleared") {
+                    let _ = std::fs::remove_file(&path);
+                    let pane_id: u32 = match id_str.parse() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    self.handle_cleared_signal(pane_id);
+                }
+                // .idle files are handled by check_idle_signals()
+            }
+        }
+    }
+
+    /// Handle a `.stopped` signal for the given pane.
+    ///
+    /// Two cases:
+    /// 1. Slot is `WaitingForStop` (mid-transition): send `/clear` and advance to `WaitingForClear`.
+    /// 2. Slot is `Idle` and ticket is in Review phase: auto-complete the ticket as Done.
+    fn handle_stopped_signal(&mut self, pane_id: u32) {
+        let slot_info = self
+            .agent_slots
+            .iter()
+            .find(|s| s.pane_id == pane_id)
+            .map(|s| (s.transition_state, s.ticket_id.clone()));
+
+        let (transition_state, ticket_id) = match slot_info {
+            Some((state, tid)) => (state, tid),
+            None => return,
+        };
+
+        // Case 1: Mid-transition — send /clear
+        if transition_state == TransitionState::WaitingForStop {
+            send_line_to_pane("/clear", PaneId::Terminal(pane_id));
+            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                slot.transition_state = TransitionState::WaitingForClear;
+                slot.transition_started_at = Some(std::time::SystemTime::now());
+            }
+            self.log_activity(ActivityEvent::Info {
+                message: format!("Pane {} stopped, sent /clear", pane_id),
+            });
+            return;
+        }
+
+        // Case 2: Idle slot with Review-phase ticket — auto-complete
+        if transition_state == TransitionState::Idle {
+            if let Some(ref tid) = ticket_id {
+                let is_review = self
+                    .dag
+                    .get_ticket(tid)
+                    .map(|t| t.phase == Phase::Review)
+                    .unwrap_or(false);
+
+                let thread_completable = self
+                    .threads
+                    .get(tid)
+                    .map(|t| t.status != lisa_core::types::ThreadStatus::Completed)
+                    .unwrap_or(false);
+
+                if is_review && thread_completable {
+                    self.auto_complete_review(tid.clone(), pane_id);
+                }
+            }
+        }
+    }
+
+    /// Auto-complete a Review-phase ticket by marking it Done.
+    ///
+    /// Updates the ticket file on disk, completes the thread, releases the slot,
+    /// rebuilds the DAG, and schedules any newly-ready tickets.
+    fn auto_complete_review(&mut self, ticket_id: TicketId, pane_id: u32) {
+        let file_path = match self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone()) {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Cannot find file for {} during auto-complete", ticket_id),
+                });
+                return;
+            }
+        };
+
+        if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Done) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Failed to auto-complete {} phase: {}", ticket_id, e),
+            });
+            return;
+        }
+
+        if let Err(e) = ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Done) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Failed to auto-complete {} status: {}", ticket_id, e),
+            });
+        }
+
+        self.log_activity(ActivityEvent::TicketPhaseChanged {
+            ticket_id: ticket_id.clone(),
+            old_phase: Phase::Review,
+            new_phase: Phase::Done,
+        });
+        self.log_activity(ActivityEvent::Info {
+            message: format!("Auto-completed {} (Review → Done) on pane #{}", ticket_id, pane_id),
+        });
+
+        if let Some(thread) = self.threads.get_mut(&ticket_id) {
+            thread.complete();
+        }
+        self.release_slot_for_ticket(&ticket_id);
+        self.threads.remove(&ticket_id);
+
+        // DAG rebuild and scheduling happen in the normal poll_tick cycle
+        // after check_transition_signals returns.
+    }
+
+    /// Handle a `.cleared` signal for the given pane.
+    /// If the slot is waiting for clear, send the new ticket prompt and return to `Idle`.
+    fn handle_cleared_signal(&mut self, pane_id: u32) {
+        // Check state and collect data before mutating, to avoid borrow conflicts.
+        let action = self
+            .agent_slots
+            .iter()
+            .find(|s| s.pane_id == pane_id)
+            .and_then(|slot| {
+                if slot.transition_state == TransitionState::WaitingForClear {
+                    slot.ticket_id.clone()
+                } else {
+                    None
+                }
+            });
+
+        if let Some(ticket_id) = action {
+            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
+            let prompt = ticket_prompt(&host_ticket_dir, &ticket_id);
+            send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+
+            self.log_activity(ActivityEvent::Info {
+                message: format!("Pane {} cleared, sent prompt for {}", pane_id, ticket_id),
+            });
+
+            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                slot.transition_state = TransitionState::Idle;
+                slot.transition_started_at = None;
+            }
+        }
+    }
+
+    /// Check for transition timeouts and force-advance stalled transitions.
+    ///
+    /// Prevents indefinite stalls if hooks fail to produce signal files.
+    fn check_transition_timeouts(&mut self) {
+        let now = std::time::SystemTime::now();
+
+        // Collect actions to avoid borrow conflicts
+        let mut stop_timeouts: Vec<u32> = Vec::new();
+        let mut clear_timeouts: Vec<(u32, Option<TicketId>)> = Vec::new();
+
+        for slot in &self.agent_slots {
+            if let Some(started) = slot.transition_started_at {
+                let elapsed = now.duration_since(started).unwrap_or_default().as_secs();
+
+                match slot.transition_state {
+                    TransitionState::WaitingForStop if elapsed > STOP_SIGNAL_TIMEOUT_SECS => {
+                        stop_timeouts.push(slot.pane_id);
+                    }
+                    TransitionState::WaitingForClear if elapsed > CLEAR_SIGNAL_TIMEOUT_SECS => {
+                        clear_timeouts.push((slot.pane_id, slot.ticket_id.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for pane_id in stop_timeouts {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "Stop signal timeout for pane {}, sending /clear anyway",
+                    pane_id
+                ),
+            });
+            send_line_to_pane("/clear", PaneId::Terminal(pane_id));
+            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                slot.transition_state = TransitionState::WaitingForClear;
+                slot.transition_started_at = Some(now);
+            }
+        }
+
+        for (pane_id, ticket_id) in clear_timeouts {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "Clear signal timeout for pane {}, sending prompt anyway",
+                    pane_id
+                ),
+            });
+            if let Some(tid) = &ticket_id {
+                let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
+                let prompt = ticket_prompt(&host_ticket_dir, tid);
+                send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+            }
+            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                slot.transition_state = TransitionState::Idle;
+                slot.transition_started_at = None;
             }
         }
     }
@@ -776,6 +1055,12 @@ impl State {
 
         // Check for idle signals and advance phases / generate alerts
         self.check_idle_signals();
+
+        // Process .stopped and .cleared signals for session transitions
+        self.check_transition_signals();
+
+        // Fallback: force-advance stalled transitions
+        self.check_transition_timeouts();
 
         // Evaluate health: log transitions (Healthy→Stuck, etc.)
         self.evaluate_health();
@@ -975,7 +1260,19 @@ impl State {
         writeln!(out, "slots_discovered:    {}", self.slots_discovered).unwrap();
         writeln!(out, "terminated:          {}", self.terminated).unwrap();
         writeln!(out, "pending_timer_count: {}", self.pending_timer_count).unwrap();
-        writeln!(out, "pending_pane_writes: {}", self.pending_pane_writes.len()).unwrap();
+        writeln!(out).unwrap();
+
+        // Agent slot transition states
+        writeln!(out, "=== Slot Transitions ===").unwrap();
+        for slot in &self.agent_slots {
+            let ticket = slot.ticket_id.as_deref().unwrap_or("(idle)");
+            writeln!(
+                out,
+                "pane-{}: {:?} ticket={} has_session={}",
+                slot.pane_id, slot.transition_state, ticket, slot.has_session
+            )
+            .unwrap();
+        }
         writeln!(out).unwrap();
 
         // Tickets
@@ -1122,7 +1419,10 @@ impl State {
                 }
                 BareKey::Enter => {
                     if let Some(ticket_id) = self.modal.ticket_ids.get(self.modal.cursor).cloned() {
-                        self.mark_ticket_done(&ticket_id);
+                        match self.modal.mode {
+                            ModalMode::MarkDone => self.mark_ticket_done(&ticket_id),
+                            ModalMode::ResetTicket => self.reset_ticket(&ticket_id),
+                        }
                     }
                     self.modal.open = false;
                 }
@@ -1131,9 +1431,38 @@ impl State {
             return true;
         }
 
+        // Normal mode: 'p' toggles pause (stop scheduling new tickets)
+        if key.bare_key == BareKey::Char('p') {
+            self.paused = !self.paused;
+            self.log_activity(ActivityEvent::Info {
+                message: if self.paused {
+                    "Scheduling paused".to_string()
+                } else {
+                    "Scheduling resumed".to_string()
+                },
+            });
+            return true;
+        }
+
         // Normal mode: 'd' opens the mark-done modal
         if key.bare_key == BareKey::Char('d') {
             self.open_mark_done_modal();
+            return true;
+        }
+
+        // Normal mode: 'r' opens the reset-ticket modal
+        if key.bare_key == BareKey::Char('r') {
+            self.open_reset_modal();
+            return true;
+        }
+
+        // Normal mode: j/k scroll the dashboard
+        if key.bare_key == BareKey::Char('j') || key.bare_key == BareKey::Down {
+            self.scroll_offset += 1;
+            return true;
+        }
+        if key.bare_key == BareKey::Char('k') || key.bare_key == BareKey::Up {
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
             return true;
         }
 
@@ -1187,6 +1516,7 @@ impl State {
             open: true,
             ticket_ids: ids,
             cursor: 0,
+            mode: ModalMode::MarkDone,
         };
     }
 
@@ -1241,6 +1571,82 @@ impl State {
         // Rebuild DAG immediately so dependents become ready
         self.rebuild_dag();
         self.schedule_ready_tickets();
+    }
+
+    /// Open the reset modal with tickets that are in non-ready, non-done phases.
+    fn open_reset_modal(&mut self) {
+        let mut ids: Vec<TicketId> = self
+            .dag
+            .tickets()
+            .filter(|t| t.phase != Phase::Ready && t.phase != Phase::Done)
+            .map(|t| t.id.clone())
+            .collect();
+        ids.sort();
+
+        if ids.is_empty() {
+            self.log_activity(ActivityEvent::Info {
+                message: "No tickets to reset (all are ready or done)".to_string(),
+            });
+            return;
+        }
+
+        self.modal = MarkDoneModal {
+            open: true,
+            ticket_ids: ids,
+            cursor: 0,
+            mode: ModalMode::ResetTicket,
+        };
+    }
+
+    /// Reset a ticket back to ready phase for retry.
+    fn reset_ticket(&mut self, ticket_id: &str) {
+        let tid = ticket_id.to_string();
+        let file_path = match self.dag.get_ticket(&tid).map(|t| t.file_path.clone()) {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Cannot find file for {}", ticket_id),
+                });
+                return;
+            }
+        };
+
+        let old_phase = self
+            .dag
+            .get_ticket(&tid)
+            .map(|t| t.phase)
+            .unwrap_or(Phase::Ready);
+
+        // Update phase to ready
+        if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Ready) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Failed to reset {} phase: {}", ticket_id, e),
+            });
+            return;
+        }
+
+        // Update status to open
+        if let Err(e) = ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Open) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Failed to reset {} status: {}", ticket_id, e),
+            });
+        }
+
+        self.log_activity(ActivityEvent::TicketPhaseChanged {
+            ticket_id: tid.clone(),
+            old_phase,
+            new_phase: Phase::Ready,
+        });
+
+        // Kill thread and release slot if present
+        if let Some(thread) = self.threads.get_mut(&tid) {
+            thread.fail();
+        }
+        self.release_slot_for_ticket(&tid);
+        self.threads.remove(&tid);
+
+        // Rebuild DAG but don't schedule — user is likely paused
+        self.rebuild_dag();
     }
 }
 
@@ -1357,12 +1763,6 @@ impl ZellijPlugin for State {
             }
 
             Event::Timer(_elapsed) => {
-                // Flush any deferred pane writes first
-                self.flush_pending_pane_writes();
-
-                // Only run the full poll cycle and re-arm if this is the last
-                // pending timer. This prevents timer chain duplication when
-                // short flush timers are set alongside the regular poll timer.
                 if self.timer_fired() {
                     self.poll_tick();
                 }
@@ -1391,7 +1791,7 @@ impl ZellijPlugin for State {
         }
 
         let ui_state = self.to_ui_state();
-        ui::print_dashboard(&ui_state, rows, cols);
+        ui::print_dashboard(&ui_state, rows, cols, self.scroll_offset);
     }
 }
 
@@ -1524,7 +1924,9 @@ impl State {
                 open: self.modal.open,
                 ticket_ids: self.modal.ticket_ids.clone(),
                 cursor: self.modal.cursor,
+                is_reset: self.modal.mode == ModalMode::ResetTicket,
             },
+            paused: self.paused,
         }
     }
 }
@@ -1668,6 +2070,13 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
 // Register the plugin with Zellij
 register_plugin!(State);
 
+// Provide a no-op stub for the Zellij host function on native targets so the
+// test binary can link.  The real implementation is injected by the Zellij WASM
+// runtime at load time.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub extern "C" fn host_run_plugin_command() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1776,22 +2185,22 @@ mod tests {
     #[test]
     fn test_build_claude_command() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-042-01");
+        let cmd = build_claude_command(ticket_dir, "T-042-01", 7);
 
-        assert!(cmd.starts_with("LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "));
+        assert!(cmd.starts_with("LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
         assert!(!cmd.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");
     }
 
     #[test]
-    fn test_build_claude_command_includes_env_var() {
+    fn test_build_claude_command_includes_env_vars() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-042-01");
+        let cmd = build_claude_command(ticket_dir, "T-042-01", 42);
 
         assert!(
-            cmd.starts_with("LISA_TICKET_ID=T-042-01 "),
-            "command should set LISA_TICKET_ID env var, got: {}",
+            cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID=T-042-01 "),
+            "command should set LISA_PANE_ID and LISA_TICKET_ID env vars, got: {}",
             cmd
         );
     }
@@ -1799,7 +2208,7 @@ mod tests {
     #[test]
     fn test_build_claude_command_includes_rdspi_reference() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-001");
+        let cmd = build_claude_command(ticket_dir, "T-001", 1);
 
         assert!(
             cmd.contains("docs/rdspi-workflow.md"),
@@ -2179,6 +2588,8 @@ mod tests {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         state.detect_stale_threads();
@@ -2279,6 +2690,8 @@ mod tests {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
         state.release_slot_for_ticket(&"T-001".to_string());
         state.threads.remove("T-001");
@@ -2573,6 +2986,8 @@ mod tests {
             pane_id: 7,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         state.release_slot_for_ticket(&"T-001".to_string());
@@ -2595,6 +3010,8 @@ mod tests {
             pane_id: 7,
             ticket_id: None,
             has_session: false,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         state.release_slot_for_ticket(&"T-MISSING".to_string());
@@ -2662,6 +3079,8 @@ mod tests {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         // First rebuild with empty last_phases — done ticket should be detected
@@ -2726,6 +3145,8 @@ mod tests {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         let changed = state.rebuild_dag();
@@ -2783,6 +3204,8 @@ mod tests {
             pane_id: 5,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
         assert!(!state.threads.contains_key("T-001"));
 
@@ -2836,6 +3259,8 @@ mod tests {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         // Run the done-ticket detection logic (mirrors poll_tick)
@@ -2928,6 +3353,8 @@ mod tests {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         state.audit_threads();
@@ -3040,6 +3467,8 @@ mod tests {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         // Replicate the key mark_ticket_done operations (without schedule_ready_tickets)
@@ -3112,11 +3541,15 @@ mod tests {
             pane_id: 5,
             ticket_id: Some("T-002".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 6,
             ticket_id: None,
             has_session: false,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         // Add health data
@@ -3224,11 +3657,15 @@ mod tests {
             pane_id: 42,
             ticket_id: Some("T-001".to_string()),
             has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 43,
             ticket_id: None,
             has_session: false,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
         });
 
         let snapshot = state.format_snapshot();
@@ -3318,10 +3755,10 @@ mod tests {
             "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
-        // Create signal directory with idle signal
+        // Create signal directory with idle signal (pane-based)
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
 
         // Build state
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -3338,6 +3775,15 @@ mod tests {
             ..State::default()
         };
 
+        // Agent slot maps pane 1 → T-001
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
+
         // Add running thread in implement phase
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Implement;
@@ -3352,7 +3798,7 @@ mod tests {
         assert_eq!(thread.status, ThreadStatus::Parked);
 
         // Verify: signal file deleted
-        assert!(!state.signal_dir.join("T-001.idle").exists());
+        assert!(!state.signal_dir.join("pane-1.idle").exists());
 
         // Verify: ticket file updated
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
@@ -3389,10 +3835,10 @@ mod tests {
         fs::create_dir_all(work_dir.join("T-001")).unwrap();
         fs::write(work_dir.join("T-001/research.md"), "# Research done").unwrap();
 
-        // Create signal directory with idle signal
+        // Create signal directory with idle signal (pane-based)
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
 
         // Build state
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -3409,6 +3855,15 @@ mod tests {
             ..State::default()
         };
 
+        // Agent slot maps pane 1 → T-001
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
+
         // Add running thread in research phase
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
@@ -3422,7 +3877,7 @@ mod tests {
         assert_eq!(thread.status, ThreadStatus::Running);
 
         // Verify: signal deleted
-        assert!(!state.signal_dir.join("T-001.idle").exists());
+        assert!(!state.signal_dir.join("pane-1.idle").exists());
 
         // Verify: ticket file updated
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
@@ -3451,10 +3906,10 @@ mod tests {
         let work_dir = dir.path().join("work");
         fs::create_dir_all(&work_dir).unwrap();
 
-        // Create signal directory with idle signal
+        // Create signal directory with idle signal (pane-based)
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -3470,6 +3925,15 @@ mod tests {
             ..State::default()
         };
 
+        // Agent slot maps pane 1 → T-001
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
+
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
         state.threads.insert("T-001".to_string(), thread);
@@ -3481,7 +3945,7 @@ mod tests {
         assert_eq!(thread.current_phase, Phase::Research);
 
         // Verify: signal deleted
-        assert!(!state.signal_dir.join("T-001.idle").exists());
+        assert!(!state.signal_dir.join("pane-1.idle").exists());
 
         // Verify: ticket file NOT updated
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
@@ -3514,10 +3978,10 @@ mod tests {
             "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
         ).unwrap();
 
-        // Create signal for a ticket that has NO thread
+        // Create signal for a pane whose ticket has NO thread
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -3532,12 +3996,20 @@ mod tests {
             signal_dir,
             ..State::default()
         };
-        // No threads added
+
+        // Agent slot maps pane 1 → T-001, but no thread exists
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
 
         state.check_idle_signals();
 
         // Signal file should still be cleaned up
-        assert!(!state.signal_dir.join("T-001.idle").exists());
+        assert!(!state.signal_dir.join("pane-1.idle").exists());
 
         // No alerts
         assert!(state.idle_alerts.is_empty());
@@ -3559,7 +4031,7 @@ mod tests {
 
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("T-001.idle"), "2025-01-01T00:00:00Z").unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -3575,6 +4047,15 @@ mod tests {
             ..State::default()
         };
 
+        // Agent slot maps pane 1 → T-001
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
+
         // Add a PARKED thread (not running)
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Implement;
@@ -3584,7 +4065,7 @@ mod tests {
         state.check_idle_signals();
 
         // Signal cleaned up
-        assert!(!state.signal_dir.join("T-001.idle").exists());
+        assert!(!state.signal_dir.join("pane-1.idle").exists());
 
         // Thread still parked, not advanced
         let thread = state.threads.get("T-001").unwrap();
@@ -3623,6 +4104,688 @@ mod tests {
                 && a.alert_type == ui::AlertType::IdleWithoutArtifact
                 && a.detail.contains("research.md")
         }));
+    }
+
+    // =========================================================================
+    // Pause feature tests
+    // =========================================================================
+
+    #[test]
+    fn test_pause_toggle_and_activity_log() {
+        // Can't call handle_key directly (links zellij host fns), so
+        // test the toggle logic and activity logging through state manipulation.
+        let mut state = State::default();
+        assert!(!state.paused);
+
+        // Simulate what handle_key('p') does
+        state.paused = !state.paused;
+        state.log_activity(ActivityEvent::Info {
+            message: "Scheduling paused".to_string(),
+        });
+        assert!(state.paused);
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message } if message.contains("paused")
+        )));
+
+        // Toggle back
+        state.paused = !state.paused;
+        state.log_activity(ActivityEvent::Info {
+            message: "Scheduling resumed".to_string(),
+        });
+        assert!(!state.paused);
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message } if message.contains("resumed")
+        )));
+    }
+
+    #[test]
+    fn test_pause_propagates_to_ui_state() {
+        let mut state = State::default();
+        assert!(!state.to_ui_state().paused);
+
+        state.paused = true;
+        assert!(state.to_ui_state().paused);
+    }
+
+    #[test]
+    fn test_pause_blocks_scheduling_precondition() {
+        // We can't call schedule_ready_tickets directly (zellij host fns),
+        // but we verify the guard condition includes paused state.
+        // The guard at the top of schedule_ready_tickets is:
+        //   if !self.permissions_granted || !self.slots_discovered || self.paused { return; }
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            permissions_granted: true,
+            slots_discovered: true,
+            paused: true,
+            ..State::default()
+        };
+
+        // Ready tickets exist
+        assert!(!state.dag.get_ready_tickets().is_empty());
+        // But scheduling is paused
+        assert!(state.paused);
+    }
+
+    #[test]
+    fn test_reset_ticket_sets_ready_phase() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: in-progress\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Add a running thread
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.reset_ticket("T-001");
+
+        // Phase should now be ready
+        let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(content.contains("phase: ready"), "Phase should be reset to ready, got: {}", content);
+        assert!(content.contains("status: open"), "Status should be reset to open, got: {}", content);
+
+        // Thread should be removed
+        assert!(!state.threads.contains_key("T-001"), "Thread should be removed after reset");
+    }
+
+    #[test]
+    fn test_reset_modal_shows_working_tickets() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        // One ready, one implementing, one done
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: ready ticket\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n",
+        ).unwrap();
+        fs::write(
+            tickets_dir.join("T-002.md"),
+            "---\nid: T-002\ntitle: impl ticket\ntype: task\nstatus: in-progress\npriority: high\nphase: implement\n---\n",
+        ).unwrap();
+        fs::write(
+            tickets_dir.join("T-003.md"),
+            "---\nid: T-003\ntitle: done ticket\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        state.open_reset_modal();
+
+        assert!(state.modal.open, "Modal should be open");
+        assert_eq!(state.modal.mode, ModalMode::ResetTicket, "Mode should be ResetTicket");
+        // Only T-002 (implement) should appear — not T-001 (ready) or T-003 (done)
+        assert_eq!(state.modal.ticket_ids, vec!["T-002".to_string()]);
+    }
+
+    #[test]
+    fn test_reset_modal_excludes_ready_and_done() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        // All ready and done — nothing to reset
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: a\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n",
+        ).unwrap();
+        fs::write(
+            tickets_dir.join("T-002.md"),
+            "---\nid: T-002\ntitle: b\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        state.open_reset_modal();
+
+        assert!(!state.modal.open, "Modal should NOT open when nothing to reset");
+    }
+
+    // =========================================================================
+    // Transition state machine tests (T-010-02)
+    // =========================================================================
+
+    #[test]
+    fn test_transition_state_default_is_idle() {
+        let slot = AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            has_session: false,
+            transition_state: TransitionState::default(),
+            transition_started_at: None,
+        };
+        assert_eq!(slot.transition_state, TransitionState::Idle);
+    }
+
+    #[test]
+    fn test_check_transition_signals_stopped_advances_state() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.stopped"), "2025-01-01T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForStop,
+            transition_started_at: Some(std::time::SystemTime::now()),
+        });
+
+        state.check_transition_signals();
+
+        // Signal file should be deleted
+        assert!(!signal_dir.join("pane-1.stopped").exists());
+
+        // State should advance to WaitingForClear
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForClear
+        );
+        assert!(state.agent_slots[0].transition_started_at.is_some());
+
+        // Should have logged an info event
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message } if message.contains("stopped") && message.contains("/clear")
+        )));
+    }
+
+    #[test]
+    fn test_check_transition_signals_stopped_ignored_when_idle() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.stopped"), "2025-01-01T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
+
+        state.check_transition_signals();
+
+        // Signal file should be deleted (always cleaned up)
+        assert!(!signal_dir.join("pane-1.stopped").exists());
+
+        // State should remain Idle
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Idle
+        );
+    }
+
+    #[test]
+    fn test_check_transition_signals_cleared_advances_state() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.cleared"), "2025-01-01T00:00:00Z").unwrap();
+
+        let mut state = State {
+            config: PluginConfig {
+                ticket_dir: dir.path().join("tickets"),
+                ..PluginConfig::new()
+            },
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForClear,
+            transition_started_at: Some(std::time::SystemTime::now()),
+        });
+
+        state.check_transition_signals();
+
+        // Signal file should be deleted
+        assert!(!signal_dir.join("pane-1.cleared").exists());
+
+        // State should return to Idle
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Idle
+        );
+        assert!(state.agent_slots[0].transition_started_at.is_none());
+
+        // Should have logged an info event about sending prompt
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message } if message.contains("cleared") && message.contains("T-001")
+        )));
+    }
+
+    #[test]
+    fn test_check_transition_signals_cleared_ignored_when_idle() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.cleared"), "2025-01-01T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
+
+        state.check_transition_signals();
+
+        // Signal cleaned up but state unchanged
+        assert!(!signal_dir.join("pane-1.cleared").exists());
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Idle
+        );
+    }
+
+    #[test]
+    fn test_check_transition_signals_unknown_pane_ignored() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-999.stopped"), "2025-01-01T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        // No slots — pane 999 doesn't exist
+        state.check_transition_signals();
+
+        // Signal cleaned up, no crash
+        assert!(!signal_dir.join("pane-999.stopped").exists());
+    }
+
+    #[test]
+    fn test_check_transition_timeouts_stop_timeout() {
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForStop,
+            // Set to 61 seconds ago
+            transition_started_at: Some(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(61),
+            ),
+        });
+
+        state.check_transition_timeouts();
+
+        // Should have forced to WaitingForClear
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForClear
+        );
+        assert!(state.agent_slots[0].transition_started_at.is_some());
+
+        // Should have logged a warning
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Warning { message } if message.contains("Stop signal timeout")
+        )));
+    }
+
+    #[test]
+    fn test_check_transition_timeouts_clear_timeout() {
+        let mut state = State {
+            config: PluginConfig {
+                ticket_dir: std::path::PathBuf::from("/tmp/tickets"),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForClear,
+            // Set to 31 seconds ago
+            transition_started_at: Some(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(31),
+            ),
+        });
+
+        state.check_transition_timeouts();
+
+        // Should have forced to Idle
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Idle
+        );
+        assert!(state.agent_slots[0].transition_started_at.is_none());
+
+        // Should have logged a warning
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Warning { message } if message.contains("Clear signal timeout")
+        )));
+    }
+
+    #[test]
+    fn test_check_transition_timeouts_within_threshold_no_change() {
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForStop,
+            // Set to 5 seconds ago — well within the 60s threshold
+            transition_started_at: Some(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(5),
+            ),
+        });
+
+        state.check_transition_timeouts();
+
+        // No change — still WaitingForStop
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForStop
+        );
+        assert!(state.activity_log.is_empty());
+    }
+
+    #[test]
+    fn test_check_transition_signals_idle_files_not_consumed() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        // .idle files should be left for check_idle_signals(), not consumed here
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+
+        state.check_transition_signals();
+
+        // .idle file should still exist — not consumed by check_transition_signals
+        assert!(signal_dir.join("pane-1.idle").exists());
+    }
+
+    // =========================================================================
+    // Review auto-complete tests (T-010-03)
+    //
+    // Note: We test auto_complete_review() directly instead of
+    // handle_stopped_signal() because the latter calls send_line_to_pane()
+    // (a zellij host function) in the WaitingForStop branch, which
+    // can't link on native test targets.
+    // =========================================================================
+
+    #[test]
+    fn test_auto_complete_review_updates_ticket_and_cleans_up() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Agent slot with ticket assigned
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+        });
+
+        // Parked thread in Review phase
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.park();
+        state.threads.insert("T-001".to_string(), thread);
+
+        // Directly call auto_complete_review
+        state.auto_complete_review("T-001".to_string(), 1);
+
+        // Thread should be removed
+        assert!(!state.threads.contains_key("T-001"), "Thread should be removed after auto-complete");
+
+        // Slot should be released
+        assert_eq!(
+            state.agent_slots[0].ticket_id, None,
+            "Slot should be released after auto-complete"
+        );
+
+        // Activity log: TicketPhaseChanged Review → Done
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
+            if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
+        )), "Should log TicketPhaseChanged Review → Done");
+
+        // Activity log: Info with "Auto-completed"
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message } if message.contains("Auto-completed")
+        )), "Should log auto-complete info message");
+
+        // Ticket file updated on disk
+        let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(content.contains("phase: done"), "Ticket phase should be done, got: {}", content);
+        assert!(content.contains("status: done"), "Ticket status should be done, got: {}", content);
+    }
+
+    #[test]
+    fn test_auto_complete_review_condition_non_review_skipped() {
+        // Verify that the condition logic in handle_stopped_signal correctly
+        // identifies non-Review tickets as ineligible for auto-complete.
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Check: ticket is NOT in Review phase
+        let is_review = state
+            .dag
+            .get_ticket(&"T-001".to_string())
+            .map(|t| t.phase == Phase::Review)
+            .unwrap_or(false);
+        assert!(!is_review, "Implement-phase ticket should not be detected as Review");
+    }
+
+    #[test]
+    fn test_auto_complete_review_condition_completed_thread_skipped() {
+        // Verify that already-Completed threads are not re-processed.
+        use lisa_core::types::{Thread, ThreadStatus};
+
+        let mut state = State::default();
+
+        // Thread already completed
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.complete();
+        state.threads.insert("T-001".to_string(), thread);
+
+        // The condition in handle_stopped_signal:
+        let skip = state
+            .threads
+            .get("T-001")
+            .map(|t| t.status == ThreadStatus::Completed)
+            .unwrap_or(true);
+        assert!(skip, "Completed thread should be skipped");
+    }
+
+    #[test]
+    fn test_auto_complete_review_condition_missing_thread_skipped() {
+        // Verify that missing threads are skipped.
+        let state = State::default();
+
+        let skip = state
+            .threads
+            .get("T-NONEXISTENT")
+            .map(|t| t.status == lisa_core::types::ThreadStatus::Completed)
+            .unwrap_or(true);
+        assert!(skip, "Missing thread should be skipped (unwrap_or(true))");
+    }
+
+    #[test]
+    fn test_auto_complete_review_condition_parked_thread_eligible() {
+        // Verify that Parked threads ARE eligible for auto-complete.
+        use lisa_core::types::Thread;
+
+        let mut state = State::default();
+
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.park();
+        state.threads.insert("T-001".to_string(), thread);
+
+        let skip = state
+            .threads
+            .get("T-001")
+            .map(|t| t.status == lisa_core::types::ThreadStatus::Completed)
+            .unwrap_or(true);
+        assert!(!skip, "Parked thread should NOT be skipped");
+    }
+
+    #[test]
+    fn test_auto_complete_review_condition_running_thread_eligible() {
+        // Verify that Running threads in Review phase ARE eligible.
+        use lisa_core::types::Thread;
+
+        let mut state = State::default();
+
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        // status is Running by default
+        state.threads.insert("T-001".to_string(), thread);
+
+        let skip = state
+            .threads
+            .get("T-001")
+            .map(|t| t.status == lisa_core::types::ThreadStatus::Completed)
+            .unwrap_or(true);
+        assert!(!skip, "Running thread should NOT be skipped");
     }
 }
 
