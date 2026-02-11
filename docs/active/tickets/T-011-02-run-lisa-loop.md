@@ -3,7 +3,7 @@ id: T-011-02
 title: Run lisa loop end-to-end on a real project
 type: spike
 phase: ready
-status: Todo
+status: open
 priority: high
 story: S-011
 created: 2026-02-11

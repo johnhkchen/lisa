@@ -3,7 +3,7 @@ id: T-011-03
 title: Write cross-device feedback document
 type: task
 phase: ready
-status: Todo
+status: open
 priority: medium
 story: S-011
 created: 2026-02-11

@@ -3,7 +3,7 @@ id: T-011-01
 title: Build and install lisa on a fresh device
 type: chore
 phase: ready
-status: Todo
+status: open
 priority: high
 story: S-011
 created: 2026-02-11
