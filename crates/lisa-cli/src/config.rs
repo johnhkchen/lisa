@@ -26,6 +26,7 @@ pub struct DirsConfig {
 pub struct SchedulingConfig {
     pub max_threads: Option<usize>,
     pub auto_advance: Option<bool>,
+    pub review_timeout_secs: Option<u64>,
 }
 
 /// Fully resolved configuration with all defaults applied.
@@ -36,6 +37,7 @@ pub struct ResolvedConfig {
     pub work_dir: String,
     pub max_threads: usize,
     pub auto_advance: bool,
+    pub review_timeout_secs: u64,
 }
 
 impl Default for ResolvedConfig {
@@ -46,6 +48,7 @@ impl Default for ResolvedConfig {
             work_dir: PluginConfig::DEFAULT_WORK_DIR.to_string(),
             max_threads: PluginConfig::DEFAULT_MAX_THREADS,
             auto_advance: false,
+            review_timeout_secs: PluginConfig::DEFAULT_REVIEW_TIMEOUT_SECS,
         }
     }
 }
@@ -91,6 +94,10 @@ pub fn resolve_config(config: &LisaConfig, cli_max_threads: Option<usize>) -> Re
             .scheduling
             .auto_advance
             .unwrap_or(defaults.auto_advance),
+        review_timeout_secs: config
+            .scheduling
+            .review_timeout_secs
+            .unwrap_or(defaults.review_timeout_secs),
     }
 }
 
@@ -108,7 +115,7 @@ pub struct ConfigValidation {
 pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     let known_top = &["dirs", "scheduling"];
     let known_dirs = &["tickets", "stories", "work"];
-    let known_scheduling = &["max_threads", "auto_advance"];
+    let known_scheduling = &["max_threads", "auto_advance", "review_timeout_secs"];
 
     // Parse as generic Value to detect unknown keys
     let value: toml::Value = content
@@ -165,6 +172,7 @@ work = "docs/active/work"
 [scheduling]
 max_threads = 2
 # auto_advance = false
+# review_timeout_secs = 240
 "#
 }
 
@@ -370,5 +378,34 @@ foo = 1
         let validation = load_config(dir.path()).unwrap();
         assert_eq!(validation.warnings.len(), 1);
         assert!(validation.warnings[0].contains("max_thread"));
+    }
+
+    #[test]
+    fn test_parse_review_timeout_secs() {
+        let toml_str = "[scheduling]\nreview_timeout_secs = 120\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.scheduling.review_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn test_resolve_review_timeout_default() {
+        let config = LisaConfig::default();
+        let resolved = resolve_config(&config, None);
+        assert_eq!(resolved.review_timeout_secs, 240);
+    }
+
+    #[test]
+    fn test_resolve_review_timeout_from_config() {
+        let toml_str = "[scheduling]\nreview_timeout_secs = 60\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None);
+        assert_eq!(resolved.review_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_validate_review_timeout_known_key() {
+        let result = validate_config("[scheduling]\nreview_timeout_secs = 300\n").unwrap();
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.config.scheduling.review_timeout_secs, Some(300));
     }
 }

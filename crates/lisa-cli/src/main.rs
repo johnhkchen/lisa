@@ -1,5 +1,6 @@
 mod config;
 mod detect;
+mod doctor;
 mod init;
 mod loop_cmd;
 mod setup_guide;
@@ -10,7 +11,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "lisa", about = "Lisa - DAG-driven concurrent task scheduling")]
+#[command(name = "lisa", about = "Lisa - DAG-driven concurrent task scheduling", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -50,6 +51,10 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Check that all runtime dependencies are installed
+    Doctor,
+    /// Print version information
+    Version,
     /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
     Loop {
         /// Path to the project root (defaults to current directory)
@@ -70,6 +75,15 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Doctor => {
+            if let Err(e) = doctor::run_doctor() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Version => {
+            println!("lisa {}", env!("CARGO_PKG_VERSION"));
+        }
         Commands::Init { dry_run, path } => {
             let path = resolve_path(&path);
             if let Err(e) = init::run_init(&path, dry_run) {

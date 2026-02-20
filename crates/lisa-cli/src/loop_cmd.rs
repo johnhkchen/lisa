@@ -10,8 +10,12 @@ use crate::templates::PLUGIN_WASM;
 pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(), String> {
     if !dry_run {
         // Validate prerequisites (skip in dry-run — user may not have them installed)
-        check_binary("zellij", "Install zellij: https://zellij.dev/documentation/installation")?;
-        check_binary("claude", "Install Claude Code: https://docs.anthropic.com/en/docs/claude-code")?;
+        crate::doctor::check_required_deps().map_err(|missing| {
+            format!(
+                "Missing required dependencies: {}\n\nRun `lisa doctor` for details and install instructions.",
+                missing.join(", ")
+            )
+        })?;
     }
 
     if !root.join("CLAUDE.md").exists() {
@@ -60,7 +64,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     println!("Lisa loop starting...");
     println!("  WASM plugin: {}", wasm_path.display());
     println!("  Layout: {}", layout_path.display());
-    println!("  Max threads: {}", config.max_threads);
+    println!("  Max threads: {} (panes: {})", config.max_threads, config.max_threads * 2);
     println!();
 
     // Exec zellij (replaces this process)
@@ -95,7 +99,7 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
         stats.blocked_tickets,
     );
     println!("Critical path length: {}", stats.critical_path_length);
-    println!("Max threads: {}", config.max_threads);
+    println!("Max threads: {} (panes: {})", config.max_threads, config.max_threads * 2);
     println!();
 
     // Show execution order (topological sort of non-done tickets)
@@ -137,28 +141,12 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn check_binary(name: &str, install_hint: &str) -> Result<(), String> {
-    match which(name) {
-        true => Ok(()),
-        false => Err(format!("`{}` not found in PATH. {}", name, install_hint)),
-    }
-}
-
-pub(crate) fn which(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
-    // Pre-create max_threads terminal pane slots in the stacked group.
-    // The first is expanded (visible), the rest are collapsed (thumbable).
+    // Create 2x max_threads pane slots so transitions don't block scheduling.
+    // Extra idle panes absorb new tickets while finishing panes wind down.
+    let pane_count = config.max_threads * 2;
     let mut agent_panes = String::new();
-    for i in 0..config.max_threads {
+    for i in 0..pane_count {
         if i == 0 {
             agent_panes.push_str("            pane expanded=true\n");
         } else {
@@ -184,6 +172,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
                 work_dir   "{work_dir}"
                 max_threads "{max_threads}"
                 auto_advance "{auto_advance}"
+                review_timeout_secs "{review_timeout_secs}"
             }}
         }}
     }}
@@ -196,6 +185,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
         work_dir = config.work_dir,
         max_threads = config.max_threads,
         auto_advance = config.auto_advance,
+        review_timeout_secs = config.review_timeout_secs,
     )
 }
 
@@ -251,7 +241,11 @@ mod tests {
         assert!(layout.contains("work_dir   \"docs/active/work\""));
         assert!(layout.contains("max_threads \"3\""));
         assert!(layout.contains("auto_advance \"false\""));
+        assert!(layout.contains("review_timeout_secs \"240\""));
         assert!(layout.contains("compact-bar"), "layout should include status bar");
+        // max_threads=3 should produce 6 pane lines (2x)
+        let pane_count = layout.matches("            pane").count();
+        assert_eq!(pane_count, 6, "Expected 6 panes (2 * max_threads=3)");
     }
 
     #[test]
@@ -260,6 +254,9 @@ mod tests {
         let config = default_config();
         let layout = generate_layout(&wasm_path, &config);
         assert!(layout.contains("max_threads \"2\""));
+        // max_threads=2 should produce 4 pane lines (2x)
+        let pane_count = layout.matches("            pane").count();
+        assert_eq!(pane_count, 4, "Expected 4 panes (2 * max_threads=2)");
     }
 
     #[test]

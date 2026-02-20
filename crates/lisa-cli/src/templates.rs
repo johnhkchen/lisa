@@ -52,6 +52,8 @@ fi
 pub const LISA_GITIGNORE: &str = "signals/\n";
 
 /// Generate .claude/settings.local.json with Stop, SessionStart, and Notification hooks.
+/// Hook commands use `test -x` guards so they succeed silently if the scripts
+/// haven't been created yet (e.g. settings.local.json exists before `lisa init`).
 pub fn settings_local_json() -> String {
     r#"{
   "hooks": {
@@ -60,7 +62,7 @@ pub fn settings_local_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": ".lisa/hooks/on-stop.sh"
+            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"
           }
         ]
       }
@@ -71,7 +73,7 @@ pub fn settings_local_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": ".lisa/hooks/on-clear.sh"
+            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
           }
         ]
       }
@@ -82,7 +84,7 @@ pub fn settings_local_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": ".lisa/hooks/on-idle.sh"
+            "command": "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh"
           }
         ]
       }
@@ -93,9 +95,10 @@ pub fn settings_local_json() -> String {
     .to_string()
 }
 
-/// Ensure a single hook entry exists in the hooks object.
+/// Ensure a single hook entry exists in the hooks object with the correct command.
 /// For hooks with a matcher (SessionStart, Notification), deduplication checks the matcher value.
 /// For hooks without a matcher (Stop), deduplication checks the command path.
+/// If the hook exists but uses an old bare-path command, it is upgraded in place.
 fn ensure_hook(
     hooks_obj: &mut serde_json::Map<String, serde_json::Value>,
     event_type: &str,
@@ -110,35 +113,64 @@ fn ensure_hook(
         None => return,
     };
 
-    let already_exists = match matcher {
+    // Extract the script path from the command for dedup matching.
+    // Commands may be bare paths (".lisa/hooks/on-stop.sh") or guarded
+    // ("test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh").
+    // Match on the script filename to handle both forms.
+    let script_path = command.rsplit("&& ").next().unwrap_or(command).trim();
+
+    // Find the matching entry index (if any)
+    let found_idx = match matcher {
         Some(m) => arr
             .iter()
-            .any(|entry| entry.get("matcher").and_then(|v| v.as_str()) == Some(m)),
-        None => arr.iter().any(|entry| {
+            .position(|entry| entry.get("matcher").and_then(|v| v.as_str()) == Some(m)),
+        None => arr.iter().position(|entry| {
             entry
                 .get("hooks")
                 .and_then(|h| h.as_array())
                 .map_or(false, |hooks| {
-                    hooks
-                        .iter()
-                        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command))
+                    hooks.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map_or(false, |c| c.contains(script_path))
+                    })
                 })
         }),
     };
 
-    if !already_exists {
-        let mut entry = serde_json::Map::new();
-        if let Some(m) = matcher {
-            entry.insert("matcher".to_string(), serde_json::json!(m));
+    match found_idx {
+        Some(idx) => {
+            // Entry exists — upgrade the command if it uses the old bare-path form
+            if let Some(hooks_arr) = arr[idx]
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+            {
+                for hook in hooks_arr.iter_mut() {
+                    if let Some(cmd_val) = hook.get_mut("command") {
+                        if let Some(existing) = cmd_val.as_str() {
+                            if existing.contains(script_path) && existing != command {
+                                *cmd_val = serde_json::json!(command);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        entry.insert(
-            "hooks".to_string(),
-            serde_json::json!([{
-                "type": "command",
-                "command": command
-            }]),
-        );
-        arr.push(serde_json::Value::Object(entry));
+        None => {
+            // Entry doesn't exist — create it
+            let mut entry = serde_json::Map::new();
+            if let Some(m) = matcher {
+                entry.insert("matcher".to_string(), serde_json::json!(m));
+            }
+            entry.insert(
+                "hooks".to_string(),
+                serde_json::json!([{
+                    "type": "command",
+                    "command": command
+                }]),
+            );
+            arr.push(serde_json::Value::Object(entry));
+        }
     }
 }
 
@@ -160,18 +192,18 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
         .as_object_mut()
         .ok_or("settings.local.json 'hooks' is not an object")?;
 
-    ensure_hook(hooks_obj, "Stop", None, ".lisa/hooks/on-stop.sh");
+    ensure_hook(hooks_obj, "Stop", None, "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh");
     ensure_hook(
         hooks_obj,
         "SessionStart",
         Some("clear"),
-        ".lisa/hooks/on-clear.sh",
+        "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh",
     );
     ensure_hook(
         hooks_obj,
         "Notification",
         Some("idle_prompt"),
-        ".lisa/hooks/on-idle.sh",
+        "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh",
     );
 
     serde_json::to_string_pretty(&root)
@@ -244,7 +276,7 @@ docs/active/work/       # Work artifacts, one subdirectory per ticket ID
 
 ---
 
-The RDSPI workflow definition is in docs/rdspi-workflow.md and is injected into agent context by lisa automatically.
+The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is injected into agent context by lisa automatically.
 "#,
         name = project.name,
         type_label = type_label,
@@ -287,7 +319,7 @@ mod tests {
         assert!(result.contains("cargo test"));
         assert!(result.contains("lib.rs"));
         assert!(result.contains("docs/active/tickets/"));
-        assert!(result.contains("docs/rdspi-workflow.md"));
+        assert!(result.contains("docs/knowledge/rdspi-workflow.md"));
     }
 
     #[test]
@@ -401,9 +433,31 @@ mod tests {
     fn test_merge_hooks_already_complete() {
         let input = settings_local_json();
         let result = merge_hooks(&input).unwrap();
-        // No duplicates
-        assert_eq!(result.matches("on-stop.sh").count(), 1);
-        assert_eq!(result.matches("on-clear.sh").count(), 1);
+        // No duplicate hook entries (each command string contains the script name twice
+        // due to the test -x guard, so count the full command instead)
+        assert_eq!(result.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
+        assert_eq!(result.matches("test -x .lisa/hooks/on-clear.sh").count(), 1);
+        assert_eq!(result.matches("idle_prompt").count(), 1);
+    }
+
+    #[test]
+    fn test_merge_hooks_upgrades_bare_path_commands() {
+        // Old-style settings with bare-path hook commands
+        let input = r#"{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": ".lisa/hooks/on-stop.sh" }] }],
+    "SessionStart": [{ "matcher": "clear", "hooks": [{ "type": "command", "command": ".lisa/hooks/on-clear.sh" }] }],
+    "Notification": [{ "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": ".lisa/hooks/on-idle.sh" }] }]
+  }
+}"#;
+        let result = merge_hooks(input).unwrap();
+        // Should upgrade to guarded commands
+        assert!(result.contains("test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"));
+        assert!(result.contains("test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"));
+        assert!(result.contains("test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh"));
+        // No duplicates — each hook entry appears once
+        assert_eq!(result.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
+        assert_eq!(result.matches("test -x .lisa/hooks/on-clear.sh").count(), 1);
         assert_eq!(result.matches("idle_prompt").count(), 1);
     }
 
