@@ -15,7 +15,7 @@ Install these before starting:
 
 ```bash
 # Clone lisa and build the plugin
-git clone <lisa-repo-url>
+git clone https://github.com/johnhkchen/lisa
 cd lisa
 cargo build --target wasm32-wasi --release
 # Output: target/wasm32-wasi/release/lisa.wasm
@@ -266,7 +266,7 @@ layout {
             ticket_dir "docs/active/tickets"
             story_dir  "docs/active/stories"
             work_dir   "docs/active/work"
-            max_threads "2"
+            max_threads "2"  // concurrency cap; creates 4 panes (2x)
             auto_advance "false"
         }
     }
@@ -294,10 +294,10 @@ All configuration is passed through the zellij plugin config map:
 | `ticket_dir` | `docs/active/tickets` | Directory containing ticket markdown files |
 | `story_dir` | `docs/active/stories` | Directory containing story markdown files |
 | `work_dir` | `docs/active/work` | Directory for phase artifacts |
-| `max_threads` | `2` | Maximum concurrent Claude Code sessions |
+| `max_threads` | `2` | Maximum concurrent sessions (pane count is 2x) |
 | `auto_advance` | `false` | Whether to auto-advance phases without human review |
 
-**On `max_threads`:** Start with 2. Four concurrent agents on one branch works but creates more file churn. Go higher only after you have confidence your dependency graph is correct.
+**On `max_threads`:** Start with 2. The layout creates `2 * max_threads` panes so finishing sessions can wind down while new ones start immediately. Only `max_threads` tickets run concurrently. Go higher only after you have confidence your dependency graph is correct.
 
 **On `auto_advance`:** When false (default), agents park after Research and Design for human review. When true, agents proceed through all phases without stopping. Use `false` until you trust the workflow. Research and Design review catches problems before they become expensive implementation mistakes.
 

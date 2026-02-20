@@ -104,7 +104,7 @@ fn section_claude_md(root: &Path, project: &DetectedProject) -> GuideSection {
          - Build, test, and lint commands\n\
          - Source layout overview\n\
          - Directory conventions for docs/active/ and docs/archive/\n\n\
-         The RDSPI workflow reference should point to `docs/rdspi-workflow.md`."
+         The RDSPI workflow reference should point to `docs/knowledge/rdspi-workflow.md`."
             .to_string()
     } else {
         format!(
@@ -126,7 +126,7 @@ fn section_claude_md(root: &Path, project: &DetectedProject) -> GuideSection {
 
 fn section_rdspi_workflow() -> GuideSection {
     let body = format!(
-        "Create `docs/rdspi-workflow.md` with the full RDSPI workflow definition below. \
+        "Create `docs/knowledge/rdspi-workflow.md` with the full RDSPI workflow definition below. \
          Lisa injects this into each agent session automatically.\n\n\
          ```markdown\n\
          {}\n\

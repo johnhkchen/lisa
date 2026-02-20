@@ -2,5 +2,7 @@
 .DS_Store
 .lisa-layout.kdl
 .lisa-state-dump.txt
-.ralph-commit.lock
+.lisa-commit.lock
 .obsidian/
+.claude/settings.local.json
+result

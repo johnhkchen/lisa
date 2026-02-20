@@ -1,4 +1,4 @@
-//! DAG computation module for Lisa/Ralph Zellij plugin.
+//! DAG computation module for Lisa Zellij plugin.
 //!
 //! This module provides on-demand DAG computation from ticket frontmatter.
 //! The DAG is computed dynamically - there is no DAG file. This is a core
@@ -393,7 +393,7 @@ impl Dag {
     /// 1. Have all dependencies satisfied (in "done" phase)
     /// 2. Are in a startable phase themselves
     ///
-    /// These are the tickets that Ralph can spawn threads for simultaneously.
+    /// These are the tickets that Lisa can spawn threads for simultaneously.
     pub fn get_runnable_tickets(&self) -> Vec<&Ticket> {
         self.nodes
             .values()

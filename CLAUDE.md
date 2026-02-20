@@ -55,4 +55,4 @@ docs/active/work/       # Work artifacts, one subdirectory per ticket ID
 
 ---
 
-The RDSPI workflow definition is in docs/rdspi-workflow.md and is injected into agent context by lisa automatically.
+The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is injected into agent context by lisa automatically.

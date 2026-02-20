@@ -26,8 +26,8 @@
 - CLAUDE.md template for project adoption
 - Notes for future `lisa init` command
 
-### Sprint 4: First-Implementer Feedback (moron project)
-Applied feedback from first manual setup on the moron Rust motion graphics engine:
+### Sprint 4: First-Implementer Feedback (external project)
+Applied feedback from first manual setup on an external Rust project:
 - Fixed doc inconsistencies: phase example, max_threads default (4 → 2), filesystem-safe ID note
 - Made `blocks` optional — DAG fully computed from `depends_on` alone (65 tests)
 - Added archiving section to setup guide (docs/archive/ convention)

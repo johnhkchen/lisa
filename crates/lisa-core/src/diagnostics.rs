@@ -135,7 +135,7 @@ mod tests {
     }
 
     fn lock_path() -> PathBuf {
-        PathBuf::from("/host/.ralph-commit.lock")
+        PathBuf::from("/host/.lisa-commit.lock")
     }
 
     #[test]

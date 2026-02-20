@@ -1,4 +1,4 @@
-//! Ticket parsing and management module for the Lisa/Ralph Zellij plugin.
+//! Ticket parsing and management module for the Lisa Zellij plugin.
 //!
 //! This module handles reading, parsing, and updating tickets stored as markdown
 //! files with YAML frontmatter. Tickets are the unit of work in the RDSPI workflow.
