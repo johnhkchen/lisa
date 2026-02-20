@@ -1,0 +1,4 @@
+- name: Install wasm32-wasip1 target
+  run: rustup target add wasm32-wasip1
+- name: Build WASM plugin
+  run: cargo build -p lisa-plugin --target wasm32-wasip1 --release

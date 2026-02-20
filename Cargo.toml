@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.6"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/johnhkchen/lisa"
@@ -12,3 +12,7 @@ homepage = "https://github.com/johnhkchen/lisa"
 [profile.release]
 opt-level = "s"
 lto = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
