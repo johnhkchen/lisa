@@ -1,34 +1,35 @@
 # Lisa
 
-A Zellij plugin for DAG-driven concurrent task scheduling. An homage to the ralph loop, but smarter.
+DAG-driven concurrent task scheduling for AI-assisted development.
 
-Lisa reads ticket files with YAML frontmatter, computes a dependency graph, and spawns concurrent Claude Code sessions that work through the RDSPI workflow (Research, Design, Structure, Plan, Implement). It carries between projects as a single `.wasm` file.
+## What It Does
+
+When you have a set of interdependent tasks — a feature broken into tickets, a refactor with sequencing constraints, a sprint with parallel workstreams — Lisa schedules and runs them concurrently as Claude Code sessions. You define the work as markdown tickets with dependency metadata. Lisa figures out what can run in parallel, what has to wait, and launches sessions accordingly.
+
+Lisa runs as a [Zellij](https://zellij.dev/) plugin. It reads your tickets, computes a dependency graph, and spawns Claude Code sessions for every ticket whose dependencies are satisfied. A dashboard shows what's running, what's queued, and what's done. When a ticket finishes, Lisa checks what it unblocked and schedules the next wave.
+
+Each ticket goes through five phases: Research, Design, Structure, Plan, Implement. Every phase produces a short artifact (~200 lines) that serves as both a review checkpoint and crash recovery. If a session dies mid-work, the latest artifact plus the ticket is enough to seed a new session at the right phase.
+
+## Prerequisites
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — the AI coding assistant that does the work
+- [Zellij](https://zellij.dev/) — terminal multiplexer that hosts Lisa as a plugin
+
+After installing Lisa, run `lisa doctor` to verify everything is in place.
 
 ## Install
 
-### Prebuilt binaries (recommended)
-
-Download the latest release for your platform:
+### Shell installer (recommended)
 
 ```bash
-# macOS (Apple Silicon)
-curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-aarch64-macos.tar.gz | tar xz
-sudo mv lisa /usr/local/bin/
-
-# macOS (Intel)
-curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-x86_64-macos.tar.gz | tar xz
-sudo mv lisa /usr/local/bin/
-
-# Linux (x86_64)
-curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-x86_64-linux.tar.gz | tar xz
-sudo mv lisa /usr/local/bin/
-
-# Linux (ARM64)
-curl -fsSL https://github.com/johnhkchen/lisa/releases/latest/download/lisa-aarch64-linux.tar.gz | tar xz
-sudo mv lisa /usr/local/bin/
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh
 ```
 
-Or download from the [releases page](https://github.com/johnhkchen/lisa/releases).
+### Homebrew (macOS)
+
+```bash
+brew install johnhkchen/lisa/lisa
+```
 
 ### From crates.io
 
@@ -36,8 +37,7 @@ Or download from the [releases page](https://github.com/johnhkchen/lisa/releases
 cargo install lisa-cli
 ```
 
-> **Note:** `cargo install` provides the CLI without the embedded Zellij WASM plugin.
-> The `lisa loop` command requires building from source or using a prebuilt binary.
+> **Note:** Building from crates.io requires the `wasm32-wasip1` Rust target (`rustup target add wasm32-wasip1`) because the WASM plugin is compiled and embedded during the build.
 
 ### From source
 
@@ -45,92 +45,96 @@ cargo install lisa-cli
 git clone https://github.com/johnhkchen/lisa
 cd lisa
 rustup target add wasm32-wasip1
-
-# Build + install the `lisa` CLI to ~/.cargo/bin
 just install
 ```
 
-This builds the WASM plugin, embeds it in the CLI binary, and installs it via `cargo install`. Make sure `~/.cargo/bin` is on your `PATH`.
-
-#### Prerequisites
-
-- Rust toolchain (`rustup`)
-- `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
-- [just](https://github.com/casey/just) command runner
-- [Zellij](https://zellij.dev/) terminal multiplexer (for `lisa loop`)
-
-## Build
-
-```bash
-# Prerequisites
-rustup target add wasm32-wasip1
-
-# Build the WASM plugin
-just build
-
-# Build the CLI (with embedded WASM plugin)
-just build-cli
-
-# Build + install to ~/.cargo/bin
-just install
-
-# Run tests
-just test
-
-# Build + test
-just check
-```
+Requires the [Rust toolchain](https://rustup.rs/) and [just](https://github.com/casey/just).
 
 ## Quick Start
 
-```bash
-# Build (WASM plugin + CLI with embedded plugin)
-just release
+Initialize your project:
 
-# Initialize any project for lisa-loop
+```bash
 cd your-project
 lisa init
+```
 
-# Write tickets in docs/active/tickets/, then:
+This creates the ticket directories and a `CLAUDE.md` tailored to your project.
+
+Create a ticket in `docs/active/tickets/`:
+
+```yaml
+---
+id: T-001-01
+title: Add user authentication
+type: task
+status: open
+phase: ready
+priority: high
+depends_on: []
+---
+
+## Context
+
+Add JWT-based authentication to the API. The `/login` endpoint should
+accept email/password and return a signed token.
+
+## Acceptance Criteria
+
+- POST /login returns a JWT on valid credentials
+- Protected routes reject requests without a valid token
+```
+
+Launch Lisa:
+
+```bash
 lisa loop
 ```
 
+Lisa opens a Zellij session with a dashboard. It picks up all tickets in `ready` phase whose dependencies are satisfied and starts Claude Code sessions for each one.
+
 ## How It Works
 
-1. You write tickets as markdown files with YAML frontmatter defining dependencies
-2. Lisa computes a DAG from `depends_on` relationships
-3. Tickets with satisfied dependencies get scheduled as Claude Code sessions
-4. Each session works through 5 phases: Research, Design, Structure, Plan, Implement
-5. Phase artifacts (~200 lines each) provide review checkpoints and crash recovery
-6. Concurrent sessions share a branch with commit serialization via file locking
+### Workflow
+
+Every ticket passes through five phases in order:
+
+1. **Research** — Map the relevant codebase. What exists, where, how it connects.
+2. **Design** — Explore options, evaluate tradeoffs, choose an approach with rationale.
+3. **Structure** — Define file-level changes, module boundaries, public interfaces.
+4. **Plan** — Sequence implementation steps with testing strategy.
+5. **Implement** — Execute the plan, commit incrementally, track progress.
+
+Each phase produces a ~200-line artifact in `docs/active/work/{ticket-id}/`. These are review checkpoints — catching a bad design at 200 lines is cheaper than catching it at 2,000 lines of wrong code.
+
+### Scheduling
+
+Tickets declare dependencies via the `depends_on` field. Lisa computes a DAG, topologically sorts it, and schedules all tickets whose dependencies are satisfied. As tickets complete, newly unblocked tickets are scheduled automatically.
+
+### Concurrency
+
+Multiple Claude Code sessions work in parallel on the same branch. Commit serialization is handled via file locking — sessions don't need to coordinate with each other. If two tickets modify the same files, that's a missing dependency edge in the DAG.
 
 ## Project Layout
 
 ```
 crates/
-  lisa-core/          Shared types, ticket parsing, DAG computation
-  lisa-plugin/        Zellij WASM plugin (scheduler, UI, plugin entry)
-  lisa-cli/           CLI binary (lisa init, lisa validate, lisa loop)
+  lisa-core/       Shared types, ticket parsing, DAG computation
+  lisa-plugin/     Zellij WASM plugin (scheduler, dashboard, plugin entry)
+  lisa-cli/        CLI binary (lisa init, lisa validate, lisa loop, lisa doctor)
 
 docs/
+  active/
+    tickets/       Ticket files (markdown with YAML frontmatter)
+    stories/       Story files (grouping related tickets)
+    work/          Phase artifacts, one subdirectory per ticket
   knowledge/
-    rdspi-workflow.md   RDSPI workflow definition
-    lisa-loop-setup-guide.md  Setup guide for other projects
-  active/tickets/     Example ticket files
-  active/stories/     Example story files
-  active/work/        Phase artifacts (auto-populated)
-  ROADMAP.md          Sprint log and candidates
+    rdspi-workflow.md   Workflow definition (injected into agent context)
 ```
 
-## Setting Up Your Project
+## Contributing
 
-Run `lisa init` in your project root. It will:
-- Detect your project type (Rust, Node, Go, Python)
-- Create `docs/active/{tickets,stories,work}` and `docs/archive/` directories
-- Generate a project-specific `CLAUDE.md`
-- Copy the RDSPI workflow document
-
-Then run `lisa validate` to check your setup.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, test commands, and how to submit changes.
 
 ## License
 
