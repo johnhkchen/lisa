@@ -8,16 +8,7 @@ use crate::templates::PLUGIN_WASM;
 /// In dry-run mode, scans tickets, builds the DAG, and prints what would happen
 /// without writing files or launching zellij.
 pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(), String> {
-    if !dry_run {
-        // Validate prerequisites (skip in dry-run — user may not have them installed)
-        crate::doctor::check_required_deps().map_err(|missing| {
-            format!(
-                "Missing required dependencies: {}\n\nRun `lisa doctor` for details and install instructions.",
-                missing.join(", ")
-            )
-        })?;
-    }
-
+    // Validate project structure first (cheap, no external deps)
     if !root.join("CLAUDE.md").exists() {
         return Err("No CLAUDE.md found. Run `lisa init` first.".to_string());
     }
@@ -31,6 +22,14 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     if dry_run {
         return run_dry(root, config);
     }
+
+    // Validate binary prerequisites (skip in dry-run — user may not have them installed)
+    crate::doctor::check_required_deps().map_err(|missing| {
+        format!(
+            "Missing required dependencies: {}\n\nRun `lisa doctor` for details and install instructions.",
+            missing.join(", ")
+        )
+    })?;
 
     // Check the WASM plugin is actually embedded (not a dev placeholder)
     if PLUGIN_WASM.is_empty() {
