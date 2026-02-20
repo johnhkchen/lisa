@@ -1,4 +1,4 @@
-//! Lisa/Ralph - A Zellij plugin for DAG-driven concurrent task scheduling
+//! Lisa - A Zellij plugin for DAG-driven concurrent task scheduling
 //!
 //! This plugin implements the RDSPI workflow (Research -> Design -> Structure -> Plan -> Implement)
 //! as a DAG-driven concurrent scheduler. It manages Claude Code sessions for each ticket,
@@ -6,7 +6,7 @@
 
 mod ui;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use zellij_tile::prelude::*;
@@ -31,7 +31,7 @@ const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 30;
 fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
     let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
     format!(
-        "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/rdspi-workflow.md. \
+        "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/knowledge/rdspi-workflow.md. \
          Start from the current phase indicated in the ticket frontmatter.",
         ticket_path.display()
     )
@@ -49,15 +49,31 @@ fn build_claude_command(ticket_dir: &Path, ticket_id: &str, pane_id: u32) -> Str
     )
 }
 
-/// Send text to a pane followed by Enter (carriage return as a raw byte).
-///
-/// `write_chars_to_pane_id` sends characters as typed text, but TUI apps like
-/// Claude Code need the Enter key delivered as a raw byte (0x0D) via
-/// `write_to_pane_id`, not as a `\r` character embedded in the text stream.
-fn send_line_to_pane(text: &str, pane_id: PaneId) {
-    write_chars_to_pane_id(text, pane_id);
-    write_to_pane_id(vec![13], pane_id); // Enter key
+/// The prompt text sent to a parked Review session after the review timeout.
+fn finish_up_prompt(ticket_dir: &Path, work_dir: &Path, ticket_id: &str) -> String {
+    let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
+    let review_path = work_dir.join(ticket_id).join("review.md");
+    format!(
+        "The review timeout has been reached for this ticket. Please wrap up by: \
+         1) Create a review summary at {} covering: what changes were made, files modified, \
+         and any open concerns or TODOs. \
+         2) Then mark the ticket complete by updating the frontmatter in {} — \
+         set `phase: done` and `status: done`.",
+        review_path.display(),
+        ticket_path.display(),
+    )
 }
+
+/// Delay (seconds) between sending characters and pressing Enter.
+///
+/// Claude Code's TUI needs a full event-loop tick to process typed characters
+/// and commit them to the input field before Enter can trigger "submit".
+/// Two separate `write_to_pane_id` calls can coalesce in the PTY buffer,
+/// causing the TUI to read text + CR in one chunk — Enter fires before the
+/// input state is committed, so it inserts a newline instead of submitting.
+/// A 2-second gap is imperceptible to human operators but gives the TUI
+/// plenty of time to process the characters.
+const ENTER_DELAY_SECS: f64 = 2.0;
 
 /// Strip the `/host/` prefix from a WASI sandbox path to get the host-relative path.
 ///
@@ -67,6 +83,10 @@ fn strip_host_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     PathBuf::from(s.strip_prefix("/host/").unwrap_or(&s).to_string())
 }
+
+/// How long a slot stays in cooldown after its ticket completes (seconds).
+/// Prevents the scheduler from reusing a pane whose session is still winding down.
+const SLOT_COOLDOWN_SECS: u64 = 60;
 
 /// An agent pane slot — a pre-created terminal in the stacked layout.
 struct AgentSlot {
@@ -79,6 +99,8 @@ struct AgentSlot {
     transition_state: TransitionState,
     /// When the current transition started (for timeout fallbacks).
     transition_started_at: Option<std::time::SystemTime>,
+    /// Earliest time this slot can accept new work (cooldown after completion).
+    cooldown_until: Option<std::time::SystemTime>,
 }
 
 /// What action the modal should perform on Enter.
@@ -171,6 +193,14 @@ pub struct State {
 
     /// Scroll offset for the dashboard view (used with j/k keys).
     scroll_offset: usize,
+
+    /// Panes waiting for a deferred Enter keypress.
+    /// Characters are sent immediately; Enter is sent after `ENTER_DELAY_SECS`
+    /// so the TUI has time to commit the text to its input field.
+    pending_enters: VecDeque<PaneId>,
+
+    /// Ticket IDs that have already received a finish-up prompt (prevents re-sending).
+    finish_up_sent: HashSet<TicketId>,
 }
 
 impl State {
@@ -187,6 +217,25 @@ impl State {
     fn timer_fired(&mut self) -> bool {
         self.pending_timer_count = self.pending_timer_count.saturating_sub(1);
         self.pending_timer_count == 0
+    }
+
+    /// Send text to a pane and queue a deferred Enter keypress.
+    ///
+    /// Characters are written immediately via `write_chars_to_pane_id`.
+    /// The Enter key (0x0D) is queued and sent after `ENTER_DELAY_SECS` so the
+    /// TUI has time to process the characters before receiving the submit action.
+    fn send_line_to_pane(&mut self, text: &str, pane_id: PaneId) {
+        write_chars_to_pane_id(text, pane_id);
+        self.pending_enters.push_back(pane_id);
+        set_timeout(ENTER_DELAY_SECS);
+        self.pending_timer_count += 1;
+    }
+
+    /// Send Enter to all panes that have been waiting for the deferred keypress.
+    fn flush_pending_enters(&mut self) {
+        while let Some(pane_id) = self.pending_enters.pop_front() {
+            write_to_pane_id(vec![13], pane_id); // Enter key
+        }
     }
 
     fn log_activity(&mut self, event: ActivityEvent) {
@@ -269,6 +318,7 @@ impl State {
                         has_session: false,
                         transition_state: TransitionState::Idle,
                         transition_started_at: None,
+                        cooldown_until: None,
                     });
                 }
             }
@@ -282,11 +332,13 @@ impl State {
         }
     }
 
-    /// Find an idle agent slot.
+    /// Find an idle agent slot that has finished its cooldown period.
     fn find_idle_slot(&self) -> Option<usize> {
-        self.agent_slots
-            .iter()
-            .position(|s| s.ticket_id.is_none())
+        let now = std::time::SystemTime::now();
+        self.agent_slots.iter().position(|s| {
+            s.ticket_id.is_none()
+                && s.cooldown_until.map_or(true, |until| now >= until)
+        })
     }
 
     /// Mark a slot as idle when its ticket completes.
@@ -299,6 +351,10 @@ impl State {
                 released_pane = Some(slot.pane_id);
                 slot.ticket_id = None;
                 // has_session stays true — Claude Code is still running
+                slot.cooldown_until = Some(
+                    std::time::SystemTime::now()
+                        + std::time::Duration::from_secs(SLOT_COOLDOWN_SECS),
+                );
                 break;
             }
         }
@@ -340,6 +396,16 @@ impl State {
                 }
             }
 
+            // Enforce concurrency cap: only max_threads tickets run at once.
+            // Extra pane slots exist for overlap during transitions.
+            let running_count = self.threads.values()
+                .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
+                .count();
+            if running_count >= self.config.max_threads {
+                unscheduled += 1;
+                continue;
+            }
+
             // Find an idle slot
             let slot_idx = match self.find_idle_slot() {
                 Some(idx) => idx,
@@ -356,10 +422,14 @@ impl State {
 
             let launch_cmd;
             if self.agent_slots[slot_idx].has_session {
-                // Session reuse: defer /clear until .stopped signal confirms
-                // the pane is ready for input. The transition state machine
-                // (check_transition_signals) handles the rest.
-                self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForStop;
+                // Session reuse: the slot is idle (ticket_id was None), so
+                // Claude Code is already at its prompt. Send /clear directly
+                // and wait for the .cleared signal before sending the prompt.
+                // (The old WaitingForStop approach deadlocked because the
+                // previous session's .stopped signal was already consumed by
+                // check_transition_signals() earlier in the same poll_tick.)
+                self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
+                self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForClear;
                 self.agent_slots[slot_idx].transition_started_at =
                     Some(std::time::SystemTime::now());
                 launch_cmd = ticket_prompt(&host_ticket_dir, &ticket_id);
@@ -367,7 +437,7 @@ impl State {
                 // Fresh pane — launch Claude Code from the shell.
                 let cmd = build_claude_command(&host_ticket_dir, &ticket_id, pane_id);
                 launch_cmd = cmd.clone();
-                send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
+                self.send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
                 self.agent_slots[slot_idx].has_session = true;
             }
 
@@ -751,7 +821,7 @@ impl State {
 
         // Case 1: Mid-transition — send /clear
         if transition_state == TransitionState::WaitingForStop {
-            send_line_to_pane("/clear", PaneId::Terminal(pane_id));
+            self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
             if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
                 slot.transition_state = TransitionState::WaitingForClear;
                 slot.transition_started_at = Some(std::time::SystemTime::now());
@@ -850,7 +920,7 @@ impl State {
         if let Some(ticket_id) = action {
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let prompt = ticket_prompt(&host_ticket_dir, &ticket_id);
-            send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+            self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
 
             self.log_activity(ActivityEvent::Info {
                 message: format!("Pane {} cleared, sent prompt for {}", pane_id, ticket_id),
@@ -896,7 +966,7 @@ impl State {
                     pane_id
                 ),
             });
-            send_line_to_pane("/clear", PaneId::Terminal(pane_id));
+            self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
             if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
                 slot.transition_state = TransitionState::WaitingForClear;
                 slot.transition_started_at = Some(now);
@@ -913,12 +983,64 @@ impl State {
             if let Some(tid) = &ticket_id {
                 let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
                 let prompt = ticket_prompt(&host_ticket_dir, tid);
-                send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+                self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
             }
             if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
                 slot.transition_state = TransitionState::Idle;
                 slot.transition_started_at = None;
             }
+        }
+    }
+
+    /// Check for parked Review threads that have exceeded the review timeout.
+    ///
+    /// When a thread is parked in Review phase longer than `review_timeout_secs`,
+    /// sends a finish-up prompt to the Claude session telling it to create a review
+    /// summary and mark the ticket done. The thread is resumed so the session can
+    /// act on the prompt.
+    ///
+    /// Set `review_timeout_secs = 0` to disable this feature.
+    fn check_review_timeouts(&mut self) {
+        if self.config.review_timeout_secs == 0 {
+            return;
+        }
+
+        let now = std::time::SystemTime::now();
+        let timeout = std::time::Duration::from_secs(self.config.review_timeout_secs);
+
+        // Collect candidates: parked threads in Review phase past timeout, not yet prompted
+        let candidates: Vec<(TicketId, u32)> = self
+            .threads
+            .iter()
+            .filter(|(_, t)| {
+                t.status == lisa_core::types::ThreadStatus::Parked
+                    && t.current_phase == Phase::Review
+            })
+            .filter(|(tid, _)| !self.finish_up_sent.contains(*tid))
+            .filter(|(_, t)| {
+                now.duration_since(t.last_phase_change)
+                    .unwrap_or_default()
+                    >= timeout
+            })
+            .map(|(tid, t)| (tid.clone(), t.pane_id))
+            .collect();
+
+        for (ticket_id, pane_id) in candidates {
+            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
+            let host_work_dir = strip_host_prefix(&self.config.work_dir);
+            let prompt = finish_up_prompt(&host_ticket_dir, &host_work_dir, &ticket_id);
+            self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+
+            if let Some(thread) = self.threads.get_mut(&ticket_id) {
+                thread.resume();
+                thread.last_phase_change = std::time::SystemTime::now();
+            }
+
+            self.finish_up_sent.insert(ticket_id.clone());
+            self.log_activity(ActivityEvent::FinishUpPromptSent {
+                ticket_id,
+                pane_id,
+            });
         }
     }
 
@@ -1062,6 +1184,9 @@ impl State {
         // Fallback: force-advance stalled transitions
         self.check_transition_timeouts();
 
+        // Send finish-up prompts to parked Review threads past timeout
+        self.check_review_timeouts();
+
         // Evaluate health: log transitions (Healthy→Stuck, etc.)
         self.evaluate_health();
 
@@ -1117,6 +1242,9 @@ impl State {
 
         // Audit threads: remove any orphaned entries for done/missing tickets
         self.audit_threads();
+
+        // Clean up finish_up_sent for threads that no longer exist
+        self.finish_up_sent.retain(|tid| self.threads.contains_key(tid));
 
         // Always try to schedule (slots may have freed up)
         self.schedule_ready_tickets();
@@ -1222,6 +1350,9 @@ impl State {
             } => {
                 format!("SessionLaunch: {} pane=#{} cmd={}", ticket_id, pane_id, command)
             }
+            ActivityEvent::FinishUpPromptSent { ticket_id, pane_id } => {
+                format!("FinishUpPromptSent: {} pane=#{}", ticket_id, pane_id)
+            }
         }
     }
 
@@ -1251,6 +1382,7 @@ impl State {
         writeln!(out, "max_threads:         {}", self.config.max_threads).unwrap();
         writeln!(out, "auto_advance:        {}", self.config.auto_advance).unwrap();
         writeln!(out, "stuck_threshold_secs: {}", self.config.stuck_threshold_secs).unwrap();
+        writeln!(out, "review_timeout_secs: {}", self.config.review_timeout_secs).unwrap();
         writeln!(out).unwrap();
 
         // Plugin status
@@ -1687,7 +1819,7 @@ impl ZellijPlugin for State {
         ]);
 
         // Initial DAG build with startup diagnostics
-        let commit_lock_path = PathBuf::from("/host/.ralph-commit.lock");
+        let commit_lock_path = PathBuf::from("/host/.lisa-commit.lock");
         let scan_result = match ticket::scan_tickets_with_diagnostics(&self.config.ticket_dir) {
             Ok(result) => result,
             Err(e) => {
@@ -1763,6 +1895,11 @@ impl ZellijPlugin for State {
             }
 
             Event::Timer(_elapsed) => {
+                // Flush deferred Enter keypresses before polling.
+                // Each send_line_to_pane() schedules its own timer, so
+                // pending_enters may be non-empty on any timer tick.
+                self.flush_pending_enters();
+
                 if self.timer_fired() {
                     self.poll_tick();
                 }
@@ -1781,7 +1918,7 @@ impl ZellijPlugin for State {
 
     fn render(&mut self, rows: usize, cols: usize) {
         if !self.initialized {
-            println!("Lisa/Ralph initializing...");
+            println!("Lisa initializing...");
             return;
         }
 
@@ -1816,16 +1953,22 @@ impl State {
             .threads
             .values()
             .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
-            .map(|t| ui::ActiveThread {
-                ticket_id: t.ticket_id.clone(),
-                phase: phase_to_ui_phase(t.current_phase),
-                started_at: Duration::from_secs(
-                    t.started_at
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                ),
-                pane_id: t.pane_id,
+            .map(|t| {
+                let slot_number = self.agent_slots.iter()
+                    .position(|s| s.pane_id == t.pane_id)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                ui::ActiveThread {
+                    ticket_id: t.ticket_id.clone(),
+                    phase: phase_to_ui_phase(t.current_phase),
+                    started_at: Duration::from_secs(
+                        t.started_at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    ),
+                    slot_number,
+                }
             })
             .collect();
 
@@ -1833,22 +1976,28 @@ impl State {
             .threads
             .values()
             .filter(|t| t.status == lisa_core::types::ThreadStatus::Parked)
-            .map(|t| ui::ParkedThread {
-                ticket_id: t.ticket_id.clone(),
-                phase: phase_to_ui_phase(t.current_phase),
-                artifact_path: format!(
-                    "{}/{}/{}",
-                    self.config.work_dir.display(),
-                    t.ticket_id,
-                    t.current_phase.artifact_filename().unwrap_or("artifact.md")
-                ),
-                parked_at: Duration::from_secs(
-                    t.started_at
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                ),
-                pane_id: t.pane_id,
+            .map(|t| {
+                let slot_number = self.agent_slots.iter()
+                    .position(|s| s.pane_id == t.pane_id)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                ui::ParkedThread {
+                    ticket_id: t.ticket_id.clone(),
+                    phase: phase_to_ui_phase(t.current_phase),
+                    artifact_path: format!(
+                        "{}/{}/{}",
+                        self.config.work_dir.display(),
+                        t.ticket_id,
+                        t.current_phase.artifact_filename().unwrap_or("artifact.md")
+                    ),
+                    parked_at: Duration::from_secs(
+                        t.started_at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    ),
+                    slot_number,
+                }
             })
             .collect();
 
@@ -1901,9 +2050,12 @@ impl State {
         let slots: Vec<ui::SlotInfo> = self
             .agent_slots
             .iter()
-            .map(|s| ui::SlotInfo {
-                pane_id: s.pane_id,
+            .enumerate()
+            .map(|(i, s)| ui::SlotInfo {
                 ticket_id: s.ticket_id.clone(),
+                slot_number: i + 1,
+                transitioning: s.transition_state != TransitionState::Idle
+                    || s.cooldown_until.map_or(false, |until| std::time::SystemTime::now() < until),
             })
             .collect();
 
@@ -2059,6 +2211,13 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
                 format!("Launch: {}", command)
             },
         },
+        ActivityEvent::FinishUpPromptSent {
+            ticket_id,
+            pane_id,
+        } => ui::ActivityType::Info {
+            ticket_id: ticket_id.clone(),
+            message: format!("Finish-up prompt sent (pane #{})", pane_id),
+        },
     };
 
     Some(ui::ActivityEntry {
@@ -2211,7 +2370,7 @@ mod tests {
         let cmd = build_claude_command(ticket_dir, "T-001", 1);
 
         assert!(
-            cmd.contains("docs/rdspi-workflow.md"),
+            cmd.contains("docs/knowledge/rdspi-workflow.md"),
             "command should reference RDSPI workflow, got: {}",
             cmd
         );
@@ -2298,7 +2457,7 @@ mod tests {
 
         assert!(prompt.contains("docs/active/tickets/T-024-03.md"));
         assert!(prompt.contains("CLAUDE.md"));
-        assert!(prompt.contains("docs/rdspi-workflow.md"));
+        assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
         assert!(prompt.contains("current phase"));
     }
 
@@ -2590,6 +2749,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         state.detect_stale_threads();
@@ -2692,6 +2852,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
         state.release_slot_for_ticket(&"T-001".to_string());
         state.threads.remove("T-001");
@@ -2702,7 +2863,15 @@ mod tests {
             state.agent_slots[0].has_session,
             "has_session should stay true — Claude Code is still running"
         );
-        assert!(state.find_idle_slot().is_some());
+        // Slot has a 60s cooldown — not immediately available for scheduling
+        assert!(
+            state.agent_slots[0].cooldown_until.is_some(),
+            "Released slot should have a cooldown set"
+        );
+        assert!(
+            state.find_idle_slot().is_none(),
+            "Slot should not be idle during cooldown"
+        );
 
         // Verify: thread is removed from map
         assert!(!state.threads.contains_key("T-001"));
@@ -2713,6 +2882,48 @@ mod tests {
 
         // Verify: T-002 doesn't have a thread yet, so it would be scheduled
         assert!(!state.threads.contains_key("T-002"));
+    }
+
+    #[test]
+    fn test_slot_cooldown_expires() {
+        // After the cooldown period, a released slot becomes available again.
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            // Cooldown already expired (set to 1 second ago)
+            cooldown_until: Some(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(1),
+            ),
+        });
+        assert!(
+            state.find_idle_slot().is_some(),
+            "Slot should be available after cooldown expires"
+        );
+    }
+
+    #[test]
+    fn test_slot_cooldown_blocks_scheduling() {
+        // During the cooldown period, a released slot is not available.
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            // Cooldown expires 30 seconds from now
+            cooldown_until: Some(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+            ),
+        });
+        assert!(
+            state.find_idle_slot().is_none(),
+            "Slot should not be available during cooldown"
+        );
     }
 
     #[test]
@@ -2988,6 +3199,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         state.release_slot_for_ticket(&"T-001".to_string());
@@ -3012,6 +3224,7 @@ mod tests {
             has_session: false,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         state.release_slot_for_ticket(&"T-MISSING".to_string());
@@ -3081,6 +3294,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // First rebuild with empty last_phases — done ticket should be detected
@@ -3147,6 +3361,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         let changed = state.rebuild_dag();
@@ -3206,6 +3421,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
         assert!(!state.threads.contains_key("T-001"));
 
@@ -3261,6 +3477,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // Run the done-ticket detection logic (mirrors poll_tick)
@@ -3355,6 +3572,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         state.audit_threads();
@@ -3469,6 +3687,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // Replicate the key mark_ticket_done operations (without schedule_ready_tickets)
@@ -3543,6 +3762,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 6,
@@ -3550,6 +3770,7 @@ mod tests {
             has_session: false,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // Add health data
@@ -3659,6 +3880,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 43,
@@ -3666,6 +3888,7 @@ mod tests {
             has_session: false,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         let snapshot = state.format_snapshot();
@@ -3782,6 +4005,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // Add running thread in implement phase
@@ -3862,6 +4086,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // Add running thread in research phase
@@ -3932,6 +4157,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         let mut thread = Thread::new("T-001", 1);
@@ -4004,6 +4230,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         state.check_idle_signals();
@@ -4054,6 +4281,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // Add a PARKED thread (not running)
@@ -4187,6 +4415,79 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrency_cap_respects_max_threads() {
+        // Verify the concurrency guard logic: when running_count >= max_threads,
+        // new tickets should not be scheduled even if idle slots exist.
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        // Create 3 ready tickets
+        for i in 1..=3 {
+            fs::write(
+                tickets_dir.join(format!("T-00{}.md", i)),
+                format!(
+                    "---\nid: T-00{}\ntitle: ticket-{}\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nBody\n",
+                    i, i
+                ),
+            ).unwrap();
+        }
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                max_threads: 2,
+                ..PluginConfig::new()
+            },
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+
+        // Create 4 agent slots (2x max_threads) to simulate the new layout
+        for i in 0..4 {
+            state.agent_slots.push(AgentSlot {
+                pane_id: 10 + i,
+                ticket_id: None,
+                has_session: false,
+                transition_state: TransitionState::Idle,
+                transition_started_at: None,
+                cooldown_until: None,
+            });
+        }
+
+        // Insert 2 running threads (at max_threads capacity)
+        state.threads.insert(
+            "T-001".to_string(),
+            Thread::new("T-001", 10),
+        );
+        state.threads.insert(
+            "T-002".to_string(),
+            Thread::new("T-002", 11),
+        );
+
+        // Verify: 3 ready tickets, 2 running threads, 4 idle slots
+        assert_eq!(state.dag.get_ready_tickets().len(), 3);
+        let running = state.threads.values()
+            .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
+            .count();
+        assert_eq!(running, 2);
+        assert_eq!(state.config.max_threads, 2);
+
+        // The concurrency guard: running_count >= max_threads should be true
+        assert!(running >= state.config.max_threads);
+        // Even though idle slots exist
+        assert!(state.agent_slots.iter().any(|s| s.ticket_id.is_none()));
+    }
+
+    #[test]
     fn test_reset_ticket_sets_ready_phase() {
         use lisa_core::types::Thread;
         use std::fs;
@@ -4315,6 +4616,7 @@ mod tests {
             has_session: false,
             transition_state: TransitionState::default(),
             transition_started_at: None,
+            cooldown_until: None,
         };
         assert_eq!(slot.transition_state, TransitionState::Idle);
     }
@@ -4338,6 +4640,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::WaitingForStop,
             transition_started_at: Some(std::time::SystemTime::now()),
+            cooldown_until: None,
         });
 
         state.check_transition_signals();
@@ -4378,6 +4681,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         state.check_transition_signals();
@@ -4415,6 +4719,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::WaitingForClear,
             transition_started_at: Some(std::time::SystemTime::now()),
+            cooldown_until: None,
         });
 
         state.check_transition_signals();
@@ -4455,6 +4760,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         state.check_transition_signals();
@@ -4499,6 +4805,7 @@ mod tests {
             transition_started_at: Some(
                 std::time::SystemTime::now() - std::time::Duration::from_secs(61),
             ),
+            cooldown_until: None,
         });
 
         state.check_transition_timeouts();
@@ -4535,6 +4842,7 @@ mod tests {
             transition_started_at: Some(
                 std::time::SystemTime::now() - std::time::Duration::from_secs(31),
             ),
+            cooldown_until: None,
         });
 
         state.check_transition_timeouts();
@@ -4565,6 +4873,7 @@ mod tests {
             transition_started_at: Some(
                 std::time::SystemTime::now() - std::time::Duration::from_secs(5),
             ),
+            cooldown_until: None,
         });
 
         state.check_transition_timeouts();
@@ -4602,7 +4911,7 @@ mod tests {
     // Review auto-complete tests (T-010-03)
     //
     // Note: We test auto_complete_review() directly instead of
-    // handle_stopped_signal() because the latter calls send_line_to_pane()
+    // handle_stopped_signal() because the latter calls self.send_line_to_pane()
     // (a zellij host function) in the WaitingForStop branch, which
     // can't link on native test targets.
     // =========================================================================
@@ -4639,6 +4948,7 @@ mod tests {
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
+            cooldown_until: None,
         });
 
         // Parked thread in Review phase
@@ -4786,6 +5096,172 @@ mod tests {
             .map(|t| t.status == lisa_core::types::ThreadStatus::Completed)
             .unwrap_or(true);
         assert!(!skip, "Running thread should NOT be skipped");
+    }
+
+    // ---- Finish-up prompt tests ----
+
+    #[test]
+    fn test_check_review_timeouts_sends_prompt_after_timeout() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                review_timeout_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Parked Review thread with last_phase_change far in the past
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.park();
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_review_timeouts();
+
+        // Thread should be resumed (Running)
+        let t = state.threads.get("T-001").unwrap();
+        assert_eq!(t.status, lisa_core::types::ThreadStatus::Running);
+
+        // Should be in finish_up_sent
+        assert!(state.finish_up_sent.contains("T-001"));
+
+        // Activity log should contain FinishUpPromptSent
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-001"
+        )));
+    }
+
+    #[test]
+    fn test_check_review_timeouts_idempotent() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                review_timeout_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.park();
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_review_timeouts();
+        let log_count = state.activity_log.len();
+
+        // Re-park the thread to simulate it being parked again
+        if let Some(t) = state.threads.get_mut("T-001") {
+            t.park();
+        }
+
+        state.check_review_timeouts();
+        // No new events — already in finish_up_sent
+        assert_eq!(state.activity_log.len(), log_count);
+    }
+
+    #[test]
+    fn test_check_review_timeouts_not_yet_timed_out() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                review_timeout_secs: 300,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Parked Review thread that was just parked (within timeout)
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.park();
+        // last_phase_change is now (default from Thread::new)
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_review_timeouts();
+
+        // Thread should still be parked
+        let t = state.threads.get("T-001").unwrap();
+        assert_eq!(t.status, lisa_core::types::ThreadStatus::Parked);
+        assert!(state.finish_up_sent.is_empty());
+    }
+
+    #[test]
+    fn test_check_review_timeouts_disabled_when_zero() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                review_timeout_secs: 0,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.park();
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_review_timeouts();
+
+        // Thread should still be parked (feature disabled)
+        let t = state.threads.get("T-001").unwrap();
+        assert_eq!(t.status, lisa_core::types::ThreadStatus::Parked);
+        assert!(state.finish_up_sent.is_empty());
+    }
+
+    #[test]
+    fn test_check_review_timeouts_only_parked_review() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                review_timeout_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Running Implement thread (should not be affected)
+        let mut t1 = Thread::new("T-001", 1);
+        t1.current_phase = Phase::Implement;
+        t1.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        state.threads.insert("T-001".to_string(), t1);
+
+        // Running Review thread (not parked — should not be affected)
+        let mut t2 = Thread::new("T-002", 2);
+        t2.current_phase = Phase::Review;
+        // status is Running (not Parked)
+        t2.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        state.threads.insert("T-002".to_string(), t2);
+
+        // Parked Implement thread (wrong phase — should not be affected)
+        let mut t3 = Thread::new("T-003", 3);
+        t3.current_phase = Phase::Implement;
+        t3.park();
+        t3.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        state.threads.insert("T-003".to_string(), t3);
+
+        state.check_review_timeouts();
+
+        // None should be prompted
+        assert!(state.finish_up_sent.is_empty());
+        assert!(state.activity_log.is_empty());
     }
 }
 

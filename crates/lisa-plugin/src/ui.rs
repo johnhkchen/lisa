@@ -1,4 +1,4 @@
-//! UI/Dashboard module for the Lisa/Ralph Zellij plugin.
+//! UI/Dashboard module for the Lisa Zellij plugin.
 //!
 //! This module provides the dashboard view that shows:
 //! - DAG with dependency edges and ticket status
@@ -7,7 +7,7 @@
 //! - Recent activity log: phase completions, commits, errors
 //! - Quick-jump to any thread's pane
 //!
-//! Replaces `just dag-status`, `just ralph-status`, and `just ralph-logs` with a single live view.
+//! Replaces manual status checking with a single live view.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -139,7 +139,7 @@ pub struct ActiveThread {
     pub ticket_id: String,
     pub phase: Phase,
     pub started_at: Duration,
-    pub pane_id: u32,
+    pub slot_number: usize,
 }
 
 /// Represents a parked thread waiting for review
@@ -149,7 +149,7 @@ pub struct ParkedThread {
     pub phase: Phase,
     pub artifact_path: String,
     pub parked_at: Duration,
-    pub pane_id: u32,
+    pub slot_number: usize,
 }
 
 /// Type of health alert for the attention banner.
@@ -175,8 +175,9 @@ pub struct HealthAlert {
 /// Information about an agent pane slot for dashboard display.
 #[derive(Debug, Clone)]
 pub struct SlotInfo {
-    pub pane_id: u32,
     pub ticket_id: Option<String>,
+    pub slot_number: usize,
+    pub transitioning: bool,
 }
 
 /// Activity log entry types
@@ -285,20 +286,23 @@ fn render_slots(state: &PluginState, output: &mut Vec<String>) {
 
     let total = state.slots.len();
     let occupied: Vec<&SlotInfo> = state.slots.iter().filter(|s| s.ticket_id.is_some()).collect();
-    let idle = total - occupied.len();
+    let transitioning: Vec<&SlotInfo> = state.slots.iter().filter(|s| s.transitioning).collect();
+    let idle = total - occupied.len() - transitioning.iter().filter(|s| s.ticket_id.is_none()).count();
 
     // Header
-    if occupied.is_empty() {
-        output.push(format!(
-            "{}{}=== Slots: {} total, {} idle ==={}",
-            BOLD, CYAN, total, idle, RESET
-        ));
-    } else {
-        output.push(format!(
-            "{}{}=== Slots: {} total, {} idle, {} occupied ==={}",
-            BOLD, CYAN, total, idle, occupied.len(), RESET
-        ));
+    let mut parts = vec![format!("{} total", total)];
+    if !occupied.is_empty() {
+        parts.push(format!("{} active", occupied.len()));
     }
+    let trans_count = transitioning.len();
+    if trans_count > 0 {
+        parts.push(format!("{} winding down", trans_count));
+    }
+    parts.push(format!("{} idle", idle));
+    output.push(format!(
+        "{}{}=== Slots: {} ==={}",
+        BOLD, CYAN, parts.join(", "), RESET
+    ));
     output.push(String::new());
 
     // Occupied slot details
@@ -312,8 +316,16 @@ fn render_slots(state: &PluginState, output: &mut Vec<String>) {
             .map(|t| t.phase.short_name())
             .unwrap_or("---");
         output.push(format!(
-            "  {}#{:<4}{} {:<12} [{}]",
-            DIM, slot.pane_id, RESET, tid, phase_str
+            "  [{}] {:<12} [{}]",
+            slot.slot_number, tid, phase_str
+        ));
+    }
+
+    // Transitioning slots (no ticket, but not idle yet)
+    for slot in state.slots.iter().filter(|s| s.transitioning && s.ticket_id.is_none()) {
+        output.push(format!(
+            "  {}[{}] winding down...{}",
+            DIM, slot.slot_number, RESET
         ));
     }
 
@@ -720,7 +732,7 @@ fn render_active_threads(state: &PluginState, output: &mut Vec<String>) {
     // Header
     output.push(format!(
         "{}{:<12} {:<10} {:<10} {:<6}{}",
-        DIM, "TICKET", "PHASE", "RUNNING", "PANE", RESET
+        DIM, "TICKET", "PHASE", "RUNNING", "SLOT", RESET
     ));
     output.push(format!("{}{}{}", DIM, "-".repeat(42), RESET));
 
@@ -729,13 +741,13 @@ fn render_active_threads(state: &PluginState, output: &mut Vec<String>) {
         let phase_color = thread.phase.color_code();
 
         output.push(format!(
-            "{:<12} {}{:<10}{} {:<10} #{}",
+            "{:<12} {}{:<10}{} {:<10} [{}]",
             thread.ticket_id,
             phase_color,
             thread.phase.full_name(),
             RESET,
             elapsed,
-            thread.pane_id
+            thread.slot_number
         ));
     }
 }
@@ -772,14 +784,14 @@ fn render_parked_threads(state: &PluginState, output: &mut Vec<String>) {
         };
 
         output.push(format!(
-            "{:<12} {}{:<10}{} {:<10} {} [#{}]",
+            "{:<12} {}{:<10}{} {:<10} {} [{}]",
             thread.ticket_id,
             phase_color,
             thread.phase.full_name(),
             RESET,
             elapsed,
             artifact_display,
-            thread.pane_id
+            thread.slot_number
         ));
     }
 }
@@ -880,28 +892,28 @@ fn render_quick_jump(state: &PluginState, output: &mut Vec<String>) {
     output.push(format!("{}{}=== Quick Jump ==={}", BOLD, WHITE, RESET));
     output.push(String::new());
 
-    // Collect all panes from active and parked threads
-    let mut panes: Vec<(u32, &str, &Phase)> = Vec::new();
+    // Collect all slots from active and parked threads
+    let mut slots: Vec<(usize, &str, &Phase)> = Vec::new();
 
     for thread in &state.active_threads {
-        panes.push((thread.pane_id, &thread.ticket_id, &thread.phase));
+        slots.push((thread.slot_number, &thread.ticket_id, &thread.phase));
     }
 
     for thread in &state.parked_threads {
-        panes.push((thread.pane_id, &thread.ticket_id, &thread.phase));
+        slots.push((thread.slot_number, &thread.ticket_id, &thread.phase));
     }
 
-    // Sort by pane ID for consistent ordering
-    panes.sort_by_key(|(pane_id, _, _)| *pane_id);
+    // Sort by slot number for consistent ordering
+    slots.sort_by_key(|(slot_number, _, _)| *slot_number);
 
-    if panes.is_empty() {
+    if slots.is_empty() {
         output.push(format!("{}(no active panes){}", DIM, RESET));
     } else {
-        output.push(format!("{}Press number to jump to pane:{}", DIM, RESET));
-        for (i, (pane_id, ticket_id, phase)) in panes.iter().enumerate().take(9) {
+        output.push(format!("{}Slot to jump to:{}", DIM, RESET));
+        for (i, (slot_number, ticket_id, phase)) in slots.iter().enumerate().take(9) {
             let phase_color = phase.color_code();
             output.push(format!(
-                "  {}[{}]{} {} ({}{}{}) - pane #{}",
+                "  {}[{}]{} {} ({}{}{}) - slot {}",
                 BOLD,
                 i + 1,
                 RESET,
@@ -909,7 +921,7 @@ fn render_quick_jump(state: &PluginState, output: &mut Vec<String>) {
                 phase_color,
                 phase.short_name(),
                 RESET,
-                pane_id
+                slot_number
             ));
         }
     }
@@ -970,7 +982,7 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
     // Title bar with status
     let status = render_status_line(state);
     output.push(format!(
-        "{}{}  LISA/RALPH Dashboard  {} {}{}",
+        "{}{}  LISA Dashboard  {} {}{}",
         BOLD, BG_BLUE, RESET, DIM, status
     ));
     output.push(render_separator(width));
@@ -1143,7 +1155,7 @@ mod tests {
                 ticket_id: "T-002".to_string(),
                 phase: Phase::Design,
                 started_at: Duration::from_secs(60),
-                pane_id: 1,
+                slot_number: 1,
             }],
             parked_threads: vec![],
             activity_log: vec![
@@ -1242,7 +1254,7 @@ mod tests {
             phase: Phase::Research,
             artifact_path: "docs/active/work/T-003/research.md".to_string(),
             parked_at: Duration::from_secs(100),
-            pane_id: 2,
+            slot_number: 2,
         });
 
         let mut output = Vec::new();
@@ -1293,7 +1305,7 @@ mod tests {
 
         assert!(output.iter().any(|l| l.contains("Quick Jump")));
         assert!(output.iter().any(|l| l.contains("T-002")));
-        assert!(output.iter().any(|l| l.contains("pane #1")));
+        assert!(output.iter().any(|l| l.contains("slot 1")));
     }
 
     #[test]
@@ -1360,14 +1372,14 @@ mod tests {
                 ticket_id: "T-002".to_string(),
                 phase: Phase::Design,
                 started_at: Duration::from_secs(100),
-                pane_id: 5,
+                slot_number: 1,
             }],
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-003".to_string(),
                 phase: Phase::Research,
                 artifact_path: "docs/active/work/T-003/research.md".to_string(),
                 parked_at: Duration::from_secs(80),
-                pane_id: 6,
+                slot_number: 2,
             }],
             activity_log: vec![
                 ActivityEntry {
@@ -1458,7 +1470,7 @@ mod tests {
                 phase: Phase::Review,
                 artifact_path: "docs/active/work/T-005/design.md".to_string(),
                 parked_at: Duration::from_secs(50),
-                pane_id: 3,
+                slot_number: 1,
             }],
             current_time: Duration::from_secs(200),
             ..PluginState::default()
@@ -1550,7 +1562,7 @@ mod tests {
                 phase: Phase::Review,
                 artifact_path: "docs/active/work/T-002/plan.md".to_string(),
                 parked_at: Duration::from_secs(10),
-                pane_id: 1,
+                slot_number: 1,
             }],
             current_time: Duration::from_secs(100),
             ..PluginState::default()
@@ -1667,7 +1679,7 @@ mod tests {
                 phase: Phase::Review,
                 artifact_path: "docs/active/work/T-005/design.md".to_string(),
                 parked_at: Duration::from_secs(50),
-                pane_id: 3,
+                slot_number: 1,
             }],
             current_time: Duration::from_secs(200),
             ..PluginState::default()
@@ -1688,8 +1700,8 @@ mod tests {
     fn test_render_slots_all_idle() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 1, ticket_id: None },
-                SlotInfo { pane_id: 2, ticket_id: None },
+                SlotInfo { ticket_id: None, slot_number: 1, transitioning: false },
+                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
             ],
             ..PluginState::default()
         };
@@ -1700,28 +1712,28 @@ mod tests {
 
         assert!(full.contains("2 total"), "Total count missing");
         assert!(full.contains("2 idle"), "Idle count missing");
-        assert!(!full.contains("occupied"), "Should not show occupied when all idle");
+        assert!(!full.contains("active"), "Should not show active when all idle");
     }
 
     #[test]
     fn test_render_slots_all_occupied() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-003-01".to_string()) },
-                SlotInfo { pane_id: 6, ticket_id: Some("T-003-02".to_string()) },
+                SlotInfo { ticket_id: Some("T-003-01".to_string()), slot_number: 1, transitioning: false },
+                SlotInfo { ticket_id: Some("T-003-02".to_string()), slot_number: 2, transitioning: false },
             ],
             active_threads: vec![
                 ActiveThread {
                     ticket_id: "T-003-01".to_string(),
                     phase: Phase::Implement,
                     started_at: Duration::from_secs(100),
-                    pane_id: 5,
+                    slot_number: 1,
                 },
                 ActiveThread {
                     ticket_id: "T-003-02".to_string(),
                     phase: Phase::Research,
                     started_at: Duration::from_secs(100),
-                    pane_id: 6,
+                    slot_number: 2,
                 },
             ],
             ..PluginState::default()
@@ -1733,7 +1745,7 @@ mod tests {
 
         assert!(full.contains("2 total"), "Total count missing");
         assert!(full.contains("0 idle"), "Idle count missing");
-        assert!(full.contains("2 occupied"), "Occupied count missing");
+        assert!(full.contains("2 active"), "Active count missing");
         assert!(full.contains("T-003-01"), "Occupied ticket missing");
         assert!(full.contains("T-003-02"), "Occupied ticket missing");
         assert!(full.contains("IMP"), "Phase shortname missing");
@@ -1744,15 +1756,15 @@ mod tests {
     fn test_render_slots_mixed() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()) },
-                SlotInfo { pane_id: 6, ticket_id: None },
-                SlotInfo { pane_id: 7, ticket_id: None },
+                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
+                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
+                SlotInfo { ticket_id: None, slot_number: 3, transitioning: false },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
                 phase: Phase::Design,
                 started_at: Duration::from_secs(50),
-                pane_id: 5,
+                slot_number: 1,
             }],
             ..PluginState::default()
         };
@@ -1763,7 +1775,7 @@ mod tests {
 
         assert!(full.contains("3 total"), "Total count missing");
         assert!(full.contains("2 idle"), "Idle count missing");
-        assert!(full.contains("1 occupied"), "Occupied count missing");
+        assert!(full.contains("1 active"), "Active count missing");
         assert!(full.contains("T-001"), "Occupied ticket missing");
         assert!(full.contains("DES"), "Phase shortname missing");
     }
@@ -1809,13 +1821,13 @@ mod tests {
                 },
             ],
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()) },
+                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
                 phase: Phase::Implement,
                 started_at: Duration::from_secs(100),
-                pane_id: 5,
+                slot_number: 1,
             }],
             ..PluginState::default()
         };
@@ -1831,8 +1843,8 @@ mod tests {
     fn test_status_line_with_slots() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { pane_id: 1, ticket_id: Some("T-001".to_string()) },
-                SlotInfo { pane_id: 2, ticket_id: None },
+                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
+                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
             ],
             ..PluginState::default()
         };
@@ -1854,14 +1866,14 @@ mod tests {
 
             }],
             slots: vec![
-                SlotInfo { pane_id: 5, ticket_id: Some("T-001".to_string()) },
-                SlotInfo { pane_id: 6, ticket_id: None },
+                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
+                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
                 phase: Phase::Implement,
                 started_at: Duration::from_secs(50),
-                pane_id: 5,
+                slot_number: 1,
             }],
             ..PluginState::default()
         };

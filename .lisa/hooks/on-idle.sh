@@ -5,6 +5,6 @@
 SIGNAL_DIR=".lisa/signals"
 mkdir -p "$SIGNAL_DIR"
 
-if [ -n "$LISA_TICKET_ID" ]; then
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/$LISA_TICKET_ID.idle"
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.idle"
 fi

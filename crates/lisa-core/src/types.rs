@@ -1,4 +1,4 @@
-//! Core data structures for the Lisa/Ralph Zellij plugin.
+//! Core data structures for the Lisa Zellij plugin.
 //!
 //! This module defines the fundamental types used throughout the plugin:
 //! - Ticket representation with frontmatter fields
@@ -308,7 +308,7 @@ pub enum HealthStatus {
 /// A thread representing an active Claude Code session working on a ticket.
 ///
 /// Each thread runs a single ticket through the RDSPI workflow phases.
-/// Threads are managed by Ralph and can be paused at review points.
+/// Threads are managed by Lisa and can be paused at review points.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thread {
     /// The ticket ID this thread is working on
@@ -431,7 +431,7 @@ impl Thread {
     }
 }
 
-/// Configuration for the Lisa/Ralph plugin.
+/// Configuration for the Lisa plugin.
 ///
 /// Parsed from the Zellij plugin configuration map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,6 +453,10 @@ pub struct PluginConfig {
 
     /// Seconds a thread can stay in one phase before being considered stuck (default: 600)
     pub stuck_threshold_secs: u64,
+
+    /// Seconds a parked Review thread waits before receiving a finish-up prompt (default: 240).
+    /// Set to 0 to disable.
+    pub review_timeout_secs: u64,
 }
 
 impl PluginConfig {
@@ -471,6 +475,9 @@ impl PluginConfig {
     /// Default stuck threshold in seconds (10 minutes).
     pub const DEFAULT_STUCK_THRESHOLD_SECS: u64 = 600;
 
+    /// Default review timeout in seconds (4 minutes).
+    pub const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 240;
+
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
         Self {
@@ -480,6 +487,7 @@ impl PluginConfig {
             max_threads: Self::DEFAULT_MAX_THREADS,
             auto_advance: false,
             stuck_threshold_secs: Self::DEFAULT_STUCK_THRESHOLD_SECS,
+            review_timeout_secs: Self::DEFAULT_REVIEW_TIMEOUT_SECS,
         }
     }
 
@@ -512,6 +520,12 @@ impl PluginConfig {
         if let Some(stuck_threshold) = config.get("stuck_threshold_secs") {
             if let Ok(n) = stuck_threshold.parse() {
                 result.stuck_threshold_secs = n;
+            }
+        }
+
+        if let Some(review_timeout) = config.get("review_timeout_secs") {
+            if let Ok(n) = review_timeout.parse() {
+                result.review_timeout_secs = n;
             }
         }
 
@@ -607,6 +621,9 @@ pub enum ActivityEvent {
         pane_id: u32,
         command: String,
     },
+
+    /// A finish-up prompt was sent to a parked Review session after timeout
+    FinishUpPromptSent { ticket_id: TicketId, pane_id: u32 },
 }
 
 /// Serde helper module for SystemTime serialization.
