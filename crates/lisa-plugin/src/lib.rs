@@ -5525,10 +5525,12 @@ mod tests {
 
 // wasm32-wasip1 + cdylib produces a reactor module (no entry point).
 // Zellij expects a command-style _start export to initialize the WASM instance.
+#[cfg(target_arch = "wasm32")]
 extern "C" {
     fn __wasm_call_ctors();
 }
 
+#[cfg(target_arch = "wasm32")]
 #[no_mangle]
 pub extern "C" fn _start() {
     unsafe {
