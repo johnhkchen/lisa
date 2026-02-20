@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+authors.workspace = true
 description = "Core types, ticket parsing, and DAG computation for Lisa"
 keywords = ["task-scheduling", "dag", "workflow", "ticket"]
 categories = ["development-tools"]

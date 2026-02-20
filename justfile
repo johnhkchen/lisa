@@ -18,6 +18,10 @@ build-cli: build
 
 # Build everything for distribution
 release: build build-cli
+    @echo ""
+    @echo "Build complete. To install:"
+    @echo "  cp target/release/lisa $(which lisa)"
+    @echo ""
 
 # Run all tests (native target)
 test:

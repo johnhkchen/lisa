@@ -8,6 +8,7 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/johnhkchen/lisa"
 homepage = "https://github.com/johnhkchen/lisa"
+authors = ["John Chen <john.hk.chen@gmail.com>"]
 
 [profile.release]
 opt-level = "s"

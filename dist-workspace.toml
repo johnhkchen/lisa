@@ -4,7 +4,7 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.30.4"
 ci = "github"
-installers = ["shell"]
+installers = ["shell", "homebrew"]
 targets = [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
@@ -14,3 +14,6 @@ targets = [
 packages = ["lisa-cli"]
 github-build-setup = "../build-setup.yml"
 install-path = "CARGO_HOME"
+tap = "johnhkchen/homebrew-lisa"
+formula = "lisa"
+publish-jobs = ["homebrew"]
