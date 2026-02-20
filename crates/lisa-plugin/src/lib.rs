@@ -336,8 +336,7 @@ impl State {
     fn find_idle_slot(&self) -> Option<usize> {
         let now = std::time::SystemTime::now();
         self.agent_slots.iter().position(|s| {
-            s.ticket_id.is_none()
-                && s.cooldown_until.map_or(true, |until| now >= until)
+            s.ticket_id.is_none() && s.cooldown_until.is_none_or(|until| now >= until)
         })
     }
 
@@ -398,7 +397,9 @@ impl State {
 
             // Enforce concurrency cap: only max_threads tickets run at once.
             // Extra pane slots exist for overlap during transitions.
-            let running_count = self.threads.values()
+            let running_count = self
+                .threads
+                .values()
                 .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
                 .count();
             if running_count >= self.config.max_threads {
@@ -455,10 +456,7 @@ impl State {
                 pane_id,
                 command: launch_cmd,
             });
-            self.log_activity(ActivityEvent::ThreadSpawned {
-                ticket_id,
-                pane_id,
-            });
+            self.log_activity(ActivityEvent::ThreadSpawned { ticket_id, pane_id });
         }
 
         if unscheduled > 0 {
@@ -469,7 +467,6 @@ impl State {
                 ),
             });
         }
-
     }
 
     /// Safety sweep: release any agent slots still assigned to done tickets.
@@ -548,10 +545,7 @@ impl State {
             };
 
             // Update the ticket file on disk
-            let file_path = self
-                .dag
-                .get_ticket(&ticket_id)
-                .map(|t| t.file_path.clone());
+            let file_path = self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
             let file_path = match file_path {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => continue,
@@ -643,19 +637,14 @@ impl State {
 
             // Look up thread — signal only meaningful for running threads
             let current_phase = match self.threads.get(&ticket_id) {
-                Some(t) if t.status == lisa_core::types::ThreadStatus::Running => {
-                    t.current_phase
-                }
+                Some(t) if t.status == lisa_core::types::ThreadStatus::Running => t.current_phase,
                 _ => continue,
             };
 
             match current_phase {
                 Phase::Implement => {
                     // Idle signal alone is the completion signal for Implement
-                    let file_path = self
-                        .dag
-                        .get_ticket(&ticket_id)
-                        .map(|t| t.file_path.clone());
+                    let file_path = self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
                     let file_path = match file_path {
                         Some(p) if !p.as_os_str().is_empty() => p,
                         _ => continue,
@@ -694,8 +683,7 @@ impl State {
                         Some(name) => name,
                         None => continue,
                     };
-                    let artifact_path =
-                        self.config.work_dir.join(&ticket_id).join(artifact_name);
+                    let artifact_path = self.config.work_dir.join(&ticket_id).join(artifact_name);
 
                     if artifact_path.exists() {
                         let next_phase = match current_phase.next() {
@@ -703,10 +691,8 @@ impl State {
                             None => continue,
                         };
 
-                        let file_path = self
-                            .dag
-                            .get_ticket(&ticket_id)
-                            .map(|t| t.file_path.clone());
+                        let file_path =
+                            self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
                         let file_path = match file_path {
                             Some(p) if !p.as_os_str().is_empty() => p,
                             _ => continue,
@@ -745,8 +731,7 @@ impl State {
                             "Agent idle in {} phase but {} not found",
                             current_phase, artifact_name
                         );
-                        self.idle_alerts
-                            .push((ticket_id.clone(), detail.clone()));
+                        self.idle_alerts.push((ticket_id.clone(), detail.clone()));
                         self.log_activity(ActivityEvent::Warning {
                             message: format!("{}: {}", ticket_id, detail),
                         });
@@ -869,6 +854,17 @@ impl State {
             }
         };
 
+        // Guard: don't auto-complete if direct dependencies aren't done
+        if !self.dag.all_dependencies_done(&ticket_id) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Cannot auto-complete {}: its dependencies are not all done",
+                    ticket_id
+                ),
+            });
+            return;
+        }
+
         if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Done) {
             self.log_activity(ActivityEvent::Error {
                 message: format!("Failed to auto-complete {} phase: {}", ticket_id, e),
@@ -876,7 +872,9 @@ impl State {
             return;
         }
 
-        if let Err(e) = ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Done) {
+        if let Err(e) =
+            ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Done)
+        {
             self.log_activity(ActivityEvent::Error {
                 message: format!("Failed to auto-complete {} status: {}", ticket_id, e),
             });
@@ -888,7 +886,10 @@ impl State {
             new_phase: Phase::Done,
         });
         self.log_activity(ActivityEvent::Info {
-            message: format!("Auto-completed {} (Review → Done) on pane #{}", ticket_id, pane_id),
+            message: format!(
+                "Auto-completed {} (Review → Done) on pane #{}",
+                ticket_id, pane_id
+            ),
         });
 
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
@@ -1017,11 +1018,7 @@ impl State {
                     && t.current_phase == Phase::Review
             })
             .filter(|(tid, _)| !self.finish_up_sent.contains(*tid))
-            .filter(|(_, t)| {
-                now.duration_since(t.last_phase_change)
-                    .unwrap_or_default()
-                    >= timeout
-            })
+            .filter(|(_, t)| now.duration_since(t.last_phase_change).unwrap_or_default() >= timeout)
             .map(|(tid, t)| (tid.clone(), t.pane_id))
             .collect();
 
@@ -1037,10 +1034,7 @@ impl State {
             }
 
             self.finish_up_sent.insert(ticket_id.clone());
-            self.log_activity(ActivityEvent::FinishUpPromptSent {
-                ticket_id,
-                pane_id,
-            });
+            self.log_activity(ActivityEvent::FinishUpPromptSent { ticket_id, pane_id });
         }
     }
 
@@ -1053,8 +1047,7 @@ impl State {
         use lisa_core::types::{HealthStatus, ThreadStatus};
 
         let now = std::time::SystemTime::now();
-        let threshold =
-            std::time::Duration::from_secs(self.config.stuck_threshold_secs);
+        let threshold = std::time::Duration::from_secs(self.config.stuck_threshold_secs);
 
         // Collect health transitions
         let transitions: Vec<(TicketId, HealthStatus, HealthStatus)> = self
@@ -1063,7 +1056,11 @@ impl State {
             .filter(|(_, t)| t.status == ThreadStatus::Running || t.status == ThreadStatus::Failed)
             .filter_map(|(tid, t)| {
                 let current = t.health(now, threshold);
-                let previous = self.last_health.get(tid).copied().unwrap_or(HealthStatus::Healthy);
+                let previous = self
+                    .last_health
+                    .get(tid)
+                    .copied()
+                    .unwrap_or(HealthStatus::Healthy);
                 if current != previous {
                     Some((tid.clone(), previous, current))
                 } else {
@@ -1104,8 +1101,7 @@ impl State {
 
         let now = std::time::SystemTime::now();
         // Hard timeout: 2x the configured stuck threshold
-        let hard_timeout =
-            std::time::Duration::from_secs(self.config.stuck_threshold_secs * 2);
+        let hard_timeout = std::time::Duration::from_secs(self.config.stuck_threshold_secs * 2);
 
         let stale: Vec<TicketId> = self
             .threads
@@ -1244,7 +1240,8 @@ impl State {
         self.audit_threads();
 
         // Clean up finish_up_sent for threads that no longer exist
-        self.finish_up_sent.retain(|tid| self.threads.contains_key(tid));
+        self.finish_up_sent
+            .retain(|tid| self.threads.contains_key(tid));
 
         // Always try to schedule (slots may have freed up)
         self.schedule_ready_tickets();
@@ -1300,21 +1297,32 @@ impl State {
                 old_status,
                 new_status,
             } => {
-                format!("TicketStatusChanged: {} {} -> {}", ticket_id, old_status, new_status)
+                format!(
+                    "TicketStatusChanged: {} {} -> {}",
+                    ticket_id, old_status, new_status
+                )
             }
             ActivityEvent::TicketPhaseChanged {
                 ticket_id,
                 old_phase,
                 new_phase,
             } => {
-                format!("TicketPhaseChanged: {} {} -> {}", ticket_id, old_phase, new_phase)
+                format!(
+                    "TicketPhaseChanged: {} {} -> {}",
+                    ticket_id, old_phase, new_phase
+                )
             }
             ActivityEvent::ArtifactCreated {
                 ticket_id,
                 phase,
                 path,
             } => {
-                format!("ArtifactCreated: {} {} {}", ticket_id, phase, path.display())
+                format!(
+                    "ArtifactCreated: {} {} {}",
+                    ticket_id,
+                    phase,
+                    path.display()
+                )
             }
             ActivityEvent::CommitMade {
                 ticket_id,
@@ -1332,7 +1340,10 @@ impl State {
                 old_health,
                 new_health,
             } => {
-                format!("HealthStateChanged: {} {:?} -> {:?}", ticket_id, old_health, new_health)
+                format!(
+                    "HealthStateChanged: {} {:?} -> {:?}",
+                    ticket_id, old_health, new_health
+                )
             }
             ActivityEvent::Warning { message } => format!("Warning: {}", message),
             ActivityEvent::Info { message } => format!("Info: {}", message),
@@ -1341,14 +1352,20 @@ impl State {
                 running,
                 idle_slots,
             } => {
-                format!("PollSummary: ready={} running={} idle_slots={}", ready, running, idle_slots)
+                format!(
+                    "PollSummary: ready={} running={} idle_slots={}",
+                    ready, running, idle_slots
+                )
             }
             ActivityEvent::SessionLaunch {
                 ticket_id,
                 pane_id,
                 command,
             } => {
-                format!("SessionLaunch: {} pane=#{} cmd={}", ticket_id, pane_id, command)
+                format!(
+                    "SessionLaunch: {} pane=#{} cmd={}",
+                    ticket_id, pane_id, command
+                )
             }
             ActivityEvent::FinishUpPromptSent { ticket_id, pane_id } => {
                 format!("FinishUpPromptSent: {} pane=#{}", ticket_id, pane_id)
@@ -1376,13 +1393,38 @@ impl State {
 
         // Config
         writeln!(out, "=== Config ===").unwrap();
-        writeln!(out, "ticket_dir:          {}", self.config.ticket_dir.display()).unwrap();
-        writeln!(out, "story_dir:           {}", self.config.story_dir.display()).unwrap();
-        writeln!(out, "work_dir:            {}", self.config.work_dir.display()).unwrap();
+        writeln!(
+            out,
+            "ticket_dir:          {}",
+            self.config.ticket_dir.display()
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "story_dir:           {}",
+            self.config.story_dir.display()
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "work_dir:            {}",
+            self.config.work_dir.display()
+        )
+        .unwrap();
         writeln!(out, "max_threads:         {}", self.config.max_threads).unwrap();
         writeln!(out, "auto_advance:        {}", self.config.auto_advance).unwrap();
-        writeln!(out, "stuck_threshold_secs: {}", self.config.stuck_threshold_secs).unwrap();
-        writeln!(out, "review_timeout_secs: {}", self.config.review_timeout_secs).unwrap();
+        writeln!(
+            out,
+            "stuck_threshold_secs: {}",
+            self.config.stuck_threshold_secs
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "review_timeout_secs: {}",
+            self.config.review_timeout_secs
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         // Plugin status
@@ -1411,14 +1453,24 @@ impl State {
         writeln!(out, "=== Tickets ===").unwrap();
         let mut ticket_list: Vec<_> = self.dag.tickets().collect();
         ticket_list.sort_by(|a, b| a.id.cmp(&b.id));
-        writeln!(out, "{:<14} {:<12} {:<12} {}", "ID", "PHASE", "STATUS", "DEPENDS_ON").unwrap();
+        writeln!(
+            out,
+            "{:<14} {:<12} {:<12} DEPENDS_ON",
+            "ID", "PHASE", "STATUS"
+        )
+        .unwrap();
         for t in &ticket_list {
             let deps = if t.depends_on.is_empty() {
                 "—".to_string()
             } else {
                 t.depends_on.join(", ")
             };
-            writeln!(out, "{:<14} {:<12} {:<12} {}", t.id, t.phase, t.status, deps).unwrap();
+            writeln!(
+                out,
+                "{:<14} {:<12} {:<12} {}",
+                t.id, t.phase, t.status, deps
+            )
+            .unwrap();
         }
         writeln!(out).unwrap();
 
@@ -1461,8 +1513,8 @@ impl State {
         } else {
             writeln!(
                 out,
-                "{:<14} {:<6} {:<12} {:<10} {:<14} {}",
-                "TICKET", "PANE", "PHASE", "STATUS", "STARTED_AGO", "PHASE_CHG_AGO"
+                "{:<14} {:<6} {:<12} {:<10} {:<14} PHASE_CHG_AGO",
+                "TICKET", "PANE", "PHASE", "STATUS", "STARTED_AGO"
             )
             .unwrap();
             let threshold = std::time::Duration::from_secs(self.config.stuck_threshold_secs);
@@ -1476,15 +1528,18 @@ impl State {
                     .unwrap_or_default()
                     .as_secs();
                 let health = thread.health(now, threshold);
+                let status_str = format!("{:?}", thread.status);
+                let started_str = format!("{}s", started_ago);
+                let phase_str = format!("{}s", phase_chg_ago);
                 writeln!(
                     out,
                     "{:<14} #{:<4} {:<12} {:<10} {:<14} {} [health: {:?}]",
                     tid,
                     thread.pane_id,
                     thread.current_phase,
-                    format!("{:?}", thread.status),
-                    format!("{}s", started_ago),
-                    format!("{}s", phase_chg_ago),
+                    status_str,
+                    started_str,
+                    phase_str,
                     health
                 )
                 .unwrap();
@@ -1497,10 +1552,15 @@ impl State {
         if self.agent_slots.is_empty() {
             writeln!(out, "(no slots)").unwrap();
         } else {
-            writeln!(out, "{:<8} {:<14} {}", "PANE", "TICKET", "HAS_SESSION").unwrap();
+            writeln!(out, "{:<8} {:<14} HAS_SESSION", "PANE", "TICKET").unwrap();
             for slot in &self.agent_slots {
                 let ticket = slot.ticket_id.as_deref().unwrap_or("(idle)");
-                writeln!(out, "#{:<7} {:<14} {}", slot.pane_id, ticket, slot.has_session).unwrap();
+                writeln!(
+                    out,
+                    "#{:<7} {:<14} {}",
+                    slot.pane_id, ticket, slot.has_session
+                )
+                .unwrap();
             }
         }
         writeln!(out).unwrap();
@@ -1666,6 +1726,17 @@ impl State {
             }
         };
 
+        // Guard: don't mark done if direct dependencies aren't done
+        if !self.dag.all_dependencies_done(&tid) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Cannot mark {} done: its dependencies are not all done",
+                    ticket_id
+                ),
+            });
+            return;
+        }
+
         let old_phase = self
             .dag
             .get_ticket(&tid)
@@ -1681,7 +1752,9 @@ impl State {
         }
 
         // Also update status to done
-        if let Err(e) = ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Done) {
+        if let Err(e) =
+            ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Done)
+        {
             self.log_activity(ActivityEvent::Error {
                 message: format!("Failed to update {} status: {}", ticket_id, e),
             });
@@ -1759,7 +1832,9 @@ impl State {
         }
 
         // Update status to open
-        if let Err(e) = ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Open) {
+        if let Err(e) =
+            ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Open)
+        {
             self.log_activity(ActivityEvent::Error {
                 message: format!("Failed to reset {} status: {}", ticket_id, e),
             });
@@ -1946,7 +2021,7 @@ impl State {
                 title: t.title.clone(),
                 phase: phase_to_ui_phase(t.phase),
                 status: ticket_status_to_ui_status(&t.status, t.phase),
-                depends_on: t.depends_on.iter().cloned().collect(),
+                depends_on: t.depends_on.to_vec(),
             })
             .collect();
 
@@ -1955,7 +2030,9 @@ impl State {
             .values()
             .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
             .map(|t| {
-                let slot_number = self.agent_slots.iter()
+                let slot_number = self
+                    .agent_slots
+                    .iter()
                     .position(|s| s.pane_id == t.pane_id)
                     .map(|i| i + 1)
                     .unwrap_or(0);
@@ -1978,7 +2055,9 @@ impl State {
             .values()
             .filter(|t| t.status == lisa_core::types::ThreadStatus::Parked)
             .map(|t| {
-                let slot_number = self.agent_slots.iter()
+                let slot_number = self
+                    .agent_slots
+                    .iter()
                     .position(|s| s.pane_id == t.pane_id)
                     .map(|i| i + 1)
                     .unwrap_or(0);
@@ -2005,7 +2084,7 @@ impl State {
         let activity_log: Vec<ui::ActivityEntry> = self
             .activity_log
             .iter()
-            .filter_map(|e| activity_event_to_ui_entry(e))
+            .filter_map(activity_event_to_ui_entry)
             .collect();
 
         // Build health alerts from stuck/failed threads
@@ -2014,7 +2093,10 @@ impl State {
         let mut alerts: Vec<ui::HealthAlert> = self
             .threads
             .values()
-            .filter(|t| t.status == lisa_core::types::ThreadStatus::Running || t.status == lisa_core::types::ThreadStatus::Failed)
+            .filter(|t| {
+                t.status == lisa_core::types::ThreadStatus::Running
+                    || t.status == lisa_core::types::ThreadStatus::Failed
+            })
             .filter_map(|t| {
                 let health = t.health(now, threshold);
                 match health {
@@ -2022,7 +2104,10 @@ impl State {
                         ticket_id: t.ticket_id.clone(),
                         alert_type: ui::AlertType::Stuck,
                         detail: format!("No phase change for {}+ min", threshold.as_secs() / 60),
-                        suggested_actions: vec!["Check pane".to_string(), "Restart session".to_string()],
+                        suggested_actions: vec![
+                            "Check pane".to_string(),
+                            "Restart session".to_string(),
+                        ],
                     }),
                     lisa_core::types::HealthStatus::Failed => Some(ui::HealthAlert {
                         ticket_id: t.ticket_id.clone(),
@@ -2056,7 +2141,8 @@ impl State {
                 ticket_id: s.ticket_id.clone(),
                 slot_number: i + 1,
                 transitioning: s.transition_state != TransitionState::Idle
-                    || s.cooldown_until.map_or(false, |until| std::time::SystemTime::now() < until),
+                    || s.cooldown_until
+                        .is_some_and(|until| std::time::SystemTime::now() < until),
             })
             .collect();
 
@@ -2113,8 +2199,9 @@ fn ticket_status_to_ui_status(
     }
 
     match status {
-        lisa_core::types::TicketStatus::Open
-        | lisa_core::types::TicketStatus::InProgress => ui::TicketStatus::InProgress,
+        lisa_core::types::TicketStatus::Open | lisa_core::types::TicketStatus::InProgress => {
+            ui::TicketStatus::InProgress
+        }
         lisa_core::types::TicketStatus::Blocked => ui::TicketStatus::Blocked,
         lisa_core::types::TicketStatus::Review => ui::TicketStatus::WaitingReview,
         lisa_core::types::TicketStatus::Done => ui::TicketStatus::Done,
@@ -2201,9 +2288,7 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
             message: message.clone(),
         },
         ActivityEvent::SessionLaunch {
-            ticket_id,
-            command,
-            ..
+            ticket_id, command, ..
         } => ui::ActivityType::Info {
             ticket_id: ticket_id.clone(),
             message: if command.len() > 120 {
@@ -2212,10 +2297,7 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
                 format!("Launch: {}", command)
             },
         },
-        ActivityEvent::FinishUpPromptSent {
-            ticket_id,
-            pane_id,
-        } => ui::ActivityType::Info {
+        ActivityEvent::FinishUpPromptSent { ticket_id, pane_id } => ui::ActivityType::Info {
             ticket_id: ticket_id.clone(),
             message: format!("Finish-up prompt sent (pane #{})", pane_id),
         },
@@ -2298,12 +2380,14 @@ mod tests {
         assert!(
             activity_event_to_ui_entry(&ActivityEvent::DagRecomputed { ticket_count: 5 }).is_none()
         );
-        assert!(activity_event_to_ui_entry(&ActivityEvent::TicketStatusChanged {
-            ticket_id: "T-001".to_string(),
-            old_status: TicketStatus::Open,
-            new_status: TicketStatus::InProgress,
-        })
-        .is_none());
+        assert!(
+            activity_event_to_ui_entry(&ActivityEvent::TicketStatusChanged {
+                ticket_id: "T-001".to_string(),
+                old_status: TicketStatus::Open,
+                new_status: TicketStatus::InProgress,
+            })
+            .is_none()
+        );
 
         let entry = activity_event_to_ui_entry(&ActivityEvent::ThreadSpawned {
             ticket_id: "T-001".to_string(),
@@ -2347,10 +2431,15 @@ mod tests {
         let ticket_dir = Path::new("docs/active/tickets");
         let cmd = build_claude_command(ticket_dir, "T-042-01", 7);
 
-        assert!(cmd.starts_with("LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "));
+        assert!(cmd.starts_with(
+            "LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "
+        ));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
-        assert!(!cmd.ends_with('\r'), "Enter is now sent as a raw byte, not embedded in text");
+        assert!(
+            !cmd.ends_with('\r'),
+            "Enter is now sent as a raw byte, not embedded in text"
+        );
     }
 
     #[test]
@@ -2380,13 +2469,19 @@ mod tests {
     #[test]
     fn test_strip_host_prefix_with_prefix() {
         let path = Path::new("/host/docs/active/tickets");
-        assert_eq!(strip_host_prefix(path), PathBuf::from("docs/active/tickets"));
+        assert_eq!(
+            strip_host_prefix(path),
+            PathBuf::from("docs/active/tickets")
+        );
     }
 
     #[test]
     fn test_strip_host_prefix_without_prefix() {
         let path = Path::new("docs/active/tickets");
-        assert_eq!(strip_host_prefix(path), PathBuf::from("docs/active/tickets"));
+        assert_eq!(
+            strip_host_prefix(path),
+            PathBuf::from("docs/active/tickets")
+        );
     }
 
     #[test]
@@ -2739,8 +2834,8 @@ mod tests {
         // Create a thread that's been stuck for 31+ minutes
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
-        thread.last_phase_change = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(31 * 60);
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
         state.threads.insert("T-001".to_string(), thread);
 
         // Add an agent slot so we can verify it gets released
@@ -2777,8 +2872,8 @@ mod tests {
         // Create a thread that started recently (5 minutes ago)
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
-        thread.last_phase_change = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(5 * 60);
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 60);
         state.threads.insert("T-001".to_string(), thread);
 
         state.detect_stale_threads();
@@ -2896,9 +2991,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             // Cooldown already expired (set to 1 second ago)
-            cooldown_until: Some(
-                std::time::SystemTime::now() - std::time::Duration::from_secs(1),
-            ),
+            cooldown_until: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1)),
         });
         assert!(
             state.find_idle_slot().is_some(),
@@ -2917,9 +3010,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             // Cooldown expires 30 seconds from now
-            cooldown_until: Some(
-                std::time::SystemTime::now() + std::time::Duration::from_secs(30),
-            ),
+            cooldown_until: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(30)),
         });
         assert!(
             state.find_idle_slot().is_none(),
@@ -2936,8 +3027,8 @@ mod tests {
         // Create a thread that's been stuck past the threshold (default 600s)
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
-        thread.last_phase_change = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(700); // past 600s threshold
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(700); // past 600s threshold
         state.threads.insert("T-001".to_string(), thread);
 
         state.evaluate_health();
@@ -2953,10 +3044,7 @@ mod tests {
         )));
 
         // last_health should be updated
-        assert_eq!(
-            state.last_health.get("T-001"),
-            Some(&HealthStatus::Stuck)
-        );
+        assert_eq!(state.last_health.get("T-001"), Some(&HealthStatus::Stuck));
     }
 
     #[test]
@@ -2976,10 +3064,7 @@ mod tests {
         assert!(state.activity_log.is_empty());
 
         // last_health should still be tracked
-        assert_eq!(
-            state.last_health.get("T-001"),
-            Some(&HealthStatus::Healthy)
-        );
+        assert_eq!(state.last_health.get("T-001"), Some(&HealthStatus::Healthy));
     }
 
     #[test]
@@ -3032,8 +3117,8 @@ mod tests {
         // Create a stuck thread
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
-        thread.last_phase_change = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(700);
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(700);
         state.threads.insert("T-001".to_string(), thread);
         state.initialized = true;
 
@@ -3151,8 +3236,8 @@ mod tests {
         // Create a thread stuck for 5 minutes (300s) — past hard timeout of 240s
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
-        thread.last_phase_change = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(300);
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(300);
         state.threads.insert("T-001".to_string(), thread);
 
         state.detect_stale_threads();
@@ -3177,8 +3262,8 @@ mod tests {
         // Create a thread stuck for 180s — past warning (120s) but NOT past hard timeout (240s)
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
-        thread.last_phase_change = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(180);
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(180);
         state.threads.insert("T-001".to_string(), thread);
 
         state.detect_stale_threads();
@@ -3300,7 +3385,10 @@ mod tests {
 
         // First rebuild with empty last_phases — done ticket should be detected
         let changed = state.rebuild_dag();
-        assert!(changed, "First rebuild with done ticket should detect a change");
+        assert!(
+            changed,
+            "First rebuild with done ticket should detect a change"
+        );
 
         // Run the done-ticket detection logic (same as poll_tick)
         let done_tickets: Vec<TicketId> = state
@@ -3308,7 +3396,11 @@ mod tests {
             .iter()
             .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
             .filter(|(tid, _)| {
-                state.dag.get_ticket(tid).map(|t| t.phase == Phase::Done).unwrap_or(false)
+                state
+                    .dag
+                    .get_ticket(tid)
+                    .map(|t| t.phase == Phase::Done)
+                    .unwrap_or(false)
             })
             .map(|(tid, _)| tid.clone())
             .collect();
@@ -3352,7 +3444,9 @@ mod tests {
         };
 
         // Last poll saw T-001 at Research
-        state.last_phases.insert("T-001".to_string(), Phase::Research);
+        state
+            .last_phases
+            .insert("T-001".to_string(), Phase::Research);
 
         let thread = Thread::new("T-001", 1);
         state.threads.insert("T-001".to_string(), thread);
@@ -3373,7 +3467,11 @@ mod tests {
             .iter()
             .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
             .filter(|(tid, _)| {
-                state.dag.get_ticket(tid).map(|t| t.phase == Phase::Done).unwrap_or(false)
+                state
+                    .dag
+                    .get_ticket(tid)
+                    .map(|t| t.phase == Phase::Done)
+                    .unwrap_or(false)
             })
             .map(|(tid, _)| tid.clone())
             .collect();
@@ -3428,7 +3526,10 @@ mod tests {
 
         state.sweep_stale_slots();
 
-        assert!(state.agent_slots[0].ticket_id.is_none(), "Stale slot should be released");
+        assert!(
+            state.agent_slots[0].ticket_id.is_none(),
+            "Stale slot should be released"
+        );
         assert!(state.activity_log.iter().any(|e| matches!(
             e,
             ActivityEvent::Error { message }
@@ -3487,7 +3588,11 @@ mod tests {
             .iter()
             .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
             .filter(|(tid, _)| {
-                state.dag.get_ticket(tid).map(|t| t.phase == Phase::Done).unwrap_or(false)
+                state
+                    .dag
+                    .get_ticket(tid)
+                    .map(|t| t.phase == Phase::Done)
+                    .unwrap_or(false)
             })
             .map(|(tid, _)| tid.clone())
             .collect();
@@ -3693,7 +3798,11 @@ mod tests {
 
         // Replicate the key mark_ticket_done operations (without schedule_ready_tickets)
         let tid = "T-001".to_string();
-        let file_path = state.dag.get_ticket(&tid).map(|t| t.file_path.clone()).unwrap();
+        let file_path = state
+            .dag
+            .get_ticket(&tid)
+            .map(|t| t.file_path.clone())
+            .unwrap();
         lisa_core::ticket::update_ticket_phase(&file_path, Phase::Done).unwrap();
 
         if let Some(thread) = state.threads.get_mut(&tid) {
@@ -3786,7 +3895,10 @@ mod tests {
         state.open_mark_done_modal();
 
         // Implement-phase ticket with Running thread should be excluded
-        assert!(!state.modal.open, "Modal should not open — no eligible tickets");
+        assert!(
+            !state.modal.open,
+            "Modal should not open — no eligible tickets"
+        );
     }
 
     #[test]
@@ -3853,7 +3965,9 @@ mod tests {
         });
 
         // Add health data
-        state.last_health.insert("T-002".to_string(), lisa_core::types::HealthStatus::Healthy);
+        state
+            .last_health
+            .insert("T-002".to_string(), lisa_core::types::HealthStatus::Healthy);
 
         // Add activity events
         state.log_activity(ActivityEvent::PluginStarted);
@@ -3864,16 +3978,46 @@ mod tests {
         let snapshot = state.format_snapshot();
 
         // Check all section headers
-        assert!(snapshot.contains("=== Lisa State Snapshot ==="), "Missing header");
-        assert!(snapshot.contains("=== Config ==="), "Missing config section");
-        assert!(snapshot.contains("=== Plugin Status ==="), "Missing plugin status");
-        assert!(snapshot.contains("=== Tickets ==="), "Missing tickets section");
-        assert!(snapshot.contains("=== DAG Edges ==="), "Missing edges section");
-        assert!(snapshot.contains("=== DAG Stats ==="), "Missing stats section");
-        assert!(snapshot.contains("=== Threads ==="), "Missing threads section");
-        assert!(snapshot.contains("=== Agent Slots ==="), "Missing slots section");
-        assert!(snapshot.contains("=== Last Known Health ==="), "Missing health section");
-        assert!(snapshot.contains("=== Activity Log (last 50) ==="), "Missing activity log");
+        assert!(
+            snapshot.contains("=== Lisa State Snapshot ==="),
+            "Missing header"
+        );
+        assert!(
+            snapshot.contains("=== Config ==="),
+            "Missing config section"
+        );
+        assert!(
+            snapshot.contains("=== Plugin Status ==="),
+            "Missing plugin status"
+        );
+        assert!(
+            snapshot.contains("=== Tickets ==="),
+            "Missing tickets section"
+        );
+        assert!(
+            snapshot.contains("=== DAG Edges ==="),
+            "Missing edges section"
+        );
+        assert!(
+            snapshot.contains("=== DAG Stats ==="),
+            "Missing stats section"
+        );
+        assert!(
+            snapshot.contains("=== Threads ==="),
+            "Missing threads section"
+        );
+        assert!(
+            snapshot.contains("=== Agent Slots ==="),
+            "Missing slots section"
+        );
+        assert!(
+            snapshot.contains("=== Last Known Health ==="),
+            "Missing health section"
+        );
+        assert!(
+            snapshot.contains("=== Activity Log (last 50) ==="),
+            "Missing activity log"
+        );
     }
 
     #[test]
@@ -3914,11 +4058,20 @@ mod tests {
         assert!(snapshot.contains("research"), "Missing research phase");
 
         // DAG edge
-        assert!(snapshot.contains("T-001 -> T-002"), "Missing edge T-001 -> T-002");
+        assert!(
+            snapshot.contains("T-001 -> T-002"),
+            "Missing edge T-001 -> T-002"
+        );
 
         // DAG stats
-        assert!(snapshot.contains("total_tickets:       2"), "Wrong total tickets");
-        assert!(snapshot.contains("done_tickets:        1"), "Wrong done tickets");
+        assert!(
+            snapshot.contains("total_tickets:       2"),
+            "Wrong total tickets"
+        );
+        assert!(
+            snapshot.contains("done_tickets:        1"),
+            "Wrong done tickets"
+        );
     }
 
     #[test]
@@ -3999,10 +4152,16 @@ mod tests {
         // Should contain the last 50 events (50-99), not the first 50
         assert!(snapshot.contains("event-99"), "Latest event missing");
         assert!(snapshot.contains("event-50"), "Event at boundary missing");
-        assert!(!snapshot.contains("event-49"), "Old event should not appear");
+        assert!(
+            !snapshot.contains("event-49"),
+            "Old event should not appear"
+        );
 
         // Should be numbered 1-50
-        assert!(snapshot.contains("  1. Info: event-99"), "First entry should be event-99");
+        assert!(
+            snapshot.contains("  1. Info: event-99"),
+            "First entry should be event-99"
+        );
     }
 
     #[test]
@@ -4376,10 +4535,7 @@ mod tests {
 
         // Thread still parked, not advanced
         let thread = state.threads.get("T-001").unwrap();
-        assert_eq!(
-            thread.status,
-            lisa_core::types::ThreadStatus::Parked
-        );
+        assert_eq!(thread.status, lisa_core::types::ThreadStatus::Parked);
     }
 
     #[test]
@@ -4543,18 +4699,18 @@ mod tests {
         }
 
         // Insert 2 running threads (at max_threads capacity)
-        state.threads.insert(
-            "T-001".to_string(),
-            Thread::new("T-001", 10),
-        );
-        state.threads.insert(
-            "T-002".to_string(),
-            Thread::new("T-002", 11),
-        );
+        state
+            .threads
+            .insert("T-001".to_string(), Thread::new("T-001", 10));
+        state
+            .threads
+            .insert("T-002".to_string(), Thread::new("T-002", 11));
 
         // Verify: 3 ready tickets, 2 running threads, 4 idle slots
         assert_eq!(state.dag.get_ready_tickets().len(), 3);
-        let running = state.threads.values()
+        let running = state
+            .threads
+            .values()
             .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
             .count();
         assert_eq!(running, 2);
@@ -4599,11 +4755,22 @@ mod tests {
 
         // Phase should now be ready
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(content.contains("phase: ready"), "Phase should be reset to ready, got: {}", content);
-        assert!(content.contains("status: open"), "Status should be reset to open, got: {}", content);
+        assert!(
+            content.contains("phase: ready"),
+            "Phase should be reset to ready, got: {}",
+            content
+        );
+        assert!(
+            content.contains("status: open"),
+            "Status should be reset to open, got: {}",
+            content
+        );
 
         // Thread should be removed
-        assert!(!state.threads.contains_key("T-001"), "Thread should be removed after reset");
+        assert!(
+            !state.threads.contains_key("T-001"),
+            "Thread should be removed after reset"
+        );
     }
 
     #[test]
@@ -4643,7 +4810,11 @@ mod tests {
         state.open_reset_modal();
 
         assert!(state.modal.open, "Modal should be open");
-        assert_eq!(state.modal.mode, ModalMode::ResetTicket, "Mode should be ResetTicket");
+        assert_eq!(
+            state.modal.mode,
+            ModalMode::ResetTicket,
+            "Mode should be ResetTicket"
+        );
         // Only T-002 (implement) should appear — not T-001 (ready) or T-003 (done)
         assert_eq!(state.modal.ticket_ids, vec!["T-002".to_string()]);
     }
@@ -4680,7 +4851,10 @@ mod tests {
 
         state.open_reset_modal();
 
-        assert!(!state.modal.open, "Modal should NOT open when nothing to reset");
+        assert!(
+            !state.modal.open,
+            "Modal should NOT open when nothing to reset"
+        );
     }
 
     // =========================================================================
@@ -4769,10 +4943,7 @@ mod tests {
         assert!(!signal_dir.join("pane-1.stopped").exists());
 
         // State should remain Idle
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::Idle
-        );
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
     }
 
     #[test]
@@ -4807,10 +4978,7 @@ mod tests {
         assert!(!signal_dir.join("pane-1.cleared").exists());
 
         // State should return to Idle
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::Idle
-        );
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(state.agent_slots[0].transition_started_at.is_none());
 
         // Should have logged an info event about sending prompt
@@ -4846,10 +5014,7 @@ mod tests {
 
         // Signal cleaned up but state unchanged
         assert!(!signal_dir.join("pane-1.cleared").exists());
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::Idle
-        );
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
     }
 
     #[test]
@@ -4927,10 +5092,7 @@ mod tests {
         state.check_transition_timeouts();
 
         // Should have forced to Idle
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::Idle
-        );
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(state.agent_slots[0].transition_started_at.is_none());
 
         // Should have logged a warning
@@ -5040,7 +5202,10 @@ mod tests {
         state.auto_complete_review("T-001".to_string(), 1);
 
         // Thread should be removed
-        assert!(!state.threads.contains_key("T-001"), "Thread should be removed after auto-complete");
+        assert!(
+            !state.threads.contains_key("T-001"),
+            "Thread should be removed after auto-complete"
+        );
 
         // Slot should be released
         assert_eq!(
@@ -5049,22 +5214,36 @@ mod tests {
         );
 
         // Activity log: TicketPhaseChanged Review → Done
-        assert!(state.activity_log.iter().any(|e| matches!(
-            e,
-            ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
-            if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
-        )), "Should log TicketPhaseChanged Review → Done");
+        assert!(
+            state.activity_log.iter().any(|e| matches!(
+                e,
+                ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
+                if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
+            )),
+            "Should log TicketPhaseChanged Review → Done"
+        );
 
         // Activity log: Info with "Auto-completed"
-        assert!(state.activity_log.iter().any(|e| matches!(
-            e,
-            ActivityEvent::Info { message } if message.contains("Auto-completed")
-        )), "Should log auto-complete info message");
+        assert!(
+            state.activity_log.iter().any(|e| matches!(
+                e,
+                ActivityEvent::Info { message } if message.contains("Auto-completed")
+            )),
+            "Should log auto-complete info message"
+        );
 
         // Ticket file updated on disk
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(content.contains("phase: done"), "Ticket phase should be done, got: {}", content);
-        assert!(content.contains("status: done"), "Ticket status should be done, got: {}", content);
+        assert!(
+            content.contains("phase: done"),
+            "Ticket phase should be done, got: {}",
+            content
+        );
+        assert!(
+            content.contains("status: done"),
+            "Ticket status should be done, got: {}",
+            content
+        );
     }
 
     #[test]
@@ -5099,7 +5278,10 @@ mod tests {
             .get_ticket(&"T-001".to_string())
             .map(|t| t.phase == Phase::Review)
             .unwrap_or(false);
-        assert!(!is_review, "Implement-phase ticket should not be detected as Review");
+        assert!(
+            !is_review,
+            "Implement-phase ticket should not be detected as Review"
+        );
     }
 
     #[test]
@@ -5316,24 +5498,21 @@ mod tests {
         // Running Implement thread (should not be affected)
         let mut t1 = Thread::new("T-001", 1);
         t1.current_phase = Phase::Implement;
-        t1.last_phase_change =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        t1.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-001".to_string(), t1);
 
         // Running Review thread (not parked — should not be affected)
         let mut t2 = Thread::new("T-002", 2);
         t2.current_phase = Phase::Review;
         // status is Running (not Parked)
-        t2.last_phase_change =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        t2.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-002".to_string(), t2);
 
         // Parked Implement thread (wrong phase — should not be affected)
         let mut t3 = Thread::new("T-003", 3);
         t3.current_phase = Phase::Implement;
         t3.park();
-        t3.last_phase_change =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        t3.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-003".to_string(), t3);
 
         state.check_review_timeouts();

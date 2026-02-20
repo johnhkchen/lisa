@@ -14,10 +14,7 @@ fn main() {
     let wasm_dest = out_dir.join("lisa.wasm");
 
     // Tell Cargo to rebuild if the WASM file changes
-    println!(
-        "cargo:rerun-if-changed={}",
-        wasm_source.display()
-    );
+    println!("cargo:rerun-if-changed={}", wasm_source.display());
 
     if wasm_source.exists() {
         std::fs::copy(&wasm_source, &wasm_dest).expect("Failed to copy lisa.wasm to OUT_DIR");

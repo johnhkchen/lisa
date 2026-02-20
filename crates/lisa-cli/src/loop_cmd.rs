@@ -22,7 +22,10 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         return Err("No CLAUDE.md found. Run `lisa init` first.".to_string());
     }
     if !root.join(&config.ticket_dir).exists() {
-        return Err(format!("No {}/ directory. Run `lisa init` first.", config.ticket_dir));
+        return Err(format!(
+            "No {}/ directory. Run `lisa init` first.",
+            config.ticket_dir
+        ));
     }
 
     if dry_run {
@@ -31,13 +34,11 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
 
     // Check the WASM plugin is actually embedded (not a dev placeholder)
     if PLUGIN_WASM.is_empty() {
-        return Err(
-            "WASM plugin not embedded in this binary.\n\n  \
+        return Err("WASM plugin not embedded in this binary.\n\n  \
              If installed via `cargo install`, the WASM plugin is not included.\n  \
              Build from source for full functionality:\n    \
              git clone https://github.com/johnhkchen/lisa && cd lisa && just release"
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Write WASM to a content-hashed temp path so Zellij's plugin cache is
@@ -52,8 +53,13 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         h
     };
     let wasm_path = std::env::temp_dir().join(format!("lisa-plugin-{:016x}.wasm", hash));
-    std::fs::write(&wasm_path, PLUGIN_WASM)
-        .map_err(|e| format!("Failed to write WASM plugin to {}: {}", wasm_path.display(), e))?;
+    std::fs::write(&wasm_path, PLUGIN_WASM).map_err(|e| {
+        format!(
+            "Failed to write WASM plugin to {}: {}",
+            wasm_path.display(),
+            e
+        )
+    })?;
 
     // Generate KDL layout
     let layout = generate_layout(&wasm_path, config);
@@ -64,7 +70,11 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     println!("Lisa loop starting...");
     println!("  WASM plugin: {}", wasm_path.display());
     println!("  Layout: {}", layout_path.display());
-    println!("  Max threads: {} (panes: {})", config.max_threads, config.max_threads * 2);
+    println!(
+        "  Max threads: {} (panes: {})",
+        config.max_threads,
+        config.max_threads * 2
+    );
     println!();
 
     // Exec zellij (replaces this process)
@@ -91,7 +101,8 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
 
     println!("lisa loop --dry-run");
     println!();
-    println!("Tickets:  {} total, {} done, {} ready, {} in-progress, {} blocked",
+    println!(
+        "Tickets:  {} total, {} done, {} ready, {} in-progress, {} blocked",
         stats.total_tickets,
         stats.done_tickets,
         stats.ready_tickets,
@@ -99,11 +110,16 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
         stats.blocked_tickets,
     );
     println!("Critical path length: {}", stats.critical_path_length);
-    println!("Max threads: {} (panes: {})", config.max_threads, config.max_threads * 2);
+    println!(
+        "Max threads: {} (panes: {})",
+        config.max_threads,
+        config.max_threads * 2
+    );
     println!();
 
     // Show execution order (topological sort of non-done tickets)
-    let topo = dag.topological_sort()
+    let topo = dag
+        .topological_sort()
         .map_err(|e| format!("Cycle detected in DAG: {:?}", e))?;
 
     println!("Execution order:");
@@ -117,7 +133,8 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
                 "in-progress".to_string()
             } else {
                 let deps = dag.get_dependencies(id);
-                let pending: Vec<_> = deps.iter()
+                let pending: Vec<_> = deps
+                    .iter()
                     .filter(|d| {
                         dag.get_ticket(d)
                             .map(|dt| dt.phase != lisa_core::types::Phase::Done)
@@ -242,7 +259,10 @@ mod tests {
         assert!(layout.contains("max_threads \"3\""));
         assert!(layout.contains("auto_advance \"false\""));
         assert!(layout.contains("review_timeout_secs \"240\""));
-        assert!(layout.contains("compact-bar"), "layout should include status bar");
+        assert!(
+            layout.contains("compact-bar"),
+            "layout should include status bar"
+        );
         // max_threads=3 should produce 6 pane lines (2x)
         let pane_count = layout.matches("            pane").count();
         assert_eq!(pane_count, 6, "Expected 6 panes (2 * max_threads=3)");
@@ -320,7 +340,9 @@ mod tests {
         std::fs::create_dir_all(&tickets_dir).unwrap();
 
         // Create a done root ticket and a ready ticket depending on it
-        std::fs::write(tickets_dir.join("T-001.md"), "\
+        std::fs::write(
+            tickets_dir.join("T-001.md"),
+            "\
 ---
 id: T-001
 title: root-ticket
@@ -332,9 +354,13 @@ depends_on: []
 ---
 
 Root ticket.
-").unwrap();
+",
+        )
+        .unwrap();
 
-        std::fs::write(tickets_dir.join("T-002.md"), "\
+        std::fs::write(
+            tickets_dir.join("T-002.md"),
+            "\
 ---
 id: T-002
 title: child-ticket
@@ -346,7 +372,9 @@ depends_on: [T-001]
 ---
 
 Child ticket.
-").unwrap();
+",
+        )
+        .unwrap();
 
         let config = default_config();
         let result = run_loop(dir.path(), &config, true);

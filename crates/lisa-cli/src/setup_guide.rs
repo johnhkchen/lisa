@@ -253,7 +253,8 @@ fn section_archiving() -> GuideSection {
 }
 
 fn section_validate() -> GuideSection {
-    let body = "When you have created your directories, config, CLAUDE.md, stories, and tickets, run:\n\n\
+    let body =
+        "When you have created your directories, config, CLAUDE.md, stories, and tickets, run:\n\n\
         ```bash\n\
         lisa validate\n\
         ```\n\n\
@@ -265,7 +266,7 @@ fn section_validate() -> GuideSection {
         - Ticket frontmatter parses correctly\n\
         - DAG has no cycles or missing dependencies\n\n\
         Fix any errors before running `lisa loop`."
-        .to_string();
+            .to_string();
 
     GuideSection {
         title: "Validate your setup".to_string(),
@@ -380,7 +381,11 @@ mod tests {
         // Simulate `lisa init` having run
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::write(dir.path().join("CLAUDE.md"), "# existing").unwrap();
-        fs::write(dir.path().join(".lisa.toml"), "[scheduling]\nmax_threads = 2\n").unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            "[scheduling]\nmax_threads = 2\n",
+        )
+        .unwrap();
 
         let guide = build_guide(dir.path()).unwrap();
         assert!(guide.contains("already exists"));

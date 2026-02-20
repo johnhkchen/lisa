@@ -36,9 +36,7 @@ pub fn startup_diagnostics(
         events.push(ActivityEvent::Error {
             message: format!(
                 "Failed to parse {}: {}",
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?"),
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                 error,
             ),
         });
@@ -47,10 +45,7 @@ pub fn startup_diagnostics(
     // 3. No tickets found
     if scan_result.tickets.is_empty() && scan_result.errors.is_empty() {
         events.push(ActivityEvent::Warning {
-            message: format!(
-                "No tickets found in {}",
-                config.ticket_dir.display(),
-            ),
+            message: format!("No tickets found in {}", config.ticket_dir.display(),),
         });
         return events;
     }
@@ -84,10 +79,7 @@ pub fn startup_diagnostics(
             // 5. Cycle check (Dag::from_tickets succeeds even with cycles)
             if let CycleDetectionResult::Cycle(cycle_nodes) = dag.detect_cycles() {
                 events.push(ActivityEvent::Error {
-                    message: format!(
-                        "DAG has cycle involving: {}",
-                        cycle_nodes.join(", "),
-                    ),
+                    message: format!("DAG has cycle involving: {}", cycle_nodes.join(", "),),
                 });
             }
 
@@ -261,7 +253,11 @@ mod tests {
             ActivityEvent::Warning { message } => message.contains("No tickets found"),
             _ => false,
         });
-        assert!(has_warning, "Expected warning about no tickets: {:?}", events);
+        assert!(
+            has_warning,
+            "Expected warning about no tickets: {:?}",
+            events
+        );
     }
 
     #[test]
@@ -282,9 +278,21 @@ mod tests {
 
         match &events[0] {
             ActivityEvent::Info { message } => {
-                assert!(message.contains("/custom/tickets"), "ticket_dir missing: {}", message);
-                assert!(message.contains("max_threads=8"), "max_threads missing: {}", message);
-                assert!(message.contains("/custom/.lock"), "commit_lock missing: {}", message);
+                assert!(
+                    message.contains("/custom/tickets"),
+                    "ticket_dir missing: {}",
+                    message
+                );
+                assert!(
+                    message.contains("max_threads=8"),
+                    "max_threads missing: {}",
+                    message
+                );
+                assert!(
+                    message.contains("/custom/.lock"),
+                    "commit_lock missing: {}",
+                    message
+                );
             }
             other => panic!("Expected Info, got {:?}", other),
         }

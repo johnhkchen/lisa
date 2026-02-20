@@ -2,8 +2,8 @@
 id: T-017-03
 title: Commit all pending work
 type: chore
-phase: implement
-status: open
+phase: done
+status: done
 priority: high
 story: S-017
 created: 2026-02-20

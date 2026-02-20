@@ -29,7 +29,11 @@ impl fmt::Display for CheckReport {
                 write!(f, "  {:<12} {:<14} OK", self.name, version)
             }
             CheckResult::NotFound { install_hint } => {
-                write!(f, "  {:<12} not found\n    Install: {}", self.name, install_hint)
+                write!(
+                    f,
+                    "  {:<12} not found\n    Install: {}",
+                    self.name, install_hint
+                )
             }
             CheckResult::Skipped { reason } => {
                 write!(f, "  {:<12} skipped ({})", self.name, reason)
@@ -69,7 +73,9 @@ fn check_zellij() -> CheckResult {
     match get_command_version("zellij", &["--version"]) {
         Some(version) => CheckResult::Found { version },
         None => CheckResult::NotFound {
-            install_hint: "cargo install zellij\n    Or visit: https://zellij.dev/documentation/installation".to_string(),
+            install_hint:
+                "cargo install zellij\n    Or visit: https://zellij.dev/documentation/installation"
+                    .to_string(),
         },
     }
 }
@@ -167,9 +173,9 @@ fn format_report(reports: &[CheckReport]) -> String {
 
 /// Check if any required dependency is missing.
 fn has_failures(reports: &[CheckReport]) -> bool {
-    reports.iter().any(|r| {
-        r.required && matches!(r.result, CheckResult::NotFound { .. })
-    })
+    reports
+        .iter()
+        .any(|r| r.required && matches!(r.result, CheckResult::NotFound { .. }))
 }
 
 /// Check that all required runtime dependencies are present.

@@ -2,8 +2,8 @@
 id: T-017-01
 title: Fix formatting and clippy warnings
 type: chore
-phase: ready
-status: open
+phase: done
+status: done
 priority: high
 story: S-017
 created: 2026-02-20

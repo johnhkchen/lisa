@@ -171,8 +171,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                     Err(_) => {
                         actions.push(InitAction::Skip {
                             path: settings_path,
-                            reason: "exists but JSON is malformed — add hooks manually"
-                                .to_string(),
+                            reason: "exists but JSON is malformed — add hooks manually".to_string(),
                         });
                     }
                 }
@@ -235,7 +234,8 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
     for action in &actions {
         match action {
             InitAction::CreateDir(path) => {
-                fs::create_dir_all(path).map_err(|e| format!("Failed to create {}: {}", path.display(), e))?;
+                fs::create_dir_all(path)
+                    .map_err(|e| format!("Failed to create {}: {}", path.display(), e))?;
             }
             InitAction::CreateFile { path, content } => {
                 // Ensure parent directory exists
@@ -262,8 +262,13 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
             let hook_path = root.join(format!(".lisa/hooks/{}", script));
             if hook_path.exists() {
                 let perms = fs::Permissions::from_mode(0o755);
-                fs::set_permissions(&hook_path, perms)
-                    .map_err(|e| format!("Failed to set permissions on {}: {}", hook_path.display(), e))?;
+                fs::set_permissions(&hook_path, perms).map_err(|e| {
+                    format!(
+                        "Failed to set permissions on {}: {}",
+                        hook_path.display(),
+                        e
+                    )
+                })?;
             }
         }
     }
@@ -598,7 +603,8 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
                 diagnostics.push(ValidationDiagnostic {
                     path: format!("{}/", ticket_dir_rel),
                     category: "readiness",
-                    message: "no tickets with phase 'ready' and all dependencies satisfied".to_string(),
+                    message: "no tickets with phase 'ready' and all dependencies satisfied"
+                        .to_string(),
                     severity: Severity::Error,
                 });
             }
@@ -662,7 +668,10 @@ fn print_diagnostics(result: &ValidationResult) -> Result<(), String> {
             "\n{} error(s) found. Fix and re-run `lisa validate`.",
             count
         );
-        Err(format!("{} error(s) found. Fix and re-run `lisa validate`.", count))
+        Err(format!(
+            "{} error(s) found. Fix and re-run `lisa validate`.",
+            count
+        ))
     } else {
         println!(
             "All checks passed. {} tickets, {} ready, DAG valid. Run `lisa loop` to start.",
@@ -712,7 +721,11 @@ mod tests {
     #[test]
     fn test_plan_init_actions_existing_lisa_toml() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".lisa.toml"), "[scheduling]\nmax_threads = 4\n").unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            "[scheduling]\nmax_threads = 4\n",
+        )
+        .unwrap();
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
@@ -785,10 +798,23 @@ mod tests {
         assert!(dir.path().join(".claude/settings.local.json").exists());
 
         // Check hook script content
-        for (name, ext) in &[("on-idle.sh", ".idle"), ("on-stop.sh", ".stopped"), ("on-clear.sh", ".cleared")] {
-            let hook = fs::read_to_string(dir.path().join(format!(".lisa/hooks/{}", name))).unwrap();
-            assert!(hook.starts_with("#!/bin/sh"), "{} should start with shebang", name);
-            assert!(hook.contains("LISA_PANE_ID"), "{} should reference LISA_PANE_ID", name);
+        for (name, ext) in &[
+            ("on-idle.sh", ".idle"),
+            ("on-stop.sh", ".stopped"),
+            ("on-clear.sh", ".cleared"),
+        ] {
+            let hook =
+                fs::read_to_string(dir.path().join(format!(".lisa/hooks/{}", name))).unwrap();
+            assert!(
+                hook.starts_with("#!/bin/sh"),
+                "{} should start with shebang",
+                name
+            );
+            assert!(
+                hook.contains("LISA_PANE_ID"),
+                "{} should reference LISA_PANE_ID",
+                name
+            );
             assert!(hook.contains(ext), "{} should write {} signal", name, ext);
 
             // Check hook script is executable on unix
@@ -890,7 +916,11 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
         write_ready_ticket(dir.path());
 
@@ -907,7 +937,11 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         fs::write(
             dir.path().join(".lisa.toml"),
             "[scheduling]\nmax_threads = 4\n",
@@ -929,7 +963,11 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         fs::write(dir.path().join(".lisa.toml"), "not valid toml {{{").unwrap();
 
         let result = run_validate(dir.path(), false);
@@ -945,7 +983,11 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         // Create a valid ticket
@@ -982,7 +1024,11 @@ Test ticket.
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
 
         // Create ticket with missing dependency
         fs::write(
@@ -1029,7 +1075,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // No ticket files
 
         let result = run_validate(dir.path(), false);
@@ -1044,7 +1094,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
 
         // All tickets are done — no ready tickets
         fs::write(
@@ -1064,7 +1118,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
 
         // Malformed ticket (missing required fields)
         fs::write(
@@ -1084,7 +1142,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         // Ticket without Acceptance Criteria section
@@ -1105,7 +1167,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
         write_ready_ticket(dir.path());
 
@@ -1121,7 +1187,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // No docs/active/tickets directory
 
         let result = run_validate(dir.path(), false);
@@ -1141,11 +1211,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "custom hook").unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        fs::write(
-            dir.path().join(".claude/settings.local.json"),
-            "{}",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
 
         let result = run_init(dir.path(), false);
         assert!(result.is_ok());
@@ -1227,11 +1293,7 @@ depends_on: [T-999]
     "Notification": [{ "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": ".lisa/hooks/on-idle.sh" }] }]
   }
 }"#;
-        fs::write(
-            dir.path().join(".claude/settings.local.json"),
-            old_settings,
-        )
-        .unwrap();
+        fs::write(dir.path().join(".claude/settings.local.json"), old_settings).unwrap();
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
@@ -1241,15 +1303,32 @@ depends_on: [T-999]
             .iter()
             .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with("settings.local.json")))
             .collect();
-        assert_eq!(update_settings.len(), 1, "Should update settings.local.json to upgrade hooks");
+        assert_eq!(
+            update_settings.len(),
+            1,
+            "Should update settings.local.json to upgrade hooks"
+        );
 
         // Verify the updated content has guarded commands
         if let InitAction::UpdateFile { content, .. } = &update_settings[0] {
-            assert!(content.contains("test -x .lisa/hooks/on-stop.sh"), "Stop hook should be guarded");
-            assert!(content.contains("test -x .lisa/hooks/on-clear.sh"), "Clear hook should be guarded");
-            assert!(content.contains("test -x .lisa/hooks/on-idle.sh"), "Idle hook should be guarded");
+            assert!(
+                content.contains("test -x .lisa/hooks/on-stop.sh"),
+                "Stop hook should be guarded"
+            );
+            assert!(
+                content.contains("test -x .lisa/hooks/on-clear.sh"),
+                "Clear hook should be guarded"
+            );
+            assert!(
+                content.contains("test -x .lisa/hooks/on-idle.sh"),
+                "Idle hook should be guarded"
+            );
             // No duplicate entries
-            assert_eq!(content.matches("on-stop.sh").count(), 2, "on-stop.sh should appear twice (guard + path)");
+            assert_eq!(
+                content.matches("on-stop.sh").count(),
+                2,
+                "on-stop.sh should appear twice (guard + path)"
+            );
         }
     }
 
@@ -1260,7 +1339,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // Create on-idle.sh but NOT settings.local.json
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "#!/bin/sh\n").unwrap();
@@ -1286,7 +1369,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // settings.local.json exists but without idle_prompt
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
@@ -1314,7 +1401,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // settings.local.json exists with idle_prompt, but NO on-idle.sh
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         fs::write(
@@ -1335,7 +1426,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // Full hook infra except on-stop.sh
         write_hook_infrastructure(dir.path());
         fs::remove_file(dir.path().join(".lisa/hooks/on-stop.sh")).unwrap();
@@ -1357,7 +1452,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // Full hook infra except on-clear.sh
         write_hook_infrastructure(dir.path());
         fs::remove_file(dir.path().join(".lisa/hooks/on-clear.sh")).unwrap();
@@ -1380,7 +1479,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         fs::write(
             dir.path().join(".claude/settings.local.json"),
@@ -1411,7 +1514,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         // Ticket with invalid type: "ticket" instead of task/bug/feature/spike/chore
@@ -1431,7 +1538,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         // Ticket with invalid phase: "coding" instead of valid values
@@ -1508,7 +1619,11 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
         write_ready_ticket(dir.path());
 
@@ -1538,7 +1653,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         // Malformed ticket
@@ -1564,7 +1683,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         fs::write(
@@ -1588,7 +1711,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         // All done
@@ -1640,7 +1767,11 @@ depends_on: [T-999]
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         // No hook infrastructure at all
         write_ready_ticket(dir.path());
 
@@ -1668,7 +1799,11 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-        fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), "# RDSPI").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
         write_hook_infrastructure(dir.path());
 
         // Two ready tickets, one done

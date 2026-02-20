@@ -51,10 +51,7 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     match dag.detect_cycles() {
         CycleDetectionResult::NoCycle => {}
         CycleDetectionResult::Cycle(nodes) => {
-            return Err(format!(
-                "Cycle detected involving: {}",
-                nodes.join(", ")
-            ));
+            return Err(format!("Cycle detected involving: {}", nodes.join(", ")));
         }
     }
 

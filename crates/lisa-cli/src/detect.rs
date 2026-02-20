@@ -191,7 +191,11 @@ fn scan_source_layout(root: &Path, src_dir: &str, extensions: &[&str]) -> String
     if entries.is_empty() {
         String::new()
     } else {
-        format!("{}:\n{}", if src_dir == "." { "." } else { src_dir }, entries.join("\n"))
+        format!(
+            "{}:\n{}",
+            if src_dir == "." { "." } else { src_dir },
+            entries.join("\n")
+        )
     }
 }
 

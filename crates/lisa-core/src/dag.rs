@@ -198,8 +198,8 @@ impl Dag {
             return false;
         }
 
-        // Check if all dependencies are done
-        self.all_dependencies_done(ticket_id)
+        // Check if all transitive ancestors are done
+        self.all_ancestors_done(ticket_id)
     }
 
     /// Checks if all dependencies of a ticket are in the "done" phase.
@@ -218,6 +218,45 @@ impl Dag {
                 // Dependency doesn't exist in the DAG - shouldn't happen if
                 // DAG was built correctly, but be defensive
                 return false;
+            }
+        }
+
+        true
+    }
+
+    /// Checks if all transitive ancestors of a ticket are in the "done" phase.
+    ///
+    /// Unlike `all_dependencies_done` which only checks direct deps, this walks
+    /// the full transitive closure via BFS. This prevents scheduling a ticket
+    /// when an intermediate dependency was falsely marked done while its own
+    /// dependencies are still open.
+    pub fn all_ancestors_done(&self, ticket_id: &TicketId) -> bool {
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::new();
+
+        // Seed with direct dependencies
+        if let Some(deps) = self.depends_on.get(ticket_id) {
+            for dep in deps {
+                if visited.insert(dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        while let Some(ancestor_id) = queue.pop_front() {
+            match self.nodes.get(ancestor_id) {
+                Some(ticket) if ticket.phase == Phase::Done => {
+                    // This ancestor is done — continue to check *its* ancestors
+                    if let Some(deps) = self.depends_on.get(ancestor_id) {
+                        for dep in deps {
+                            if visited.insert(dep) {
+                                queue.push_back(dep);
+                            }
+                        }
+                    }
+                }
+                Some(_) => return false, // Ancestor not done
+                None => return false,    // Missing ancestor — be defensive
             }
         }
 
@@ -1091,5 +1130,98 @@ mod tests {
         // Even though T-001 is done, T-002 is explicitly blocked
         assert!(!dag.can_start(&"T-002".to_string()));
         assert!(dag.get_ready_tickets().is_empty());
+    }
+
+    // --- all_ancestors_done tests ---
+
+    #[test]
+    fn test_all_ancestors_done_no_deps() {
+        let t1 = make_ticket("T-001", Phase::Ready, vec![], vec![]);
+        let dag = Dag::from_tickets(vec![t1]).unwrap();
+        assert!(dag.all_ancestors_done(&"T-001".to_string()));
+    }
+
+    #[test]
+    fn test_all_ancestors_done_direct_dep_done() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
+        assert!(dag.all_ancestors_done(&"T-002".to_string()));
+    }
+
+    #[test]
+    fn test_all_ancestors_done_direct_dep_not_done() {
+        let t1 = make_ticket("T-001", Phase::Research, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
+        assert!(!dag.all_ancestors_done(&"T-002".to_string()));
+    }
+
+    #[test]
+    fn test_all_ancestors_done_transitive_gap() {
+        // A(open) → B(done) → C(ready): C should NOT be schedulable
+        let a = make_ticket("A", Phase::Research, vec![], vec![]);
+        let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
+        let c = make_ticket("C", Phase::Ready, vec!["B"], vec![]);
+        let dag = Dag::from_tickets(vec![a, b, c]).unwrap();
+        assert!(!dag.all_ancestors_done(&"C".to_string()));
+    }
+
+    #[test]
+    fn test_all_ancestors_done_full_chain() {
+        // A(done) → B(done) → C(ready): C is schedulable
+        let a = make_ticket("A", Phase::Done, vec![], vec![]);
+        let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
+        let c = make_ticket("C", Phase::Ready, vec!["B"], vec![]);
+        let dag = Dag::from_tickets(vec![a, b, c]).unwrap();
+        assert!(dag.all_ancestors_done(&"C".to_string()));
+    }
+
+    #[test]
+    fn test_all_ancestors_done_diamond_partial() {
+        //     A(done)
+        //    /       \
+        // B(done)  C(open)
+        //    \       /
+        //     D(ready)
+        let a = make_ticket("A", Phase::Done, vec![], vec![]);
+        let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
+        let c = make_ticket("C", Phase::Research, vec!["A"], vec![]);
+        let d = make_ticket("D", Phase::Ready, vec!["B", "C"], vec![]);
+        let dag = Dag::from_tickets(vec![a, b, c, d]).unwrap();
+        // C is not done, so D should not be schedulable
+        assert!(!dag.all_ancestors_done(&"D".to_string()));
+    }
+
+    #[test]
+    fn test_all_ancestors_done_diamond_full() {
+        //     A(done)
+        //    /       \
+        // B(done)  C(done)
+        //    \       /
+        //     D(ready)
+        let a = make_ticket("A", Phase::Done, vec![], vec![]);
+        let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
+        let c = make_ticket("C", Phase::Done, vec!["A"], vec![]);
+        let d = make_ticket("D", Phase::Ready, vec!["B", "C"], vec![]);
+        let dag = Dag::from_tickets(vec![a, b, c, d]).unwrap();
+        assert!(dag.all_ancestors_done(&"D".to_string()));
+    }
+
+    #[test]
+    fn test_can_start_requires_transitive_ancestors() {
+        // The original regression case:
+        // A(open) → B(done) → C(ready)
+        // C's direct dep B is done, but B's dep A is not.
+        // can_start should return false for C.
+        let a = make_ticket("A", Phase::Research, vec![], vec![]);
+        let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
+        let c = make_ticket("C", Phase::Ready, vec!["B"], vec![]);
+        let dag = Dag::from_tickets(vec![a, b, c]).unwrap();
+
+        assert!(!dag.can_start(&"C".to_string()));
+        // A is still runnable (Research, no deps), but C must not appear
+        let ready = dag.get_ready_tickets();
+        assert!(!ready.contains(&"C".to_string()));
     }
 }

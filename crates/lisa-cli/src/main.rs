@@ -11,7 +11,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "lisa", about = "Lisa - DAG-driven concurrent task scheduling", version)]
+#[command(
+    name = "lisa",
+    about = "Lisa - DAG-driven concurrent task scheduling",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

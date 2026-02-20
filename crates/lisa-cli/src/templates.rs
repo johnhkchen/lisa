@@ -128,11 +128,11 @@ fn ensure_hook(
             entry
                 .get("hooks")
                 .and_then(|h| h.as_array())
-                .map_or(false, |hooks| {
+                .is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h.get("command")
                             .and_then(|c| c.as_str())
-                            .map_or(false, |c| c.contains(script_path))
+                            .is_some_and(|c| c.contains(script_path))
                     })
                 })
         }),
@@ -141,10 +141,7 @@ fn ensure_hook(
     match found_idx {
         Some(idx) => {
             // Entry exists — upgrade the command if it uses the old bare-path form
-            if let Some(hooks_arr) = arr[idx]
-                .get_mut("hooks")
-                .and_then(|h| h.as_array_mut())
-            {
+            if let Some(hooks_arr) = arr[idx].get_mut("hooks").and_then(|h| h.as_array_mut()) {
                 for hook in hooks_arr.iter_mut() {
                     if let Some(cmd_val) = hook.get_mut("command") {
                         if let Some(existing) = cmd_val.as_str() {
@@ -185,14 +182,17 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
         .as_object_mut()
         .ok_or("settings.local.json root is not an object")?;
 
-    let hooks = obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     let hooks_obj = hooks
         .as_object_mut()
         .ok_or("settings.local.json 'hooks' is not an object")?;
 
-    ensure_hook(hooks_obj, "Stop", None, "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh");
+    ensure_hook(
+        hooks_obj,
+        "Stop",
+        None,
+        "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh",
+    );
     ensure_hook(
         hooks_obj,
         "SessionStart",
@@ -206,8 +206,7 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
         "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh",
     );
 
-    serde_json::to_string_pretty(&root)
-        .map_err(|e| format!("failed to serialize JSON: {}", e))
+    serde_json::to_string_pretty(&root).map_err(|e| format!("failed to serialize JSON: {}", e))
 }
 
 /// Generate a project-specific CLAUDE.md

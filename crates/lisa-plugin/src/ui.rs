@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-
 /// ANSI color codes for terminal output
 mod colors {
     pub const RESET: &str = "\x1b[0m";
@@ -285,9 +284,18 @@ fn render_slots(state: &PluginState, output: &mut Vec<String>) {
     }
 
     let total = state.slots.len();
-    let occupied: Vec<&SlotInfo> = state.slots.iter().filter(|s| s.ticket_id.is_some()).collect();
+    let occupied: Vec<&SlotInfo> = state
+        .slots
+        .iter()
+        .filter(|s| s.ticket_id.is_some())
+        .collect();
     let transitioning: Vec<&SlotInfo> = state.slots.iter().filter(|s| s.transitioning).collect();
-    let idle = total - occupied.len() - transitioning.iter().filter(|s| s.ticket_id.is_none()).count();
+    let idle = total
+        - occupied.len()
+        - transitioning
+            .iter()
+            .filter(|s| s.ticket_id.is_none())
+            .count();
 
     // Header
     let mut parts = vec![format!("{} total", total)];
@@ -301,7 +309,10 @@ fn render_slots(state: &PluginState, output: &mut Vec<String>) {
     parts.push(format!("{} idle", idle));
     output.push(format!(
         "{}{}=== Slots: {} ==={}",
-        BOLD, CYAN, parts.join(", "), RESET
+        BOLD,
+        CYAN,
+        parts.join(", "),
+        RESET
     ));
     output.push(String::new());
 
@@ -322,7 +333,11 @@ fn render_slots(state: &PluginState, output: &mut Vec<String>) {
     }
 
     // Transitioning slots (no ticket, but not idle yet)
-    for slot in state.slots.iter().filter(|s| s.transitioning && s.ticket_id.is_none()) {
+    for slot in state
+        .slots
+        .iter()
+        .filter(|s| s.transitioning && s.ticket_id.is_none())
+    {
         output.push(format!(
             "  {}[{}] winding down...{}",
             DIM, slot.slot_number, RESET
@@ -390,17 +405,26 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
     // Top border
     output.push(format!(
         "{}{}╔{}╗{}",
-        BOLD, BRIGHT_YELLOW, "═".repeat(box_w.saturating_sub(2)), RESET
+        BOLD,
+        BRIGHT_YELLOW,
+        "═".repeat(box_w.saturating_sub(2)),
+        RESET
     ));
 
     // Header line
     let header = "⚠ ATTENTION NEEDED";
     let header_pad = inner_w.saturating_sub(header.chars().count());
     output.push(format!(
-        "{}{}║ {}{}{}{}{}║{}",
-        BOLD, BRIGHT_YELLOW,
-        BG_YELLOW, WHITE, header, RESET,
-        format!("{}{} ", " ".repeat(header_pad), format!("{}{}", BOLD, BRIGHT_YELLOW)),
+        "{}{}║ {}{}{}{}{}{}{} ║{}",
+        BOLD,
+        BRIGHT_YELLOW,
+        BG_YELLOW,
+        WHITE,
+        header,
+        RESET,
+        " ".repeat(header_pad),
+        BOLD,
+        BRIGHT_YELLOW,
         RESET
     ));
 
@@ -440,11 +464,16 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
         let row_pad = inner_w.saturating_sub(content_visible_len);
 
         output.push(format!(
-            "{}{}║{} {}{}{} {}║{}",
-            BOLD, BRIGHT_YELLOW,
+            "{}{}║{} {}{}{} {}{}{}║{}",
+            BOLD,
+            BRIGHT_YELLOW,
             RESET,
-            YELLOW, content, RESET,
-            format!("{}{}{}", " ".repeat(row_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+            YELLOW,
+            content,
+            RESET,
+            " ".repeat(row_pad.saturating_sub(1)),
+            BOLD,
+            BRIGHT_YELLOW,
             RESET
         ));
     }
@@ -459,7 +488,14 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
 
         let detail_max = inner_w.saturating_sub(24); // label + space + ticket_id + space
         let detail: String = if alert.detail.chars().count() > detail_max {
-            format!("{}..", alert.detail.chars().take(detail_max.saturating_sub(2)).collect::<String>())
+            format!(
+                "{}..",
+                alert
+                    .detail
+                    .chars()
+                    .take(detail_max.saturating_sub(2))
+                    .collect::<String>()
+            )
         } else {
             alert.detail.clone()
         };
@@ -469,11 +505,16 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
         let row_pad = inner_w.saturating_sub(content_visible_len);
 
         output.push(format!(
-            "{}{}║{} {}{}{} {}║{}",
-            BOLD, BRIGHT_YELLOW,
+            "{}{}║{} {}{}{} {}{}{}║{}",
+            BOLD,
+            BRIGHT_YELLOW,
             RESET,
-            color, content, RESET,
-            format!("{}{}{}", " ".repeat(row_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+            color,
+            content,
+            RESET,
+            " ".repeat(row_pad.saturating_sub(1)),
+            BOLD,
+            BRIGHT_YELLOW,
             RESET
         ));
 
@@ -483,11 +524,16 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
             let actions_len = actions.chars().count();
             let actions_pad = inner_w.saturating_sub(actions_len);
             output.push(format!(
-                "{}{}║{} {}{}{} {}║{}",
-                BOLD, BRIGHT_YELLOW,
+                "{}{}║{} {}{}{} {}{}{}║{}",
+                BOLD,
+                BRIGHT_YELLOW,
                 RESET,
-                DIM, actions, RESET,
-                format!("{}{}{}", " ".repeat(actions_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+                DIM,
+                actions,
+                RESET,
+                " ".repeat(actions_pad.saturating_sub(1)),
+                BOLD,
+                BRIGHT_YELLOW,
                 RESET
             ));
         }
@@ -497,11 +543,16 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
         let more = format!("... and {} more alerts", state.alerts.len() - 5);
         let pad = inner_w.saturating_sub(more.len());
         output.push(format!(
-            "{}{}║{} {}{}{} {}║{}",
-            BOLD, BRIGHT_YELLOW,
+            "{}{}║{} {}{}{} {}{}{}║{}",
+            BOLD,
+            BRIGHT_YELLOW,
             RESET,
-            DIM, more, RESET,
-            format!("{}{}{}", " ".repeat(pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+            DIM,
+            more,
+            RESET,
+            " ".repeat(pad.saturating_sub(1)),
+            BOLD,
+            BRIGHT_YELLOW,
             RESET
         ));
     }
@@ -511,18 +562,26 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
     let hint_len = hint.chars().count();
     let hint_pad = inner_w.saturating_sub(hint_len);
     output.push(format!(
-        "{}{}║{} {}{}{} {}║{}",
-        BOLD, BRIGHT_YELLOW,
+        "{}{}║{} {}{}{} {}{}{}║{}",
+        BOLD,
+        BRIGHT_YELLOW,
         RESET,
-        DIM, hint, RESET,
-        format!("{}{}{}", " ".repeat(hint_pad.saturating_sub(1)), BOLD, BRIGHT_YELLOW),
+        DIM,
+        hint,
+        RESET,
+        " ".repeat(hint_pad.saturating_sub(1)),
+        BOLD,
+        BRIGHT_YELLOW,
         RESET
     ));
 
     // Bottom border
     output.push(format!(
         "{}{}╚{}╝{}",
-        BOLD, BRIGHT_YELLOW, "═".repeat(box_w.saturating_sub(2)), RESET
+        BOLD,
+        BRIGHT_YELLOW,
+        "═".repeat(box_w.saturating_sub(2)),
+        RESET
     ));
 
     output.push(String::new());
@@ -627,7 +686,11 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
     let edges: Vec<(&str, &str)> = state
         .tickets
         .iter()
-        .flat_map(|t| t.depends_on.iter().map(move |dep| (dep.as_str(), t.id.as_str())))
+        .flat_map(|t| {
+            t.depends_on
+                .iter()
+                .map(move |dep| (dep.as_str(), t.id.as_str()))
+        })
         .collect();
 
     // Render each layer with connector lines above
@@ -689,10 +752,14 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
 
             line.push_str(&format!(
                 "{}{}{} {:<8}{}{}{}{} ",
-                phase_color, indicator, RESET,
+                phase_color,
+                indicator,
+                RESET,
                 id_str,
                 " ".repeat(pad),
-                status_color, status_str, RESET,
+                status_color,
+                status_str,
+                RESET,
             ));
         }
         output.push(line);
@@ -778,7 +845,10 @@ fn render_parked_threads(state: &PluginState, output: &mut Vec<String>) {
 
         // Truncate artifact path if too long
         let artifact_display = if thread.artifact_path.len() > 28 {
-            format!("...{}", &thread.artifact_path[thread.artifact_path.len() - 25..])
+            format!(
+                "...{}",
+                &thread.artifact_path[thread.artifact_path.len() - 25..]
+            )
         } else {
             thread.artifact_path.clone()
         };
@@ -1007,7 +1077,7 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
     // Calculate remaining space for activity log
     let used_lines = output.len();
     let remaining = height.saturating_sub(used_lines + 4);
-    let max_log_entries = remaining.max(3).min(10);
+    let max_log_entries = remaining.clamp(3, 10);
 
     // Activity log
     render_activity_log(state, max_log_entries, &mut output);
@@ -1050,7 +1120,9 @@ fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> 
     output.push(format!(
         "│{}{}{}{}{}│",
         " ".repeat(left_pad),
-        BOLD, title, RESET,
+        BOLD,
+        title,
+        RESET,
         " ".repeat(right_pad),
     ));
 
@@ -1083,7 +1155,9 @@ fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> 
     output.push(format!(
         "│{}{}{}{}{}│",
         " ".repeat(fl),
-        DIM, footer, RESET,
+        DIM,
+        footer,
+        RESET,
         " ".repeat(fr),
     ));
     // Bottom border
@@ -1148,7 +1222,6 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Blocked,
                     depends_on: vec!["T-002".to_string()],
-
                 },
             ],
             active_threads: vec![ActiveThread {
@@ -1281,9 +1354,9 @@ mod tests {
 
         // T-001 has no deps, should be in first layer
         assert!(layers[0].contains(&0)); // T-001 is at index 0
-        // T-002 depends on T-001, should be in second layer
+                                         // T-002 depends on T-001, should be in second layer
         assert!(layers[1].contains(&1)); // T-002 is at index 1
-        // T-003 depends on T-002, should be in third layer
+                                         // T-003 depends on T-002, should be in third layer
         assert!(layers[2].contains(&2)); // T-003 is at index 2
     }
 
@@ -1365,7 +1438,6 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Blocked,
                     depends_on: vec!["T-002".to_string(), "T-003".to_string()],
-
                 },
             ],
             active_threads: vec![ActiveThread {
@@ -1415,16 +1487,34 @@ mod tests {
         let full_output = lines.join("\n");
 
         // All ticket IDs appear
-        assert!(full_output.contains("T-001"), "T-001 missing from dashboard");
-        assert!(full_output.contains("T-002"), "T-002 missing from dashboard");
-        assert!(full_output.contains("T-003"), "T-003 missing from dashboard");
-        assert!(full_output.contains("T-004"), "T-004 missing from dashboard");
+        assert!(
+            full_output.contains("T-001"),
+            "T-001 missing from dashboard"
+        );
+        assert!(
+            full_output.contains("T-002"),
+            "T-002 missing from dashboard"
+        );
+        assert!(
+            full_output.contains("T-003"),
+            "T-003 missing from dashboard"
+        );
+        assert!(
+            full_output.contains("T-004"),
+            "T-004 missing from dashboard"
+        );
 
         // Dashboard header
-        assert!(full_output.contains("Dashboard"), "Dashboard header missing");
+        assert!(
+            full_output.contains("Dashboard"),
+            "Dashboard header missing"
+        );
 
         // Active thread section shows T-002 with Design phase
-        assert!(full_output.contains("Design"), "Active thread phase missing");
+        assert!(
+            full_output.contains("Design"),
+            "Active thread phase missing"
+        );
 
         // Parked thread section shows T-003 with artifact
         assert!(
@@ -1433,10 +1523,7 @@ mod tests {
         );
 
         // Activity log has entries
-        assert!(
-            full_output.contains("test error"),
-            "Error activity missing"
-        );
+        assert!(full_output.contains("test error"), "Error activity missing");
 
         // Status line: Active: 1, Parked: 1, Done: 1/4
         assert!(full_output.contains("Active: 1"), "Active count wrong");
@@ -1463,7 +1550,6 @@ mod tests {
                 phase: Phase::Review,
                 status: TicketStatus::WaitingReview,
                 depends_on: vec![],
-
             }],
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-005".to_string(),
@@ -1482,8 +1568,14 @@ mod tests {
         let full = output.join("\n");
         assert!(full.contains("ATTENTION NEEDED"), "Banner header missing");
         assert!(full.contains("T-005"), "Ticket ID missing from banner");
-        assert!(full.contains("review-ticket"), "Ticket title missing from banner");
-        assert!(full.contains("design.md"), "Artifact path missing from banner");
+        assert!(
+            full.contains("review-ticket"),
+            "Ticket title missing from banner"
+        );
+        assert!(
+            full.contains("design.md"),
+            "Artifact path missing from banner"
+        );
         // Wait time: 200 - 50 = 150s = 2m 30s
         assert!(full.contains("2m 30s"), "Wait time missing from banner");
         // Box drawing characters
@@ -1500,7 +1592,6 @@ mod tests {
                 phase: Phase::Implement,
                 status: TicketStatus::InProgress,
                 depends_on: vec![],
-
             }],
             ..PluginState::default()
         };
@@ -1508,7 +1599,10 @@ mod tests {
         let mut output = Vec::new();
         render_attention_banner(&state, 80, &mut output);
 
-        assert!(output.is_empty(), "Banner should not render when no review tickets");
+        assert!(
+            output.is_empty(),
+            "Banner should not render when no review tickets"
+        );
     }
 
     #[test]
@@ -1520,7 +1614,6 @@ mod tests {
                 phase: Phase::Review,
                 status: TicketStatus::WaitingReview,
                 depends_on: vec![],
-
             }],
             parked_threads: vec![], // No matching parked thread
             current_time: Duration::from_secs(100),
@@ -1531,9 +1624,15 @@ mod tests {
         render_attention_banner(&state, 80, &mut output);
 
         let full = output.join("\n");
-        assert!(full.contains("ATTENTION NEEDED"), "Banner should still render");
+        assert!(
+            full.contains("ATTENTION NEEDED"),
+            "Banner should still render"
+        );
         assert!(full.contains("T-006"), "Ticket ID should appear");
-        assert!(full.contains("—"), "Dash placeholder should appear for missing data");
+        assert!(
+            full.contains("—"),
+            "Dash placeholder should appear for missing data"
+        );
     }
 
     #[test]
@@ -1546,7 +1645,6 @@ mod tests {
                     phase: Phase::Done,
                     status: TicketStatus::Done,
                     depends_on: vec![],
-
                 },
                 TicketNode {
                     id: "T-002".to_string(),
@@ -1554,7 +1652,6 @@ mod tests {
                     phase: Phase::Review,
                     status: TicketStatus::WaitingReview,
                     depends_on: vec!["T-001".to_string()],
-
                 },
             ],
             parked_threads: vec![ParkedThread {
@@ -1572,12 +1669,18 @@ mod tests {
         let full = lines.join("\n");
 
         // Banner should appear
-        assert!(full.contains("ATTENTION NEEDED"), "Banner missing from full dashboard");
+        assert!(
+            full.contains("ATTENTION NEEDED"),
+            "Banner missing from full dashboard"
+        );
 
         // Banner should appear BEFORE DAG
         let banner_pos = full.find("ATTENTION NEEDED").unwrap();
         let dag_pos = full.find("DAG").unwrap();
-        assert!(banner_pos < dag_pos, "Banner should appear before DAG section");
+        assert!(
+            banner_pos < dag_pos,
+            "Banner should appear before DAG section"
+        );
     }
 
     #[test]
@@ -1647,14 +1750,20 @@ mod tests {
         };
 
         let status = render_status_line(&state);
-        assert!(status.contains("Alerts: 1"), "Alert count missing from status line");
+        assert!(
+            status.contains("Alerts: 1"),
+            "Alert count missing from status line"
+        );
     }
 
     #[test]
     fn test_status_line_no_alerts() {
         let state = PluginState::default();
         let status = render_status_line(&state);
-        assert!(!status.contains("Alerts"), "Alerts should not appear when count is 0");
+        assert!(
+            !status.contains("Alerts"),
+            "Alerts should not appear when count is 0"
+        );
     }
 
     #[test]
@@ -1666,7 +1775,6 @@ mod tests {
                 phase: Phase::Review,
                 status: TicketStatus::WaitingReview,
                 depends_on: vec![],
-
             }],
             alerts: vec![HealthAlert {
                 ticket_id: "T-010".to_string(),
@@ -1700,8 +1808,16 @@ mod tests {
     fn test_render_slots_all_idle() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { ticket_id: None, slot_number: 1, transitioning: false },
-                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
+                SlotInfo {
+                    ticket_id: None,
+                    slot_number: 1,
+                    transitioning: false,
+                },
+                SlotInfo {
+                    ticket_id: None,
+                    slot_number: 2,
+                    transitioning: false,
+                },
             ],
             ..PluginState::default()
         };
@@ -1712,15 +1828,26 @@ mod tests {
 
         assert!(full.contains("2 total"), "Total count missing");
         assert!(full.contains("2 idle"), "Idle count missing");
-        assert!(!full.contains("active"), "Should not show active when all idle");
+        assert!(
+            !full.contains("active"),
+            "Should not show active when all idle"
+        );
     }
 
     #[test]
     fn test_render_slots_all_occupied() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { ticket_id: Some("T-003-01".to_string()), slot_number: 1, transitioning: false },
-                SlotInfo { ticket_id: Some("T-003-02".to_string()), slot_number: 2, transitioning: false },
+                SlotInfo {
+                    ticket_id: Some("T-003-01".to_string()),
+                    slot_number: 1,
+                    transitioning: false,
+                },
+                SlotInfo {
+                    ticket_id: Some("T-003-02".to_string()),
+                    slot_number: 2,
+                    transitioning: false,
+                },
             ],
             active_threads: vec![
                 ActiveThread {
@@ -1756,9 +1883,21 @@ mod tests {
     fn test_render_slots_mixed() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
-                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
-                SlotInfo { ticket_id: None, slot_number: 3, transitioning: false },
+                SlotInfo {
+                    ticket_id: Some("T-001".to_string()),
+                    slot_number: 1,
+                    transitioning: false,
+                },
+                SlotInfo {
+                    ticket_id: None,
+                    slot_number: 2,
+                    transitioning: false,
+                },
+                SlotInfo {
+                    ticket_id: None,
+                    slot_number: 3,
+                    transitioning: false,
+                },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
@@ -1801,7 +1940,6 @@ mod tests {
                     phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec![],
-
                 },
                 TicketNode {
                     id: "T-002".to_string(),
@@ -1809,7 +1947,6 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Ready,
                     depends_on: vec![],
-
                 },
                 TicketNode {
                     id: "T-003".to_string(),
@@ -1817,12 +1954,13 @@ mod tests {
                     phase: Phase::Ready,
                     status: TicketStatus::Ready,
                     depends_on: vec![],
-
                 },
             ],
-            slots: vec![
-                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
-            ],
+            slots: vec![SlotInfo {
+                ticket_id: Some("T-001".to_string()),
+                slot_number: 1,
+                transitioning: false,
+            }],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
                 phase: Phase::Implement,
@@ -1836,21 +1974,35 @@ mod tests {
         render_slots(&state, &mut output);
         let full = output.join("\n");
 
-        assert!(full.contains("2 tickets waiting for slots"), "Warning missing");
+        assert!(
+            full.contains("2 tickets waiting for slots"),
+            "Warning missing"
+        );
     }
 
     #[test]
     fn test_status_line_with_slots() {
         let state = PluginState {
             slots: vec![
-                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
-                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
+                SlotInfo {
+                    ticket_id: Some("T-001".to_string()),
+                    slot_number: 1,
+                    transitioning: false,
+                },
+                SlotInfo {
+                    ticket_id: None,
+                    slot_number: 2,
+                    transitioning: false,
+                },
             ],
             ..PluginState::default()
         };
 
         let status = render_status_line(&state);
-        assert!(status.contains("Slots: 1/2"), "Slot count missing from status line");
+        assert!(
+            status.contains("Slots: 1/2"),
+            "Slot count missing from status line"
+        );
         assert!(status.contains("Active: 0"), "Active count missing");
     }
 
@@ -1863,11 +2015,18 @@ mod tests {
                 phase: Phase::Implement,
                 status: TicketStatus::InProgress,
                 depends_on: vec![],
-
             }],
             slots: vec![
-                SlotInfo { ticket_id: Some("T-001".to_string()), slot_number: 1, transitioning: false },
-                SlotInfo { ticket_id: None, slot_number: 2, transitioning: false },
+                SlotInfo {
+                    ticket_id: Some("T-001".to_string()),
+                    slot_number: 1,
+                    transitioning: false,
+                },
+                SlotInfo {
+                    ticket_id: None,
+                    slot_number: 2,
+                    transitioning: false,
+                },
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
@@ -1882,12 +2041,18 @@ mod tests {
         let full = lines.join("\n");
 
         // Slots section should appear
-        assert!(full.contains("Slots:"), "Slots section missing from dashboard");
+        assert!(
+            full.contains("Slots:"),
+            "Slots section missing from dashboard"
+        );
 
         // Slots should appear before DAG
         let slots_pos = full.find("Slots:").unwrap();
         let dag_pos = full.find("DAG").unwrap();
-        assert!(slots_pos < dag_pos, "Slots section should appear before DAG");
+        assert!(
+            slots_pos < dag_pos,
+            "Slots section should appear before DAG"
+        );
     }
 
     #[test]
@@ -1905,7 +2070,10 @@ mod tests {
     fn test_status_line_not_paused() {
         let state = sample_state();
         let status = render_status_line(&state);
-        assert!(!status.contains("PAUSED"), "should not show PAUSED when unpaused");
+        assert!(
+            !status.contains("PAUSED"),
+            "should not show PAUSED when unpaused"
+        );
         assert!(status.contains("[p] pause"), "should show pause hint");
     }
 
@@ -1913,7 +2081,10 @@ mod tests {
     fn test_status_line_has_reset_hint() {
         let state = sample_state();
         let status = render_status_line(&state);
-        assert!(status.contains("[r] reset"), "Status line should show [r] reset hint");
+        assert!(
+            status.contains("[r] reset"),
+            "Status line should show [r] reset hint"
+        );
     }
 
     #[test]
@@ -1926,7 +2097,10 @@ mod tests {
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");
-        assert!(full.contains("Reset Ticket to Ready"), "Reset modal should have correct title");
+        assert!(
+            full.contains("Reset Ticket to Ready"),
+            "Reset modal should have correct title"
+        );
     }
 
     #[test]
@@ -1939,7 +2113,10 @@ mod tests {
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");
-        assert!(full.contains("Mark Ticket Done"), "Mark-done modal should have correct title");
+        assert!(
+            full.contains("Mark Ticket Done"),
+            "Mark-done modal should have correct title"
+        );
     }
 
     #[test]
@@ -1950,7 +2127,11 @@ mod tests {
         let blank_lines = lines.iter().filter(|l| l.is_empty()).count();
         // Compacted dashboard should have fewer blank lines than before (~12).
         // Sub-sections still add a few internally, but we removed the padding between them.
-        assert!(blank_lines <= 8, "Dashboard should have <= 8 blank lines, got {}", blank_lines);
+        assert!(
+            blank_lines <= 8,
+            "Dashboard should have <= 8 blank lines, got {}",
+            blank_lines
+        );
     }
 
     #[test]
@@ -1963,7 +2144,13 @@ mod tests {
         let rows = 10;
         let max_scroll = total_lines.saturating_sub(rows);
         let clamped = 9999usize.min(max_scroll);
-        assert!(clamped <= total_lines, "Clamped scroll should not exceed total lines");
-        assert_eq!(clamped, max_scroll, "Clamped scroll should equal max_scroll");
+        assert!(
+            clamped <= total_lines,
+            "Clamped scroll should not exceed total lines"
+        );
+        assert_eq!(
+            clamped, max_scroll,
+            "Clamped scroll should equal max_scroll"
+        );
     }
 }

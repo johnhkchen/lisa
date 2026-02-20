@@ -395,11 +395,7 @@ impl Thread {
     /// - `Failed` if the thread status is Failed.
     /// - `Stuck` if the thread is Running and time-in-phase exceeds the threshold.
     /// - `Healthy` otherwise (including Parked and Completed threads).
-    pub fn health(
-        &self,
-        now: SystemTime,
-        stuck_threshold: std::time::Duration,
-    ) -> HealthStatus {
+    pub fn health(&self, now: SystemTime, stuck_threshold: std::time::Duration) -> HealthStatus {
         if self.status == ThreadStatus::Failed {
             return HealthStatus::Failed;
         }

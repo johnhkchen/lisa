@@ -69,8 +69,7 @@ pub fn load_config(root: &Path) -> Result<ConfigValidation, String> {
     let content = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Failed to read {}: {}", config_path.display(), e))?;
 
-    validate_config(&content)
-        .map_err(|e| format!("{}: {}", config_path.display(), e))
+    validate_config(&content).map_err(|e| format!("{}: {}", config_path.display(), e))
 }
 
 /// Merge config file values with CLI overrides.
@@ -80,11 +79,7 @@ pub fn resolve_config(config: &LisaConfig, cli_max_threads: Option<usize>) -> Re
     let defaults = ResolvedConfig::default();
 
     ResolvedConfig {
-        ticket_dir: config
-            .dirs
-            .tickets
-            .clone()
-            .unwrap_or(defaults.ticket_dir),
+        ticket_dir: config.dirs.tickets.clone().unwrap_or(defaults.ticket_dir),
         story_dir: config.dirs.stories.clone().unwrap_or(defaults.story_dir),
         work_dir: config.dirs.work.clone().unwrap_or(defaults.work_dir),
         max_threads: cli_max_threads
@@ -149,8 +144,8 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     }
 
     // Deserialize into typed struct
-    let config: LisaConfig = toml::from_str(content)
-        .map_err(|e| format!("Invalid config value: {}", e))?;
+    let config: LisaConfig =
+        toml::from_str(content).map_err(|e| format!("Invalid config value: {}", e))?;
 
     // Semantic validation
     if config.scheduling.max_threads == Some(0) {
@@ -326,7 +321,9 @@ max_threads = 6
     fn test_validate_max_threads_zero() {
         let result = validate_config("[scheduling]\nmax_threads = 0\n");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max_threads must be at least 1"));
+        assert!(result
+            .unwrap_err()
+            .contains("max_threads must be at least 1"));
     }
 
     #[test]

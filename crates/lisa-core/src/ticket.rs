@@ -21,7 +21,11 @@ pub enum TicketError {
     /// Required field is missing from frontmatter
     MissingField(String),
     /// Invalid field value
-    InvalidField { field: String, value: String, reason: String },
+    InvalidField {
+        field: String,
+        value: String,
+        reason: String,
+    },
     /// File path is not valid UTF-8
     InvalidPath(PathBuf),
 }
@@ -31,14 +35,25 @@ impl std::fmt::Display for TicketError {
         match self {
             TicketError::Io(err) => write!(f, "I/O error: {}", err),
             TicketError::MissingFrontmatter => {
-                write!(f, "File does not contain valid YAML frontmatter (missing --- delimiters)")
+                write!(
+                    f,
+                    "File does not contain valid YAML frontmatter (missing --- delimiters)"
+                )
             }
             TicketError::YamlParse(msg) => write!(f, "YAML parse error: {}", msg),
             TicketError::MissingField(field) => {
                 write!(f, "Required field '{}' is missing from frontmatter", field)
             }
-            TicketError::InvalidField { field, value, reason } => {
-                write!(f, "Invalid value '{}' for field '{}': {}", value, field, reason)
+            TicketError::InvalidField {
+                field,
+                value,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Invalid value '{}' for field '{}': {}",
+                    value, field, reason
+                )
             }
             TicketError::InvalidPath(path) => {
                 write!(f, "Path is not valid UTF-8: {:?}", path)
@@ -273,7 +288,8 @@ fn parse_status(value: &str) -> Result<TicketStatus, TicketError> {
         _ => Err(TicketError::InvalidField {
             field: "status".to_string(),
             value: value.to_string(),
-            reason: "expected one of: open, in_progress, blocked, review, done, cancelled".to_string(),
+            reason: "expected one of: open, in_progress, blocked, review, done, cancelled"
+                .to_string(),
         }),
     }
 }
@@ -307,7 +323,9 @@ fn parse_phase(value: &str) -> Result<Phase, TicketError> {
         _ => Err(TicketError::InvalidField {
             field: "phase".to_string(),
             value: value.to_string(),
-            reason: "expected one of: ready, research, design, structure, plan, implement, review, done".to_string(),
+            reason:
+                "expected one of: ready, research, design, structure, plan, implement, review, done"
+                    .to_string(),
         }),
     }
 }
@@ -487,7 +505,11 @@ pub fn update_ticket_phase<P: AsRef<Path>>(path: P, new_phase: Phase) -> Result<
 }
 
 /// Updates a single field in the YAML frontmatter.
-fn update_frontmatter_field(content: &str, field: &str, new_value: &str) -> Result<String, TicketError> {
+fn update_frontmatter_field(
+    content: &str,
+    field: &str,
+    new_value: &str,
+) -> Result<String, TicketError> {
     let content_trimmed = content.trim_start();
 
     // Must start with ---
@@ -509,10 +531,9 @@ fn update_frontmatter_field(content: &str, field: &str, new_value: &str) -> Resu
 
     // Reconstruct the file
     let leading_whitespace = &content[..content.len() - content_trimmed.len()];
-    Ok(format!("{}---{}{}",
-        leading_whitespace,
-        updated_frontmatter,
-        rest
+    Ok(format!(
+        "{}---{}{}",
+        leading_whitespace, updated_frontmatter, rest
     ))
 }
 
@@ -568,7 +589,10 @@ fn phase_to_string(phase: Phase) -> String {
 ///
 /// * `path` - Path to the ticket file
 /// * `new_status` - The new status to set
-pub fn update_ticket_status<P: AsRef<Path>>(path: P, new_status: TicketStatus) -> Result<(), TicketError> {
+pub fn update_ticket_status<P: AsRef<Path>>(
+    path: P,
+    new_status: TicketStatus,
+) -> Result<(), TicketError> {
     let path = path.as_ref();
     let content = fs::read_to_string(path)?;
 
@@ -816,7 +840,10 @@ This ticket has no blocks field at all.
 
         assert_eq!(ticket.id, "T-001");
         assert_eq!(ticket.title, "no-blocks-field");
-        assert!(ticket.blocks.is_empty(), "blocks should be empty when field is absent");
+        assert!(
+            ticket.blocks.is_empty(),
+            "blocks should be empty when field is absent"
+        );
         assert_eq!(ticket.depends_on, vec!["T-000".to_string()]);
     }
 
@@ -874,7 +901,8 @@ This ticket has no blocks field at all.
         fs::write(
             dir.path().join("T-BAD.md"),
             "---\nid: T-BAD\ntitle: bad\n---\nNo type/status/priority/phase\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = scan_tickets_with_diagnostics(dir.path()).unwrap();
         assert_eq!(result.tickets.len(), 1);
