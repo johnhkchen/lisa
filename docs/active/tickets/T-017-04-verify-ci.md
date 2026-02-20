@@ -2,8 +2,8 @@
 id: T-017-04
 title: Push and verify CI green
 type: chore
-phase: implement
-status: in_progress
+phase: done
+status: done
 priority: high
 story: S-017
 created: 2026-02-20
