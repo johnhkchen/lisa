@@ -151,13 +151,37 @@ fn parse_frontmatter_into_ticket(
     let mut depends_on: Vec<String> = Vec::new();
     let mut blocks: Vec<String> = Vec::new();
 
+    // Track which list field we're accumulating multiline items for.
+    // YAML allows both inline `depends_on: [A, B]` and multiline:
+    //   depends_on:
+    //     - A
+    //     - B
+    let mut list_field: Option<&str> = None;
+
     for line in yaml.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            list_field = None;
             continue;
         }
 
-        if let Some((key, value)) = parse_yaml_line(line) {
+        // Check for YAML list item (  - value)
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            let item = item.trim();
+            if !item.is_empty() {
+                match list_field {
+                    Some("depends_on") => depends_on.push(item.to_string()),
+                    Some("blocks") => blocks.push(item.to_string()),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        // New key resets list accumulation
+        list_field = None;
+
+        if let Some((key, value)) = parse_yaml_line(trimmed) {
             match key {
                 "id" => id = Some(value.to_string()),
                 "story" => story = Some(value.to_string()),
@@ -166,8 +190,23 @@ fn parse_frontmatter_into_ticket(
                 "status" => status = Some(parse_status(value)?),
                 "priority" => priority = Some(parse_priority(value)?),
                 "phase" => phase = Some(parse_phase(value)?),
-                "depends_on" => depends_on = parse_string_vec(value)?,
-                "blocks" => blocks = parse_string_vec(value)?,
+                "depends_on" => {
+                    let parsed = parse_string_vec(value)?;
+                    if parsed.is_empty() && value.is_empty() {
+                        // Empty value — expect multiline list items to follow
+                        list_field = Some("depends_on");
+                    } else {
+                        depends_on = parsed;
+                    }
+                }
+                "blocks" => {
+                    let parsed = parse_string_vec(value)?;
+                    if parsed.is_empty() && value.is_empty() {
+                        list_field = Some("blocks");
+                    } else {
+                        blocks = parsed;
+                    }
+                }
                 _ => {
                     // Ignore unknown fields for forward compatibility
                 }
@@ -850,5 +889,70 @@ This ticket has no blocks field at all.
         let result = scan_tickets_with_diagnostics(dir.path()).unwrap();
         assert!(result.tickets.is_empty());
         assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiline_depends_on() {
+        let content = "---\nid: T-003\ntitle: multi-dep\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on:\n  - T-001\n  - T-002\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+
+        assert_eq!(ticket.depends_on.len(), 2);
+        assert!(ticket.depends_on.contains(&"T-001".to_string()));
+        assert!(ticket.depends_on.contains(&"T-002".to_string()));
+    }
+
+    #[test]
+    fn test_parse_multiline_blocks() {
+        let content = "---\nid: T-001\ntitle: multi-block\ntype: task\nstatus: open\npriority: high\nphase: ready\nblocks:\n  - T-002\n  - T-003\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+
+        assert_eq!(ticket.blocks.len(), 2);
+        assert!(ticket.blocks.contains(&"T-002".to_string()));
+        assert!(ticket.blocks.contains(&"T-003".to_string()));
+    }
+
+    #[test]
+    fn test_parse_multiline_single_item() {
+        let content = "---\nid: T-002\ntitle: single-dep\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on:\n  - T-001\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+
+        assert_eq!(ticket.depends_on, vec!["T-001".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_multiline_and_inline_both_work() {
+        // Inline format still works
+        let inline = "---\nid: T-002\ntitle: inline\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [T-001]\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let t1 = parse_ticket_content(inline, path).unwrap();
+        assert_eq!(t1.depends_on, vec!["T-001".to_string()]);
+
+        // Multiline format also works
+        let multiline = "---\nid: T-002\ntitle: multiline\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on:\n  - T-001\n---\nBody\n";
+        let t2 = parse_ticket_content(multiline, path).unwrap();
+        assert_eq!(t2.depends_on, vec!["T-001".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_multiline_empty_list() {
+        // `depends_on: []` should still produce empty vec
+        let content = "---\nid: T-001\ntitle: empty\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: []\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert!(ticket.depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiline_list_resets_on_new_key() {
+        // depends_on multiline list should stop when a new key appears
+        let content = "---\nid: T-002\ntitle: reset\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on:\n  - T-001\nblocks:\n  - T-003\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+
+        assert_eq!(ticket.depends_on, vec!["T-001".to_string()]);
+        assert_eq!(ticket.blocks, vec!["T-003".to_string()]);
     }
 }

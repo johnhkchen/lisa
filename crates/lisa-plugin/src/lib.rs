@@ -1618,9 +1618,10 @@ impl State {
 
     /// Open the mark-done modal with a list of non-done tickets.
     fn open_mark_done_modal(&mut self) {
-        // Show non-done tickets that do NOT have a running agent thread.
-        // This surfaces tickets agents left behind (forgot to mark done)
-        // without letting the user accidentally interrupt active work.
+        // Show non-done tickets that do NOT have a running agent thread,
+        // UNLESS the ticket is in Review phase (review tickets may have been
+        // resumed by the review-timeout finish-up prompt but should still be
+        // manually completable).
         let running: std::collections::HashSet<&str> = self
             .threads
             .iter()
@@ -1632,7 +1633,7 @@ impl State {
             .dag
             .tickets()
             .filter(|t| t.phase != Phase::Done)
-            .filter(|t| !running.contains(t.id.as_str()))
+            .filter(|t| t.phase == Phase::Review || !running.contains(t.id.as_str()))
             .map(|t| t.id.clone())
             .collect();
         ids.sort();
@@ -3708,6 +3709,84 @@ mod tests {
         // Ticket file updated
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
         assert!(content.contains("phase: done"));
+    }
+
+    #[test]
+    fn test_review_ticket_appears_in_mark_done_modal() {
+        // A Review-phase ticket should appear in the mark-done modal even if
+        // it has a Running thread (e.g. from review-timeout finish-up prompt).
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: in-review\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Simulate a running thread (as if review_timeout resumed it)
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        // thread starts as Running by default
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.open_mark_done_modal();
+
+        // Review ticket should appear despite having a Running thread
+        assert!(state.modal.open, "Modal should open");
+        assert!(
+            state.modal.ticket_ids.contains(&"T-001".to_string()),
+            "Review-phase ticket should be in mark-done list even with Running thread"
+        );
+    }
+
+    #[test]
+    fn test_running_non_review_ticket_excluded_from_mark_done() {
+        // A non-Review ticket with a Running thread should NOT appear.
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: implementing\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.open_mark_done_modal();
+
+        // Implement-phase ticket with Running thread should be excluded
+        assert!(!state.modal.open, "Modal should not open — no eligible tickets");
     }
 
     #[test]

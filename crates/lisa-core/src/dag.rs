@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::types::{Phase, Ticket, TicketId};
+use crate::types::{Phase, Ticket, TicketId, TicketStatus};
 
 /// Represents the dependency graph computed from ticket frontmatter.
 ///
@@ -190,6 +190,11 @@ impl Dag {
 
         // Check if the ticket is in a startable phase
         if !ticket.phase.is_startable() {
+            return false;
+        }
+
+        // Respect explicit blocked status
+        if ticket.status == TicketStatus::Blocked {
             return false;
         }
 
@@ -1062,5 +1067,29 @@ mod tests {
             dag.execution_waves(),
             Err(DagError::CycleDetected(_))
         ));
+    }
+
+    #[test]
+    fn test_blocked_status_prevents_scheduling() {
+        let mut t1 = make_ticket("T-001", Phase::Ready, vec![], vec![]);
+        t1.status = TicketStatus::Blocked;
+
+        let dag = Dag::from_tickets(vec![t1]).unwrap();
+
+        assert!(!dag.can_start(&"T-001".to_string()));
+        assert!(dag.get_ready_tickets().is_empty());
+    }
+
+    #[test]
+    fn test_blocked_status_with_deps_done() {
+        let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
+        let mut t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
+        t2.status = TicketStatus::Blocked;
+
+        let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
+
+        // Even though T-001 is done, T-002 is explicitly blocked
+        assert!(!dag.can_start(&"T-002".to_string()));
+        assert!(dag.get_ready_tickets().is_empty());
     }
 }
