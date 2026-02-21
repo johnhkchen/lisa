@@ -95,6 +95,44 @@ lisa loop
 
 Lisa opens a Zellij session with a dashboard. It picks up all tickets in `ready` phase whose dependencies are satisfied and starts Claude Code sessions for each one.
 
+By default Lisa runs 2 concurrent sessions. To run more:
+
+```bash
+# One-off: pass a flag
+lisa loop --max-threads 4
+
+# Persistent: edit .lisa.toml
+```
+
+```toml
+# .lisa.toml
+[scheduling]
+max_threads = 4
+```
+
+The `--max-threads` flag overrides `.lisa.toml` for that run.
+
+## Configuration
+
+`lisa init` creates a `.lisa.toml` in your project root:
+
+```toml
+[dirs]
+tickets = "docs/active/tickets"
+stories = "docs/active/stories"
+work = "docs/active/work"
+
+[scheduling]
+max_threads = 2
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `dirs.tickets` | `docs/active/tickets` | Where Lisa reads ticket files |
+| `dirs.stories` | `docs/active/stories` | Where Lisa reads story files |
+| `dirs.work` | `docs/active/work` | Where phase artifacts are written |
+| `scheduling.max_threads` | `2` | Maximum concurrent Claude Code sessions |
+
 ## How It Works
 
 ### Workflow
@@ -132,6 +170,61 @@ docs/
     work/          Phase artifacts, one subdirectory per ticket
   knowledge/
     rdspi-workflow.md   Workflow definition (injected into agent context)
+```
+
+## CLI Reference
+
+### `lisa init`
+
+Scaffold a project for Lisa: creates ticket directories, `CLAUDE.md`, RDSPI workflow, hooks, and `.lisa.toml`.
+
+```bash
+lisa init              # Initialize current directory
+lisa init --dry-run    # Preview what would be created
+lisa init --path ../other-project
+```
+
+### `lisa validate`
+
+Check that tickets parse correctly, the DAG has no cycles or missing dependencies, and the project structure is sound.
+
+```bash
+lisa validate
+lisa validate --check-tools   # Also verify zellij and claude are on PATH
+```
+
+### `lisa loop`
+
+Launch a Zellij session with the Lisa plugin. Schedules and runs Claude Code sessions based on the ticket DAG.
+
+```bash
+lisa loop
+lisa loop --max-threads 4     # Override concurrent session limit
+lisa loop --dry-run            # Show what would launch without starting
+```
+
+### `lisa status`
+
+Inspect the DAG offline: tickets, dependencies, execution waves, and scheduling readiness.
+
+```bash
+lisa status
+```
+
+### `lisa doctor`
+
+Verify that all runtime dependencies (Zellij, Claude Code, wasm32-wasip1 target) are installed.
+
+```bash
+lisa doctor
+```
+
+### `lisa setup-guide`
+
+Print LLM-friendly setup instructions for the current project. Useful for seeding a Claude Code session with project context.
+
+```bash
+lisa setup-guide
 ```
 
 ## Contributing
