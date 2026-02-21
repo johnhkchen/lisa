@@ -50,7 +50,7 @@ Artifact: `docs/active/work/{ticket-id}/progress.md`
 
 2. **~200 lines per artifact.** This is not a hard limit but a forcing function for structured thinking. Enough to be thorough, short enough to review quickly.
 
-3. **Phase transitions.** When a phase completes, update the ticket's `phase` field in its YAML frontmatter. Lisa watches for these changes to update scheduling.
+3. **Phase transitions.** Lisa detects completed artifacts and advances the ticket's `phase` field in the YAML frontmatter automatically. Do not update phase or status fields manually — just produce the artifact and continue to the next phase.
 
 4. **Review points.** Research and Design are high-leverage review points. Reviewing ~200 lines of research or design catches problems before they become thousands of lines of wrong code. Structure and Plan may auto-advance depending on project configuration.
 

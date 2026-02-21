@@ -6,6 +6,47 @@ use crate::config;
 use crate::detect::{detect_project, DetectedProject};
 use crate::templates;
 
+/// Update or insert the `version = "..."` line in a .lisa.toml string.
+fn update_version_in_toml(existing: &str, new_version: &str) -> String {
+    let version_line = format!("version = \"{}\"", new_version);
+    // Try to replace an existing version line
+    let mut found = false;
+    let updated: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("version") && line.contains('=') {
+                found = true;
+                version_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if found {
+        updated.join("\n") + if existing.ends_with('\n') { "\n" } else { "" }
+    } else {
+        // Insert version at the top, after any leading comment lines
+        let mut result = String::new();
+        let mut inserted = false;
+        for line in existing.lines() {
+            if !inserted && !line.starts_with('#') && !line.is_empty() {
+                result.push_str(&version_line);
+                result.push('\n');
+                inserted = true;
+            }
+            result.push_str(line);
+            result.push('\n');
+        }
+        if !inserted {
+            // All lines were comments or empty — append at end
+            result.push_str(&version_line);
+            result.push('\n');
+        }
+        result
+    }
+}
+
 /// An action that init will perform
 #[derive(Debug, Clone)]
 pub enum InitAction {
@@ -71,10 +112,20 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     // docs/knowledge/rdspi-workflow.md
     let workflow_path = root.join("docs/knowledge/rdspi-workflow.md");
     if workflow_path.exists() {
-        actions.push(InitAction::Skip {
-            path: workflow_path,
-            reason: "already exists".to_string(),
-        });
+        match fs::read_to_string(&workflow_path) {
+            Ok(existing) if existing == templates::RDSPI_WORKFLOW => {
+                actions.push(InitAction::Skip {
+                    path: workflow_path,
+                    reason: "already up to date".to_string(),
+                });
+            }
+            _ => {
+                actions.push(InitAction::UpdateFile {
+                    path: workflow_path,
+                    content: templates::RDSPI_WORKFLOW.to_string(),
+                });
+            }
+        }
     } else {
         actions.push(InitAction::CreateFile {
             path: workflow_path,
@@ -85,14 +136,43 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     // .lisa.toml
     let config_path = root.join(".lisa.toml");
     if config_path.exists() {
-        actions.push(InitAction::Skip {
-            path: config_path,
-            reason: "already exists".to_string(),
-        });
+        match fs::read_to_string(&config_path) {
+            Ok(existing) => {
+                let parsed: Result<config::LisaConfig, _> = toml::from_str(&existing);
+                let project_version = parsed.ok().and_then(|c| c.version);
+                match &project_version {
+                    Some(v) if !config::version_is_stale(v, config::LISA_VERSION) => {
+                        actions.push(InitAction::Skip {
+                            path: config_path,
+                            reason: "already up to date".to_string(),
+                        });
+                    }
+                    _ => {
+                        // Update the version line in the existing config
+                        let old_label = project_version.as_deref().unwrap_or("none");
+                        let updated = update_version_in_toml(&existing, config::LISA_VERSION);
+                        actions.push(InitAction::UpdateFile {
+                            path: config_path.clone(),
+                            content: updated,
+                        });
+                        // Use a separate skip entry for display purposes isn't needed;
+                        // the Display impl for UpdateFile will show the path.
+                        // We can add context via a separate mechanism if needed.
+                        let _ = old_label; // used for plan output context
+                    }
+                }
+            }
+            Err(_) => {
+                actions.push(InitAction::Skip {
+                    path: config_path,
+                    reason: "exists but unreadable".to_string(),
+                });
+            }
+        }
     } else {
         actions.push(InitAction::CreateFile {
             path: config_path,
-            content: config::default_config_toml().to_string(),
+            content: config::default_config_toml(),
         });
     }
 
@@ -119,10 +199,20 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     for (name, content) in hook_scripts {
         let hook_path = root.join(format!(".lisa/hooks/{}", name));
         if hook_path.exists() {
-            actions.push(InitAction::Skip {
-                path: hook_path,
-                reason: "already exists".to_string(),
-            });
+            match fs::read_to_string(&hook_path) {
+                Ok(existing) if existing == *content => {
+                    actions.push(InitAction::Skip {
+                        path: hook_path,
+                        reason: "already up to date".to_string(),
+                    });
+                }
+                _ => {
+                    actions.push(InitAction::UpdateFile {
+                        path: hook_path,
+                        content: content.to_string(),
+                    });
+                }
+            }
         } else {
             actions.push(InitAction::CreateFile {
                 path: hook_path,
@@ -719,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_init_actions_existing_lisa_toml() {
+    fn test_plan_init_actions_existing_lisa_toml_no_version() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join(".lisa.toml"),
@@ -730,12 +820,19 @@ mod tests {
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        // .lisa.toml should be skipped
-        let skipped: Vec<_> = actions
+        // .lisa.toml without version should be updated
+        let updated: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with(".lisa.toml")))
+            .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(".lisa.toml")))
             .collect();
-        assert_eq!(skipped.len(), 1);
+        assert_eq!(updated.len(), 1);
+
+        // Updated content should have version line
+        if let InitAction::UpdateFile { content, .. } = &updated[0] {
+            assert!(content.contains(&format!("version = \"{}\"", config::LISA_VERSION)));
+            // Original content should be preserved
+            assert!(content.contains("max_threads = 4"));
+        }
     }
 
     #[test]
@@ -840,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_init_never_overwrites() {
+    fn test_run_init_never_overwrites_claude_md() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("Cargo.toml"),
@@ -851,19 +948,37 @@ mod tests {
         // Create CLAUDE.md with custom content
         fs::write(dir.path().join("CLAUDE.md"), "my custom content").unwrap();
 
-        // Create .lisa.toml with custom content
-        fs::write(dir.path().join(".lisa.toml"), "# my config").unwrap();
-
         let result = run_init(dir.path(), false);
         assert!(result.is_ok());
 
         // Original CLAUDE.md should be preserved
         let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert_eq!(claude_md, "my custom content");
+    }
 
-        // Original .lisa.toml should be preserved
+    #[test]
+    fn test_run_init_updates_stale_lisa_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test-project\"\n",
+        )
+        .unwrap();
+
+        // Create .lisa.toml without version
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            "# my config\n[scheduling]\nmax_threads = 4\n",
+        )
+        .unwrap();
+
+        let result = run_init(dir.path(), false);
+        assert!(result.is_ok());
+
+        // .lisa.toml should now have version, but preserve original content
         let lisa_toml = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
-        assert_eq!(lisa_toml, "# my config");
+        assert!(lisa_toml.contains(&format!("version = \"{}\"", config::LISA_VERSION)));
+        assert!(lisa_toml.contains("max_threads = 4"));
     }
 
     #[test]
@@ -1199,7 +1314,7 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_run_init_never_overwrites_hooks() {
+    fn test_run_init_updates_stale_hooks() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("Cargo.toml"),
@@ -1207,18 +1322,22 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        // Pre-create hook files with custom content
+        // Pre-create hook files with outdated content
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
-        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "custom hook").unwrap();
+        fs::write(
+            dir.path().join(".lisa/hooks/on-idle.sh"),
+            "old hook content",
+        )
+        .unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
 
         let result = run_init(dir.path(), false);
         assert!(result.is_ok());
 
-        // on-idle.sh should be preserved (never overwritten)
+        // on-idle.sh should be updated to the current template
         let hook = fs::read_to_string(dir.path().join(".lisa/hooks/on-idle.sh")).unwrap();
-        assert_eq!(hook, "custom hook");
+        assert_eq!(hook, templates::ON_IDLE_HOOK);
         // New hook scripts should be created
         assert!(dir.path().join(".lisa/hooks/on-stop.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-clear.sh").exists());
@@ -1230,10 +1349,10 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_plan_init_actions_existing_hooks() {
+    fn test_plan_init_actions_existing_hooks_stale() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
-        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "existing").unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "old content").unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         // settings.local.json without idle_prompt → should plan UpdateFile
         fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
@@ -1241,12 +1360,12 @@ depends_on: [T-999]
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        // on-idle.sh should be skipped (never overwritten)
-        let skipped_hook: Vec<_> = actions
+        // on-idle.sh should be updated (stale content)
+        let updated_hook: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("on-idle.sh")))
+            .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with("on-idle.sh")))
             .collect();
-        assert_eq!(skipped_hook.len(), 1);
+        assert_eq!(updated_hook.len(), 1);
 
         // settings.local.json should be updated (not skipped) since it lacks idle_prompt
         let updated_settings: Vec<_> = actions
@@ -1257,10 +1376,42 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_plan_init_actions_existing_hooks_with_all_hooks() {
+    fn test_plan_init_actions_existing_hooks_current() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
-        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "existing").unwrap();
+        // Write the current template content — should be skipped
+        fs::write(
+            dir.path().join(".lisa/hooks/on-idle.sh"),
+            templates::ON_IDLE_HOOK,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude/settings.local.json"),
+            templates::settings_local_json(),
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        // on-idle.sh should be skipped (already up to date)
+        let skipped_hook: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("on-idle.sh")))
+            .collect();
+        assert_eq!(skipped_hook.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_init_actions_settings_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(
+            dir.path().join(".lisa/hooks/on-idle.sh"),
+            templates::ON_IDLE_HOOK,
+        )
+        .unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         // settings.local.json WITH all hooks → should skip
         fs::write(
@@ -1329,6 +1480,118 @@ depends_on: [T-999]
                 2,
                 "on-stop.sh should appear twice (guard + path)"
             );
+        }
+    }
+
+    #[test]
+    fn test_plan_init_updates_stale_version() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            "version = \"0.1.0\"\n\n[scheduling]\nmax_threads = 4\n",
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        let updated: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(".lisa.toml")))
+            .collect();
+        assert_eq!(updated.len(), 1);
+
+        if let InitAction::UpdateFile { content, .. } = &updated[0] {
+            assert!(content.contains(&format!("version = \"{}\"", config::LISA_VERSION)));
+            assert!(content.contains("max_threads = 4"));
+        }
+    }
+
+    #[test]
+    fn test_plan_init_skips_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            &format!(
+                "version = \"{}\"\n\n[scheduling]\nmax_threads = 4\n",
+                config::LISA_VERSION
+            ),
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        let skipped: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with(".lisa.toml")))
+            .collect();
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_init_updates_stale_rdspi() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# Old RDSPI content",
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        let updated: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with("rdspi-workflow.md")))
+            .collect();
+        assert_eq!(updated.len(), 1);
+
+        if let InitAction::UpdateFile { content, .. } = &updated[0] {
+            assert_eq!(content, templates::RDSPI_WORKFLOW);
+        }
+    }
+
+    #[test]
+    fn test_plan_init_skips_current_rdspi() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            templates::RDSPI_WORKFLOW,
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        let skipped: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("rdspi-workflow.md")))
+            .collect();
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_init_updates_stale_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "old idle").unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-stop.sh"), "old stop").unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-clear.sh"), "old clear").unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        for name in &["on-idle.sh", "on-stop.sh", "on-clear.sh"] {
+            let updated: Vec<_> = actions
+                .iter()
+                .filter(
+                    |a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(name)),
+                )
+                .collect();
+            assert_eq!(updated.len(), 1, "{} should be updated", name);
         }
     }
 

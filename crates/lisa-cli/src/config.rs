@@ -7,6 +7,7 @@ use lisa_core::types::PluginConfig;
 /// Top-level .lisa.toml structure.
 #[derive(Debug, Default, Deserialize)]
 pub struct LisaConfig {
+    pub version: Option<String>,
     #[serde(default)]
     pub dirs: DirsConfig,
     #[serde(default)]
@@ -108,7 +109,7 @@ pub struct ConfigValidation {
 /// Returns the parsed config plus any warnings about unknown keys.
 /// Returns `Err` for parse failures or invalid values (e.g. max_threads = 0).
 pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
-    let known_top = &["dirs", "scheduling"];
+    let known_top = &["version", "dirs", "scheduling"];
     let known_dirs = &["tickets", "stories", "work"];
     let known_scheduling = &["max_threads", "auto_advance", "review_timeout_secs"];
 
@@ -155,11 +156,39 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     Ok(ConfigValidation { config, warnings })
 }
 
-/// Returns the default .lisa.toml content for `lisa init`.
-pub fn default_config_toml() -> &'static str {
-    r#"# Lisa project configuration
+/// The current Lisa CLI version, used for project version tracking.
+pub const LISA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-[dirs]
+/// Returns true if `project_version` is older than `current_version`.
+/// Uses simple tuple comparison of (major, minor, patch) parsed from semver strings.
+/// Returns true (needs update) if parsing fails.
+pub fn version_is_stale(project_version: &str, current_version: &str) -> bool {
+    fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        Some((
+            parts[0].parse().ok()?,
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
+        ))
+    }
+    match (parse_semver(project_version), parse_semver(current_version)) {
+        (Some(proj), Some(curr)) => proj < curr,
+        _ => true,
+    }
+}
+
+/// Returns the default .lisa.toml content for `lisa init`.
+pub fn default_config_toml() -> String {
+    format!(
+        r#"# Lisa project configuration
+version = "{}"
+
+[dirs]"#,
+        LISA_VERSION,
+    ) + r#"
 tickets = "docs/active/tickets"
 stories = "docs/active/stories"
 work = "docs/active/work"
@@ -289,7 +318,7 @@ max_threads = 6
     #[test]
     fn test_default_config_toml_parses() {
         let content = default_config_toml();
-        let config: LisaConfig = toml::from_str(content).unwrap();
+        let config: LisaConfig = toml::from_str(&content).unwrap();
         assert_eq!(config.dirs.tickets, Some("docs/active/tickets".to_string()));
         assert_eq!(config.scheduling.max_threads, Some(2));
     }
@@ -404,5 +433,25 @@ foo = 1
         let result = validate_config("[scheduling]\nreview_timeout_secs = 300\n").unwrap();
         assert!(result.warnings.is_empty());
         assert_eq!(result.config.scheduling.review_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_validate_version_is_known_key() {
+        let result = validate_config("version = \"0.2.1\"\n").unwrap();
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_default_config_toml_has_version() {
+        let content = default_config_toml();
+        assert!(content.contains(&format!("version = \"{}\"", LISA_VERSION)));
+    }
+
+    #[test]
+    fn test_parse_config_with_version() {
+        let toml_str = "version = \"0.2.1\"\n\n[scheduling]\nmax_threads = 4\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.version, Some("0.2.1".to_string()));
+        assert_eq!(config.scheduling.max_threads, Some(4));
     }
 }

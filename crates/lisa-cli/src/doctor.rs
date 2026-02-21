@@ -1,5 +1,8 @@
 use std::fmt;
+use std::path::Path;
 use std::process::Command;
+
+use crate::config;
 
 /// Result of checking a single dependency.
 enum CheckResult {
@@ -198,11 +201,82 @@ fn check_required_deps_inner(checks: Vec<DependencyCheck>) -> Result<(), Vec<Str
     }
 }
 
+/// Check the project version from .lisa.toml at the given path.
+fn check_project_version(root: &Path) -> CheckReport {
+    let config_path = root.join(".lisa.toml");
+    if !config_path.exists() {
+        return CheckReport {
+            name: "project version",
+            required: false,
+            result: CheckResult::Skipped {
+                reason: "no .lisa.toml in current directory".to_string(),
+            },
+        };
+    }
+
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => {
+            let parsed: Result<config::LisaConfig, _> = toml::from_str(&content);
+            match parsed.ok().and_then(|c| c.version) {
+                Some(v) => {
+                    if config::version_is_stale(&v, config::LISA_VERSION) {
+                        CheckReport {
+                            name: "project version",
+                            required: false,
+                            result: CheckResult::NotFound {
+                                install_hint: format!(
+                                    "{} (current: {}). Run `lisa init` to update",
+                                    v,
+                                    config::LISA_VERSION
+                                ),
+                            },
+                        }
+                    } else {
+                        CheckReport {
+                            name: "project version",
+                            required: false,
+                            result: CheckResult::Found { version: v },
+                        }
+                    }
+                }
+                None => CheckReport {
+                    name: "project version",
+                    required: false,
+                    result: CheckResult::NotFound {
+                        install_hint: format!(
+                            "no version field. Run `lisa init` to update (current: {})",
+                            config::LISA_VERSION
+                        ),
+                    },
+                },
+            }
+        }
+        Err(_) => CheckReport {
+            name: "project version",
+            required: false,
+            result: CheckResult::Skipped {
+                reason: "could not read .lisa.toml".to_string(),
+            },
+        },
+    }
+}
+
 /// Run the doctor command: check all dependencies and report.
-pub fn run_doctor() -> Result<(), String> {
+pub fn run_doctor(root: &Path) -> Result<(), String> {
     let checks = build_checks();
-    let reports = run_checks(checks);
-    let output = format_report(&reports);
+    let mut reports = run_checks(checks);
+
+    // Add project version check
+    let project_report = check_project_version(root);
+    let has_project = !matches!(project_report.result, CheckResult::Skipped { .. });
+
+    let mut output = format_report(&reports);
+
+    if has_project {
+        output.push_str("\n\nChecking project...\n\n");
+        output.push_str(&format!("{}\n", project_report));
+    }
+    reports.push(project_report);
 
     println!("{}", output);
 
@@ -435,5 +509,59 @@ mod tests {
             mock_skipped("wasm target", "rustup not found"),
         ];
         assert!(check_required_deps_inner(checks).is_ok());
+    }
+
+    #[test]
+    fn test_project_version_check_current() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".lisa.toml"),
+            format!("version = \"{}\"\n", config::LISA_VERSION),
+        )
+        .unwrap();
+
+        let report = check_project_version(dir.path());
+        assert!(matches!(report.result, CheckResult::Found { .. }));
+        if let CheckResult::Found { version } = &report.result {
+            assert_eq!(version, config::LISA_VERSION);
+        }
+    }
+
+    #[test]
+    fn test_project_version_check_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".lisa.toml"), "version = \"0.1.0\"\n").unwrap();
+
+        let report = check_project_version(dir.path());
+        assert!(matches!(report.result, CheckResult::NotFound { .. }));
+        if let CheckResult::NotFound { install_hint } = &report.result {
+            assert!(install_hint.contains("0.1.0"));
+            assert!(install_hint.contains(config::LISA_VERSION));
+            assert!(install_hint.contains("lisa init"));
+        }
+    }
+
+    #[test]
+    fn test_project_version_check_missing_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".lisa.toml"),
+            "[scheduling]\nmax_threads = 2\n",
+        )
+        .unwrap();
+
+        let report = check_project_version(dir.path());
+        assert!(matches!(report.result, CheckResult::NotFound { .. }));
+        if let CheckResult::NotFound { install_hint } = &report.result {
+            assert!(install_hint.contains("no version field"));
+            assert!(install_hint.contains("lisa init"));
+        }
+    }
+
+    #[test]
+    fn test_project_version_check_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = check_project_version(dir.path());
+        assert!(matches!(report.result, CheckResult::Skipped { .. }));
     }
 }

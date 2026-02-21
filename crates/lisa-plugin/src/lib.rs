@@ -31,9 +31,15 @@ const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 30;
 fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
     let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
     format!(
-        "Read the ticket at {}, the project context in CLAUDE.md, and the RDSPI workflow in docs/knowledge/rdspi-workflow.md. \
-         Start from the current phase indicated in the ticket frontmatter.",
-        ticket_path.display()
+        "Read the ticket at {path}, CLAUDE.md, and docs/knowledge/rdspi-workflow.md. \
+         Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
+         (Research, Design, Structure, Plan, Implement) without stopping between phases. \
+         For each phase, write the artifact to docs/active/work/{id}/ then immediately continue to the next phase. \
+         Do NOT update the ticket's phase or status fields in the frontmatter — \
+         Lisa detects your artifacts and handles all phase transitions automatically. \
+         After Implement is complete (code written, tests passing, progress.md updated), simply stop — Lisa handles the rest.",
+        path = ticket_path.display(),
+        id = ticket_id,
     )
 }
 
@@ -169,8 +175,11 @@ pub struct State {
     /// Whether agent slots have been discovered from PaneUpdate.
     slots_discovered: bool,
 
-    /// Whether scheduling of new tickets is paused (toggle with 'p').
+    /// Whether scheduling of new tickets is paused (toggle with space).
     paused: bool,
+
+    /// Which preset view is active on the dashboard (cycle with 'p').
+    view_preset: ui::ViewPreset,
 
     /// Whether the loop has terminated (all tickets done).
     terminated: bool,
@@ -1623,8 +1632,15 @@ impl State {
             return true;
         }
 
-        // Normal mode: 'p' toggles pause (stop scheduling new tickets)
+        // Normal mode: 'p' cycles preset views
         if key.bare_key == BareKey::Char('p') {
+            self.view_preset = self.view_preset.next();
+            self.scroll_offset = 0;
+            return true;
+        }
+
+        // Normal mode: space toggles pause (stop scheduling new tickets)
+        if key.bare_key == BareKey::Char(' ') {
             self.paused = !self.paused;
             self.log_activity(ActivityEvent::Info {
                 message: if self.paused {
@@ -2166,6 +2182,7 @@ impl State {
                 is_reset: self.modal.mode == ModalMode::ResetTicket,
             },
             paused: self.paused,
+            active_view: self.view_preset,
         }
     }
 }
@@ -4580,7 +4597,7 @@ mod tests {
         let mut state = State::default();
         assert!(!state.paused);
 
-        // Simulate what handle_key('p') does
+        // Simulate what handle_key(space) does
         state.paused = !state.paused;
         state.log_activity(ActivityEvent::Info {
             message: "Scheduling paused".to_string(),

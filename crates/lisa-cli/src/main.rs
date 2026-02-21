@@ -56,7 +56,11 @@ enum Commands {
         path: PathBuf,
     },
     /// Check that all runtime dependencies are installed
-    Doctor,
+    Doctor {
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     /// Print version information
     Version,
     /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
@@ -79,8 +83,9 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Doctor => {
-            if let Err(e) = doctor::run_doctor() {
+        Commands::Doctor { path } => {
+            let path = resolve_path(&path);
+            if let Err(e) = doctor::run_doctor(&path) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
