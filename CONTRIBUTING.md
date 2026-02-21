@@ -36,7 +36,7 @@ Lisa is a Cargo workspace with three crates:
 |-------|-------------|
 | `lisa-core` | Shared types, ticket parsing from YAML frontmatter, DAG computation. No Zellij dependencies — fully testable on native targets. |
 | `lisa-plugin` | Zellij WASM plugin. Implements the scheduler, dashboard UI, and `ZellijPlugin` trait. Compiles to `wasm32-wasip1`. |
-| `lisa-cli` | CLI binary (`lisa init`, `lisa validate`, `lisa loop`). Embeds the WASM plugin via `include_bytes!`. |
+| `lisa-cli` | CLI binary (`lisa init`, `lisa validate`, `lisa loop`, `lisa doctor`, `lisa status`, `lisa setup-guide`). Embeds the WASM plugin via `include_bytes!`. |
 
 See `CLAUDE.md` for a detailed source layout.
 
@@ -90,4 +90,4 @@ Lisa uses its own RDSPI ticket system to manage development. You'll notice two d
 
 Every ticket goes through five phases: Research, Design, Structure, Plan, Implement. Each phase produces a ~200-line artifact. See the [RDSPI workflow](docs/knowledge/rdspi-workflow.md) for details.
 
-This means Lisa's own development history is visible in the repo — the archive contains 30 completed tickets with full phase artifacts, all produced by Lisa orchestrating Claude Code sessions.
+This means Lisa's own development history is visible in the repo — the archive contains 50+ completed tickets with full phase artifacts, all produced by Lisa orchestrating Claude Code sessions.

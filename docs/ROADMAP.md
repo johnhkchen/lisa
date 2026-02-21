@@ -93,16 +93,51 @@ Use Claude Code's `idle_prompt` notification hook to detect agent idle state.
 - IdleWithoutArtifact alert type for missing artifacts
 - Mark-done modal feedback when no candidates available
 
----
-
-## Active
-
 ### S-009: First-User Readiness
 Fix bugs surfaced in dogfood runs, harden init/validate for external projects.
-- T-009-01: Bug sweep — remove `--print`, fix double state transitions, dead code cleanup
-- T-009-02: Init hardening — verify generated files, improve validate coverage
-- T-009-03: External project dogfood — full pipeline test on a non-lisa project
-- T-009-04: LLM-driven validate loop — make validate output machine-actionable
+- Bug sweep: remove `--print`, fix double state transitions, dead code cleanup
+- Init hardening: verify generated files, improve validate coverage
+- External project dogfood: full pipeline test on a non-lisa project
+
+### S-010: Event-Driven Session Transitions
+Replace blind-fire timing with event-driven handshakes using Claude Code hooks.
+- Clean session transitions via hook signals instead of polling delays
+
+### S-011: Cross-Device Verification
+Build and install Lisa on a fresh device, document friction points.
+- QoL improvements driven by real-world setup experience
+
+### S-012: Repo Hygiene & Security Sweep
+Clean up before public release.
+- Removed broken symlinks, hardcoded paths, Ralph naming remnants, tracked local files
+
+### S-013: `lisa doctor`
+Runtime dependency checking subcommand.
+- Checks for Claude Code, Zellij, and wasm32-wasip1 target
+- Provides install instructions for missing dependencies
+
+### S-014: Distribution Infrastructure
+Automated cross-platform binary builds via cargo-dist.
+- GitHub Actions release workflow for 4 platform targets (macOS/Linux × x86_64/aarch64)
+- Shell installer and Homebrew formula generation
+- WASM build setup integrated into CI
+
+### S-015: Public Documentation
+Rewrite docs for external audience.
+- README rewritten for users, not contributors
+- Added CONTRIBUTING.md with build/test/submit instructions
+
+### S-016: Package Manager Distribution
+Publish Lisa through Homebrew.
+- Homebrew tap (`johnhkchen/homebrew-lisa`) with auto-published formula
+- Nix flake and AUR deferred
+
+### S-017: Alpha Release
+Cut v0.2.0 and verify install paths.
+- Fmt/clippy fixes, archived completed stories, CI green
+- Tagged v0.2.0, cargo-dist produced all 4 platform binaries
+- Verified: direct download, shell installer, Homebrew, cargo install --path
+- 133 tests across workspace
 
 ---
 

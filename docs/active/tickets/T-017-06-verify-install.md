@@ -2,8 +2,8 @@
 id: T-017-06
 title: Verify release artifacts and install paths
 type: chore
-phase: ready
-status: open
+phase: done
+status: done
 priority: medium
 story: S-017
 created: 2026-02-20
@@ -66,7 +66,7 @@ Document in `docs/active/work/T-017-06/progress.md`:
 
 ## Acceptance Criteria
 
-- [ ] At least one install path verified end-to-end (direct download or shell installer)
-- [ ] Installed binary is the correct version
-- [ ] `lisa doctor` runs correctly from the installed binary
-- [ ] Results documented
+- [x] At least one install path verified end-to-end (direct download or shell installer)
+- [x] Installed binary is the correct version
+- [x] `lisa doctor` runs correctly from the installed binary
+- [x] Results documented

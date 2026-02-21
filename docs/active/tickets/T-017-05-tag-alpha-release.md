@@ -2,8 +2,8 @@
 id: T-017-05
 title: Tag and cut alpha release
 type: task
-phase: ready
-status: blocked
+phase: done
+status: done
 priority: high
 story: S-017
 created: 2026-02-20

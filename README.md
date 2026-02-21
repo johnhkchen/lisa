@@ -1,5 +1,7 @@
 # Lisa
 
+[![Release](https://img.shields.io/github/v/release/johnhkchen/lisa)](https://github.com/johnhkchen/lisa/releases/latest)
+
 DAG-driven concurrent task scheduling for AI-assisted development.
 
 ## What It Does
@@ -31,13 +33,13 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/release
 brew install johnhkchen/lisa/lisa
 ```
 
-### From crates.io
+### From crates.io (coming soon)
 
 ```bash
 cargo install lisa-cli
 ```
 
-> **Note:** Building from crates.io requires the `wasm32-wasip1` Rust target (`rustup target add wasm32-wasip1`) because the WASM plugin is compiled and embedded during the build.
+> **Note:** `lisa-cli` is not yet published to crates.io. For now, use the shell installer, Homebrew, or build from source. When available, building from crates.io will require the `wasm32-wasip1` Rust target (`rustup target add wasm32-wasip1`) because the WASM plugin is compiled and embedded during the build.
 
 ### From source
 
