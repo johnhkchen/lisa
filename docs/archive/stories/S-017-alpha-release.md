@@ -2,7 +2,7 @@
 id: S-017
 title: Alpha release preparation
 type: story
-status: Active
+status: done
 created: 2026-02-20
 ---
 
