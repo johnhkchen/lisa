@@ -274,11 +274,14 @@ impl Dag {
     ///
     /// A vector of ticket IDs that are ready to run.
     pub fn get_ready_tickets(&self) -> Vec<TicketId> {
-        self.nodes
+        let mut ready: Vec<TicketId> = self
+            .nodes
             .keys()
             .filter(|id| self.can_start(id))
             .cloned()
-            .collect()
+            .collect();
+        ready.sort();
+        ready
     }
 
     /// Gets all tickets currently in progress (active phases).
