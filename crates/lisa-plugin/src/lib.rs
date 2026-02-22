@@ -677,7 +677,11 @@ impl State {
                     }
                 }
 
-                Phase::Research | Phase::Design | Phase::Structure | Phase::Plan | Phase::Review => {
+                Phase::Research
+                | Phase::Design
+                | Phase::Structure
+                | Phase::Plan
+                | Phase::Review => {
                     // Need artifact + idle signal for these phases
                     let artifact_name = match current_phase.artifact_filename() {
                         Some(name) => name,
