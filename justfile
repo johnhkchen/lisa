@@ -16,12 +16,23 @@ build-cli: build
     touch target/wasm32-wasip1/release/lisa.wasm
     cargo build -p lisa-cli --release
 
-# Build everything for distribution
-release: build build-cli
-    @echo ""
-    @echo "Build complete. To install:"
-    @echo "  cp target/release/lisa $(which lisa)"
-    @echo ""
+# Tag and push a release (cargo-dist builds + publishes to Homebrew)
+release: check fmt-check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lisa-cli") | .version')
+    tag="v${version}"
+    if git rev-parse "$tag" >/dev/null 2>&1; then
+        echo "Error: tag $tag already exists. Bump version in Cargo.toml first."
+        exit 1
+    fi
+    echo "Releasing $tag..."
+    git tag "$tag"
+    git push origin main "$tag"
+    echo ""
+    echo "Release $tag pushed. cargo-dist CI will build and publish to Homebrew."
+    echo "  Monitor: gh run list -R johnhkchen/lisa --limit 2"
+    echo "  Install: brew update && brew upgrade lisa"
 
 # Run all tests (native target)
 test:
