@@ -455,6 +455,24 @@ impl State {
             let mut thread = Thread::new(ticket_id.clone(), pane_id);
             if let Some(ticket) = self.dag.get_ticket(&ticket_id) {
                 thread.current_phase = ticket.phase;
+
+                // Ready is a scheduling sentinel — once spawned, advance to
+                // Research so the artifact detection pipeline can track progress.
+                if ticket.phase == Phase::Ready {
+                    thread.current_phase = Phase::Research;
+                    if !ticket.file_path.as_os_str().is_empty() {
+                        if let Err(e) =
+                            ticket::update_ticket_phase(&ticket.file_path, Phase::Research)
+                        {
+                            self.log_activity(ActivityEvent::Error {
+                                message: format!(
+                                    "Failed to advance {} from Ready: {}",
+                                    ticket_id, e
+                                ),
+                            });
+                        }
+                    }
+                }
             }
             self.threads.insert(ticket_id.clone(), thread);
 
