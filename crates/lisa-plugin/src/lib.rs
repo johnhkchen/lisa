@@ -33,11 +33,12 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
     format!(
         "Read the ticket at {path}, CLAUDE.md, and docs/knowledge/rdspi-workflow.md. \
          Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
-         (Research, Design, Structure, Plan, Implement) without stopping between phases. \
+         (Research, Design, Structure, Plan, Implement, Review) without stopping between phases. \
          For each phase, write the artifact to docs/active/work/{id}/ then immediately continue to the next phase. \
          Do NOT update the ticket's phase or status fields in the frontmatter — \
          Lisa detects your artifacts and handles all phase transitions automatically. \
-         After Implement is complete (code written, tests passing, progress.md updated), simply stop — Lisa handles the rest.",
+         After Review is complete (review.md written summarizing changes, test coverage, and open concerns), \
+         simply stop — Lisa handles the rest.",
         path = ticket_path.display(),
         id = ticket_id,
     )
@@ -55,18 +56,15 @@ fn build_claude_command(ticket_dir: &Path, ticket_id: &str, pane_id: u32) -> Str
     )
 }
 
-/// The prompt text sent to a parked Review session after the review timeout.
-fn finish_up_prompt(ticket_dir: &Path, work_dir: &Path, ticket_id: &str) -> String {
-    let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
+/// The prompt text sent to a stuck Review session after the review timeout.
+fn finish_up_prompt(_ticket_dir: &Path, work_dir: &Path, ticket_id: &str) -> String {
     let review_path = work_dir.join(ticket_id).join("review.md");
     format!(
-        "The review timeout has been reached for this ticket. Please wrap up by: \
-         1) Create a review summary at {} covering: what changes were made, files modified, \
-         and any open concerns or TODOs. \
-         2) Then mark the ticket complete by updating the frontmatter in {} — \
-         set `phase: done` and `status: done`.",
+        "You have been in the Review phase for a while. Please finish writing your review artifact at {}. \
+         It should cover: what changes were made, files created/modified/deleted, test coverage, \
+         any open concerns or TODOs, and critical issues to surface for human review. \
+         Do NOT update the ticket's phase or status fields — Lisa detects review.md and handles the rest.",
         review_path.display(),
-        ticket_path.display(),
     )
 }
 
@@ -518,7 +516,6 @@ impl State {
     /// For each running thread, checks if the artifact for the current phase
     /// exists in the work directory. If so, advances the ticket to the next
     /// phase by updating the YAML frontmatter and logs the appropriate events.
-    /// If the new phase is Review, the thread is parked.
     fn check_artifact_advances(&mut self) {
         // Collect running threads to avoid borrow conflict
         let running: Vec<(TicketId, Phase)> = self
@@ -582,11 +579,6 @@ impl State {
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.current_phase = next_phase;
                 thread.last_phase_change = std::time::SystemTime::now();
-
-                // Park if advancing to Review
-                if next_phase == Phase::Review {
-                    thread.park();
-                }
             }
         }
     }
@@ -682,11 +674,10 @@ impl State {
                     if let Some(thread) = self.threads.get_mut(&ticket_id) {
                         thread.current_phase = Phase::Review;
                         thread.last_phase_change = std::time::SystemTime::now();
-                        thread.park();
                     }
                 }
 
-                Phase::Research | Phase::Design | Phase::Structure | Phase::Plan => {
+                Phase::Research | Phase::Design | Phase::Structure | Phase::Plan | Phase::Review => {
                     // Need artifact + idle signal for these phases
                     let artifact_name = match current_phase.artifact_filename() {
                         Some(name) => name,
@@ -730,9 +721,6 @@ impl State {
                         if let Some(thread) = self.threads.get_mut(&ticket_id) {
                             thread.current_phase = next_phase;
                             thread.last_phase_change = std::time::SystemTime::now();
-                            if next_phase == Phase::Review {
-                                thread.park();
-                            }
                         }
                     } else {
                         // Idle without artifact — alert
@@ -748,7 +736,7 @@ impl State {
                 }
 
                 _ => {
-                    // Ready, Review, Done — signal already cleaned up, nothing to do
+                    // Ready, Done — signal already cleaned up, nothing to do
                 }
             }
         }
@@ -1002,12 +990,10 @@ impl State {
         }
     }
 
-    /// Check for parked Review threads that have exceeded the review timeout.
+    /// Check for running Review threads that have exceeded the review timeout.
     ///
-    /// When a thread is parked in Review phase longer than `review_timeout_secs`,
-    /// sends a finish-up prompt to the Claude session telling it to create a review
-    /// summary and mark the ticket done. The thread is resumed so the session can
-    /// act on the prompt.
+    /// When a thread has been running in Review phase longer than `review_timeout_secs`
+    /// without producing `review.md`, sends a finish-up prompt to prod the agent.
     ///
     /// Set `review_timeout_secs = 0` to disable this feature.
     fn check_review_timeouts(&mut self) {
@@ -1018,12 +1004,12 @@ impl State {
         let now = std::time::SystemTime::now();
         let timeout = std::time::Duration::from_secs(self.config.review_timeout_secs);
 
-        // Collect candidates: parked threads in Review phase past timeout, not yet prompted
+        // Collect candidates: running threads in Review phase past timeout, not yet prompted
         let candidates: Vec<(TicketId, u32)> = self
             .threads
             .iter()
             .filter(|(_, t)| {
-                t.status == lisa_core::types::ThreadStatus::Parked
+                t.status == lisa_core::types::ThreadStatus::Running
                     && t.current_phase == Phase::Review
             })
             .filter(|(tid, _)| !self.finish_up_sent.contains(*tid))
@@ -1038,7 +1024,6 @@ impl State {
             self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
 
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
-                thread.resume();
                 thread.last_phase_change = std::time::SystemTime::now();
             }
 
@@ -2732,6 +2717,63 @@ mod tests {
     }
 
     #[test]
+    fn test_check_artifact_advances_review_to_done() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create ticket file in review phase
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nBody\n",
+        ).unwrap();
+
+        // Create work dir with review.md artifact
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(work_dir.join("T-001")).unwrap();
+        fs::write(work_dir.join("T-001/review.md"), "# Review summary").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Running thread in Review phase
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_artifact_advances();
+
+        // Thread should advance to Done
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.status, ThreadStatus::Running);
+
+        // Ticket file should be updated
+        let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(updated.contains("phase: done"));
+
+        // Activity log should show phase transition
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
+            if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
+        )));
+    }
+
+    #[test]
     fn test_check_all_done_true() {
         use std::fs;
 
@@ -4271,10 +4313,10 @@ mod tests {
         // Run idle signal check
         state.check_idle_signals();
 
-        // Verify: thread advanced to Review and parked
+        // Verify: thread advanced to Review, stays running
         let thread = state.threads.get("T-001").unwrap();
         assert_eq!(thread.current_phase, Phase::Review);
-        assert_eq!(thread.status, ThreadStatus::Parked);
+        assert_eq!(thread.status, ThreadStatus::Running);
 
         // Verify: signal file deleted
         assert!(!state.signal_dir.join("pane-1.idle").exists());
@@ -4442,6 +4484,81 @@ mod tests {
             e,
             ActivityEvent::Warning { message }
             if message.contains("T-001") && message.contains("research.md")
+        )));
+    }
+
+    #[test]
+    fn test_idle_signal_review_with_artifact_advances_to_done() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create ticket file in review phase
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nBody\n",
+        ).unwrap();
+
+        // Create signal directory with idle signal
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        // Create work dir with review.md artifact
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(work_dir.join("T-001")).unwrap();
+        fs::write(work_dir.join("T-001/review.md"), "# Review summary").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+        });
+
+        // Running thread in Review phase
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_idle_signals();
+
+        // Thread should advance to Done
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.status, ThreadStatus::Running);
+
+        // Signal file cleaned up
+        assert!(!state.signal_dir.join("pane-1.idle").exists());
+
+        // Ticket file updated
+        let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(updated.contains("phase: done"));
+
+        // Activity log
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::PhaseCompleted { ticket_id, phase }
+            if ticket_id == "T-001" && *phase == Phase::Review
         )));
     }
 
@@ -5209,10 +5326,9 @@ mod tests {
             cooldown_until: None,
         });
 
-        // Parked thread in Review phase
+        // Running thread in Review phase
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
-        thread.park();
         state.threads.insert("T-001".to_string(), thread);
 
         // Directly call auto_complete_review
@@ -5390,17 +5506,16 @@ mod tests {
             ..State::default()
         };
 
-        // Parked Review thread with last_phase_change far in the past
+        // Running Review thread with last_phase_change far in the past
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
-        thread.park();
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_review_timeouts();
 
-        // Thread should be resumed (Running)
+        // Thread should still be Running
         let t = state.threads.get("T-001").unwrap();
         assert_eq!(t.status, lisa_core::types::ThreadStatus::Running);
 
@@ -5428,18 +5543,12 @@ mod tests {
 
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
-        thread.park();
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_review_timeouts();
         let log_count = state.activity_log.len();
-
-        // Re-park the thread to simulate it being parked again
-        if let Some(t) = state.threads.get_mut("T-001") {
-            t.park();
-        }
 
         state.check_review_timeouts();
         // No new events — already in finish_up_sent
@@ -5458,18 +5567,17 @@ mod tests {
             ..State::default()
         };
 
-        // Parked Review thread that was just parked (within timeout)
+        // Running Review thread that just entered Review (within timeout)
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
-        thread.park();
         // last_phase_change is now (default from Thread::new)
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_review_timeouts();
 
-        // Thread should still be parked
+        // Thread should still be Running, no prompt sent
         let t = state.threads.get("T-001").unwrap();
-        assert_eq!(t.status, lisa_core::types::ThreadStatus::Parked);
+        assert_eq!(t.status, lisa_core::types::ThreadStatus::Running);
         assert!(state.finish_up_sent.is_empty());
     }
 
@@ -5487,21 +5595,20 @@ mod tests {
 
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
-        thread.park();
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(600);
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_review_timeouts();
 
-        // Thread should still be parked (feature disabled)
+        // Thread should still be Running (feature disabled)
         let t = state.threads.get("T-001").unwrap();
-        assert_eq!(t.status, lisa_core::types::ThreadStatus::Parked);
+        assert_eq!(t.status, lisa_core::types::ThreadStatus::Running);
         assert!(state.finish_up_sent.is_empty());
     }
 
     #[test]
-    fn test_check_review_timeouts_only_parked_review() {
+    fn test_check_review_timeouts_only_running_review() {
         use lisa_core::types::Thread;
 
         let mut state = State {
@@ -5512,29 +5619,29 @@ mod tests {
             ..State::default()
         };
 
-        // Running Implement thread (should not be affected)
+        // Running Implement thread (wrong phase — should not be affected)
         let mut t1 = Thread::new("T-001", 1);
         t1.current_phase = Phase::Implement;
         t1.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-001".to_string(), t1);
 
-        // Running Review thread (not parked — should not be affected)
+        // Parked Review thread (not Running — should not be affected)
         let mut t2 = Thread::new("T-002", 2);
         t2.current_phase = Phase::Review;
-        // status is Running (not Parked)
+        t2.park();
         t2.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-002".to_string(), t2);
 
-        // Parked Implement thread (wrong phase — should not be affected)
+        // Completed Review thread (should not be affected)
         let mut t3 = Thread::new("T-003", 3);
-        t3.current_phase = Phase::Implement;
-        t3.park();
+        t3.current_phase = Phase::Review;
+        t3.complete();
         t3.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         state.threads.insert("T-003".to_string(), t3);
 
         state.check_review_timeouts();
 
-        // None should be prompted
+        // None should be prompted — wrong phase, wrong status
         assert!(state.finish_up_sent.is_empty());
         assert!(state.activity_log.is_empty());
     }

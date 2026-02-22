@@ -672,11 +672,11 @@ mod tests {
     }
 
     #[test]
-    fn test_review_phase_not_startable() {
-        // Review is parked — waiting for human, not schedulable
+    fn test_review_phase_is_startable() {
+        // Review is agent-driven (produces review.md), so it's schedulable
         let ticket = make_ticket("T-001", Phase::Review, vec![], vec![]);
         let dag = Dag::from_tickets(vec![ticket]).unwrap();
-        assert!(!dag.can_start(&"T-001".to_string()));
+        assert!(dag.can_start(&"T-001".to_string()));
     }
 
     #[test]

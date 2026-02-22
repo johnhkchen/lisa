@@ -18,8 +18,8 @@ pub type TicketId = String;
 
 /// The phase of work a ticket is currently in.
 ///
-/// Phases follow the RDSPI workflow: Research -> Design -> Structure -> Plan -> Implement.
-/// Ready is the initial state, Review is for human review, and Done is terminal.
+/// Phases follow the RDSPIR workflow: Research -> Design -> Structure -> Plan -> Implement -> Review.
+/// Ready is the initial state and Done is terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -36,7 +36,7 @@ pub enum Phase {
     Plan,
     /// Active implementation work
     Implement,
-    /// Awaiting human review
+    /// Agent self-review: produces review.md artifact
     Review,
     /// Work completed
     Done,
@@ -80,7 +80,8 @@ impl Phase {
             Phase::Structure => Some("structure.md"),
             Phase::Plan => Some("plan.md"),
             Phase::Implement => Some("progress.md"),
-            _ => None,
+            Phase::Review => Some("review.md"),
+            Phase::Ready | Phase::Done => None,
         }
     }
 
@@ -100,10 +101,9 @@ impl Phase {
 
     /// Returns true if this phase indicates the ticket can be scheduled.
     ///
-    /// Ready through Implement are schedulable. Review and Done are not —
-    /// Review is parked waiting for human action, Done is terminal.
+    /// Ready through Review are schedulable. Done is terminal.
     pub fn is_startable(&self) -> bool {
-        !matches!(self, Phase::Review | Phase::Done)
+        !matches!(self, Phase::Done)
     }
 
     /// Returns true if this phase indicates active work is happening.
@@ -450,7 +450,7 @@ pub struct PluginConfig {
     /// Seconds a thread can stay in one phase before being considered stuck (default: 600)
     pub stuck_threshold_secs: u64,
 
-    /// Seconds a parked Review thread waits before receiving a finish-up prompt (default: 240).
+    /// Seconds a running Review thread waits before receiving a finish-up prompt (default: 240).
     /// Set to 0 to disable.
     pub review_timeout_secs: u64,
 }
@@ -668,7 +668,7 @@ mod tests {
         assert_eq!(Phase::Plan.artifact_filename(), Some("plan.md"));
         assert_eq!(Phase::Implement.artifact_filename(), Some("progress.md"));
         assert_eq!(Phase::Ready.artifact_filename(), None);
-        assert_eq!(Phase::Review.artifact_filename(), None);
+        assert_eq!(Phase::Review.artifact_filename(), Some("review.md"));
         assert_eq!(Phase::Done.artifact_filename(), None);
     }
 

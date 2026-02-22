@@ -1,6 +1,6 @@
 ## RDSPI Workflow
 
-Every ticket passes through five phases in order. No phases are skipped regardless of ticket size.
+Every ticket passes through six phases in order. No phases are skipped regardless of ticket size. Complete all phases in a single continuous pass — do not stop between phases.
 
 ### Research
 
@@ -42,17 +42,25 @@ Follow the plan step by step. After each meaningful unit of work, commit. Update
 
 Artifact: `docs/active/work/{ticket-id}/progress.md`
 
+### Review
+
+Self-assess the completed work. Produce `review.md` (~200 lines).
+
+Summarize what changed: files created, modified, or deleted. Evaluate test coverage and flag gaps. Surface open concerns, TODOs, or known limitations. Flag critical issues that need human attention. This is the handoff document — what a human reviewer needs to understand the work without reading every diff.
+
+Artifact: `docs/active/work/{ticket-id}/review.md`
+
 ---
 
 ## Phase Rules
 
-1. **All five phases always run.** Research, Design, Structure, Plan, Implement. Each phase is cheap (~200 lines, a few minutes). Skipping phases based on ticket size is how context degrades.
+1. **All six phases always run.** Research, Design, Structure, Plan, Implement, Review. Each phase is cheap (~200 lines, a few minutes). Skipping phases based on ticket size is how context degrades.
 
 2. **~200 lines per artifact.** This is not a hard limit but a forcing function for structured thinking. Enough to be thorough, short enough to review quickly.
 
 3. **Phase transitions.** Lisa detects completed artifacts and advances the ticket's `phase` field in the YAML frontmatter automatically. Do not update phase or status fields manually — just produce the artifact and continue to the next phase.
 
-4. **Review points.** Research and Design are high-leverage review points. Reviewing ~200 lines of research or design catches problems before they become thousands of lines of wrong code. Structure and Plan may auto-advance depending on project configuration.
+4. **High-leverage phases.** Research and Design artifacts are the best return on review time. Reviewing ~200 lines of research or design catches problems before they become thousands of lines of wrong code. Structure and Plan may auto-advance depending on project configuration.
 
 5. **Artifacts are insurance.** If a session crashes or hits limits, the latest artifact plus the ticket is enough to seed a new session at the correct phase.
 
