@@ -42,16 +42,9 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
 
     // Write WASM to a content-hashed temp path so Zellij's plugin cache is
     // busted whenever the plugin binary changes.
-    let hash = {
-        // Simple FNV-1a hash of the WASM bytes — fast, no extra deps
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &byte in PLUGIN_WASM {
-            h ^= byte as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
-    };
-    let wasm_path = std::env::temp_dir().join(format!("lisa-plugin-{:016x}.wasm", hash));
+    let hash = wasm_hash(PLUGIN_WASM);
+    let wasm_filename = format!("lisa-plugin-{:016x}.wasm", hash);
+    let wasm_path = std::env::temp_dir().join(&wasm_filename);
     std::fs::write(&wasm_path, PLUGIN_WASM).map_err(|e| {
         format!(
             "Failed to write WASM plugin to {}: {}",
@@ -59,6 +52,12 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
             e
         )
     })?;
+
+    // Remove stale lisa-plugin-*.wasm files from temp dir
+    clean_stale_wasm_files(&wasm_filename);
+
+    // Clean Zellij's compiled plugin cache so it picks up the new WASM
+    crate::doctor::clean_zellij_plugin_cache();
 
     // Generate KDL layout
     let layout = generate_layout(&wasm_path, config);
@@ -155,6 +154,40 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
     println!("{}", layout);
 
     Ok(())
+}
+
+/// FNV-1a hash of WASM bytes + CLI version. Including the version ensures
+/// a new filename on every release, busting Zellij's path-based cache even
+/// when the WASM binary is byte-identical (e.g. same-version reinstall via brew).
+fn wasm_hash(wasm: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &byte in wasm {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &byte in env!("CARGO_PKG_VERSION").as_bytes() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Delete old `lisa-plugin-*.wasm` files in the temp directory that don't
+/// match the current filename.
+fn clean_stale_wasm_files(current_filename: &str) {
+    let tmp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("lisa-plugin-")
+                && name.ends_with(".wasm")
+                && name.as_ref() != current_filename
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
@@ -291,6 +324,27 @@ mod tests {
         assert!(layout.contains("ticket_dir \"custom/tickets\""));
         assert!(layout.contains("story_dir  \"custom/stories\""));
         assert!(layout.contains("work_dir   \"custom/work\""));
+    }
+
+    #[test]
+    fn test_wasm_hash_includes_version() {
+        let wasm = b"fake-wasm-bytes";
+        let hash_with_version = wasm_hash(wasm);
+
+        // Compute hash without version (raw FNV-1a of just WASM bytes)
+        let hash_without_version = {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &byte in wasm.iter() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        };
+
+        assert_ne!(
+            hash_with_version, hash_without_version,
+            "Hash should differ when version is folded in"
+        );
     }
 
     #[test]

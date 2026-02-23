@@ -261,6 +261,58 @@ fn check_project_version(root: &Path) -> CheckReport {
     }
 }
 
+/// Return the platform-specific Zellij plugin cache directory.
+fn zellij_cache_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let home = std::path::Path::new(&home);
+
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library/Caches/org.Zellij-Contributors.Zellij"))
+    } else {
+        // Linux / other Unix
+        Some(home.join(".cache/zellij"))
+    }
+}
+
+/// Walk session subdirectories under `cache_dir` and remove any entries
+/// whose name contains `lisa-plugin`. Returns the number of entries removed.
+pub(crate) fn clean_zellij_plugin_cache_in(cache_dir: &Path) -> usize {
+    let mut removed = 0;
+    let Ok(sessions) = std::fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    for session in sessions.flatten() {
+        if !session.path().is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(session.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().contains("lisa-plugin") {
+                let path = entry.path();
+                let ok = if path.is_dir() {
+                    std::fs::remove_dir_all(&path).is_ok()
+                } else {
+                    std::fs::remove_file(&path).is_ok()
+                };
+                if ok {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Resolve the Zellij cache dir and clean any cached lisa-plugin entries.
+pub(crate) fn clean_zellij_plugin_cache() {
+    if let Some(dir) = zellij_cache_dir() {
+        clean_zellij_plugin_cache_in(&dir);
+    }
+}
+
 /// Run the doctor command: check all dependencies and report.
 pub fn run_doctor(root: &Path) -> Result<(), String> {
     let checks = build_checks();
@@ -277,6 +329,23 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
         output.push_str(&format!("{}\n", project_report));
     }
     reports.push(project_report);
+
+    // Clean stale Zellij plugin cache
+    output.push_str("\n\nChecking Zellij plugin cache...\n\n");
+    if let Some(dir) = zellij_cache_dir() {
+        let removed = clean_zellij_plugin_cache_in(&dir);
+        if removed > 0 {
+            output.push_str(&format!(
+                "  Cleaned {} cached lisa-plugin entr{}\n",
+                removed,
+                if removed == 1 { "y" } else { "ies" }
+            ));
+        } else {
+            output.push_str("  No stale cache entries found.\n");
+        }
+    } else {
+        output.push_str("  Could not determine Zellij cache directory.\n");
+    }
 
     println!("{}", output);
 
@@ -563,5 +632,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = check_project_version(dir.path());
         assert!(matches!(report.result, CheckResult::Skipped { .. }));
+    }
+
+    #[test]
+    fn test_clean_cache_no_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a session dir with a non-lisa entry
+        let session = dir.path().join("session-abc");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("some-other-plugin"), "data").unwrap();
+
+        let removed = clean_zellij_plugin_cache_in(dir.path());
+        assert_eq!(removed, 0);
+        // Non-lisa file should still exist
+        assert!(session.join("some-other-plugin").exists());
+    }
+
+    #[test]
+    fn test_clean_cache_removes_lisa_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session-abc");
+        std::fs::create_dir_all(&session).unwrap();
+
+        // Create a lisa-plugin entry (directory) and a non-lisa entry (file)
+        std::fs::create_dir_all(session.join("lisa-plugin-abc123")).unwrap();
+        std::fs::write(session.join("other-plugin"), "data").unwrap();
+
+        let removed = clean_zellij_plugin_cache_in(dir.path());
+        assert_eq!(removed, 1);
+        assert!(!session.join("lisa-plugin-abc123").exists());
+        assert!(session.join("other-plugin").exists());
+    }
+
+    #[test]
+    fn test_clean_cache_nonexistent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does-not-exist");
+        let removed = clean_zellij_plugin_cache_in(&nonexistent);
+        assert_eq!(removed, 0);
     }
 }
