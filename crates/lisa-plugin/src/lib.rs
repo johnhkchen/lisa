@@ -534,69 +534,87 @@ impl State {
     /// For each running thread, checks if the artifact for the current phase
     /// exists in the work directory. If so, advances the ticket to the next
     /// phase by updating the YAML frontmatter and logs the appropriate events.
+    ///
+    /// Loops until no more advances can be made so that an agent which
+    /// completes multiple phases in a single session catches up in one tick
+    /// rather than advancing one phase per poll cycle.
+    ///
+    /// For the Implement phase, `review.md` (not `progress.md`) is the
+    /// completion artifact. `progress.md` is a living tracking document
+    /// created early in the implement phase, so it cannot serve as a
+    /// completion signal. The presence of `review.md` means the agent has
+    /// moved past implement into review.
     fn check_artifact_advances(&mut self) {
-        // Collect running threads to avoid borrow conflict
-        let running: Vec<(TicketId, Phase)> = self
-            .threads
-            .iter()
-            .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
-            .map(|(tid, t)| (tid.clone(), t.current_phase))
-            .collect();
+        loop {
+            // Snapshot running threads each iteration — phases change as we advance
+            let running: Vec<(TicketId, Phase)> = self
+                .threads
+                .iter()
+                .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
+                .map(|(tid, t)| (tid.clone(), t.current_phase))
+                .collect();
 
-        for (ticket_id, current_phase) in running {
-            // Skip implement phase — progress.md is a living tracking document,
-            // not a completion signal. The agent sets phase: done in frontmatter
-            // when implement work is complete.
-            if current_phase == Phase::Implement {
-                continue;
-            }
+            let mut advanced_any = false;
 
-            // Only phases with artifacts can be advanced
-            let artifact_name = match current_phase.artifact_filename() {
-                Some(name) => name,
-                None => continue,
-            };
+            for (ticket_id, current_phase) in running {
+                // Determine which artifact signals completion of this phase.
+                // Implement uses review.md instead of progress.md (living doc).
+                let artifact_name = if current_phase == Phase::Implement {
+                    "review.md"
+                } else {
+                    match current_phase.artifact_filename() {
+                        Some(name) => name,
+                        None => continue,
+                    }
+                };
 
-            let artifact_path = self.config.work_dir.join(&ticket_id).join(artifact_name);
-            if !artifact_path.exists() {
-                continue;
-            }
+                let artifact_path = self.config.work_dir.join(&ticket_id).join(artifact_name);
+                if !artifact_path.exists() {
+                    continue;
+                }
 
-            // Compute next phase (always Some for phases with artifacts)
-            let next_phase = match current_phase.next() {
-                Some(p) => p,
-                None => continue,
-            };
+                // Compute next phase (always Some for phases with artifacts)
+                let next_phase = match current_phase.next() {
+                    Some(p) => p,
+                    None => continue,
+                };
 
-            // Update the ticket file on disk
-            let file_path = self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
-            let file_path = match file_path {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => continue,
-            };
+                // Update the ticket file on disk
+                let file_path = self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
+                let file_path = match file_path {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => continue,
+                };
 
-            if let Err(e) = ticket::update_ticket_phase(&file_path, next_phase) {
-                self.log_activity(ActivityEvent::Error {
-                    message: format!("Failed to advance {}: {}", ticket_id, e),
+                if let Err(e) = ticket::update_ticket_phase(&file_path, next_phase) {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!("Failed to advance {}: {}", ticket_id, e),
+                    });
+                    continue;
+                }
+
+                // Log events
+                self.log_activity(ActivityEvent::PhaseCompleted {
+                    ticket_id: ticket_id.clone(),
+                    phase: current_phase,
                 });
-                continue;
+                self.log_activity(ActivityEvent::TicketPhaseChanged {
+                    ticket_id: ticket_id.clone(),
+                    old_phase: current_phase,
+                    new_phase: next_phase,
+                });
+
+                // Update thread phase
+                if let Some(thread) = self.threads.get_mut(&ticket_id) {
+                    thread.current_phase = next_phase;
+                    thread.last_phase_change = std::time::SystemTime::now();
+                }
+
+                advanced_any = true;
             }
 
-            // Log events
-            self.log_activity(ActivityEvent::PhaseCompleted {
-                ticket_id: ticket_id.clone(),
-                phase: current_phase,
-            });
-            self.log_activity(ActivityEvent::TicketPhaseChanged {
-                ticket_id: ticket_id.clone(),
-                old_phase: current_phase,
-                new_phase: next_phase,
-            });
-
-            // Update thread phase
-            if let Some(thread) = self.threads.get_mut(&ticket_id) {
-                thread.current_phase = next_phase;
-                thread.last_phase_change = std::time::SystemTime::now();
+            if !advanced_any {
+                break;
             }
         }
     }
@@ -2693,16 +2711,14 @@ mod tests {
     }
 
     #[test]
-    fn test_check_artifact_advances_implement_skipped() {
+    fn test_check_artifact_advances_implement_ignores_progress_md() {
         // progress.md is a living tracking document, not a completion signal.
-        // The agent sets phase: done in frontmatter when implement work is complete.
-        // So check_artifact_advances should NOT advance implement → review.
+        // Only review.md advances implement → review.
         use lisa_core::types::{Thread, ThreadStatus};
         use std::fs;
 
         let dir = tempfile::tempdir().unwrap();
 
-        // Create ticket file
         let tickets_dir = dir.path().join("tickets");
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
@@ -2710,10 +2726,10 @@ mod tests {
             "---\nid: T-002\ntitle: impl-test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
-        // Create work dir with progress.md artifact
+        // Only progress.md — should NOT advance
         let work_dir = dir.path().join("work");
         fs::create_dir_all(work_dir.join("T-002")).unwrap();
-        fs::write(work_dir.join("T-002/progress.md"), "# Progress done").unwrap();
+        fs::write(work_dir.join("T-002/progress.md"), "# Progress").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -2734,10 +2750,112 @@ mod tests {
 
         state.check_artifact_advances();
 
-        // Implement phase should NOT be advanced by artifact detection
         let thread = state.threads.get("T-002").unwrap();
         assert_eq!(thread.current_phase, Phase::Implement);
         assert_eq!(thread.status, ThreadStatus::Running);
+    }
+
+    #[test]
+    fn test_check_artifact_advances_implement_to_review_via_review_md() {
+        // review.md is the completion artifact for implement phase.
+        // When it exists, implement should advance to review.
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-002.md"),
+            "---\nid: T-002\ntitle: impl-test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(work_dir.join("T-002")).unwrap();
+        fs::write(work_dir.join("T-002/review.md"), "# Review\nAll good.").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let mut thread = Thread::new("T-002", 2);
+        thread.current_phase = Phase::Implement;
+        state.threads.insert("T-002".to_string(), thread);
+
+        state.check_artifact_advances();
+
+        // review.md also satisfies the Review→Done transition, so the loop
+        // should advance all the way: Implement→Review→Done
+        let thread = state.threads.get("T-002").unwrap();
+        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.status, ThreadStatus::Running);
+
+        // Ticket file should be updated to done
+        let updated = fs::read_to_string(tickets_dir.join("T-002.md")).unwrap();
+        assert!(updated.contains("phase: done"));
+    }
+
+    #[test]
+    fn test_check_artifact_advances_full_catchup() {
+        // When all artifacts exist, a single call should advance
+        // from research all the way through to done.
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-005.md"),
+            "---\nid: T-005\ntitle: full-run\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        ).unwrap();
+
+        // All artifacts present
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(work_dir.join("T-005")).unwrap();
+        fs::write(work_dir.join("T-005/research.md"), "# Research").unwrap();
+        fs::write(work_dir.join("T-005/design.md"), "# Design").unwrap();
+        fs::write(work_dir.join("T-005/structure.md"), "# Structure").unwrap();
+        fs::write(work_dir.join("T-005/plan.md"), "# Plan").unwrap();
+        fs::write(work_dir.join("T-005/review.md"), "# Review").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let mut thread = Thread::new("T-005", 5);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-005".to_string(), thread);
+
+        state.check_artifact_advances();
+
+        // Should advance all the way from Research to Done in one call
+        let thread = state.threads.get("T-005").unwrap();
+        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.status, ThreadStatus::Running);
+
+        let updated = fs::read_to_string(tickets_dir.join("T-005.md")).unwrap();
+        assert!(updated.contains("phase: done"));
     }
 
     #[test]
