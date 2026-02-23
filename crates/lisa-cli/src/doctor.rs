@@ -274,18 +274,15 @@ fn zellij_cache_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Walk session subdirectories under `cache_dir` and remove any entries
-/// whose name contains `lisa-plugin`. Returns the number of entries removed.
+/// Recursively walk `cache_dir` and remove any directory or file whose name
+/// contains `lisa-plugin`. Zellij nests cached plugins deep under
+/// `session-uuid/file:/var/folders/.../T/lisa-plugin-*.wasm/`, so a shallow
+/// walk is insufficient. Returns the number of entries removed.
 pub(crate) fn clean_zellij_plugin_cache_in(cache_dir: &Path) -> usize {
     let mut removed = 0;
-    let Ok(sessions) = std::fs::read_dir(cache_dir) else {
-        return 0;
-    };
-    for session in sessions.flatten() {
-        if !session.path().is_dir() {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(session.path()) else {
+    let mut stack = vec![cache_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -300,6 +297,8 @@ pub(crate) fn clean_zellij_plugin_cache_in(cache_dir: &Path) -> usize {
                 if ok {
                     removed += 1;
                 }
+            } else if entry.path().is_dir() {
+                stack.push(entry.path());
             }
         }
     }
@@ -637,31 +636,29 @@ mod tests {
     #[test]
     fn test_clean_cache_no_entries() {
         let dir = tempfile::tempdir().unwrap();
-        // Create a session dir with a non-lisa entry
-        let session = dir.path().join("session-abc");
-        std::fs::create_dir_all(&session).unwrap();
-        std::fs::write(session.join("some-other-plugin"), "data").unwrap();
+        // Mimic Zellij structure: session/file:/path/to/other-plugin
+        let nested = dir.path().join("session-abc/file:/var/folders/xx/T");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(nested.join("some-other-plugin")).unwrap();
 
         let removed = clean_zellij_plugin_cache_in(dir.path());
         assert_eq!(removed, 0);
-        // Non-lisa file should still exist
-        assert!(session.join("some-other-plugin").exists());
+        assert!(nested.join("some-other-plugin").exists());
     }
 
     #[test]
     fn test_clean_cache_removes_lisa_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("session-abc");
-        std::fs::create_dir_all(&session).unwrap();
-
-        // Create a lisa-plugin entry (directory) and a non-lisa entry (file)
-        std::fs::create_dir_all(session.join("lisa-plugin-abc123")).unwrap();
-        std::fs::write(session.join("other-plugin"), "data").unwrap();
+        // Mimic real Zellij cache: session/file:/var/folders/.../T/lisa-plugin-hash.wasm
+        let nested = dir.path().join("session-abc/file:/var/folders/xx/T");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(nested.join("lisa-plugin-abc123.wasm")).unwrap();
+        std::fs::create_dir_all(nested.join("other-plugin")).unwrap();
 
         let removed = clean_zellij_plugin_cache_in(dir.path());
         assert_eq!(removed, 1);
-        assert!(!session.join("lisa-plugin-abc123").exists());
-        assert!(session.join("other-plugin").exists());
+        assert!(!nested.join("lisa-plugin-abc123.wasm").exists());
+        assert!(nested.join("other-plugin").exists());
     }
 
     #[test]

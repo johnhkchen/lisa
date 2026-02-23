@@ -693,6 +693,37 @@ impl State {
                         thread.current_phase = Phase::Review;
                         thread.last_phase_change = std::time::SystemTime::now();
                     }
+
+                    // If review.md already exists (agent ran all phases in one
+                    // session), advance straight to Done in the same tick.
+                    // check_artifact_advances() already ran this cycle so it
+                    // won't catch this transition.
+                    let review_path = self.config.work_dir.join(&ticket_id).join("review.md");
+                    if review_path.exists() {
+                        if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Done) {
+                            self.log_activity(ActivityEvent::Error {
+                                message: format!(
+                                    "Failed to advance {} review→done: {}",
+                                    ticket_id, e
+                                ),
+                            });
+                            continue;
+                        }
+
+                        self.log_activity(ActivityEvent::PhaseCompleted {
+                            ticket_id: ticket_id.clone(),
+                            phase: Phase::Review,
+                        });
+                        self.log_activity(ActivityEvent::TicketPhaseChanged {
+                            ticket_id: ticket_id.clone(),
+                            old_phase: Phase::Review,
+                            new_phase: Phase::Done,
+                        });
+
+                        if let Some(thread) = self.threads.get_mut(&ticket_id) {
+                            thread.current_phase = Phase::Done;
+                        }
+                    }
                 }
 
                 Phase::Research
@@ -1716,7 +1747,23 @@ impl State {
             .dag
             .tickets()
             .filter(|t| t.phase != Phase::Done)
-            .filter(|t| t.phase == Phase::Review || !running.contains(t.id.as_str()))
+            .filter(|t| {
+                // Always show tickets without a running agent
+                if !running.contains(t.id.as_str()) {
+                    return true;
+                }
+                // Review-phase tickets are manually completable
+                if t.phase == Phase::Review {
+                    return true;
+                }
+                // Implement-phase tickets where review.md exists — the agent
+                // finished all phases but the transition didn't fire
+                if t.phase == Phase::Implement {
+                    let review_path = self.config.work_dir.join(&t.id).join("review.md");
+                    return review_path.exists();
+                }
+                false
+            })
             .map(|t| t.id.clone())
             .collect();
         ids.sort();
@@ -3983,6 +4030,52 @@ mod tests {
     }
 
     #[test]
+    fn test_implement_ticket_with_review_artifact_in_mark_done() {
+        // An Implement-phase ticket with review.md should appear in the
+        // mark-done modal — the agent finished all phases but transitions
+        // didn't fire.
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: stuck-implement\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        // review.md exists — agent completed all work
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(work_dir.join("T-001")).unwrap();
+        fs::write(work_dir.join("T-001/review.md"), "# Review\nDone.").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let thread = Thread::new("T-001", 1);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.open_mark_done_modal();
+
+        assert!(state.modal.open, "Modal should open");
+        assert!(
+            state.modal.ticket_ids.contains(&"T-001".to_string()),
+            "Implement ticket with review.md should be in mark-done list"
+        );
+    }
+
+    #[test]
     fn test_format_snapshot_contains_all_sections() {
         use lisa_core::types::Thread;
         use std::fs;
@@ -4356,6 +4449,84 @@ mod tests {
 
         // Verify: no idle alerts
         assert!(state.idle_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_idle_signal_implement_with_review_artifact_advances_to_done() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create ticket file in implement phase
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        // Create work dir with review.md already present (agent ran all phases)
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(work_dir.join("T-001")).unwrap();
+        fs::write(work_dir.join("T-001/review.md"), "# Review\nAll good.").unwrap();
+
+        // Create signal directory with idle signal
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        // Build state
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+        });
+
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        state.threads.insert("T-001".to_string(), thread);
+
+        // Run idle signal check
+        state.check_idle_signals();
+
+        // Verify: thread advanced all the way to Done
+        let thread = state.threads.get("T-001").unwrap();
+        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.status, ThreadStatus::Running);
+
+        // Verify: ticket file updated to done
+        let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
+        assert!(updated.contains("phase: done"));
+
+        // Verify: activity log has both transitions
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::PhaseCompleted { phase, .. }
+            if *phase == Phase::Implement
+        )));
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::PhaseCompleted { phase, .. }
+            if *phase == Phase::Review
+        )));
     }
 
     #[test]

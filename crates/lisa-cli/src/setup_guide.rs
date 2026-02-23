@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use crate::config;
 use crate::detect::{detect_project, DetectedProject, ProjectType};
 use crate::templates;
 
@@ -23,119 +22,85 @@ fn render_guide(header: &str, sections: Vec<GuideSection>) -> String {
     out
 }
 
-fn section_directories(root: &Path) -> GuideSection {
-    let dirs = [
-        "docs/active/tickets",
-        "docs/active/stories",
-        "docs/active/work",
-        "docs/archive/tickets",
-        "docs/archive/stories",
-        "docs/archive/work",
-    ];
+fn section_init(root: &Path) -> GuideSection {
+    let already_initialized = root.join("CLAUDE.md").exists()
+        && root.join(".lisa.toml").exists()
+        && root.join("docs/active/tickets").exists();
 
-    let already_exists = root.join("docs/active/tickets").exists();
-
-    let body = if already_exists {
-        "Directory structure already exists. Verify these directories are present:\n\n\
-         ```\n\
-         docs/active/tickets/\n\
-         docs/active/stories/\n\
-         docs/active/work/\n\
-         docs/archive/tickets/\n\
-         docs/archive/stories/\n\
-         docs/archive/work/\n\
-         ```"
-        .to_string()
-    } else {
-        let cmds: Vec<String> = dirs.iter().map(|d| format!("mkdir -p {}", d)).collect();
-        format!(
-            "Create the lisa directory structure:\n\n\
-             ```bash\n\
-             {}\n\
-             ```",
-            cmds.join("\n")
-        )
-    };
-
-    GuideSection {
-        title: "Create directory structure".to_string(),
-        body,
-    }
-}
-
-fn section_config(root: &Path) -> GuideSection {
-    let config_path = root.join(".lisa.toml");
-    let default_content = config::default_config_toml();
-
-    let body = if config_path.exists() {
-        format!(
-            "`.lisa.toml` already exists. Verify it contains valid configuration.\n\n\
-             Default configuration for reference:\n\n\
-             ```toml\n\
-             {}\n\
-             ```",
-            default_content.trim()
-        )
-    } else {
-        format!(
-            "Create `.lisa.toml` in the project root with this content:\n\n\
-             ```toml\n\
-             {}\n\
-             ```\n\n\
-             - `max_threads` controls how many Claude Code sessions run concurrently\n\
-             - `auto_advance` when true skips review pauses between RDSPI phases",
-            default_content.trim()
-        )
-    };
-
-    GuideSection {
-        title: "Create .lisa.toml".to_string(),
-        body,
-    }
-}
-
-fn section_claude_md(root: &Path, project: &DetectedProject) -> GuideSection {
-    let claude_md_path = root.join("CLAUDE.md");
-    let template = templates::generate_claude_md(project);
-
-    let body = if claude_md_path.exists() {
-        "CLAUDE.md already exists. Review it and ensure it contains:\n\n\
-         - Project description (one line)\n\
-         - Build, test, and lint commands\n\
-         - Source layout overview\n\
-         - Directory conventions for docs/active/ and docs/archive/\n\n\
-         The RDSPI workflow reference should point to `docs/knowledge/rdspi-workflow.md`."
+    let body = if already_initialized {
+        "Project is already initialized. Run `lisa init` again to update any stale files:\n\n\
+         ```bash\n\
+         lisa init\n\
+         ```\n\n\
+         This is safe to re-run — it never overwrites CLAUDE.md and only updates files that are out of date."
             .to_string()
     } else {
-        format!(
-            "Create `CLAUDE.md` in the project root. This file tells Claude Code about your project.\n\n\
-             Use this template as a starting point — edit the TODO line and add any project-specific \
-             context (architecture decisions, conventions, important modules):\n\n\
-             ```markdown\n\
-             {}\n\
-             ```",
-            template.trim()
-        )
+        "Run `lisa init` from the project root to scaffold everything:\n\n\
+         ```bash\n\
+         lisa init\n\
+         ```\n\n\
+         This creates:\n\n\
+         | Path | Purpose |\n\
+         |------|--------|\n\
+         | `CLAUDE.md` | Project context for Claude Code |\n\
+         | `.lisa.toml` | Lisa configuration (`max_threads`, etc.) |\n\
+         | `docs/knowledge/rdspi-workflow.md` | RDSPI workflow definition (injected into agent sessions) |\n\
+         | `docs/active/tickets/` | Ticket files (YAML frontmatter markdown) |\n\
+         | `docs/active/stories/` | Story files (groups of related tickets) |\n\
+         | `docs/active/work/` | Work artifacts, one subdirectory per ticket |\n\
+         | `docs/archive/` | Completed tickets, stories, and work |\n\
+         | `.lisa/hooks/` | Signal hooks (`on-idle.sh`, `on-stop.sh`, `on-clear.sh`) |\n\
+         | `.lisa/signals/` | Ephemeral signal files (gitignored) |\n\
+         | `.claude/settings.local.json` | Claude Code hook integration |\n\n\
+         After running, edit `CLAUDE.md` to add your project description, build commands, and source layout."
+            .to_string()
     };
 
     GuideSection {
-        title: "Create CLAUDE.md".to_string(),
+        title: "Initialize the project".to_string(),
         body,
     }
 }
 
-fn section_rdspi_workflow() -> GuideSection {
+fn section_config() -> GuideSection {
+    let default_content = crate::config::default_config_toml();
+
     let body = format!(
-        "Create `docs/knowledge/rdspi-workflow.md` with the full RDSPI workflow definition below. \
-         Lisa injects this into each agent session automatically.\n\n\
-         ```markdown\n\
+        "`lisa init` creates `.lisa.toml` with these defaults:\n\n\
+         ```toml\n\
          {}\n\
-         ```",
-        templates::RDSPI_WORKFLOW.trim()
+         ```\n\n\
+         - `max_threads` — how many Claude Code sessions run concurrently\n\
+         - `auto_advance` — when true, skips review pauses between RDSPI phases\n\
+         - `review_timeout_secs` — how long before a parked Review session gets a finish-up prompt",
+        default_content.trim()
     );
 
     GuideSection {
-        title: "Create RDSPI workflow file".to_string(),
+        title: "Configure .lisa.toml".to_string(),
+        body,
+    }
+}
+
+fn section_claude_md(_root: &Path, project: &DetectedProject) -> GuideSection {
+    let template = templates::generate_claude_md(project);
+
+    let body = format!(
+        "`lisa init` generates a CLAUDE.md template for your project type. \
+         Edit it to include:\n\n\
+         - Project description (one line)\n\
+         - Build, test, and lint commands\n\
+         - Source layout overview\n\
+         - Any project-specific conventions or architecture decisions\n\n\
+         Generated template:\n\n\
+         ```markdown\n\
+         {}\n\
+         ```",
+        template.trim()
+    );
+
+    GuideSection {
+        title: "Edit CLAUDE.md".to_string(),
         body,
     }
 }
@@ -148,8 +113,8 @@ fn section_ticket_format() -> GuideSection {
         id: T-001-01          # Unique ID. Convention: T-{story}-{sequence}\n\
         story: S-001           # Parent story ID\n\
         title: kebab-case-name # Short descriptive name\n\
-        type: task             # task | bug | spike\n\
-        status: open           # open | in-progress | review | done | blocked\n\
+        type: task             # task | bug | feature | spike | chore\n\
+        status: open           # open | in_progress | blocked | review | done | cancelled\n\
         priority: high         # critical | high | medium | low\n\
         phase: ready           # ready | research | design | structure | plan | implement | review | done\n\
         depends_on: []         # List of ticket IDs that must complete first\n\
@@ -169,7 +134,7 @@ fn section_ticket_format() -> GuideSection {
         ### Rules\n\n\
         - Every ticket starts at `phase: ready` and `status: open`\n\
         - `depends_on` lists ticket IDs that must reach `phase: done` before this ticket starts\n\
-        - `blocks` is optional — lisa computes it automatically from `depends_on`\n\
+        - Lisa computes the reverse (`blocks`) automatically from `depends_on`\n\
         - Ticket filenames should match the ID: `T-001-01.md`\n\
         - Each ticket gets a work directory: `docs/active/work/{ticket-id}/`"
         .to_string();
@@ -233,43 +198,23 @@ fn section_dependencies() -> GuideSection {
     }
 }
 
-fn section_archiving() -> GuideSection {
-    let body = "When a ticket or story is complete (`phase: done`, `status: done`):\n\n\
-        ```bash\n\
-        # Archive a completed ticket\n\
-        mv docs/active/tickets/T-001-01.md docs/archive/tickets/\n\
-        mv docs/active/work/T-001-01/ docs/archive/work/\n\
-        \n\
-        # Archive a completed story (when all its tickets are done)\n\
-        mv docs/active/stories/S-001.md docs/archive/stories/\n\
-        ```\n\n\
-        This keeps the active directory clean. Lisa only scans `docs/active/tickets/` for scheduling."
-        .to_string();
-
-    GuideSection {
-        title: "Archiving completed work".to_string(),
-        body,
-    }
-}
-
 fn section_validate() -> GuideSection {
-    let body =
-        "When you have created your directories, config, CLAUDE.md, stories, and tickets, run:\n\n\
+    let body = "When you have created your tickets and stories, validate the setup:\n\n\
         ```bash\n\
         lisa validate\n\
         ```\n\n\
         This checks:\n\
-        - CLAUDE.md exists\n\
-        - RDSPI workflow file exists\n\
+        - CLAUDE.md and RDSPI workflow file exist\n\
         - .lisa.toml is valid (if present)\n\
-        - Required directories exist\n\
+        - Hook scripts and settings.local.json are configured correctly\n\
         - Ticket frontmatter parses correctly\n\
-        - DAG has no cycles or missing dependencies\n\n\
-        Fix any errors before running `lisa loop`."
-            .to_string();
+        - DAG has no cycles or missing dependencies\n\
+        - At least one ticket is in `phase: ready`\n\n\
+        Fix any errors, then launch with `lisa loop`."
+        .to_string();
 
     GuideSection {
-        title: "Validate your setup".to_string(),
+        title: "Validate and launch".to_string(),
         body,
     }
 }
@@ -300,14 +245,12 @@ fn build_guide(root: &Path) -> Result<String, String> {
     );
 
     let sections = vec![
-        section_directories(root),
-        section_config(root),
+        section_init(root),
+        section_config(),
         section_claude_md(root, &project),
-        section_rdspi_workflow(),
         section_ticket_format(),
         section_story_format(),
         section_dependencies(),
-        section_archiving(),
         section_validate(),
     ];
 
@@ -339,7 +282,7 @@ mod tests {
         assert!(guide.contains("Rust"));
         assert!(guide.contains("cargo build"));
         assert!(guide.contains("cargo test"));
-        assert!(guide.contains("mkdir -p"));
+        assert!(guide.contains("lisa init"));
     }
 
     #[test]
@@ -364,7 +307,6 @@ mod tests {
 
         let guide = build_guide(dir.path()).unwrap();
         assert!(guide.contains("unknown"));
-        // Should still have ticket format, workflow, etc.
         assert!(guide.contains("depends_on"));
         assert!(guide.contains("RDSPI"));
     }
@@ -388,22 +330,22 @@ mod tests {
         .unwrap();
 
         let guide = build_guide(dir.path()).unwrap();
-        assert!(guide.contains("already exists"));
-        // Should NOT contain mkdir commands when dirs exist
+        assert!(guide.contains("already initialized"));
+        // Should NOT contain mkdir commands when initialized
         assert!(!guide.contains("mkdir -p"));
     }
 
     #[test]
-    fn test_guide_contains_rdspi_workflow() {
+    fn test_guide_references_rdspi() {
         let dir = tempfile::tempdir().unwrap();
 
         let guide = build_guide(dir.path()).unwrap();
-        assert!(guide.contains("Research"));
-        assert!(guide.contains("Design"));
-        assert!(guide.contains("Structure"));
-        assert!(guide.contains("Plan"));
-        assert!(guide.contains("Implement"));
-        assert!(guide.contains("~200 lines"));
+        // Guide should reference the RDSPI workflow file and phases
+        assert!(guide.contains("rdspi-workflow.md"));
+        assert!(guide.contains("research"));
+        assert!(guide.contains("design"));
+        assert!(guide.contains("implement"));
+        assert!(guide.contains("review"));
     }
 
     #[test]
@@ -425,7 +367,7 @@ mod tests {
         assert!(guide.contains("## Step 1:"));
         assert!(guide.contains("## Step 2:"));
         assert!(guide.contains("## Step 3:"));
-        assert!(guide.contains("## Step 9:"));
+        assert!(guide.contains("## Step 7:"));
     }
 
     #[test]
@@ -439,11 +381,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let guide = build_guide(dir.path()).unwrap();
-        // The last step should be about validation
         assert!(guide.contains("lisa validate"));
-        // Find the last "## Step" and verify it's about validation
         let last_step = guide.rfind("## Step").unwrap();
         let last_section = &guide[last_step..];
         assert!(last_section.contains("Validate"));
+    }
+
+    #[test]
+    fn test_guide_mentions_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let guide = build_guide(dir.path()).unwrap();
+        assert!(guide.contains(".lisa/hooks/"));
+        assert!(guide.contains("settings.local.json"));
+    }
+
+    #[test]
+    fn test_guide_correct_type_values() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let guide = build_guide(dir.path()).unwrap();
+        // Should list the correct type enum values
+        assert!(guide.contains("task | bug | feature | spike | chore"));
+        // Should list correct status values
+        assert!(guide.contains("open | in_progress | blocked | review | done | cancelled"));
     }
 }
