@@ -110,6 +110,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b62fc65de8e4e7f52534fb52b0f3ed04746ae267519eef2a83941e8085068b"
 
 [[package]]
+name = "ascii-dag"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7677644e7993a1957d106e5d68650403302e22bb5c6ad6d00e69ee8936b1ddda"
+
+[[package]]
 name = "async-attributes"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1551,7 +1557,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "lisa-cli"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "clap 4.5.57",
  "lisa-core",
@@ -1563,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "lisa-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -1573,8 +1579,9 @@ dependencies = [
 
 [[package]]
 name = "lisa-plugin"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
+ "ascii-dag",
  "libc",
  "lisa-core",
  "serde",

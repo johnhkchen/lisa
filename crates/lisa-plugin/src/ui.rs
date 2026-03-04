@@ -531,64 +531,11 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
 // =============================================================================
 
 /// Compute DAG layers for visualization (topological sort into layers)
-fn compute_dag_layers(tickets: &[TicketNode]) -> Vec<Vec<usize>> {
-    if tickets.is_empty() {
-        return Vec::new();
-    }
-
-    // Build a map of ticket ID to index for quick lookup
-    let id_to_idx: HashMap<&str, usize> = tickets
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.id.as_str(), i))
-        .collect();
-
-    let mut layers: Vec<Vec<usize>> = Vec::new();
-    let mut placed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut remaining: Vec<usize> = (0..tickets.len()).collect();
-
-    while !remaining.is_empty() {
-        // Find all tickets whose dependencies are satisfied
-        let mut layer = Vec::new();
-        for &idx in &remaining {
-            let ticket = &tickets[idx];
-            let deps_satisfied = ticket.depends_on.iter().all(|dep| {
-                if let Some(&dep_idx) = id_to_idx.get(dep.as_str()) {
-                    placed.contains(&dep_idx)
-                } else {
-                    // External dependency or doesn't exist, consider satisfied
-                    true
-                }
-            });
-            if deps_satisfied {
-                layer.push(idx);
-            }
-        }
-
-        // If no tickets can be placed, we have a cycle - just place remaining
-        if layer.is_empty() && !remaining.is_empty() {
-            layer = remaining.clone();
-        }
-
-        // Mark as placed and remove from remaining
-        for &idx in &layer {
-            placed.insert(idx);
-        }
-        remaining.retain(|idx| !layer.contains(idx));
-
-        if !layer.is_empty() {
-            layers.push(layer);
-        }
-    }
-
-    layers
-}
-
-/// Render the DAG with fixed-width grid layout and properly aligned edges.
+/// Render the DAG using ascii-dag for proper edge routing and layout.
 ///
-/// Each node occupies a fixed-width cell. Layers are sorted by ticket ID
-/// for deterministic ordering. Edges are drawn as │ connectors at the
-/// parent node's column center, including pass-through for multi-layer edges.
+/// Filters out completed tickets to keep the view focused on active work.
+/// Uses Sugiyama layered layout via ascii-dag for crossing minimization
+/// and proper fan-in/fan-out visualization.
 fn render_dag(state: &PluginState, output: &mut Vec<String>) {
     output.push(format!("{}{}≡≡ DAG ≡≡{}", BOLD, CYAN, RESET));
     output.push(String::new());
@@ -598,113 +545,107 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
         return;
     }
 
-    // Visible character widths
-    // Cell: "{indicator} {id:<8} {status}" = 1+1+8+1+3 = 14, padded to CELL_W
-    const CELL_W: usize = 15;
-    const GAP: usize = 1;
-    const INDENT: usize = 2;
-
-    // Compute layers and sort each by ticket ID for stable ordering
-    let mut layers = compute_dag_layers(&state.tickets);
-    for layer in &mut layers {
-        layer.sort_by(|a, b| state.tickets[*a].id.cmp(&state.tickets[*b].id));
-    }
-
-    // Map ticket_id → (layer_index, center_x in visible chars)
-    let mut center_x: HashMap<&str, usize> = HashMap::new();
-    let mut ticket_layer: HashMap<&str, usize> = HashMap::new();
-    for (li, layer) in layers.iter().enumerate() {
-        for (col, &idx) in layer.iter().enumerate() {
-            let cx = INDENT + col * (CELL_W + GAP) + CELL_W / 2;
-            center_x.insert(&state.tickets[idx].id, cx);
-            ticket_layer.insert(&state.tickets[idx].id, li);
-        }
-    }
-
-    // Collect all edges (parent_id, child_id)
-    let edges: Vec<(&str, &str)> = state
+    // Filter out done tickets — they clutter the view as sessions progress
+    let active: Vec<&TicketNode> = state
         .tickets
         .iter()
-        .flat_map(|t| {
-            t.depends_on
-                .iter()
-                .map(move |dep| (dep.as_str(), t.id.as_str()))
+        .filter(|t| t.status != TicketStatus::Done)
+        .collect();
+
+    let done_count = state.tickets.len() - active.len();
+
+    if active.is_empty() {
+        output.push(format!(
+            "{}All {} tickets complete!{}",
+            BRIGHT_GREEN, done_count, RESET
+        ));
+        return;
+    }
+
+    // Build ID-to-index map for active tickets (ascii-dag uses integer IDs)
+    let active_ids: std::collections::HashSet<&str> =
+        active.iter().map(|t| t.id.as_str()).collect();
+    let id_to_int: HashMap<&str, usize> = active
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.as_str(), i + 1)) // ascii-dag IDs are 1-based
+        .collect();
+
+    // Build ascii-dag graph
+    let nodes: Vec<(usize, String)> = active
+        .iter()
+        .map(|t| {
+            let status_str = match &t.status {
+                TicketStatus::Ready => "RDY",
+                TicketStatus::InProgress => "WRK",
+                TicketStatus::WaitingReview => "REV",
+                TicketStatus::Blocked => "BLK",
+                TicketStatus::Done => "DON",
+            };
+            let label = format!("{} {}", t.id, status_str);
+            (id_to_int[t.id.as_str()], label)
         })
         .collect();
 
-    // Render each layer with connector lines above
-    for (li, layer) in layers.iter().enumerate() {
-        // Connector line between previous layer and this one
-        if li > 0 {
-            // Find max width needed across both layers
-            let this_w = INDENT + layer.len() * (CELL_W + GAP);
-            let prev_w = INDENT + layers[li - 1].len() * (CELL_W + GAP);
-            let width = this_w.max(prev_w);
-
-            let mut conn: Vec<char> = vec![' '; width];
-
-            // Draw │ for every edge that crosses this boundary:
-            // parent in layer < li, child in layer >= li
-            for &(parent_id, child_id) in &edges {
-                let pl = ticket_layer.get(parent_id).copied().unwrap_or(0);
-                let cl = ticket_layer.get(child_id).copied().unwrap_or(0);
-                if pl < li && cl >= li {
-                    if let Some(&px) = center_x.get(parent_id) {
-                        if px < conn.len() {
-                            conn[px] = '│';
-                        }
-                    }
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for t in &active {
+        let child_int = id_to_int[t.id.as_str()];
+        for dep in &t.depends_on {
+            if active_ids.contains(dep.as_str()) {
+                if let Some(&parent_int) = id_to_int.get(dep.as_str()) {
+                    edges.push((parent_int, child_int));
                 }
             }
-
-            let line: String = conn.iter().collect();
-            let trimmed = line.trim_end();
-            if !trimmed.trim().is_empty() {
-                output.push(format!("{}{}{}", DIM, trimmed, RESET));
-            }
         }
-
-        // Node line
-        let mut line = " ".repeat(INDENT);
-        for (col, &idx) in layer.iter().enumerate() {
-            if col > 0 {
-                line.push_str(&" ".repeat(GAP));
-            }
-            let ticket = &state.tickets[idx];
-            let indicator = ticket.phase.indicator();
-            let phase_color = ticket.phase.color_code();
-
-            let (status_str, status_color) = match &ticket.status {
-                TicketStatus::Ready => ("RDY", CYAN),
-                TicketStatus::InProgress => ("WRK", GREEN),
-                TicketStatus::WaitingReview => ("REV", BRIGHT_YELLOW),
-                TicketStatus::Blocked => ("BLK", RED),
-                TicketStatus::Done => ("DON", BRIGHT_GREEN),
-            };
-
-            // Truncate or pad ID to 8 visible chars
-            let id_str: String = ticket.id.chars().take(8).collect();
-
-            // Visible content: indicator(1) + space(1) + id(8) + space(1) + status(3) = 14
-            let content_w = 1 + 1 + 8 + 1 + 3; // 14
-            let pad = CELL_W.saturating_sub(content_w);
-
-            line.push_str(&format!(
-                "{}{}{} {:<8}{}{}{}{} ",
-                phase_color,
-                indicator,
-                RESET,
-                id_str,
-                " ".repeat(pad),
-                status_color,
-                status_str,
-                RESET,
-            ));
-        }
-        output.push(line);
     }
 
-    // Legend
+    // Build node refs for from_edges
+    let node_refs: Vec<(usize, &str)> = nodes
+        .iter()
+        .map(|(id, label)| (*id, label.as_str()))
+        .collect();
+
+    let dag = ascii_dag::DAG::from_edges(&node_refs, &edges);
+    let rendered = dag.render();
+
+    // Build a color map for post-processing: ticket_id -> (phase_color, status_color)
+    let color_map: HashMap<&str, (&str, &str)> = active
+        .iter()
+        .map(|t| {
+            let status_color = match &t.status {
+                TicketStatus::Ready => CYAN,
+                TicketStatus::InProgress => GREEN,
+                TicketStatus::WaitingReview => BRIGHT_YELLOW,
+                TicketStatus::Blocked => RED,
+                TicketStatus::Done => BRIGHT_GREEN,
+            };
+            (t.id.as_str(), (t.phase.color_code(), status_color))
+        })
+        .collect();
+
+    // Post-process: inject ANSI colors for ticket IDs
+    for line in rendered.lines() {
+        let mut colored_line = line.to_string();
+        for (ticket_id, (phase_color, _status_color)) in &color_map {
+            if colored_line.contains(ticket_id) {
+                colored_line = colored_line
+                    .replace(ticket_id, &format!("{}{}{}", phase_color, ticket_id, RESET));
+            }
+        }
+        output.push(colored_line);
+    }
+
+    // Summary + legend
+    if done_count > 0 {
+        output.push(String::new());
+        output.push(format!(
+            "{}({} done ticket{} hidden){}",
+            DIM,
+            done_count,
+            if done_count == 1 { "" } else { "s" },
+            RESET
+        ));
+    }
     output.push(String::new());
     output.push(format!(
         "{}Phases: {} Rdy {} Res {} Des {} Str {} Pln {} Imp {} Rev {} Don{}",
@@ -1371,16 +1312,282 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_dag_layers() {
-        let state = sample_state();
-        let layers = compute_dag_layers(&state.tickets);
+    fn test_render_dag_filters_done_tickets() {
+        let state = sample_state(); // T-001 is Done, T-002 InProgress, T-003 Blocked
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
 
-        // T-001 has no deps, should be in first layer
-        assert!(layers[0].contains(&0)); // T-001 is at index 0
-                                         // T-002 depends on T-001, should be in second layer
-        assert!(layers[1].contains(&1)); // T-002 is at index 1
-                                         // T-003 depends on T-002, should be in third layer
-        assert!(layers[2].contains(&2)); // T-003 is at index 2
+        // T-001 is Done — should be filtered out, mentioned in hidden count
+        assert!(
+            full.contains("1 done ticket"),
+            "Should show hidden done ticket count"
+        );
+        // Active tickets should still appear
+        assert!(full.contains("T-002"), "Active ticket T-002 missing");
+        assert!(full.contains("T-003"), "Active ticket T-003 missing");
+    }
+
+    #[test]
+    fn test_render_dag_all_done() {
+        let state = PluginState {
+            tickets: vec![TicketNode {
+                id: "T-001".to_string(),
+                title: "Done ticket".to_string(),
+                phase: Phase::Done,
+                status: TicketStatus::Done,
+                depends_on: vec![],
+            }],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        assert!(
+            full.contains("All 1 tickets complete"),
+            "Should show completion message"
+        );
+    }
+
+    #[test]
+    fn test_render_dag_diamond_has_edge_routing() {
+        // Diamond: T-001 -> {T-002, T-003} -> T-004
+        // ascii-dag should render horizontal connectors between fan-out and fan-in
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-001".to_string(),
+                    title: "root".to_string(),
+                    phase: Phase::Implement,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-002".to_string(),
+                    title: "left".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-001".to_string()],
+                },
+                TicketNode {
+                    id: "T-003".to_string(),
+                    title: "right".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-001".to_string()],
+                },
+                TicketNode {
+                    id: "T-004".to_string(),
+                    title: "leaf".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-002".to_string(), "T-003".to_string()],
+                },
+            ],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        // All four tickets should appear (none are done)
+        assert!(full.contains("T-001"), "T-001 missing");
+        assert!(full.contains("T-002"), "T-002 missing");
+        assert!(full.contains("T-003"), "T-003 missing");
+        assert!(full.contains("T-004"), "T-004 missing");
+
+        // ascii-dag renders horizontal edge routing characters for fan-out/fan-in
+        // Unlike old renderer which only had vertical │ pipes
+        let has_horizontal = full.contains('─') || full.contains('└') || full.contains('┌');
+        assert!(
+            has_horizontal,
+            "Diamond DAG should have horizontal edge connectors, got:\n{}",
+            full
+        );
+
+        // Should have arrow indicators showing flow direction
+        assert!(
+            full.contains('↓'),
+            "Should have directional arrows, got:\n{}",
+            full
+        );
+    }
+
+    #[test]
+    fn test_render_dag_fan_in_convergence() {
+        // Three roots converge into one leaf — tests fan-in rendering
+        // A ──┐
+        // B ──┤ -> D
+        // C ──┘
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-A".to_string(),
+                    title: "a".to_string(),
+                    phase: Phase::Implement,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-B".to_string(),
+                    title: "b".to_string(),
+                    phase: Phase::Design,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-C".to_string(),
+                    title: "c".to_string(),
+                    phase: Phase::Research,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-D".to_string(),
+                    title: "d".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-A".to_string(), "T-B".to_string(), "T-C".to_string()],
+                },
+            ],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        // All three roots and the leaf should appear
+        assert!(full.contains("T-A"), "T-A missing");
+        assert!(full.contains("T-B"), "T-B missing");
+        assert!(full.contains("T-C"), "T-C missing");
+        assert!(full.contains("T-D"), "T-D missing");
+
+        // Fan-in of 3 parents into 1 child must have horizontal routing
+        let has_horizontal = full.contains('─') || full.contains('└') || full.contains('┌');
+        assert!(
+            has_horizontal,
+            "Fan-in of 3 parents should produce horizontal connectors, got:\n{}",
+            full
+        );
+
+        // No done tickets hidden
+        assert!(
+            !full.contains("done ticket"),
+            "No tickets are done, shouldn't show hidden count"
+        );
+    }
+
+    #[test]
+    fn test_render_dag_independent_chains_both_shown() {
+        // Two completely independent chains — both should render
+        // Chain 1: T-001 -> T-002
+        // Chain 2: T-003 -> T-004
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-001".to_string(),
+                    title: "chain1-root".to_string(),
+                    phase: Phase::Implement,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-002".to_string(),
+                    title: "chain1-leaf".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-001".to_string()],
+                },
+                TicketNode {
+                    id: "T-003".to_string(),
+                    title: "chain2-root".to_string(),
+                    phase: Phase::Design,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-004".to_string(),
+                    title: "chain2-leaf".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-003".to_string()],
+                },
+            ],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        assert!(full.contains("T-001"), "T-001 missing");
+        assert!(full.contains("T-002"), "T-002 missing");
+        assert!(full.contains("T-003"), "T-003 missing");
+        assert!(full.contains("T-004"), "T-004 missing");
+
+        // Both root nodes should appear on the same line (same layer)
+        let root_line = output
+            .iter()
+            .find(|line| line.contains("T-001") && line.contains("T-003"));
+        assert!(
+            root_line.is_some(),
+            "Independent roots should be on the same line, got:\n{}",
+            full
+        );
+    }
+
+    #[test]
+    fn test_render_dag_done_filtered_edges_still_work() {
+        // Chain: T-001(done) -> T-002(wip) -> T-003(blocked)
+        // T-001 is filtered out, but T-002 -> T-003 edge should still render
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-001".to_string(),
+                    title: "done-root".to_string(),
+                    phase: Phase::Done,
+                    status: TicketStatus::Done,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-002".to_string(),
+                    title: "active-mid".to_string(),
+                    phase: Phase::Design,
+                    status: TicketStatus::InProgress,
+                    depends_on: vec!["T-001".to_string()],
+                },
+                TicketNode {
+                    id: "T-003".to_string(),
+                    title: "blocked-leaf".to_string(),
+                    phase: Phase::Ready,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-002".to_string()],
+                },
+            ],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        // T-001 should be filtered
+        assert!(
+            full.contains("1 done ticket"),
+            "Should mention filtered done ticket"
+        );
+
+        // T-002 and T-003 should appear with an edge between them
+        assert!(full.contains("T-002"), "T-002 missing");
+        assert!(full.contains("T-003"), "T-003 missing");
+
+        // Should have an edge connector between T-002 and T-003
+        // ascii-dag may use → for inline chains or │/↓ for vertical layout
+        let has_edge = full.contains('│') || full.contains('↓') || full.contains('→');
+        assert!(
+            has_edge,
+            "Should have edge connector between T-002 and T-003, got:\n{}",
+            full
+        );
     }
 
     #[test]
@@ -1529,13 +1736,18 @@ mod tests {
             active_view: ViewPreset::default(),
         };
 
-        // Test DAG view: all ticket IDs should appear
+        // Test DAG view: done tickets filtered, active tickets shown
         let mut dag_state = state.clone();
         dag_state.active_view = ViewPreset::Dag;
         let dag_lines = render_dashboard_lines(&dag_state, 80, 50);
         let dag_output = dag_lines.join("\n");
 
-        assert!(dag_output.contains("T-001"), "T-001 missing from DAG view");
+        // T-001 is Done — filtered out, but mentioned in hidden count
+        assert!(
+            dag_output.contains("1 done ticket"),
+            "Hidden done count missing from DAG view"
+        );
+        // Active tickets should appear
         assert!(dag_output.contains("T-002"), "T-002 missing from DAG view");
         assert!(dag_output.contains("T-003"), "T-003 missing from DAG view");
         assert!(dag_output.contains("T-004"), "T-004 missing from DAG view");
@@ -1548,16 +1760,6 @@ mod tests {
         assert!(ops_output.contains("test error"), "Error activity missing");
         assert!(ops_output.contains("Active: 1"), "Active count wrong");
         assert!(ops_output.contains("Done: 1/4"), "Done count wrong");
-
-        // DAG layers: T-001 should be in first layer, T-002/T-003 in second, T-004 in third
-        let layers = compute_dag_layers(&state.tickets);
-        assert_eq!(layers.len(), 3, "Expected 3 DAG layers for diamond");
-        assert!(layers[0].contains(&0), "T-001 not in first layer");
-        assert!(
-            layers[1].contains(&1) && layers[1].contains(&2),
-            "T-002 and T-003 not in second layer"
-        );
-        assert!(layers[2].contains(&3), "T-004 not in third layer");
     }
 
     #[test]
