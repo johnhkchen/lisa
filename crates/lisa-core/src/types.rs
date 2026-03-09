@@ -8,7 +8,7 @@
 //! - Activity event logging
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -124,6 +124,21 @@ impl Phase {
     /// Returns true if this phase is complete.
     pub fn is_complete(&self) -> bool {
         matches!(self, Phase::Done)
+    }
+
+    /// Parse a phase from its lowercase string name.
+    pub fn from_name(s: &str) -> Option<Phase> {
+        match s {
+            "ready" => Some(Phase::Ready),
+            "research" => Some(Phase::Research),
+            "design" => Some(Phase::Design),
+            "structure" => Some(Phase::Structure),
+            "plan" => Some(Phase::Plan),
+            "implement" => Some(Phase::Implement),
+            "review" => Some(Phase::Review),
+            "done" => Some(Phase::Done),
+            _ => None,
+        }
     }
 }
 
@@ -453,6 +468,15 @@ pub struct PluginConfig {
     /// Seconds a running Review thread waits before receiving a finish-up prompt (default: 240).
     /// Set to 0 to disable.
     pub review_timeout_secs: u64,
+
+    /// Maximum wall-clock seconds a single agent session can run before being
+    /// considered stalled (default: 1800 = 30 minutes). Set to 0 to disable.
+    pub session_timeout_secs: u64,
+
+    /// Optional per-phase timeout overrides. When set, the value for a phase
+    /// overrides `session_timeout_secs` for time-in-phase checks. Missing
+    /// phases fall back to `session_timeout_secs`.
+    pub phase_timeouts: HashMap<Phase, u64>,
 }
 
 impl PluginConfig {
@@ -474,6 +498,9 @@ impl PluginConfig {
     /// Default review timeout in seconds (4 minutes).
     pub const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 240;
 
+    /// Default session timeout in seconds (30 minutes).
+    pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
+
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
         Self {
@@ -484,6 +511,8 @@ impl PluginConfig {
             auto_advance: false,
             stuck_threshold_secs: Self::DEFAULT_STUCK_THRESHOLD_SECS,
             review_timeout_secs: Self::DEFAULT_REVIEW_TIMEOUT_SECS,
+            session_timeout_secs: Self::DEFAULT_SESSION_TIMEOUT_SECS,
+            phase_timeouts: HashMap::new(),
         }
     }
 
@@ -525,7 +554,35 @@ impl PluginConfig {
             }
         }
 
+        if let Some(session_timeout) = config.get("session_timeout_secs") {
+            if let Ok(n) = session_timeout.parse() {
+                result.session_timeout_secs = n;
+            }
+        }
+
+        // Parse phase_timeout_{phase} keys
+        let prefix = "phase_timeout_";
+        for (key, val) in config {
+            if let Some(phase_name) = key.strip_prefix(prefix) {
+                if let (Some(phase), Ok(secs)) = (Phase::from_name(phase_name), val.parse::<u64>())
+                {
+                    result.phase_timeouts.insert(phase, secs);
+                }
+            }
+        }
+
         result
+    }
+
+    /// Returns the effective timeout for a given phase.
+    ///
+    /// If a per-phase override exists, returns it. Otherwise falls back
+    /// to `session_timeout_secs`.
+    pub fn timeout_for_phase(&self, phase: Phase) -> u64 {
+        self.phase_timeouts
+            .get(&phase)
+            .copied()
+            .unwrap_or(self.session_timeout_secs)
     }
 }
 
@@ -620,6 +677,13 @@ pub enum ActivityEvent {
 
     /// A finish-up prompt was sent to a parked Review session after timeout
     FinishUpPromptSent { ticket_id: TicketId, pane_id: u32 },
+
+    /// A session was timed out (exceeded session_timeout_secs)
+    SessionTimedOut {
+        ticket_id: TicketId,
+        elapsed_secs: u64,
+        phase: Phase,
+    },
 }
 
 /// Serde helper module for SystemTime serialization.
@@ -893,5 +957,70 @@ mod tests {
         map.insert("stuck_threshold_secs".to_string(), "300".to_string());
         let config = PluginConfig::from_config_map(&map);
         assert_eq!(config.stuck_threshold_secs, 300);
+    }
+
+    #[test]
+    fn test_config_session_timeout_default() {
+        let config = PluginConfig::new();
+        assert_eq!(config.session_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn test_config_session_timeout_from_map() {
+        let mut map = BTreeMap::new();
+        map.insert("session_timeout_secs".to_string(), "3600".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.session_timeout_secs, 3600);
+    }
+
+    #[test]
+    fn test_config_phase_timeouts_default() {
+        let config = PluginConfig::new();
+        assert!(config.phase_timeouts.is_empty());
+    }
+
+    #[test]
+    fn test_config_phase_timeouts_from_map() {
+        let mut map = BTreeMap::new();
+        map.insert("phase_timeout_research".to_string(), "300".to_string());
+        map.insert("phase_timeout_implement".to_string(), "1800".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.phase_timeouts.get(&Phase::Research), Some(&300));
+        assert_eq!(config.phase_timeouts.get(&Phase::Implement), Some(&1800));
+        assert_eq!(config.phase_timeouts.len(), 2);
+    }
+
+    #[test]
+    fn test_timeout_for_phase_with_override() {
+        let mut config = PluginConfig::new();
+        config.phase_timeouts.insert(Phase::Implement, 1800);
+        assert_eq!(config.timeout_for_phase(Phase::Implement), 1800);
+    }
+
+    #[test]
+    fn test_timeout_for_phase_fallback() {
+        let config = PluginConfig::new();
+        // No override → falls back to session_timeout_secs (1800)
+        assert_eq!(config.timeout_for_phase(Phase::Research), 1800);
+    }
+
+    #[test]
+    fn test_timeout_for_phase_disabled() {
+        let mut config = PluginConfig::new();
+        config.session_timeout_secs = 0;
+        // No override and session timeout disabled → 0
+        assert_eq!(config.timeout_for_phase(Phase::Research), 0);
+        // But explicit override still works
+        config.phase_timeouts.insert(Phase::Research, 300);
+        assert_eq!(config.timeout_for_phase(Phase::Research), 300);
+    }
+
+    #[test]
+    fn test_phase_from_name() {
+        assert_eq!(Phase::from_name("research"), Some(Phase::Research));
+        assert_eq!(Phase::from_name("implement"), Some(Phase::Implement));
+        assert_eq!(Phase::from_name("done"), Some(Phase::Done));
+        assert_eq!(Phase::from_name("invalid"), None);
+        assert_eq!(Phase::from_name("Research"), None); // case-sensitive
     }
 }

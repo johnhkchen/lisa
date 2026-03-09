@@ -222,6 +222,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
                 max_threads "{max_threads}"
                 auto_advance "{auto_advance}"
                 review_timeout_secs "{review_timeout_secs}"
+                session_timeout_secs "{session_timeout_secs}"
             }}
         }}
     }}
@@ -235,6 +236,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
         max_threads = config.max_threads,
         auto_advance = config.auto_advance,
         review_timeout_secs = config.review_timeout_secs,
+        session_timeout_secs = config.session_timeout_secs,
     )
 }
 
@@ -291,6 +293,7 @@ mod tests {
         assert!(layout.contains("max_threads \"3\""));
         assert!(layout.contains("auto_advance \"false\""));
         assert!(layout.contains("review_timeout_secs \"240\""));
+        assert!(layout.contains("session_timeout_secs \"1800\""));
         assert!(
             layout.contains("compact-bar"),
             "layout should include status bar"

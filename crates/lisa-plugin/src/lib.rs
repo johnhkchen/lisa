@@ -208,6 +208,11 @@ pub struct State {
 
     /// Ticket IDs that have already received a finish-up prompt (prevents re-sending).
     finish_up_sent: HashSet<TicketId>,
+
+    /// Recent session timeouts for dashboard display.
+    /// Entries: (ticket_id, elapsed_secs, phase_at_timeout).
+    /// Cleared when the ticket is rescheduled.
+    timeout_alerts: Vec<(TicketId, u64, Phase)>,
 }
 
 impl State {
@@ -475,6 +480,9 @@ impl State {
                 }
             }
             self.threads.insert(ticket_id.clone(), thread);
+
+            // Clear any stale timeout alert for this ticket (it's being rescheduled)
+            self.timeout_alerts.retain(|(tid, _, _)| tid != &ticket_id);
 
             self.log_activity(ActivityEvent::SessionLaunch {
                 ticket_id: ticket_id.clone(),
@@ -1156,6 +1164,65 @@ impl State {
             .retain(|tid, _| self.threads.contains_key(tid));
     }
 
+    /// Check for sessions that have exceeded the configured session timeout.
+    ///
+    /// When `session_timeout_secs > 0` and a running thread's total wall-clock
+    /// time (since `started_at`) exceeds the limit, the thread is marked failed,
+    /// the slot is released, and the thread is removed. The Claude Code process
+    /// is NOT killed — it may still be doing useful work.
+    fn check_session_timeouts(&mut self) {
+        let now = std::time::SystemTime::now();
+        let global_timeout = self.config.session_timeout_secs;
+        let has_phase_timeouts = !self.config.phase_timeouts.is_empty();
+
+        // If both global and per-phase timeouts are disabled, skip entirely
+        if global_timeout == 0 && !has_phase_timeouts {
+            return;
+        }
+
+        let timed_out: Vec<(TicketId, u64, Phase)> = self
+            .threads
+            .iter()
+            .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
+            .filter_map(|(tid, t)| {
+                // Check global session timeout (total wall-clock since start)
+                if global_timeout > 0 {
+                    let elapsed = now.duration_since(t.started_at).unwrap_or_default();
+                    if elapsed >= std::time::Duration::from_secs(global_timeout) {
+                        return Some((tid.clone(), elapsed.as_secs(), t.current_phase));
+                    }
+                }
+
+                // Check per-phase timeout (time-in-phase since last phase change)
+                let phase_limit = self.config.timeout_for_phase(t.current_phase);
+                if phase_limit > 0 && has_phase_timeouts {
+                    let elapsed_in_phase =
+                        now.duration_since(t.last_phase_change).unwrap_or_default();
+                    if elapsed_in_phase >= std::time::Duration::from_secs(phase_limit) {
+                        return Some((tid.clone(), elapsed_in_phase.as_secs(), t.current_phase));
+                    }
+                }
+
+                None
+            })
+            .collect();
+
+        for (ticket_id, elapsed_secs, phase) in timed_out {
+            if let Some(thread) = self.threads.get_mut(&ticket_id) {
+                thread.fail();
+            }
+            self.release_slot_for_ticket(&ticket_id);
+            self.threads.remove(&ticket_id);
+            self.timeout_alerts
+                .push((ticket_id.clone(), elapsed_secs, phase));
+            self.log_activity(ActivityEvent::SessionTimedOut {
+                ticket_id,
+                elapsed_secs,
+                phase,
+            });
+        }
+    }
+
     /// Detect threads that have been stuck beyond the hard timeout.
     ///
     /// The hard timeout is 2x the configured stuck_threshold_secs.
@@ -1250,6 +1317,9 @@ impl State {
 
         // Evaluate health: log transitions (Healthy→Stuck, etc.)
         self.evaluate_health();
+
+        // Check for sessions that exceeded the configured session timeout
+        self.check_session_timeouts();
 
         // Detect and handle stale threads at hard timeout (2x threshold)
         self.detect_stale_threads();
@@ -1434,6 +1504,16 @@ impl State {
             }
             ActivityEvent::FinishUpPromptSent { ticket_id, pane_id } => {
                 format!("FinishUpPromptSent: {} pane=#{}", ticket_id, pane_id)
+            }
+            ActivityEvent::SessionTimedOut {
+                ticket_id,
+                elapsed_secs,
+                phase,
+            } => {
+                format!(
+                    "SessionTimedOut: {} after {}s ({})",
+                    ticket_id, elapsed_secs, phase
+                )
             }
         }
     }
@@ -2221,6 +2301,23 @@ impl State {
             });
         }
 
+        // Append session timeout alerts
+        for (ticket_id, elapsed_secs, phase) in &self.timeout_alerts {
+            alerts.push(ui::HealthAlert {
+                ticket_id: ticket_id.clone(),
+                alert_type: ui::AlertType::TimedOut,
+                detail: format!(
+                    "Ran for {}m, timed out in {} phase",
+                    elapsed_secs / 60,
+                    phase
+                ),
+                suggested_actions: vec![
+                    "Check pane output".to_string(),
+                    "Increase session_timeout_secs".to_string(),
+                ],
+            });
+        }
+
         let slots: Vec<ui::SlotInfo> = self
             .agent_slots
             .iter()
@@ -2389,6 +2486,18 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
         ActivityEvent::FinishUpPromptSent { ticket_id, pane_id } => ui::ActivityType::Info {
             ticket_id: ticket_id.clone(),
             message: format!("Finish-up prompt sent (pane #{})", pane_id),
+        },
+        ActivityEvent::SessionTimedOut {
+            ticket_id,
+            elapsed_secs,
+            phase,
+        } => ui::ActivityType::Warning {
+            ticket_id: ticket_id.clone(),
+            message: format!(
+                "Session timed out after {}m (in {} phase)",
+                elapsed_secs / 60,
+                phase,
+            ),
         },
     };
 
@@ -5955,6 +6064,332 @@ mod tests {
         // None should be prompted — wrong phase, wrong status
         assert!(state.finish_up_sent.is_empty());
         assert!(state.activity_log.is_empty());
+    }
+
+    #[test]
+    fn test_check_session_timeouts_expired() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: timeout-test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let mut state = State {
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                session_timeout_secs: 1800, // 30 minutes
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Create a thread that started 31+ minutes ago (past 1800s timeout)
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        // Add an agent slot
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+        });
+
+        state.check_session_timeouts();
+
+        // Thread should be removed
+        assert!(state.threads.is_empty());
+
+        // Slot should be released
+        assert!(state.agent_slots[0].ticket_id.is_none());
+
+        // Activity log should have SessionTimedOut event
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::SessionTimedOut { ticket_id, phase, .. }
+            if ticket_id == "T-001" && *phase == Phase::Implement
+        )));
+
+        // timeout_alerts should be populated
+        assert_eq!(state.timeout_alerts.len(), 1);
+        assert_eq!(state.timeout_alerts[0].0, "T-001");
+        assert_eq!(state.timeout_alerts[0].2, Phase::Implement);
+    }
+
+    #[test]
+    fn test_check_session_timeouts_not_expired() {
+        use lisa_core::types::{Thread, ThreadStatus};
+
+        let mut state = State {
+            config: PluginConfig {
+                session_timeout_secs: 1800,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Create a thread that started 5 minutes ago (well within 1800s timeout)
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_session_timeouts();
+
+        // Thread should still be running
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(
+            state.threads.get("T-001").unwrap().status,
+            ThreadStatus::Running
+        );
+        assert!(state.timeout_alerts.is_empty());
+        assert!(state.activity_log.is_empty());
+    }
+
+    #[test]
+    fn test_check_session_timeouts_disabled() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                session_timeout_secs: 0, // disabled
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Create a thread that started 2 hours ago
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        thread.started_at =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_session_timeouts();
+
+        // Thread should still exist — timeout is disabled
+        assert_eq!(state.threads.len(), 1);
+        assert!(state.timeout_alerts.is_empty());
+        assert!(state.activity_log.is_empty());
+    }
+
+    #[test]
+    fn test_session_timed_out_event_to_ui() {
+        let event = ActivityEvent::SessionTimedOut {
+            ticket_id: "T-024-01".to_string(),
+            elapsed_secs: 1920, // 32 minutes
+            phase: Phase::Implement,
+        };
+        let entry = activity_event_to_ui_entry(&event).unwrap();
+        match &entry.activity {
+            ui::ActivityType::Warning { ticket_id, message } => {
+                assert_eq!(ticket_id, "T-024-01");
+                assert!(message.contains("32m"));
+                assert!(message.contains("implement"));
+            }
+            other => panic!("Expected Warning, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_per_phase_timeout_triggers() {
+        use lisa_core::types::Thread;
+        use std::collections::HashMap;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: phase-timeout\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        ).unwrap();
+
+        let mut phase_timeouts = HashMap::new();
+        phase_timeouts.insert(Phase::Research, 300); // 5 minutes
+
+        let mut state = State {
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                session_timeout_secs: 1800, // 30 min global
+                phase_timeouts,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Thread started 10 min ago, phase change was 6 min ago (exceeds 300s phase timeout)
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60);
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+        });
+
+        state.check_session_timeouts();
+
+        // Should be timed out by per-phase timeout (not global — only 10 min < 30 min)
+        assert!(state.threads.is_empty());
+        assert_eq!(state.timeout_alerts.len(), 1);
+        assert_eq!(state.timeout_alerts[0].2, Phase::Research);
+    }
+
+    #[test]
+    fn test_per_phase_timeout_not_triggered_within_limit() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::collections::HashMap;
+
+        let mut phase_timeouts = HashMap::new();
+        phase_timeouts.insert(Phase::Research, 300);
+
+        let mut state = State {
+            config: PluginConfig {
+                session_timeout_secs: 1800,
+                phase_timeouts,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Thread in research phase for 4 minutes (within 300s limit)
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_session_timeouts();
+
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(
+            state.threads.get("T-001").unwrap().status,
+            ThreadStatus::Running
+        );
+        assert!(state.timeout_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_per_phase_timeout_fallback_to_global() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::collections::HashMap;
+
+        // Only set per-phase timeout for research, not implement
+        let mut phase_timeouts = HashMap::new();
+        phase_timeouts.insert(Phase::Research, 300);
+
+        let mut state = State {
+            config: PluginConfig {
+                session_timeout_secs: 1800,
+                phase_timeouts,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Thread in implement phase for 10 minutes — no per-phase override,
+        // falls back to global session_timeout_secs (1800s) which hasn't elapsed
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_session_timeouts();
+
+        // Should still be running (fallback timeout is 1800s, only 600s elapsed)
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(
+            state.threads.get("T-001").unwrap().status,
+            ThreadStatus::Running
+        );
+    }
+
+    #[test]
+    fn test_global_timeout_still_enforced_with_phase_timeouts() {
+        use lisa_core::types::Thread;
+        use std::collections::HashMap;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: global-timeout\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let mut phase_timeouts = HashMap::new();
+        phase_timeouts.insert(Phase::Implement, 3600); // 1 hour per-phase (generous)
+
+        let mut state = State {
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                session_timeout_secs: 1800, // 30 min global cap
+                phase_timeouts,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Thread started 35 minutes ago, but phase change was 20 min ago
+        // Global timeout (1800s) exceeded, even though per-phase (3600s) is not
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(35 * 60);
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+        });
+
+        state.check_session_timeouts();
+
+        // Should be timed out by global timeout
+        assert!(state.threads.is_empty());
+        assert_eq!(state.timeout_alerts.len(), 1);
+    }
+
+    #[test]
+    fn test_to_ui_state_includes_timeout_alerts() {
+        let mut state = State::default();
+        state.initialized = true;
+        state.timeout_alerts.push((
+            "T-001".to_string(),
+            1920, // 32 minutes
+            Phase::Implement,
+        ));
+
+        let ui_state = state.to_ui_state();
+
+        assert_eq!(ui_state.alerts.len(), 1);
+        assert_eq!(ui_state.alerts[0].ticket_id, "T-001");
+        assert_eq!(ui_state.alerts[0].alert_type, ui::AlertType::TimedOut);
+        assert!(ui_state.alerts[0].detail.contains("32m"));
     }
 }
 

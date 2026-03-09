@@ -2,19 +2,15 @@ use std::path::Path;
 
 use crate::config;
 use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
-use lisa_core::types::PluginConfig;
 
 /// Run the status command: scan tickets, build DAG, print scheduling state.
 pub fn run_status(root: &Path) -> Result<(), String> {
-    // Load config to get ticket directory
-    let ticket_dir_rel = match config::load_config(root) {
-        Ok(validation) => validation
-            .config
-            .dirs
-            .tickets
-            .unwrap_or_else(|| PluginConfig::DEFAULT_TICKET_DIR.to_string()),
-        Err(_) => PluginConfig::DEFAULT_TICKET_DIR.to_string(),
+    // Load config to get ticket directory and scheduling settings
+    let resolved = match config::load_config(root) {
+        Ok(validation) => config::resolve_config(&validation.config, None),
+        Err(_) => config::ResolvedConfig::default(),
     };
+    let ticket_dir_rel = resolved.ticket_dir.clone();
 
     let ticket_dir = root.join(&ticket_dir_rel);
     if !ticket_dir.exists() {
@@ -67,6 +63,24 @@ pub fn run_status(root: &Path) -> Result<(), String> {
         "Status: {} done, {} in progress, {} ready, {} blocked",
         stats.done_tickets, stats.in_progress_tickets, stats.ready_tickets, stats.blocked_tickets
     );
+    let timeout_str = if resolved.session_timeout_secs == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{}s", resolved.session_timeout_secs)
+    };
+    println!(
+        "Config: max_threads={}, session_timeout={}",
+        resolved.max_threads, timeout_str
+    );
+    if !resolved.phase_timeouts.is_empty() {
+        let mut entries: Vec<_> = resolved.phase_timeouts.iter().collect();
+        entries.sort_by_key(|(k, _)| k.clone());
+        let parts: Vec<String> = entries
+            .iter()
+            .map(|(k, v)| format!("{}={}s", k, v))
+            .collect();
+        println!("  phase_timeouts: {}", parts.join(" "));
+    }
     println!();
 
     // Print execution waves

@@ -28,6 +28,8 @@ pub struct SchedulingConfig {
     pub max_threads: Option<usize>,
     pub auto_advance: Option<bool>,
     pub review_timeout_secs: Option<u64>,
+    pub session_timeout_secs: Option<u64>,
+    pub phase_timeouts: Option<std::collections::HashMap<String, u64>>,
 }
 
 /// Fully resolved configuration with all defaults applied.
@@ -39,6 +41,8 @@ pub struct ResolvedConfig {
     pub max_threads: usize,
     pub auto_advance: bool,
     pub review_timeout_secs: u64,
+    pub session_timeout_secs: u64,
+    pub phase_timeouts: std::collections::HashMap<String, u64>,
 }
 
 impl Default for ResolvedConfig {
@@ -50,6 +54,8 @@ impl Default for ResolvedConfig {
             max_threads: PluginConfig::DEFAULT_MAX_THREADS,
             auto_advance: false,
             review_timeout_secs: PluginConfig::DEFAULT_REVIEW_TIMEOUT_SECS,
+            session_timeout_secs: PluginConfig::DEFAULT_SESSION_TIMEOUT_SECS,
+            phase_timeouts: std::collections::HashMap::new(),
         }
     }
 }
@@ -94,6 +100,11 @@ pub fn resolve_config(config: &LisaConfig, cli_max_threads: Option<usize>) -> Re
             .scheduling
             .review_timeout_secs
             .unwrap_or(defaults.review_timeout_secs),
+        session_timeout_secs: config
+            .scheduling
+            .session_timeout_secs
+            .unwrap_or(defaults.session_timeout_secs),
+        phase_timeouts: config.scheduling.phase_timeouts.clone().unwrap_or_default(),
     }
 }
 
@@ -111,7 +122,13 @@ pub struct ConfigValidation {
 pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     let known_top = &["version", "dirs", "scheduling"];
     let known_dirs = &["tickets", "stories", "work"];
-    let known_scheduling = &["max_threads", "auto_advance", "review_timeout_secs"];
+    let known_scheduling = &[
+        "max_threads",
+        "auto_advance",
+        "review_timeout_secs",
+        "session_timeout_secs",
+        "phase_timeouts",
+    ];
 
     // Parse as generic Value to detect unknown keys
     let value: toml::Value = content
@@ -139,6 +156,26 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
             for key in sched.keys() {
                 if !known_scheduling.contains(&key.as_str()) {
                     warnings.push(format!("Unknown key in [scheduling]: {}", key));
+                }
+            }
+
+            // Validate phase names in [scheduling.phase_timeouts]
+            let known_phases = &[
+                "research",
+                "design",
+                "structure",
+                "plan",
+                "implement",
+                "review",
+            ];
+            if let Some(toml::Value::Table(pt)) = sched.get("phase_timeouts") {
+                for key in pt.keys() {
+                    if !known_phases.contains(&key.as_str()) {
+                        warnings.push(format!(
+                            "Unknown phase in [scheduling.phase_timeouts]: {}",
+                            key
+                        ));
+                    }
                 }
             }
         }
@@ -197,6 +234,12 @@ work = "docs/active/work"
 max_threads = 2
 # auto_advance = false
 # review_timeout_secs = 240
+# session_timeout_secs = 1800
+
+# [scheduling.phase_timeouts]
+# research = 300
+# design = 300
+# implement = 1800
 "#
 }
 
@@ -436,6 +479,35 @@ foo = 1
     }
 
     #[test]
+    fn test_parse_session_timeout_secs() {
+        let toml_str = "[scheduling]\nsession_timeout_secs = 3600\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.scheduling.session_timeout_secs, Some(3600));
+    }
+
+    #[test]
+    fn test_resolve_session_timeout_default() {
+        let config = LisaConfig::default();
+        let resolved = resolve_config(&config, None);
+        assert_eq!(resolved.session_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn test_resolve_session_timeout_from_config() {
+        let toml_str = "[scheduling]\nsession_timeout_secs = 900\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None);
+        assert_eq!(resolved.session_timeout_secs, 900);
+    }
+
+    #[test]
+    fn test_validate_session_timeout_known_key() {
+        let result = validate_config("[scheduling]\nsession_timeout_secs = 1800\n").unwrap();
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.config.scheduling.session_timeout_secs, Some(1800));
+    }
+
+    #[test]
     fn test_validate_version_is_known_key() {
         let result = validate_config("version = \"0.2.1\"\n").unwrap();
         assert!(result.warnings.is_empty());
@@ -453,5 +525,81 @@ foo = 1
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.version, Some("0.2.1".to_string()));
         assert_eq!(config.scheduling.max_threads, Some(4));
+    }
+
+    #[test]
+    fn test_parse_phase_timeouts() {
+        let toml_str = r#"
+[scheduling]
+session_timeout_secs = 900
+
+[scheduling.phase_timeouts]
+research = 300
+implement = 1800
+"#;
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let pt = config.scheduling.phase_timeouts.unwrap();
+        assert_eq!(pt.get("research"), Some(&300));
+        assert_eq!(pt.get("implement"), Some(&1800));
+        assert_eq!(pt.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_phase_timeouts() {
+        let toml_str = r#"
+[scheduling.phase_timeouts]
+research = 300
+implement = 1800
+"#;
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None);
+        assert_eq!(resolved.phase_timeouts.get("research"), Some(&300));
+        assert_eq!(resolved.phase_timeouts.get("implement"), Some(&1800));
+    }
+
+    #[test]
+    fn test_resolve_phase_timeouts_empty_default() {
+        let config = LisaConfig::default();
+        let resolved = resolve_config(&config, None);
+        assert!(resolved.phase_timeouts.is_empty());
+    }
+
+    #[test]
+    fn test_validate_phase_timeouts_known_key() {
+        let toml_str = r#"
+[scheduling]
+session_timeout_secs = 900
+
+[scheduling.phase_timeouts]
+research = 300
+implement = 1800
+"#;
+        let result = validate_config(toml_str).unwrap();
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_phase_timeouts_unknown_phase() {
+        let toml_str = r#"
+[scheduling.phase_timeouts]
+research = 300
+compile = 1800
+"#;
+        let result = validate_config(toml_str).unwrap();
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("compile"));
+        assert!(result.warnings[0].contains("[scheduling.phase_timeouts]"));
+    }
+
+    #[test]
+    fn test_parse_partial_phase_timeouts() {
+        let toml_str = r#"
+[scheduling.phase_timeouts]
+implement = 1800
+"#;
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let pt = config.scheduling.phase_timeouts.unwrap();
+        assert_eq!(pt.len(), 1);
+        assert_eq!(pt.get("implement"), Some(&1800));
     }
 }

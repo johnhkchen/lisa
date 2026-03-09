@@ -47,6 +47,124 @@ fn update_version_in_toml(existing: &str, new_version: &str) -> String {
     }
 }
 
+/// Upsert missing keys from the default config template into an existing .lisa.toml.
+/// New keys are appended as commented-out lines under the appropriate section.
+fn upsert_missing_config_keys(existing: &str) -> String {
+    let mut result = existing.to_string();
+
+    // Parse existing to detect what's present (both active and commented keys)
+    let has_key = |content: &str, section: &str, key: &str| -> bool {
+        let mut in_section = section.is_empty(); // top-level keys: always "in section"
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // Track section headers (both active and commented)
+            if trimmed.starts_with('[') || trimmed.starts_with("# [") {
+                let cleaned = trimmed.trim_start_matches('#').trim().trim_matches('[').trim_matches(']');
+                if section.is_empty() {
+                    // We left the top-level area
+                    if !cleaned.is_empty() {
+                        in_section = false;
+                    }
+                } else {
+                    in_section = cleaned == section;
+                }
+                continue;
+            }
+            if in_section {
+                // Check both active and commented forms: "key = " or "# key = "
+                let without_comment = trimmed.trim_start_matches('#').trim();
+                if without_comment.starts_with(key)
+                    && without_comment[key.len()..].trim_start().starts_with('=')
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    // Check if a section header exists (active or commented)
+    let has_section = |content: &str, section: &str| -> bool {
+        let active = format!("[{}]", section);
+        let commented = format!("# [{}]", section);
+        content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed == active || trimmed == commented
+        })
+    };
+
+    // Find insertion point: the line index after the last line of a section
+    let find_section_end = |content: &str, section: &str| -> Option<usize> {
+        let mut in_section = false;
+        let mut last_section_line = None;
+        for (i, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') || trimmed.starts_with("# [") {
+                let cleaned = trimmed.trim_start_matches('#').trim().trim_matches('[').trim_matches(']');
+                if cleaned == section {
+                    in_section = true;
+                    last_section_line = Some(i);
+                    continue;
+                } else if in_section {
+                    // Hit a different section — end of our section
+                    return last_section_line.map(|l| l + 1);
+                }
+            }
+            if in_section && !trimmed.is_empty() {
+                last_section_line = Some(i);
+            }
+        }
+        // Section goes to end of file
+        last_section_line.map(|l| l + 1)
+    };
+
+    // Insert a line after a given line index
+    let insert_after = |content: &str, after_line: usize, new_lines: &str| -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut out = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            out.push_str(line);
+            out.push('\n');
+            if i + 1 == after_line {
+                out.push_str(new_lines);
+            }
+        }
+        // If after_line is past the end, append
+        if after_line >= lines.len() {
+            out.push_str(new_lines);
+        }
+        out
+    };
+
+    // [scheduling] keys to upsert
+    let scheduling_keys: &[(&str, &str)] = &[
+        ("auto_advance", "# auto_advance = false"),
+        ("review_timeout_secs", "# review_timeout_secs = 240"),
+        ("session_timeout_secs", "# session_timeout_secs = 1800"),
+    ];
+
+    for (key, commented_line) in scheduling_keys {
+        if !has_key(&result, "scheduling", key) {
+            if let Some(end) = find_section_end(&result, "scheduling") {
+                result = insert_after(&result, end, &format!("{}\n", commented_line));
+            }
+        }
+    }
+
+    // [scheduling.phase_timeouts] section
+    if !has_section(&result, "scheduling.phase_timeouts") {
+        let phase_block = "\n# [scheduling.phase_timeouts]\n# research = 300\n# design = 300\n# implement = 1800\n";
+        if let Some(end) = find_section_end(&result, "scheduling") {
+            result = insert_after(&result, end, phase_block);
+        } else {
+            // No scheduling section at all — append
+            result.push_str(phase_block);
+        }
+    }
+
+    result
+}
+
 /// An action that init will perform
 #[derive(Debug, Clone)]
 pub enum InitAction {
@@ -140,26 +258,26 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
             Ok(existing) => {
                 let parsed: Result<config::LisaConfig, _> = toml::from_str(&existing);
                 let project_version = parsed.ok().and_then(|c| c.version);
-                match &project_version {
-                    Some(v) if !config::version_is_stale(v, config::LISA_VERSION) => {
-                        actions.push(InitAction::Skip {
-                            path: config_path,
-                            reason: "already up to date".to_string(),
-                        });
-                    }
-                    _ => {
-                        // Update the version line in the existing config
-                        let old_label = project_version.as_deref().unwrap_or("none");
-                        let updated = update_version_in_toml(&existing, config::LISA_VERSION);
-                        actions.push(InitAction::UpdateFile {
-                            path: config_path.clone(),
-                            content: updated,
-                        });
-                        // Use a separate skip entry for display purposes isn't needed;
-                        // the Display impl for UpdateFile will show the path.
-                        // We can add context via a separate mechanism if needed.
-                        let _ = old_label; // used for plan output context
-                    }
+                let version_current = matches!(&project_version, Some(v) if !config::version_is_stale(v, config::LISA_VERSION));
+
+                // Always upsert missing keys, even if version is current
+                let with_version = if version_current {
+                    existing.clone()
+                } else {
+                    update_version_in_toml(&existing, config::LISA_VERSION)
+                };
+                let updated = upsert_missing_config_keys(&with_version);
+
+                if updated == existing {
+                    actions.push(InitAction::Skip {
+                        path: config_path,
+                        reason: "already up to date".to_string(),
+                    });
+                } else {
+                    actions.push(InitAction::UpdateFile {
+                        path: config_path.clone(),
+                        content: updated,
+                    });
                 }
             }
             Err(_) => {
@@ -735,7 +853,32 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
 /// When `check_tools` is true, also verifies that `zellij` and `claude` are on PATH.
 pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
     let result = validate(root, check_tools);
-    print_diagnostics(&result)
+    print_diagnostics(&result)?;
+
+    // On success, print config summary including timeout
+    let resolved = match config::load_config(root) {
+        Ok(validation) => config::resolve_config(&validation.config, None),
+        Err(_) => config::ResolvedConfig::default(),
+    };
+    let timeout_str = if resolved.session_timeout_secs == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{}s", resolved.session_timeout_secs)
+    };
+    println!(
+        "Config: max_threads={}, session_timeout={}",
+        resolved.max_threads, timeout_str
+    );
+    if !resolved.phase_timeouts.is_empty() {
+        let mut entries: Vec<_> = resolved.phase_timeouts.iter().collect();
+        entries.sort_by_key(|(k, _)| k.clone());
+        let parts: Vec<String> = entries
+            .iter()
+            .map(|(k, v)| format!("{}={}s", k, v))
+            .collect();
+        println!("  phase_timeouts: {}", parts.join(" "));
+    }
+    Ok(())
 }
 
 /// Print structured validation diagnostics and return appropriate Result.
@@ -1510,6 +1653,27 @@ depends_on: [T-999]
     #[test]
     fn test_plan_init_skips_current_version() {
         let dir = tempfile::tempdir().unwrap();
+        // Include all known keys so upsert has nothing to add
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            config::default_config_toml(),
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        let skipped: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with(".lisa.toml")))
+            .collect();
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_init_upserts_missing_config_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        // Current version but missing new keys
         fs::write(
             dir.path().join(".lisa.toml"),
             &format!(
@@ -1522,11 +1686,56 @@ depends_on: [T-999]
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        let skipped: Vec<_> = actions
+        let updated: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with(".lisa.toml")))
+            .filter(
+                |a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(".lisa.toml")),
+            )
             .collect();
-        assert_eq!(skipped.len(), 1);
+        assert_eq!(updated.len(), 1, "should update to add missing keys");
+
+        // Verify the content has the new keys
+        if let InitAction::UpdateFile { content, .. } = &updated[0] {
+            assert!(content.contains("session_timeout_secs"));
+            assert!(content.contains("phase_timeouts"));
+            assert!(content.contains("review_timeout_secs"));
+            // Original content preserved
+            assert!(content.contains("max_threads = 4"));
+        }
+    }
+
+    #[test]
+    fn test_upsert_missing_config_keys_preserves_active_values() {
+        let existing = "[scheduling]\nmax_threads = 4\nsession_timeout_secs = 900\n";
+        let result = upsert_missing_config_keys(existing);
+        // Should not duplicate session_timeout_secs
+        assert_eq!(
+            result.matches("session_timeout_secs").count(),
+            1,
+            "should not duplicate existing key"
+        );
+        // Should add missing keys
+        assert!(result.contains("review_timeout_secs"));
+        assert!(result.contains("phase_timeouts"));
+    }
+
+    #[test]
+    fn test_upsert_missing_config_keys_preserves_commented_values() {
+        let existing = "[scheduling]\nmax_threads = 4\n# session_timeout_secs = 3600\n";
+        let result = upsert_missing_config_keys(existing);
+        // Should not duplicate — commented key counts as present
+        assert_eq!(
+            result.matches("session_timeout_secs").count(),
+            1,
+            "should not duplicate commented key"
+        );
+    }
+
+    #[test]
+    fn test_upsert_noop_when_complete() {
+        let complete = config::default_config_toml();
+        let result = upsert_missing_config_keys(&complete);
+        assert_eq!(result, complete, "should be no-op when all keys present");
     }
 
     #[test]

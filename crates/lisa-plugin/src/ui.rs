@@ -158,6 +158,8 @@ pub enum AlertType {
     Stuck,
     /// Agent went idle but expected phase artifact is missing.
     IdleWithoutArtifact,
+    /// Session exceeded the configured session_timeout_secs.
+    TimedOut,
 }
 
 /// A health alert for the attention banner.
@@ -423,6 +425,7 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
             AlertType::Failed => ("✗ FAILED", RED),
             AlertType::Stuck => ("! STUCK ", YELLOW),
             AlertType::IdleWithoutArtifact => ("⏸ IDLE  ", YELLOW),
+            AlertType::TimedOut => ("⏱ TIMEOUT", YELLOW),
         };
 
         let detail_max = inner_w.saturating_sub(24); // label + space + ticket_id + space
