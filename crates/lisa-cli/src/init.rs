@@ -59,7 +59,11 @@ fn upsert_missing_config_keys(existing: &str) -> String {
             let trimmed = line.trim();
             // Track section headers (both active and commented)
             if trimmed.starts_with('[') || trimmed.starts_with("# [") {
-                let cleaned = trimmed.trim_start_matches('#').trim().trim_matches('[').trim_matches(']');
+                let cleaned = trimmed
+                    .trim_start_matches('#')
+                    .trim()
+                    .trim_matches('[')
+                    .trim_matches(']');
                 if section.is_empty() {
                     // We left the top-level area
                     if !cleaned.is_empty() {
@@ -100,7 +104,11 @@ fn upsert_missing_config_keys(existing: &str) -> String {
         for (i, line) in content.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with('[') || trimmed.starts_with("# [") {
-                let cleaned = trimmed.trim_start_matches('#').trim().trim_matches('[').trim_matches(']');
+                let cleaned = trimmed
+                    .trim_start_matches('#')
+                    .trim()
+                    .trim_matches('[')
+                    .trim_matches(']');
                 if cleaned == section {
                     in_section = true;
                     last_section_line = Some(i);
@@ -1654,11 +1662,7 @@ depends_on: [T-999]
     fn test_plan_init_skips_current_version() {
         let dir = tempfile::tempdir().unwrap();
         // Include all known keys so upsert has nothing to add
-        fs::write(
-            dir.path().join(".lisa.toml"),
-            config::default_config_toml(),
-        )
-        .unwrap();
+        fs::write(dir.path().join(".lisa.toml"), config::default_config_toml()).unwrap();
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
