@@ -74,7 +74,7 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     );
     if !resolved.phase_timeouts.is_empty() {
         let mut entries: Vec<_> = resolved.phase_timeouts.iter().collect();
-        entries.sort_by_key(|(k, _)| k.clone());
+        entries.sort_by_key(|(k, _)| (*k).clone());
         let parts: Vec<String> = entries
             .iter()
             .map(|(k, v)| format!("{}={}s", k, v))

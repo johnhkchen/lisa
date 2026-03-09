@@ -879,7 +879,7 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
     );
     if !resolved.phase_timeouts.is_empty() {
         let mut entries: Vec<_> = resolved.phase_timeouts.iter().collect();
-        entries.sort_by_key(|(k, _)| k.clone());
+        entries.sort_by_key(|(k, _)| (*k).clone());
         let parts: Vec<String> = entries
             .iter()
             .map(|(k, v)| format!("{}={}s", k, v))
