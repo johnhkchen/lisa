@@ -197,17 +197,28 @@ pub struct ActivityEntry {
     pub activity: ActivityType,
 }
 
+/// Which kind of modal is being shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModalKind {
+    #[default]
+    MarkDone,
+    ResetTicket,
+    QuitConfirm,
+}
+
 /// State for the modal overlay (UI representation).
 #[derive(Debug, Clone, Default)]
 pub struct ModalState {
     /// Whether the modal is visible.
     pub open: bool,
-    /// Ticket IDs shown in the list.
+    /// Ticket IDs shown in the list (undone tickets for QuitConfirm).
     pub ticket_ids: Vec<String>,
     /// Currently highlighted index.
     pub cursor: usize,
-    /// Whether this is a reset modal (vs mark-done).
-    pub is_reset: bool,
+    /// Which modal variant is shown.
+    pub kind: ModalKind,
+    /// (QuitConfirm only) New ticket IDs not in the current DAG.
+    pub new_ticket_ids: Vec<String>,
 }
 
 /// Which preset view is active on the dashboard.
@@ -1034,8 +1045,12 @@ fn render_activity_view(state: &PluginState, height: usize, output: &mut Vec<Str
     render_activity_log(state, max_entries, output);
 }
 
-/// Render the mark-done modal as an overlay.
+/// Render a modal overlay (mark-done, reset-ticket, or quit-confirm).
 fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> {
+    if modal.kind == ModalKind::QuitConfirm {
+        return render_quit_confirm_modal(modal, width, height);
+    }
+
     let mut output = Vec::new();
 
     let box_w = width.min(50);
@@ -1054,7 +1069,7 @@ fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> 
     output.push(format!("┌{}┐", border_h));
 
     // Title
-    let title = if modal.is_reset {
+    let title = if modal.kind == ModalKind::ResetTicket {
         " Reset Ticket to Ready "
     } else {
         " Mark Ticket Done "
@@ -1105,6 +1120,123 @@ fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> 
         RESET,
         " ".repeat(fr),
     ));
+    // Bottom border
+    output.push(format!("└{}┘", border_h));
+
+    output
+}
+
+/// Render the quit confirmation modal.
+///
+/// Shows undone tickets (current DAG) and new tickets (not yet in DAG),
+/// with Enter=keep working, q=quit.
+fn render_quit_confirm_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> {
+    let mut output = Vec::new();
+
+    let box_w = width.min(50);
+    let inner_w = box_w.saturating_sub(2);
+
+    // Calculate content lines
+    let has_undone = !modal.ticket_ids.is_empty();
+    let has_new = !modal.new_ticket_ids.is_empty();
+    // content: warning line + blank + optional sections + blank before footer
+    let undone_lines = if has_undone {
+        2 + modal.ticket_ids.len() // header + tickets + blank
+    } else {
+        0
+    };
+    let new_lines = if has_new {
+        2 + modal.new_ticket_ids.len() // header + tickets + blank
+    } else {
+        0
+    };
+    let content_lines = 1 + undone_lines + new_lines; // warning line + sections
+    let box_h = content_lines + 4; // top border + title + separator + content + footer-sep + footer + bottom border
+    let pad_top = height.saturating_sub(box_h) / 2;
+
+    let border_h = "─".repeat(inner_w);
+
+    // Helper: pad a visible string to fill the box interior
+    let pad_line = |visible: &str, visible_len: usize| -> String {
+        let pad = inner_w.saturating_sub(visible_len);
+        format!("│{}{}│", visible, " ".repeat(pad))
+    };
+
+    // Top padding
+    for _ in 0..pad_top {
+        output.push(String::new());
+    }
+
+    // Top border
+    output.push(format!("┌{}┐", border_h));
+
+    // Title
+    let title = " Quit Lisa? ";
+    let title_pad = inner_w.saturating_sub(title.len());
+    let tl = title_pad / 2;
+    let tr = title_pad - tl;
+    output.push(format!(
+        "│{}{}{}{}{}│",
+        " ".repeat(tl),
+        BOLD,
+        title,
+        RESET,
+        " ".repeat(tr),
+    ));
+
+    // Separator
+    output.push(format!("├{}┤", border_h));
+
+    // Warning line
+    let warn = "  There is pending work:";
+    output.push(pad_line(
+        &format!("{}{}{}", YELLOW, warn, RESET),
+        warn.len(),
+    ));
+
+    // Undone tickets section
+    if has_undone {
+        output.push(pad_line("", 0));
+        let hdr = "  In progress (current DAG):";
+        output.push(pad_line(
+            &format!("{}{}{}", DIM, hdr, RESET),
+            hdr.len(),
+        ));
+        for tid in &modal.ticket_ids {
+            let entry = format!("    {}", tid);
+            output.push(pad_line(&entry, entry.len()));
+        }
+    }
+
+    // New tickets section
+    if has_new {
+        output.push(pad_line("", 0));
+        let hdr = "  New tickets (not yet scheduled):";
+        output.push(pad_line(
+            &format!("{}{}{}", DIM, hdr, RESET),
+            hdr.len(),
+        ));
+        for tid in &modal.new_ticket_ids {
+            let entry = format!("    {}", tid);
+            output.push(pad_line(&entry, entry.len()));
+        }
+    }
+
+    // Footer
+    output.push(format!("├{}┤", border_h));
+    let footer = " Enter=keep working  q=quit ";
+    let footer_pad = inner_w.saturating_sub(footer.len());
+    let fl = footer_pad / 2;
+    let fr = footer_pad - fl;
+    output.push(format!(
+        "│{}{}{}{}{}│",
+        " ".repeat(fl),
+        DIM,
+        footer,
+        RESET,
+        " ".repeat(fr),
+    ));
+
     // Bottom border
     output.push(format!("└{}┘", border_h));
 
@@ -2258,7 +2390,8 @@ mod tests {
             open: true,
             ticket_ids: vec!["T-001".to_string()],
             cursor: 0,
-            is_reset: true,
+            kind: ModalKind::ResetTicket,
+            new_ticket_ids: Vec::new(),
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");
@@ -2274,7 +2407,8 @@ mod tests {
             open: true,
             ticket_ids: vec!["T-001".to_string()],
             cursor: 0,
-            is_reset: false,
+            kind: ModalKind::MarkDone,
+            new_ticket_ids: Vec::new(),
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");

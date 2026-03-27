@@ -113,6 +113,8 @@ enum ModalMode {
     #[default]
     MarkDone,
     ResetTicket,
+    /// Quit confirmation: shows pending/new work, Enter=keep working, q=quit.
+    QuitConfirm,
 }
 
 /// Per-slot state machine for session transitions.
@@ -129,7 +131,7 @@ enum TransitionState {
     WaitingForClear,
 }
 
-/// State for the modal overlay (mark-done or reset-ticket).
+/// State for the modal overlay (mark-done, reset-ticket, or quit-confirm).
 #[derive(Default)]
 struct MarkDoneModal {
     /// Whether the modal is currently visible.
@@ -140,6 +142,8 @@ struct MarkDoneModal {
     cursor: usize,
     /// What action to take on confirm.
     mode: ModalMode,
+    /// (QuitConfirm only) New ticket IDs found outside the current DAG.
+    new_ticket_ids: Vec<TicketId>,
 }
 
 /// Main plugin state
@@ -1740,6 +1744,27 @@ impl State {
     /// Handle keyboard input. Returns true if the UI should re-render.
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
         if self.modal.open {
+            // Quit-confirm modal has its own key handling
+            if self.modal.mode == ModalMode::QuitConfirm {
+                match key.bare_key {
+                    BareKey::Char('q') => {
+                        // Actually quit
+                        self.modal.open = false;
+                        quit_zellij();
+                    }
+                    BareKey::Enter => {
+                        // Keep working: rescan, acquire new tickets, resume
+                        self.keep_working();
+                    }
+                    BareKey::Esc => {
+                        // Dismiss without quitting (back to dashboard)
+                        self.modal.open = false;
+                    }
+                    _ => return false,
+                }
+                return true;
+            }
+
             match key.bare_key {
                 BareKey::Esc | BareKey::Char('q') => {
                     self.modal.open = false;
@@ -1759,6 +1784,7 @@ impl State {
                         match self.modal.mode {
                             ModalMode::MarkDone => self.mark_ticket_done(&ticket_id),
                             ModalMode::ResetTicket => self.reset_ticket(&ticket_id),
+                            ModalMode::QuitConfirm => {} // handled above
                         }
                     }
                     self.modal.open = false;
@@ -1825,6 +1851,12 @@ impl State {
             return true;
         }
 
+        // Normal mode: 'q' tries to quit — shows confirmation if work remains
+        if key.bare_key == BareKey::Char('q') {
+            self.try_quit();
+            return true;
+        }
+
         false
     }
 
@@ -1878,6 +1910,7 @@ impl State {
             ticket_ids: ids,
             cursor: 0,
             mode: ModalMode::MarkDone,
+            new_ticket_ids: Vec::new(),
         };
     }
 
@@ -1969,6 +2002,7 @@ impl State {
             ticket_ids: ids,
             cursor: 0,
             mode: ModalMode::ResetTicket,
+            new_ticket_ids: Vec::new(),
         };
     }
 
@@ -2023,6 +2057,71 @@ impl State {
 
         // Rebuild DAG but don't schedule — user is likely paused
         self.rebuild_dag();
+    }
+
+    /// Try to quit: rescan tickets and show confirmation if there's undone or new work.
+    /// If nothing remains, quit immediately.
+    fn try_quit(&mut self) {
+        // Rescan tickets from disk to detect any new ones
+        let fresh_tickets = match ticket::scan_tickets(&self.config.ticket_dir) {
+            Ok(t) => t,
+            Err(_) => {
+                // Can't scan — just quit
+                quit_zellij();
+                return;
+            }
+        };
+
+        // Current DAG ticket IDs
+        let current_ids: HashSet<&str> = self.dag.tickets().map(|t| t.id.as_str()).collect();
+
+        // Undone tickets in the current DAG
+        let mut undone: Vec<TicketId> = self
+            .dag
+            .tickets()
+            .filter(|t| t.phase != Phase::Done)
+            .map(|t| t.id.clone())
+            .collect();
+        undone.sort();
+
+        // New tickets not in the current DAG (any phase)
+        let mut new_tickets: Vec<TicketId> = fresh_tickets
+            .iter()
+            .filter(|t| !current_ids.contains(t.id.as_str()))
+            .map(|t| t.id.clone())
+            .collect();
+        new_tickets.sort();
+
+        if undone.is_empty() && new_tickets.is_empty() {
+            // Nothing pending — quit immediately
+            quit_zellij();
+            return;
+        }
+
+        // Show confirmation modal
+        self.modal = MarkDoneModal {
+            open: true,
+            ticket_ids: undone,
+            cursor: 0,
+            mode: ModalMode::QuitConfirm,
+            new_ticket_ids: new_tickets,
+        };
+    }
+
+    /// Resume work after quit confirmation: rebuild DAG (acquires new tickets),
+    /// clear terminated state, and re-arm the scheduler.
+    fn keep_working(&mut self) {
+        self.modal.open = false;
+        self.terminated = false;
+        self.rebuild_dag();
+        self.schedule_ready_tickets();
+        // Re-arm the poll timer if it was stopped
+        if self.pending_timer_count == 0 {
+            self.arm_timer(POLL_INTERVAL_SECS);
+        }
+        self.log_activity(ActivityEvent::Info {
+            message: "Resuming — rescanned tickets and rebuilt DAG".to_string(),
+        });
     }
 }
 
@@ -2166,8 +2265,8 @@ impl ZellijPlugin for State {
             return;
         }
 
-        if self.terminated {
-            println!("All tickets done. Lisa loop complete.");
+        if self.terminated && !self.modal.open {
+            println!("All tickets done. Lisa loop complete. Press [q] to quit.");
             return;
         }
 
@@ -2348,7 +2447,12 @@ impl State {
                 open: self.modal.open,
                 ticket_ids: self.modal.ticket_ids.clone(),
                 cursor: self.modal.cursor,
-                is_reset: self.modal.mode == ModalMode::ResetTicket,
+                kind: match self.modal.mode {
+                    ModalMode::MarkDone => ui::ModalKind::MarkDone,
+                    ModalMode::ResetTicket => ui::ModalKind::ResetTicket,
+                    ModalMode::QuitConfirm => ui::ModalKind::QuitConfirm,
+                },
+                new_ticket_ids: self.modal.new_ticket_ids.clone(),
             },
             paused: self.paused,
             active_view: self.view_preset,
