@@ -147,8 +147,9 @@ fn upsert_missing_config_keys(existing: &str) -> String {
     // [scheduling] keys to upsert
     let scheduling_keys: &[(&str, &str)] = &[
         ("auto_advance", "# auto_advance = false"),
-        ("review_timeout_secs", "# review_timeout_secs = 240"),
-        ("session_timeout_secs", "# session_timeout_secs = 1800"),
+        ("review_timeout_secs", "# review_timeout_secs = 600"),
+        ("session_timeout_secs", "# session_timeout_secs = 3600"),
+        ("wind_down_secs", "# wind_down_secs = 300"),
     ];
 
     for (key, commented_line) in scheduling_keys {
@@ -321,6 +322,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         ("on-idle.sh", templates::ON_IDLE_HOOK),
         ("on-stop.sh", templates::ON_STOP_HOOK),
         ("on-clear.sh", templates::ON_CLEAR_HOOK),
+        ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
     ];
     for (name, content) in hook_scripts {
         let hook_path = root.join(format!(".lisa/hooks/{}", name));
@@ -474,7 +476,7 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh"] {
+        for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh", "on-heartbeat.sh"] {
             let hook_path = root.join(format!(".lisa/hooks/{}", script));
             if hook_path.exists() {
                 let perms = fs::Permissions::from_mode(0o755);
@@ -646,6 +648,7 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
                     ("idle_prompt", "Notification[idle_prompt]"),
                     ("\"Stop\"", "Stop"),
                     ("\"SessionStart\"", "SessionStart[clear]"),
+                    ("\"PostToolUse\"", "PostToolUse[heartbeat]"),
                 ] {
                     if !content.contains(key) {
                         diagnostics.push(ValidationDiagnostic {
@@ -668,8 +671,8 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         }
     }
 
-    // Hook scripts — on-idle.sh, on-stop.sh, on-clear.sh
-    for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh"] {
+    // Hook scripts — on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh
+    for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh", "on-heartbeat.sh"] {
         let hook_path = root.join(format!(".lisa/hooks/{}", script));
         if !hook_path.exists() {
             diagnostics.push(ValidationDiagnostic {
@@ -935,12 +938,12 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   8 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, .lisa/.gitignore, settings.local.json)
+        //   9 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, .lisa/.gitignore, settings.local.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| !matches!(a, InitAction::Skip { .. }))
             .collect();
-        assert_eq!(creates.len(), 16);
+        assert_eq!(creates.len(), 17);
     }
 
     #[test]
@@ -1152,6 +1155,7 @@ mod tests {
             ("on-idle.sh", templates::ON_IDLE_HOOK),
             ("on-stop.sh", templates::ON_STOP_HOOK),
             ("on-clear.sh", templates::ON_CLEAR_HOOK),
+            ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
         ];
         for (name, content) in hooks {
             fs::write(root.join(format!(".lisa/hooks/{}", name)), content).unwrap();

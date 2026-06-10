@@ -223,6 +223,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
                 auto_advance "{auto_advance}"
                 review_timeout_secs "{review_timeout_secs}"
                 session_timeout_secs "{session_timeout_secs}"
+                wind_down_secs "{wind_down_secs}"
             }}
         }}
     }}
@@ -237,6 +238,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
         auto_advance = config.auto_advance,
         review_timeout_secs = config.review_timeout_secs,
         session_timeout_secs = config.session_timeout_secs,
+        wind_down_secs = config.wind_down_secs,
     )
 }
 
@@ -292,8 +294,8 @@ mod tests {
         assert!(layout.contains("work_dir   \"docs/active/work\""));
         assert!(layout.contains("max_threads \"3\""));
         assert!(layout.contains("auto_advance \"false\""));
-        assert!(layout.contains("review_timeout_secs \"240\""));
-        assert!(layout.contains("session_timeout_secs \"1800\""));
+        assert!(layout.contains("review_timeout_secs \"600\""));
+        assert!(layout.contains("session_timeout_secs \"3600\""));
         assert!(
             layout.contains("compact-bar"),
             "layout should include status bar"

@@ -49,7 +49,7 @@ fn section_init(root: &Path) -> GuideSection {
          | `docs/active/stories/` | Story files (groups of related tickets) |\n\
          | `docs/active/work/` | Work artifacts, one subdirectory per ticket |\n\
          | `docs/archive/` | Completed tickets, stories, and work |\n\
-         | `.lisa/hooks/` | Signal hooks (`on-idle.sh`, `on-stop.sh`, `on-clear.sh`) |\n\
+         | `.lisa/hooks/` | Signal hooks (`on-idle.sh`, `on-stop.sh`, `on-clear.sh`, `on-heartbeat.sh`) |\n\
          | `.lisa/signals/` | Ephemeral signal files (gitignored) |\n\
          | `.claude/settings.local.json` | Claude Code hook integration |\n\n\
          After running, edit `CLAUDE.md` to add your project description, build commands, and source layout."
@@ -73,7 +73,12 @@ fn section_config() -> GuideSection {
          - `max_threads` — how many Claude Code sessions run concurrently\n\
          - `auto_advance` — when true, skips review pauses between RDSPI phases\n\
          - `review_timeout_secs` — how long before a parked Review session gets a finish-up prompt\n\
-         - `session_timeout_secs` — global timeout for any single session (default: 1800s / 30min)\n\
+         - `session_timeout_secs` — advisory budget for any single session (default: 3600s / 1h); \
+         an over-budget session is flagged but never interrupted — reclamation requires \
+         prolonged total silence (2x `stuck_threshold_secs`, i.e. no tool calls at all; \
+         default bar: 40min, tolerating 30-minute silent test runs)\n\
+         - `wind_down_secs` — how long a pane must be signal-silent before it can be \
+         reused for a new ticket (default: 300s)\n\
          - `[scheduling.phase_timeouts]` — per-phase timeout overrides (e.g. `research = 300`)",
         default_content.trim()
     );

@@ -1198,10 +1198,7 @@ fn render_quit_confirm_modal(modal: &ModalState, width: usize, height: usize) ->
     if has_undone {
         output.push(pad_line("", 0));
         let hdr = "  In progress (current DAG):";
-        output.push(pad_line(
-            &format!("{}{}{}", DIM, hdr, RESET),
-            hdr.len(),
-        ));
+        output.push(pad_line(&format!("{}{}{}", DIM, hdr, RESET), hdr.len()));
         for tid in &modal.ticket_ids {
             let entry = format!("    {}", tid);
             output.push(pad_line(&entry, entry.len()));
@@ -1212,10 +1209,7 @@ fn render_quit_confirm_modal(modal: &ModalState, width: usize, height: usize) ->
     if has_new {
         output.push(pad_line("", 0));
         let hdr = "  New tickets (not yet scheduled):";
-        output.push(pad_line(
-            &format!("{}{}{}", DIM, hdr, RESET),
-            hdr.len(),
-        ));
+        output.push(pad_line(&format!("{}{}{}", DIM, hdr, RESET), hdr.len()));
         for tid in &modal.new_ticket_ids {
             let entry = format!("    {}", tid);
             output.push(pad_line(&entry, entry.len()));

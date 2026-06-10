@@ -29,6 +29,7 @@ pub struct SchedulingConfig {
     pub auto_advance: Option<bool>,
     pub review_timeout_secs: Option<u64>,
     pub session_timeout_secs: Option<u64>,
+    pub wind_down_secs: Option<u64>,
     pub phase_timeouts: Option<std::collections::HashMap<String, u64>>,
 }
 
@@ -42,6 +43,7 @@ pub struct ResolvedConfig {
     pub auto_advance: bool,
     pub review_timeout_secs: u64,
     pub session_timeout_secs: u64,
+    pub wind_down_secs: u64,
     pub phase_timeouts: std::collections::HashMap<String, u64>,
 }
 
@@ -55,6 +57,7 @@ impl Default for ResolvedConfig {
             auto_advance: false,
             review_timeout_secs: PluginConfig::DEFAULT_REVIEW_TIMEOUT_SECS,
             session_timeout_secs: PluginConfig::DEFAULT_SESSION_TIMEOUT_SECS,
+            wind_down_secs: PluginConfig::DEFAULT_WIND_DOWN_SECS,
             phase_timeouts: std::collections::HashMap::new(),
         }
     }
@@ -104,6 +107,10 @@ pub fn resolve_config(config: &LisaConfig, cli_max_threads: Option<usize>) -> Re
             .scheduling
             .session_timeout_secs
             .unwrap_or(defaults.session_timeout_secs),
+        wind_down_secs: config
+            .scheduling
+            .wind_down_secs
+            .unwrap_or(defaults.wind_down_secs),
         phase_timeouts: config.scheduling.phase_timeouts.clone().unwrap_or_default(),
     }
 }
@@ -127,6 +134,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
         "auto_advance",
         "review_timeout_secs",
         "session_timeout_secs",
+        "wind_down_secs",
         "phase_timeouts",
     ];
 
@@ -233,8 +241,9 @@ work = "docs/active/work"
 [scheduling]
 max_threads = 2
 # auto_advance = false
-# review_timeout_secs = 240
-# session_timeout_secs = 1800
+# review_timeout_secs = 600
+# session_timeout_secs = 3600
+# wind_down_secs = 300
 
 # [scheduling.phase_timeouts]
 # research = 300
@@ -460,7 +469,7 @@ foo = 1
     fn test_resolve_review_timeout_default() {
         let config = LisaConfig::default();
         let resolved = resolve_config(&config, None);
-        assert_eq!(resolved.review_timeout_secs, 240);
+        assert_eq!(resolved.review_timeout_secs, 600);
     }
 
     #[test]
@@ -489,7 +498,7 @@ foo = 1
     fn test_resolve_session_timeout_default() {
         let config = LisaConfig::default();
         let resolved = resolve_config(&config, None);
-        assert_eq!(resolved.session_timeout_secs, 1800);
+        assert_eq!(resolved.session_timeout_secs, 3600);
     }
 
     #[test]

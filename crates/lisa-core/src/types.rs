@@ -339,9 +339,16 @@ pub struct Thread {
     #[serde(with = "system_time_serde")]
     pub started_at: SystemTime,
 
-    /// When the thread last changed phase (used for stuck detection)
+    /// When the thread last changed phase (used for time-in-phase displays)
     #[serde(with = "system_time_serde")]
     pub last_phase_change: SystemTime,
+
+    /// When activity was last observed from the session (heartbeat signal,
+    /// stop/idle/cleared signal, or phase change). Used for stuck detection:
+    /// a session is only considered stuck when it has gone *silent*, not
+    /// merely because a phase is taking a long time.
+    #[serde(with = "system_time_serde")]
+    pub last_activity: SystemTime,
 
     /// Current status of the thread
     #[serde(default)]
@@ -358,8 +365,21 @@ impl Thread {
             current_phase: Phase::Ready,
             started_at: now,
             last_phase_change: now,
+            last_activity: now,
             status: ThreadStatus::Running,
         }
+    }
+
+    /// Record observed activity from the session (heartbeat, signal, or
+    /// phase change). Resets the inactivity clock used by `health()`.
+    pub fn record_activity(&mut self, now: SystemTime) {
+        self.last_activity = now;
+    }
+
+    /// Record a phase change, which also counts as activity.
+    pub fn mark_phase_change(&mut self, now: SystemTime) {
+        self.last_phase_change = now;
+        self.last_activity = now;
     }
 
     /// Returns true if the thread is actively running.
@@ -408,7 +428,10 @@ impl Thread {
     /// Compute the health status of this thread.
     ///
     /// - `Failed` if the thread status is Failed.
-    /// - `Stuck` if the thread is Running and time-in-phase exceeds the threshold.
+    /// - `Stuck` if the thread is Running and no activity (heartbeat, signal,
+    ///   or phase change) has been observed for longer than the threshold.
+    ///   A session actively making tool calls is never stuck, no matter how
+    ///   long it stays in one phase.
     /// - `Healthy` otherwise (including Parked and Completed threads).
     pub fn health(&self, now: SystemTime, stuck_threshold: std::time::Duration) -> HealthStatus {
         if self.status == ThreadStatus::Failed {
@@ -417,9 +440,7 @@ impl Thread {
         if self.status != ThreadStatus::Running {
             return HealthStatus::Healthy;
         }
-        let elapsed = now
-            .duration_since(self.last_phase_change)
-            .unwrap_or_default();
+        let elapsed = now.duration_since(self.last_activity).unwrap_or_default();
         if elapsed >= stuck_threshold {
             HealthStatus::Stuck
         } else {
@@ -462,21 +483,34 @@ pub struct PluginConfig {
     /// Whether to auto-advance certain phases without review (default: false)
     pub auto_advance: bool,
 
-    /// Seconds a thread can stay in one phase before being considered stuck (default: 600)
+    /// Seconds of total inactivity (no heartbeats, signals, or phase changes)
+    /// before a thread is flagged Stuck (default: 1200 = 20 minutes). The hard
+    /// reclaim bar is 2x this value, so the default tolerates a single silent
+    /// 30-minute test or integration run with room to spare.
     pub stuck_threshold_secs: u64,
 
-    /// Seconds a running Review thread waits before receiving a finish-up prompt (default: 240).
+    /// Seconds a running Review thread waits before receiving a finish-up prompt (default: 600).
     /// Set to 0 to disable.
     pub review_timeout_secs: u64,
 
-    /// Maximum wall-clock seconds a single agent session can run before being
-    /// considered stalled (default: 1800 = 30 minutes). Set to 0 to disable.
+    /// Advisory wall-clock budget for a single agent session (default: 3600 =
+    /// 1 hour). An over-budget session is flagged but only reclaimed after
+    /// prolonged total silence (2x `stuck_threshold_secs`). Set to 0 to disable.
     pub session_timeout_secs: u64,
 
     /// Optional per-phase timeout overrides. When set, the value for a phase
     /// overrides `session_timeout_secs` for time-in-phase checks. Missing
     /// phases fall back to `session_timeout_secs`.
     pub phase_timeouts: HashMap<Phase, u64>,
+
+    /// Seconds a pane must be signal-silent (no heartbeat, stop, idle, or
+    /// cleared signal) before the scheduler may reuse it for a new ticket,
+    /// and how long a released slot stays in cooldown (default: 300).
+    ///
+    /// Agents often report "stopped" and then keep working for another minute
+    /// or two before sending a final message, so reuse is gated on sustained
+    /// quiet rather than on any single signal.
+    pub wind_down_secs: u64,
 }
 
 impl PluginConfig {
@@ -492,14 +526,18 @@ impl PluginConfig {
     /// Default maximum concurrent threads.
     pub const DEFAULT_MAX_THREADS: usize = 2;
 
-    /// Default stuck threshold in seconds (10 minutes).
-    pub const DEFAULT_STUCK_THRESHOLD_SECS: u64 = 600;
+    /// Default stuck threshold in seconds (20 minutes of silence; hard
+    /// reclaim at 2x = 40 minutes, tolerating 30-minute silent test runs).
+    pub const DEFAULT_STUCK_THRESHOLD_SECS: u64 = 1200;
 
-    /// Default review timeout in seconds (4 minutes).
-    pub const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 240;
+    /// Default review timeout in seconds (10 minutes).
+    pub const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 600;
 
-    /// Default session timeout in seconds (30 minutes).
-    pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
+    /// Default session budget in seconds (1 hour, advisory).
+    pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 3600;
+
+    /// Default wind-down period in seconds (5 minutes).
+    pub const DEFAULT_WIND_DOWN_SECS: u64 = 300;
 
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
@@ -513,6 +551,7 @@ impl PluginConfig {
             review_timeout_secs: Self::DEFAULT_REVIEW_TIMEOUT_SECS,
             session_timeout_secs: Self::DEFAULT_SESSION_TIMEOUT_SECS,
             phase_timeouts: HashMap::new(),
+            wind_down_secs: Self::DEFAULT_WIND_DOWN_SECS,
         }
     }
 
@@ -557,6 +596,12 @@ impl PluginConfig {
         if let Some(session_timeout) = config.get("session_timeout_secs") {
             if let Ok(n) = session_timeout.parse() {
                 result.session_timeout_secs = n;
+            }
+        }
+
+        if let Some(wind_down) = config.get("wind_down_secs") {
+            if let Ok(n) = wind_down.parse() {
+                result.wind_down_secs = n;
             }
         }
 
@@ -809,12 +854,38 @@ mod tests {
     #[test]
     fn test_health_stuck_after_threshold() {
         let mut thread = Thread::new("T-001", 1);
-        // Simulate phase change 10 minutes ago
+        // Simulate total silence for 11+ minutes
         thread.last_phase_change = SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.last_activity = SystemTime::now() - std::time::Duration::from_secs(700);
         let now = SystemTime::now();
         let threshold = std::time::Duration::from_secs(600);
 
         assert_eq!(thread.health(now, threshold), HealthStatus::Stuck);
+    }
+
+    #[test]
+    fn test_health_active_long_phase_not_stuck() {
+        let mut thread = Thread::new("T-001", 1);
+        // Phase started long ago, but the session is still making tool calls
+        thread.last_phase_change = SystemTime::now() - std::time::Duration::from_secs(3600);
+        thread.record_activity(SystemTime::now());
+        let now = SystemTime::now();
+        let threshold = std::time::Duration::from_secs(600);
+
+        assert_eq!(thread.health(now, threshold), HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_mark_phase_change_updates_both_clocks() {
+        let mut thread = Thread::new("T-001", 1);
+        let past = SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.last_phase_change = past;
+        thread.last_activity = past;
+
+        let now = SystemTime::now();
+        thread.mark_phase_change(now);
+        assert_eq!(thread.last_phase_change, now);
+        assert_eq!(thread.last_activity, now);
     }
 
     #[test]
@@ -854,6 +925,7 @@ mod tests {
     fn test_is_attention_needed_stuck() {
         let mut thread = Thread::new("T-001", 1);
         thread.last_phase_change = SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.last_activity = SystemTime::now() - std::time::Duration::from_secs(700);
         let now = SystemTime::now();
         let threshold = std::time::Duration::from_secs(600);
 
@@ -948,7 +1020,7 @@ mod tests {
     #[test]
     fn test_config_stuck_threshold_default() {
         let config = PluginConfig::new();
-        assert_eq!(config.stuck_threshold_secs, 600);
+        assert_eq!(config.stuck_threshold_secs, 1200);
     }
 
     #[test]
@@ -962,7 +1034,21 @@ mod tests {
     #[test]
     fn test_config_session_timeout_default() {
         let config = PluginConfig::new();
-        assert_eq!(config.session_timeout_secs, 1800);
+        assert_eq!(config.session_timeout_secs, 3600);
+    }
+
+    #[test]
+    fn test_config_wind_down_default() {
+        let config = PluginConfig::new();
+        assert_eq!(config.wind_down_secs, 300);
+    }
+
+    #[test]
+    fn test_config_wind_down_from_map() {
+        let mut map = BTreeMap::new();
+        map.insert("wind_down_secs".to_string(), "300".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.wind_down_secs, 300);
     }
 
     #[test]
@@ -1000,8 +1086,8 @@ mod tests {
     #[test]
     fn test_timeout_for_phase_fallback() {
         let config = PluginConfig::new();
-        // No override → falls back to session_timeout_secs (1800)
-        assert_eq!(config.timeout_for_phase(Phase::Research), 1800);
+        // No override → falls back to session_timeout_secs (3600)
+        assert_eq!(config.timeout_for_phase(Phase::Research), 3600);
     }
 
     #[test]

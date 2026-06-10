@@ -48,15 +48,42 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 "#;
 
+/// The heartbeat hook script, called by Claude Code's PostToolUse event.
+/// Fires after every tool call, proving the session is actively working.
+/// The plugin uses the absence of recent heartbeats — not stop/idle signals,
+/// which fire before agents truly finish — to decide a pane is safe to reuse.
+pub const ON_HEARTBEAT_HOOK: &str = r#"#!/bin/sh
+# Lisa heartbeat signal hook — called by Claude Code after each tool call.
+# Writes a signal file so the plugin knows this session is actively working.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
+fi
+"#;
+
 /// Gitignore content for the .lisa/ directory — ignores ephemeral signal files.
 pub const LISA_GITIGNORE: &str = "signals/\n";
 
-/// Generate .claude/settings.local.json with Stop, SessionStart, and Notification hooks.
+/// Generate .claude/settings.local.json with Stop, SessionStart, Notification,
+/// and PostToolUse hooks.
 /// Hook commands use `test -x` guards so they succeed silently if the scripts
 /// haven't been created yet (e.g. settings.local.json exists before `lisa init`).
 pub fn settings_local_json() -> String {
     r#"{
   "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
@@ -171,9 +198,9 @@ fn ensure_hook(
     }
 }
 
-/// Merge all Lisa hooks (Stop, SessionStart[clear], Notification[idle_prompt]) into
-/// an existing settings.local.json. Returns the updated JSON string, or an error if
-/// the JSON is malformed.
+/// Merge all Lisa hooks (Stop, SessionStart[clear], Notification[idle_prompt],
+/// PostToolUse heartbeat) into an existing settings.local.json. Returns the
+/// updated JSON string, or an error if the JSON is malformed.
 pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
     let mut root: serde_json::Value = serde_json::from_str(existing_json)
         .map_err(|e| format!("invalid JSON in settings.local.json: {}", e))?;
@@ -204,6 +231,12 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
         "Notification",
         Some("idle_prompt"),
         "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "PostToolUse",
+        None,
+        "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
     );
 
     serde_json::to_string_pretty(&root).map_err(|e| format!("failed to serialize JSON: {}", e))
@@ -382,16 +415,26 @@ mod tests {
     }
 
     #[test]
+    fn test_on_heartbeat_hook_content() {
+        assert!(ON_HEARTBEAT_HOOK.starts_with("#!/bin/sh"));
+        assert!(ON_HEARTBEAT_HOOK.contains("LISA_PANE_ID"));
+        assert!(ON_HEARTBEAT_HOOK.contains(".lisa/signals"));
+        assert!(ON_HEARTBEAT_HOOK.contains(".heartbeat"));
+    }
+
+    #[test]
     fn test_settings_local_json() {
         let json = settings_local_json();
-        // All three hook types present
+        // All four hook types present
         assert!(json.contains("\"Stop\""));
         assert!(json.contains("\"SessionStart\""));
         assert!(json.contains("\"Notification\""));
+        assert!(json.contains("\"PostToolUse\""));
         // Hook commands
         assert!(json.contains("on-stop.sh"));
         assert!(json.contains("on-clear.sh"));
         assert!(json.contains("on-idle.sh"));
+        assert!(json.contains("on-heartbeat.sh"));
         // Matchers
         assert!(json.contains("\"clear\""));
         assert!(json.contains("idle_prompt"));
@@ -413,6 +456,8 @@ mod tests {
         assert!(result.contains("\"Notification\""));
         assert!(result.contains("idle_prompt"));
         assert!(result.contains("on-idle.sh"));
+        assert!(result.contains("\"PostToolUse\""));
+        assert!(result.contains("on-heartbeat.sh"));
     }
 
     #[test]

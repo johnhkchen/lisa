@@ -20,12 +20,15 @@ use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
 const POLL_INTERVAL_SECS: f64 = 5.0;
 
 /// Timeout (seconds) for waiting for a `.stopped` signal after phase completion.
-/// If no signal arrives, fall back to sending `/clear` anyway.
+/// If no signal arrives AND the pane has been signal-silent for the wind-down
+/// period, fall back to sending `/clear` anyway.
 const STOP_SIGNAL_TIMEOUT_SECS: u64 = 60;
 
 /// Timeout (seconds) for waiting for a `.cleared` signal after sending `/clear`.
-/// If no signal arrives, fall back to sending the prompt anyway.
-const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 30;
+/// If no signal arrives AND the pane has been signal-silent for the wind-down
+/// period, fall back to sending the prompt anyway. The quiet requirement means
+/// the prompt is never injected into a session that is still working.
+const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 90;
 
 /// The prompt text sent to Claude Code for a ticket.
 fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
@@ -88,10 +91,6 @@ fn strip_host_prefix(path: &Path) -> PathBuf {
     PathBuf::from(s.strip_prefix("/host/").unwrap_or(&s).to_string())
 }
 
-/// How long a slot stays in cooldown after its ticket completes (seconds).
-/// Prevents the scheduler from reusing a pane whose session is still winding down.
-const SLOT_COOLDOWN_SECS: u64 = 60;
-
 /// An agent pane slot — a pre-created terminal in the stacked layout.
 struct AgentSlot {
     pane_id: u32,
@@ -105,6 +104,12 @@ struct AgentSlot {
     transition_started_at: Option<std::time::SystemTime>,
     /// Earliest time this slot can accept new work (cooldown after completion).
     cooldown_until: Option<std::time::SystemTime>,
+    /// When this pane last showed signs of life: a heartbeat/stop/idle/cleared
+    /// signal arrived, or the plugin sent input to it. The scheduler only
+    /// reuses a pane that has been quiet for the configured wind-down period —
+    /// stop/idle signals alone are not trusted because agents often report
+    /// stopped and then keep working for another minute or two.
+    last_activity_at: Option<std::time::SystemTime>,
 }
 
 /// What action the modal should perform on Enter.
@@ -212,6 +217,10 @@ pub struct State {
 
     /// Ticket IDs that have already received a finish-up prompt (prevents re-sending).
     finish_up_sent: HashSet<TicketId>,
+
+    /// Ticket IDs already warned about exceeding their session/phase timeout
+    /// while still active (prevents repeated warnings while waiting for quiet).
+    over_budget_warned: HashSet<TicketId>,
 
     /// Recent session timeouts for dashboard display.
     /// Entries: (ticket_id, elapsed_secs, phase_at_timeout).
@@ -335,6 +344,7 @@ impl State {
                         transition_state: TransitionState::Idle,
                         transition_started_at: None,
                         cooldown_until: None,
+                        last_activity_at: None,
                     });
                 }
             }
@@ -349,10 +359,21 @@ impl State {
     }
 
     /// Find an idle agent slot that has finished its cooldown period.
+    ///
+    /// Busy-pane guard: a slot with a live session is only eligible once the
+    /// pane has been signal-silent for the wind-down period. A session that is
+    /// still making tool calls (heartbeats) or emitting stop/idle signals is
+    /// never reused, even if its ticket was released — clearing a pane that is
+    /// mid-task wastes the partial work and forces a repeat attempt.
     fn find_idle_slot(&self) -> Option<usize> {
         let now = std::time::SystemTime::now();
+        let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
         self.agent_slots.iter().position(|s| {
-            s.ticket_id.is_none() && s.cooldown_until.is_none_or(|until| now >= until)
+            s.ticket_id.is_none()
+                && s.cooldown_until.is_none_or(|until| now >= until)
+                && (!s.has_session
+                    || s.last_activity_at
+                        .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down))
         })
     }
 
@@ -368,7 +389,7 @@ impl State {
                 // has_session stays true — Claude Code is still running
                 slot.cooldown_until = Some(
                     std::time::SystemTime::now()
-                        + std::time::Duration::from_secs(SLOT_COOLDOWN_SECS),
+                        + std::time::Duration::from_secs(self.config.wind_down_secs),
                 );
                 break;
             }
@@ -459,6 +480,8 @@ impl State {
             }
 
             self.agent_slots[slot_idx].ticket_id = Some(ticket_id.clone());
+            // Sending input counts as pane activity — restarts the wind-down clock.
+            self.agent_slots[slot_idx].last_activity_at = Some(std::time::SystemTime::now());
 
             // Create thread record with the ticket's current phase
             let mut thread = Thread::new(ticket_id.clone(), pane_id);
@@ -619,7 +642,7 @@ impl State {
                 // Update thread phase
                 if let Some(thread) = self.threads.get_mut(&ticket_id) {
                     thread.current_phase = next_phase;
-                    thread.last_phase_change = std::time::SystemTime::now();
+                    thread.mark_phase_change(std::time::SystemTime::now());
                 }
 
                 advanced_any = true;
@@ -628,6 +651,52 @@ impl State {
             if !advanced_any {
                 break;
             }
+        }
+    }
+
+    /// Record observed activity for a pane: updates the slot's activity clock
+    /// and, if a thread is running in that pane, the thread's inactivity clock.
+    fn bump_pane_activity(&mut self, pane_id: u32) {
+        let now = std::time::SystemTime::now();
+        let mut ticket_id = None;
+        if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+            slot.last_activity_at = Some(now);
+            ticket_id = slot.ticket_id.clone();
+        }
+        if let Some(tid) = ticket_id {
+            if let Some(thread) = self.threads.get_mut(&tid) {
+                thread.record_activity(now);
+            }
+        }
+    }
+
+    /// Scan for `.heartbeat` signal files written by the PostToolUse hook.
+    ///
+    /// Each heartbeat proves the session in that pane is actively making tool
+    /// calls. Heartbeats reset both the thread's stuck/stale clocks and the
+    /// pane's wind-down clock, so an active session is never flagged stuck,
+    /// never reclaimed by a timeout, and never has its pane reused.
+    fn check_heartbeat_signals(&mut self) {
+        let entries = match std::fs::read_dir(&self.signal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let pane_id = match path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("pane-"))
+                .and_then(|n| n.strip_suffix(".heartbeat"))
+                .and_then(|id| id.parse::<u32>().ok())
+            {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let _ = std::fs::remove_file(&path);
+            self.bump_pane_activity(pane_id);
         }
     }
 
@@ -670,6 +739,8 @@ impl State {
                     Ok(id) => id,
                     Err(_) => continue,
                 };
+                // An idle signal is recent life — restart the wind-down clock.
+                self.bump_pane_activity(pane_id);
                 match self
                     .agent_slots
                     .iter()
@@ -721,7 +792,7 @@ impl State {
 
                     if let Some(thread) = self.threads.get_mut(&ticket_id) {
                         thread.current_phase = Phase::Review;
-                        thread.last_phase_change = std::time::SystemTime::now();
+                        thread.mark_phase_change(std::time::SystemTime::now());
                     }
 
                     // If review.md already exists (agent ran all phases in one
@@ -803,7 +874,7 @@ impl State {
 
                         if let Some(thread) = self.threads.get_mut(&ticket_id) {
                             thread.current_phase = next_phase;
-                            thread.last_phase_change = std::time::SystemTime::now();
+                            thread.mark_phase_change(std::time::SystemTime::now());
                         }
                     } else {
                         // Idle without artifact — alert
@@ -853,6 +924,9 @@ impl State {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
+                    // A stop signal is recent life — restart the wind-down
+                    // clock. Agents often keep working past their stop signal.
+                    self.bump_pane_activity(pane_id);
                     self.handle_stopped_signal(pane_id);
                 } else if let Some(id_str) = rest.strip_suffix(".cleared") {
                     let _ = std::fs::remove_file(&path);
@@ -860,6 +934,7 @@ impl State {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
+                    self.bump_pane_activity(pane_id);
                     self.handle_cleared_signal(pane_id);
                 }
                 // .idle files are handled by check_idle_signals()
@@ -1017,8 +1092,14 @@ impl State {
     /// Check for transition timeouts and force-advance stalled transitions.
     ///
     /// Prevents indefinite stalls if hooks fail to produce signal files.
+    ///
+    /// Busy-pane guard: a fallback only fires once the pane has also been
+    /// signal-silent for the wind-down period. If the expected signal never
+    /// arrives because the session is still working (heartbeats flowing), the
+    /// transition waits rather than injecting input into a busy session.
     fn check_transition_timeouts(&mut self) {
         let now = std::time::SystemTime::now();
+        let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
 
         // Collect actions to avoid borrow conflicts
         let mut stop_timeouts: Vec<u32> = Vec::new();
@@ -1027,12 +1108,19 @@ impl State {
         for slot in &self.agent_slots {
             if let Some(started) = slot.transition_started_at {
                 let elapsed = now.duration_since(started).unwrap_or_default().as_secs();
+                let quiet = slot
+                    .last_activity_at
+                    .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down);
 
                 match slot.transition_state {
-                    TransitionState::WaitingForStop if elapsed > STOP_SIGNAL_TIMEOUT_SECS => {
+                    TransitionState::WaitingForStop
+                        if elapsed > STOP_SIGNAL_TIMEOUT_SECS && quiet =>
+                    {
                         stop_timeouts.push(slot.pane_id);
                     }
-                    TransitionState::WaitingForClear if elapsed > CLEAR_SIGNAL_TIMEOUT_SECS => {
+                    TransitionState::WaitingForClear
+                        if elapsed > CLEAR_SIGNAL_TIMEOUT_SECS && quiet =>
+                    {
                         clear_timeouts.push((slot.pane_id, slot.ticket_id.clone()));
                     }
                     _ => {}
@@ -1086,8 +1174,11 @@ impl State {
 
         let now = std::time::SystemTime::now();
         let timeout = std::time::Duration::from_secs(self.config.review_timeout_secs);
+        let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
 
-        // Collect candidates: running threads in Review phase past timeout, not yet prompted
+        // Collect candidates: running threads in Review phase past timeout,
+        // not yet prompted, and quiet — never prod a session that is still
+        // actively working (heartbeats flowing).
         let candidates: Vec<(TicketId, u32)> = self
             .threads
             .iter()
@@ -1097,6 +1188,7 @@ impl State {
             })
             .filter(|(tid, _)| !self.finish_up_sent.contains(*tid))
             .filter(|(_, t)| now.duration_since(t.last_phase_change).unwrap_or_default() >= timeout)
+            .filter(|(_, t)| now.duration_since(t.last_activity).unwrap_or_default() >= wind_down)
             .map(|(tid, t)| (tid.clone(), t.pane_id))
             .collect();
 
@@ -1105,9 +1197,10 @@ impl State {
             let host_work_dir = strip_host_prefix(&self.config.work_dir);
             let prompt = finish_up_prompt(&host_ticket_dir, &host_work_dir, &ticket_id);
             self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+            self.bump_pane_activity(pane_id);
 
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
-                thread.last_phase_change = std::time::SystemTime::now();
+                thread.mark_phase_change(std::time::SystemTime::now());
             }
 
             self.finish_up_sent.insert(ticket_id.clone());
@@ -1174,42 +1267,82 @@ impl State {
     /// time (since `started_at`) exceeds the limit, the thread is marked failed,
     /// the slot is released, and the thread is removed. The Claude Code process
     /// is NOT killed — it may still be doing useful work.
+    ///
+    /// Busy-pane guard: a session that is over budget but not provably dead
+    /// is never reclaimed — interrupting a partially-done ticket wastes the
+    /// work and forces a repeat attempt. A warning is logged once, and
+    /// reclamation requires the same prolonged silence as stale detection
+    /// (2x stuck_threshold_secs), so slow tests or long integration calls
+    /// (multi-minute silent stretches) never get a progressing session
+    /// reclaimed. Budgets warn; only silence kills.
     fn check_session_timeouts(&mut self) {
         let now = std::time::SystemTime::now();
         let global_timeout = self.config.session_timeout_secs;
         let has_phase_timeouts = !self.config.phase_timeouts.is_empty();
+        let hard_silence = std::time::Duration::from_secs(self.config.stuck_threshold_secs * 2);
 
         // If both global and per-phase timeouts are disabled, skip entirely
         if global_timeout == 0 && !has_phase_timeouts {
             return;
         }
 
-        let timed_out: Vec<(TicketId, u64, Phase)> = self
-            .threads
-            .iter()
-            .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
-            .filter_map(|(tid, t)| {
-                // Check global session timeout (total wall-clock since start)
-                if global_timeout > 0 {
-                    let elapsed = now.duration_since(t.started_at).unwrap_or_default();
-                    if elapsed >= std::time::Duration::from_secs(global_timeout) {
-                        return Some((tid.clone(), elapsed.as_secs(), t.current_phase));
-                    }
-                }
+        let mut timed_out: Vec<(TicketId, u64, Phase)> = Vec::new();
+        let mut over_budget_active: Vec<(TicketId, u64, Phase)> = Vec::new();
 
-                // Check per-phase timeout (time-in-phase since last phase change)
+        for (tid, t) in &self.threads {
+            if t.status != lisa_core::types::ThreadStatus::Running {
+                continue;
+            }
+
+            // Check global session timeout (total wall-clock since start)
+            let mut exceeded: Option<(u64, Phase)> = None;
+            if global_timeout > 0 {
+                let elapsed = now.duration_since(t.started_at).unwrap_or_default();
+                if elapsed >= std::time::Duration::from_secs(global_timeout) {
+                    exceeded = Some((elapsed.as_secs(), t.current_phase));
+                }
+            }
+
+            // Check per-phase timeout (time-in-phase since last phase change)
+            if exceeded.is_none() && has_phase_timeouts {
                 let phase_limit = self.config.timeout_for_phase(t.current_phase);
-                if phase_limit > 0 && has_phase_timeouts {
+                if phase_limit > 0 {
                     let elapsed_in_phase =
                         now.duration_since(t.last_phase_change).unwrap_or_default();
                     if elapsed_in_phase >= std::time::Duration::from_secs(phase_limit) {
-                        return Some((tid.clone(), elapsed_in_phase.as_secs(), t.current_phase));
+                        exceeded = Some((elapsed_in_phase.as_secs(), t.current_phase));
                     }
                 }
+            }
 
-                None
-            })
-            .collect();
+            if let Some((elapsed_secs, phase)) = exceeded {
+                // Reclaim only at death-level silence (same bar as stale
+                // detection), not a mere wind-down gap: slow test or
+                // integration commands routinely produce multi-minute silent
+                // stretches in a session that is progressing fine, and a
+                // wind-down gap after the budget line would reclaim it
+                // mid-ticket. The budget itself is advisory — silence kills,
+                // budgets warn.
+                let silent_for = now.duration_since(t.last_activity).unwrap_or_default();
+                if silent_for >= hard_silence {
+                    timed_out.push((tid.clone(), elapsed_secs, phase));
+                } else {
+                    over_budget_active.push((tid.clone(), elapsed_secs, phase));
+                }
+            }
+        }
+
+        for (ticket_id, elapsed_secs, phase) in over_budget_active {
+            if self.over_budget_warned.insert(ticket_id.clone()) {
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!(
+                        "{} exceeded its timeout ({}s in {}) but is still active — \
+                         waiting for it to wind down instead of interrupting",
+                        ticket_id, elapsed_secs, phase
+                    ),
+                });
+            }
+        }
 
         for (ticket_id, elapsed_secs, phase) in timed_out {
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
@@ -1227,10 +1360,12 @@ impl State {
         }
     }
 
-    /// Detect threads that have been stuck beyond the hard timeout.
+    /// Detect threads that have been silent beyond the hard timeout.
     ///
-    /// The hard timeout is 2x the configured stuck_threshold_secs.
-    /// Stuck threads at this point are marked as failed, their slots released,
+    /// The hard timeout is 2x the configured stuck_threshold_secs of total
+    /// inactivity — no heartbeats, signals, or phase changes. A session that
+    /// is actively making tool calls never trips this, no matter how long its
+    /// phase runs. Silent threads are marked as failed, their slots released,
     /// and they are removed from the threads map for retry.
     fn detect_stale_threads(&mut self) {
         use lisa_core::types::{HealthStatus, ThreadStatus};
@@ -1256,7 +1391,7 @@ impl State {
             self.threads.remove(&ticket_id);
             self.log_activity(ActivityEvent::Error {
                 message: format!(
-                    "{} stale — no phase change for {}+ minutes, marked failed for retry",
+                    "{} stale — no activity for {}+ minutes, marked failed for retry",
                     ticket_id, mins
                 ),
             });
@@ -1304,6 +1439,10 @@ impl State {
     /// Rescans tickets, detects phase changes, marks completed threads,
     /// frees agent slots, and schedules new work.
     fn poll_tick(&mut self) {
+        // Consume heartbeat signals first so activity clocks are current
+        // before any health or timeout decisions this tick.
+        self.check_heartbeat_signals();
+
         // Check for new artifacts and advance phases before rebuilding DAG
         self.check_artifact_advances();
 
@@ -1366,7 +1505,7 @@ impl State {
                 if let Some(ticket) = self.dag.get_ticket(tid) {
                     if thread.current_phase != ticket.phase {
                         thread.current_phase = ticket.phase;
-                        thread.last_phase_change = std::time::SystemTime::now();
+                        thread.mark_phase_change(std::time::SystemTime::now());
                     }
                 }
             }
@@ -1380,6 +1519,8 @@ impl State {
 
         // Clean up finish_up_sent for threads that no longer exist
         self.finish_up_sent
+            .retain(|tid| self.threads.contains_key(tid));
+        self.over_budget_warned
             .retain(|tid| self.threads.contains_key(tid));
 
         // Always try to schedule (slots may have freed up)
@@ -3285,16 +3426,18 @@ mod tests {
             dag,
             config: PluginConfig {
                 ticket_dir: tickets_dir,
+                stuck_threshold_secs: 600, // hard-silence bar = 2x = 1200s
                 ..PluginConfig::new()
             },
             ..State::default()
         };
 
-        // Create a thread that's been stuck for 31+ minutes
+        // Create a thread that's been silent for 31+ minutes (past the bar)
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         // Add an agent slot so we can verify it gets released
@@ -3305,6 +3448,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.detect_stale_threads();
@@ -3333,6 +3477,7 @@ mod tests {
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 60);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.detect_stale_threads();
@@ -3408,6 +3553,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
         state.release_slot_for_ticket(&"T-001".to_string());
         state.threads.remove("T-001");
@@ -3451,6 +3597,7 @@ mod tests {
             transition_started_at: None,
             // Cooldown already expired (set to 1 second ago)
             cooldown_until: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1)),
+            last_activity_at: None,
         });
         assert!(
             state.find_idle_slot().is_some(),
@@ -3470,6 +3617,7 @@ mod tests {
             transition_started_at: None,
             // Cooldown expires 30 seconds from now
             cooldown_until: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(30)),
+            last_activity_at: None,
         });
         assert!(
             state.find_idle_slot().is_none(),
@@ -3482,12 +3630,14 @@ mod tests {
         use lisa_core::types::{HealthStatus, Thread};
 
         let mut state = State::default();
+        state.config.stuck_threshold_secs = 600;
 
-        // Create a thread that's been stuck past the threshold (default 600s)
+        // Create a thread that's been silent past the 600s threshold
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(700); // past 600s threshold
+            std::time::SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.evaluate_health();
@@ -3572,12 +3722,14 @@ mod tests {
         use lisa_core::types::Thread;
 
         let mut state = State::default();
+        state.config.stuck_threshold_secs = 600;
 
-        // Create a stuck thread
+        // Create a thread silent past the stuck threshold
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
         state.initialized = true;
 
@@ -3697,6 +3849,7 @@ mod tests {
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.detect_stale_threads();
@@ -3723,6 +3876,7 @@ mod tests {
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(180);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.detect_stale_threads();
@@ -3745,6 +3899,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.release_slot_for_ticket(&"T-001".to_string());
@@ -3770,6 +3925,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.release_slot_for_ticket(&"T-MISSING".to_string());
@@ -3840,6 +3996,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // First rebuild with empty last_phases — done ticket should be detected
@@ -3916,6 +4073,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         let changed = state.rebuild_dag();
@@ -3980,6 +4138,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
         assert!(!state.threads.contains_key("T-001"));
 
@@ -4039,6 +4198,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Run the done-ticket detection logic (mirrors poll_tick)
@@ -4138,6 +4298,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.audit_threads();
@@ -4253,6 +4414,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Replicate the key mark_ticket_done operations (without schedule_ready_tickets)
@@ -4459,6 +4621,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 6,
@@ -4467,6 +4630,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Add health data
@@ -4618,6 +4782,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 43,
@@ -4626,6 +4791,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         let snapshot = state.format_snapshot();
@@ -4749,6 +4915,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Add running thread in implement phase
@@ -4829,6 +4996,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         let mut thread = Thread::new("T-001", 1);
@@ -4908,6 +5076,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Add running thread in research phase
@@ -4979,6 +5148,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         let mut thread = Thread::new("T-001", 1);
@@ -5057,6 +5227,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Running thread in Review phase
@@ -5127,6 +5298,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_idle_signals();
@@ -5178,6 +5350,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Add a PARKED thread (not running)
@@ -5353,6 +5526,7 @@ mod tests {
                 transition_state: TransitionState::Idle,
                 transition_started_at: None,
                 cooldown_until: None,
+                last_activity_at: None,
             });
         }
 
@@ -5528,6 +5702,7 @@ mod tests {
             transition_state: TransitionState::default(),
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         };
         assert_eq!(slot.transition_state, TransitionState::Idle);
     }
@@ -5552,6 +5727,7 @@ mod tests {
             transition_state: TransitionState::WaitingForStop,
             transition_started_at: Some(std::time::SystemTime::now()),
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_transition_signals();
@@ -5593,6 +5769,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_transition_signals();
@@ -5628,6 +5805,7 @@ mod tests {
             transition_state: TransitionState::WaitingForClear,
             transition_started_at: Some(std::time::SystemTime::now()),
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_transition_signals();
@@ -5666,6 +5844,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_transition_signals();
@@ -5708,6 +5887,7 @@ mod tests {
                 std::time::SystemTime::now() - std::time::Duration::from_secs(61),
             ),
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_transition_timeouts();
@@ -5740,11 +5920,12 @@ mod tests {
             ticket_id: Some("T-001".to_string()),
             has_session: true,
             transition_state: TransitionState::WaitingForClear,
-            // Set to 31 seconds ago
+            // Past the 90s clear-signal timeout
             transition_started_at: Some(
-                std::time::SystemTime::now() - std::time::Duration::from_secs(31),
+                std::time::SystemTime::now() - std::time::Duration::from_secs(91),
             ),
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_transition_timeouts();
@@ -5773,6 +5954,7 @@ mod tests {
                 std::time::SystemTime::now() - std::time::Duration::from_secs(5),
             ),
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_transition_timeouts();
@@ -5848,6 +6030,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         // Running thread in Review phase
@@ -6025,16 +6208,19 @@ mod tests {
         let mut state = State {
             config: PluginConfig {
                 review_timeout_secs: 10,
+                wind_down_secs: 180,
                 ..PluginConfig::new()
             },
             ..State::default()
         };
 
-        // Running Review thread with last_phase_change far in the past
+        // Running Review thread, silent past both the review timeout and the
+        // wind-down period — eligible for a finish-up prompt
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
         thread.last_phase_change =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+            std::time::SystemTime::now() - std::time::Duration::from_secs(200);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_review_timeouts();
@@ -6069,6 +6255,7 @@ mod tests {
         thread.current_phase = Phase::Review;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_review_timeouts();
@@ -6121,6 +6308,7 @@ mod tests {
         thread.current_phase = Phase::Review;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_review_timeouts();
@@ -6147,6 +6335,7 @@ mod tests {
         let mut t1 = Thread::new("T-001", 1);
         t1.current_phase = Phase::Implement;
         t1.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        t1.last_activity = t1.last_phase_change;
         state.threads.insert("T-001".to_string(), t1);
 
         // Parked Review thread (not Running — should not be affected)
@@ -6154,6 +6343,7 @@ mod tests {
         t2.current_phase = Phase::Review;
         t2.park();
         t2.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        t2.last_activity = t2.last_phase_change;
         state.threads.insert("T-002".to_string(), t2);
 
         // Completed Review thread (should not be affected)
@@ -6161,6 +6351,7 @@ mod tests {
         t3.current_phase = Phase::Review;
         t3.complete();
         t3.last_phase_change = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        t3.last_activity = t3.last_phase_change;
         state.threads.insert("T-003".to_string(), t3);
 
         state.check_review_timeouts();
@@ -6187,15 +6378,19 @@ mod tests {
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
                 session_timeout_secs: 1800, // 30 minutes
+                stuck_threshold_secs: 600,  // hard-silence bar = 2x = 1200s
                 ..PluginConfig::new()
             },
             ..State::default()
         };
 
         // Create a thread that started 31+ minutes ago (past 1800s timeout)
+        // and has been silent the whole time (past the hard-silence bar),
+        // so it is reclaimable
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Implement;
         thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+        thread.last_activity = thread.started_at;
         state.threads.insert("T-001".to_string(), thread);
 
         // Add an agent slot
@@ -6206,6 +6401,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_session_timeouts();
@@ -6227,6 +6423,234 @@ mod tests {
         assert_eq!(state.timeout_alerts.len(), 1);
         assert_eq!(state.timeout_alerts[0].0, "T-001");
         assert_eq!(state.timeout_alerts[0].2, Phase::Implement);
+    }
+
+    #[test]
+    fn test_check_session_timeouts_active_session_deferred() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                session_timeout_secs: 1800,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Over budget (started 31 minutes ago) but still active right now
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+        thread.record_activity(std::time::SystemTime::now());
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_session_timeouts();
+
+        // Thread must NOT be reclaimed while active — clean completion wins
+        assert!(state.threads.contains_key("T-001"));
+        assert!(state.timeout_alerts.is_empty());
+
+        // A single over-budget warning is logged
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Warning { message } if message.contains("still active")
+        )));
+
+        // Repeated checks do not spam the warning
+        let log_count = state.activity_log.len();
+        state.check_session_timeouts();
+        assert_eq!(state.activity_log.len(), log_count);
+    }
+
+    #[test]
+    fn test_check_session_timeouts_slow_test_gap_not_reclaimed() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                session_timeout_secs: 1800,
+                stuck_threshold_secs: 600, // hard-silence bar = 2x = 1200s
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // The long-ticket scenario: 75 minutes in, far over the 30-minute
+        // budget, and mid-way through a slow test run — silent for 5 minutes
+        // (past wind_down, but nowhere near the 20-minute hard-silence bar).
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(75 * 60);
+        thread.last_activity = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_session_timeouts();
+
+        // Must NOT be reclaimed — the session is progressing, just slowly
+        assert!(state.threads.contains_key("T-001"));
+        assert!(state.timeout_alerts.is_empty());
+        assert!(state.over_budget_warned.contains("T-001"));
+
+        // But a session silent past the hard bar (20 min) IS reclaimed
+        state.threads.get_mut("T-001").unwrap().last_activity =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(21 * 60);
+        state.check_session_timeouts();
+        assert!(state.threads.is_empty());
+        assert_eq!(state.timeout_alerts.len(), 1);
+    }
+
+    #[test]
+    fn test_detect_stale_threads_active_session_not_stale() {
+        use lisa_core::types::Thread;
+
+        let mut state = State::default();
+
+        // Phase started 31 minutes ago, but heartbeats prove the session is
+        // actively working — long phases are not staleness.
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+        thread.record_activity(std::time::SystemTime::now());
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.detect_stale_threads();
+
+        assert!(state.threads.contains_key("T-001"));
+    }
+
+    #[test]
+    fn test_check_review_timeouts_skips_active_thread() {
+        use lisa_core::types::Thread;
+
+        let mut state = State {
+            config: PluginConfig {
+                review_timeout_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        // Past the review timeout, but the session is actively working
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(200);
+        thread.record_activity(std::time::SystemTime::now());
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_review_timeouts();
+
+        // No finish-up prompt while the agent is busy
+        assert!(state.finish_up_sent.is_empty());
+    }
+
+    #[test]
+    fn test_check_heartbeat_signals_updates_activity() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.heartbeat"), "2026-01-01T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+        });
+
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(700);
+        let mut thread = Thread::new("T-001", 1);
+        thread.last_activity = stale;
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_heartbeat_signals();
+
+        // Signal file consumed
+        assert!(!signal_dir.join("pane-1.heartbeat").exists());
+
+        // Thread and slot activity clocks refreshed
+        assert!(state.threads.get("T-001").unwrap().last_activity > stale);
+        assert!(state.agent_slots[0].last_activity_at.is_some());
+    }
+
+    #[test]
+    fn test_find_idle_slot_busy_pane_guard() {
+        let mut state = State::default();
+
+        // Released slot whose session showed activity moments ago — not reusable
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: Some(std::time::SystemTime::now()),
+        });
+
+        assert_eq!(state.find_idle_slot(), None);
+
+        // Once the pane has been quiet past the wind-down period, it's eligible
+        state.agent_slots[0].last_activity_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(state.config.wind_down_secs + 1),
+        );
+        assert_eq!(state.find_idle_slot(), Some(0));
+    }
+
+    #[test]
+    fn test_find_idle_slot_fresh_pane_not_gated() {
+        let mut state = State::default();
+
+        // A pane with no session yet is immediately usable regardless of the guard
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            has_session: false,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+        });
+
+        assert_eq!(state.find_idle_slot(), Some(0));
+    }
+
+    #[test]
+    fn test_check_transition_timeouts_deferred_while_pane_active() {
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForClear,
+            // Far past the 90s clear-signal timeout...
+            transition_started_at: Some(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+            ),
+            cooldown_until: None,
+            // ...but the pane is still active, so the fallback must wait
+            last_activity_at: Some(std::time::SystemTime::now()),
+        });
+
+        state.check_transition_timeouts();
+
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForClear
+        );
+        assert!(state.activity_log.is_empty());
     }
 
     #[test]
@@ -6325,18 +6749,22 @@ mod tests {
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
                 session_timeout_secs: 1800, // 30 min global
+                stuck_threshold_secs: 150,  // hard-silence bar = 2x = 300s
                 phase_timeouts,
                 ..PluginConfig::new()
             },
             ..State::default()
         };
 
-        // Thread started 10 min ago, phase change was 6 min ago (exceeds 300s phase timeout)
+        // Thread started 10 min ago, phase change was 6 min ago (exceeds the
+        // 300s phase timeout) and silent since (exceeds the 300s hard-silence
+        // bar), so it is reclaimable
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Research;
         thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60);
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 60);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.agent_slots.push(AgentSlot {
@@ -6346,6 +6774,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_session_timeouts();
@@ -6378,6 +6807,7 @@ mod tests {
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 60);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_session_timeouts();
@@ -6414,6 +6844,7 @@ mod tests {
         thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_session_timeouts();
@@ -6447,6 +6878,7 @@ mod tests {
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
                 session_timeout_secs: 1800, // 30 min global cap
+                stuck_threshold_secs: 600,  // hard-silence bar = 2x = 1200s
                 phase_timeouts,
                 ..PluginConfig::new()
             },
@@ -6454,12 +6886,14 @@ mod tests {
         };
 
         // Thread started 35 minutes ago, but phase change was 20 min ago
-        // Global timeout (1800s) exceeded, even though per-phase (3600s) is not
+        // Global timeout (1800s) exceeded, even though per-phase (3600s) is not;
+        // 20 min of silence also clears the 1200s hard-silence bar
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Implement;
         thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(35 * 60);
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60);
+        thread.last_activity = thread.last_phase_change;
         state.threads.insert("T-001".to_string(), thread);
 
         state.agent_slots.push(AgentSlot {
@@ -6469,6 +6903,7 @@ mod tests {
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
+            last_activity_at: None,
         });
 
         state.check_session_timeouts();
