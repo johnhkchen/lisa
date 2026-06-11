@@ -195,12 +195,11 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
     // Extra idle panes absorb new tickets while finishing panes wind down.
     let pane_count = config.max_threads * 2;
     let mut agent_panes = String::new();
-    for i in 0..pane_count {
-        if i == 0 {
-            agent_panes.push_str("            pane expanded=true\n");
-        } else {
-            agent_panes.push_str("            pane\n");
-        }
+    for _ in 0..pane_count {
+        // No expanded=true: zellij expands the focused (first) pane by default,
+        // and a hardcoded expanded attribute gets re-applied on every terminal
+        // resize, snapping focus back to the first pane.
+        agent_panes.push_str("            pane\n");
     }
 
     format!(
