@@ -137,6 +137,11 @@ pub struct ActiveThread {
     pub phase: Phase,
     pub started_at: Duration,
     pub slot_number: usize,
+    /// True if this thread's pane is blocked on an `AskUserQuestion`
+    /// (mirrors the plugin's `awaiting_human` set). Drives the dashboard
+    /// "awaiting human" marker and is the same signal that exempts the pane
+    /// from wall-clock reclamation, so the two can never disagree.
+    pub awaiting: bool,
 }
 
 /// Represents a parked thread waiting for review
@@ -716,18 +721,25 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
         let slot_label = format!("[{}]", slot.slot_number);
 
         if let Some(active) = active_by_slot.get(&slot.slot_number) {
-            // Running thread in this slot
+            // Running thread in this slot. A pane blocked on AskUserQuestion is
+            // exempt from wall-clock reclamation (lib.rs), so it must be clearly
+            // marked here — an exempt-but-invisible pane is the bad state to avoid.
             let elapsed = format_time_since(active.started_at, state.current_time);
             let phase_color = active.phase.color_code();
+            let (ticket_cell, status_color, status_text) = if active.awaiting {
+                (format!("{} [AWAITING]", active.ticket_id), CYAN, "Awaiting")
+            } else {
+                (active.ticket_id.clone(), GREEN, "Running")
+            };
             output.push(format!(
                 "{:<6} {:<12} {}{:<10}{} {}{:<14}{} {}",
                 slot_label,
-                active.ticket_id,
+                ticket_cell,
                 phase_color,
                 active.phase.short_name(),
                 RESET,
-                GREEN,
-                "Running",
+                status_color,
+                status_text,
                 RESET,
                 elapsed,
             ));
@@ -1300,6 +1312,7 @@ mod tests {
                 phase: Phase::Design,
                 started_at: Duration::from_secs(60),
                 slot_number: 1,
+                awaiting: false,
             }],
             parked_threads: vec![],
             activity_log: vec![
@@ -1394,6 +1407,33 @@ mod tests {
         assert!(full.contains("T-002"), "Active ticket missing");
         assert!(full.contains("Running"), "Running status missing");
         assert!(full.contains("Idle"), "Idle slot missing");
+    }
+
+    #[test]
+    fn test_render_threads_marks_awaiting() {
+        let mut state = PluginState::default();
+        state.slots = vec![SlotInfo {
+            ticket_id: Some("T-002".to_string()),
+            slot_number: 1,
+            transitioning: false,
+        }];
+        state.active_threads = vec![ActiveThread {
+            ticket_id: "T-002".to_string(),
+            phase: Phase::Design,
+            started_at: Duration::from_secs(60),
+            slot_number: 1,
+            awaiting: true,
+        }];
+        let mut output = Vec::new();
+        render_threads(&state, &mut output);
+
+        let full = output.join("\n");
+        assert!(full.contains("[AWAITING]"), "awaiting token missing");
+        assert!(full.contains("Awaiting"), "awaiting status missing");
+        assert!(
+            !full.contains("Running"),
+            "an awaiting thread must not show Running status"
+        );
     }
 
     #[test]
@@ -1826,6 +1866,7 @@ mod tests {
                 phase: Phase::Design,
                 started_at: Duration::from_secs(100),
                 slot_number: 1,
+                awaiting: false,
             }],
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-003".to_string(),
@@ -2202,12 +2243,14 @@ mod tests {
                     phase: Phase::Implement,
                     started_at: Duration::from_secs(100),
                     slot_number: 1,
+                    awaiting: false,
                 },
                 ActiveThread {
                     ticket_id: "T-003-02".to_string(),
                     phase: Phase::Research,
                     started_at: Duration::from_secs(100),
                     slot_number: 2,
+                    awaiting: false,
                 },
             ],
             ..PluginState::default()
@@ -2249,6 +2292,7 @@ mod tests {
                 phase: Phase::Design,
                 started_at: Duration::from_secs(50),
                 slot_number: 1,
+                awaiting: false,
             }],
             ..PluginState::default()
         };
@@ -2328,6 +2372,7 @@ mod tests {
                 phase: Phase::Implement,
                 started_at: Duration::from_secs(50),
                 slot_number: 1,
+                awaiting: false,
             }],
             ..PluginState::default()
         };

@@ -226,6 +226,30 @@ pub struct State {
     /// Entries: (ticket_id, elapsed_secs, phase_at_timeout).
     /// Cleared when the ticket is rescheduled.
     timeout_alerts: Vec<(TicketId, u64, Phase)>,
+
+    /// Absolute host project root, captured from `get_plugin_ids().initial_cwd`
+    /// in `load()`. Commands launched via `run_command` run on the host (where
+    /// the sandbox `/host` mount is meaningless), so notification invocations
+    /// build absolute paths and cwd from this. Empty until `load()` runs — the
+    /// notification host call is skipped while empty (e.g. in native tests).
+    project_root: PathBuf,
+
+    /// Panes already notified for `attention` (idle-without-artifact). Prevents
+    /// a ~60s-repeating idle prompt from re-pinging. An entry is cleared when the
+    /// pane emits a heartbeat (genuine progress), so a resumed-then-re-stalled
+    /// agent can notify again.
+    notified_attention: HashSet<u32>,
+
+    /// Panes blocked on an `AskUserQuestion` (a `pane-<id>.awaiting` signal was
+    /// seen). While set, all injection into the pane is suppressed so lisa never
+    /// types over the question UI. Cleared on the pane's next heartbeat (the agent
+    /// resumed real work). Deliberately never touches the liveness clock — a
+    /// blocked-then-abandoned pane still trips stale detection on the normal
+    /// silence clock (reclaim exemption is T-020-04, not here).
+    awaiting_human: HashSet<u32>,
+
+    /// When the loop started, used to compute `LISA_DURATION_SECS` on `complete`.
+    loop_started_at: Option<std::time::SystemTime>,
 }
 
 impl State {
@@ -250,10 +274,28 @@ impl State {
     /// The Enter key (0x0D) is queued and sent after `ENTER_DELAY_SECS` so the
     /// TUI has time to process the characters before receiving the submit action.
     fn send_line_to_pane(&mut self, text: &str, pane_id: PaneId) {
+        // Belt-and-suspenders safety net: never inject into a pane that is blocked
+        // on an AskUserQuestion. The per-caller guards keep state machines coherent;
+        // this in-method drop makes a missed caller fail safe (no clobber). Return
+        // before queuing the deferred Enter so a dropped line leaves no stray Enter.
+        if let PaneId::Terminal(id) = pane_id {
+            if self.is_pane_awaiting(id) {
+                self.log_activity(ActivityEvent::Info {
+                    message: format!("Suppressed injection into pane {} (awaiting human)", id),
+                });
+                return;
+            }
+        }
         write_chars_to_pane_id(text, pane_id);
         self.pending_enters.push_back(pane_id);
         set_timeout(ENTER_DELAY_SECS);
         self.pending_timer_count += 1;
+    }
+
+    /// True if `pane_id` is currently blocked on an `AskUserQuestion` (its
+    /// `pane-<id>.awaiting` signal was seen and no heartbeat has cleared it yet).
+    fn is_pane_awaiting(&self, pane_id: u32) -> bool {
+        self.awaiting_human.contains(&pane_id)
     }
 
     /// Send Enter to all panes that have been waiting for the deferred keypress.
@@ -261,6 +303,62 @@ impl State {
         while let Some(pane_id) = self.pending_enters.pop_front() {
             write_to_pane_id(vec![13], pane_id); // Enter key
         }
+    }
+
+    /// Build the `(argv, env)` for invoking the user's `on-notify` hook.
+    ///
+    /// Pure and host-free so it can be unit-tested. The command is `sh -c` with a
+    /// guard that runs the hook only if it is executable and **exits 0 when it is
+    /// absent** (a missing/non-executable hook is a silent no-op, not a failure).
+    /// `$1`/`$2` carry `event`/`detail`, matching the `on-notify <event> [detail]`
+    /// contract; the rest of the contract is passed via environment variables.
+    fn build_notify_command(
+        project_root: &Path,
+        event: &str,
+        detail: &str,
+        extra_env: &[(&str, String)],
+    ) -> (Vec<String>, BTreeMap<String, String>) {
+        let hook = project_root.join(".lisa/hooks/on-notify");
+
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        env.insert("LISA_HOOK".to_string(), hook.to_string_lossy().into_owned());
+        env.insert("LISA_EVENT".to_string(), event.to_string());
+        env.insert(
+            "LISA_PROJECT".to_string(),
+            project_root.to_string_lossy().into_owned(),
+        );
+        for (k, v) in extra_env {
+            env.insert((*k).to_string(), v.clone());
+        }
+
+        // `if [ -x ]` (not `test -x && ...`) so an absent hook exits 0.
+        let guard = r#"if [ -x "$LISA_HOOK" ]; then "$LISA_HOOK" "$1" "$2"; fi"#;
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            guard.to_string(),
+            "sh".to_string(),
+            event.to_string(),
+            detail.to_string(),
+        ];
+
+        (argv, env)
+    }
+
+    /// Fire the `on-notify` hook on the host via Zellij's `run_command`.
+    ///
+    /// No-op until `project_root` is captured in `load()` (so native tests, which
+    /// build `State` directly, never reach the host call). The `context` carries a
+    /// `lisa_notify` key so `RunCommandResult` can be attributed back to this call.
+    fn fire_notify(&self, event: &str, detail: &str, extra_env: &[(&str, String)]) {
+        if self.project_root.as_os_str().is_empty() {
+            return;
+        }
+        let (argv, env) = Self::build_notify_command(&self.project_root, event, detail, extra_env);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut context = BTreeMap::new();
+        context.insert("lisa_notify".to_string(), event.to_string());
+        run_command_with_env_variables_and_cwd(&argv_refs, env, self.project_root.clone(), context);
     }
 
     fn log_activity(&mut self, event: ActivityEvent) {
@@ -457,6 +555,14 @@ impl State {
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
 
             let pane_id = self.agent_slots[slot_idx].pane_id;
+
+            // Defensive: an idle slot rarely hosts an agent blocked on a question,
+            // but if it does, leave the slot unassigned and retry next poll rather
+            // than /clear-ing or launching over the question UI.
+            if self.is_pane_awaiting(pane_id) {
+                unscheduled += 1;
+                continue;
+            }
 
             let launch_cmd;
             if self.agent_slots[slot_idx].has_session {
@@ -697,6 +803,56 @@ impl State {
 
             let _ = std::fs::remove_file(&path);
             self.bump_pane_activity(pane_id);
+            // A heartbeat proves genuine progress — clear any attention debounce
+            // so a pane that resumes and later re-stalls can notify again.
+            self.notified_attention.remove(&pane_id);
+            // A real tool call means an AskUserQuestion (if any) was answered and
+            // the agent resumed — stop suppressing injection into this pane.
+            self.awaiting_human.remove(&pane_id);
+        }
+    }
+
+    /// Consume `pane-<id>.awaiting` signals and flag those panes as blocked on a
+    /// human-facing `AskUserQuestion`.
+    ///
+    /// The PreToolUse[AskUserQuestion] hook writes `pane-<id>.awaiting`
+    /// unconditionally whenever an agent asks a question. While a pane is flagged,
+    /// `send_line_to_pane` and every injection caller suppress writes so lisa never
+    /// types over the question UI. The flag is cleared in `check_heartbeat_signals`
+    /// on the pane's next heartbeat (the agent resumed real work).
+    ///
+    /// Must run **before** `check_idle_signals` so the flag gates this tick's
+    /// consumers. Deliberately does NOT bump activity clocks — this gates writes
+    /// only; a blocked-then-abandoned pane must still trip stale detection on the
+    /// normal silence clock (reclaim exemption is T-020-04).
+    fn check_awaiting_signals(&mut self) {
+        let entries = match std::fs::read_dir(&self.signal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let pane_id = match path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("pane-"))
+                .and_then(|n| n.strip_suffix(".awaiting"))
+                .and_then(|id| id.parse::<u32>().ok())
+            {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let _ = std::fs::remove_file(&path);
+            if self.awaiting_human.insert(pane_id) {
+                self.log_activity(ActivityEvent::Info {
+                    message: format!(
+                        "Pane {} awaiting human (AskUserQuestion) — suppressing injection",
+                        pane_id
+                    ),
+                });
+            }
         }
     }
 
@@ -730,7 +886,10 @@ impl State {
             let _ = std::fs::remove_file(&path);
 
             // Signal files are named pane-{pane_id}.idle — resolve ticket
-            // from the agent slot that owns this pane.
+            // from the agent slot that owns this pane. `idle_pane_id` is lifted
+            // out of the parse branch so the IdleWithoutArtifact arm below can
+            // debounce on it and export LISA_PANE_ID.
+            let mut idle_pane_id: Option<u32> = None;
             let ticket_id: TicketId = if let Some(rest) = filename
                 .strip_prefix("pane-")
                 .and_then(|s| s.strip_suffix(".idle"))
@@ -739,6 +898,7 @@ impl State {
                     Ok(id) => id,
                     Err(_) => continue,
                 };
+                idle_pane_id = Some(pane_id);
                 // An idle signal is recent life — restart the wind-down clock.
                 self.bump_pane_activity(pane_id);
                 match self
@@ -886,6 +1046,25 @@ impl State {
                         self.log_activity(ActivityEvent::Warning {
                             message: format!("{}: {}", ticket_id, detail),
                         });
+
+                        // Fire the `attention` notification once per stall. The
+                        // debounce set suppresses re-firing while the pane stays
+                        // stalled (idle prompts repeat ~60s); a heartbeat clears
+                        // the entry so a resumed-then-re-stalled agent re-notifies.
+                        if let Some(pane_id) = idle_pane_id {
+                            if self.notified_attention.insert(pane_id) {
+                                let env: Vec<(&str, String)> = vec![
+                                    ("LISA_PANE_ID", pane_id.to_string()),
+                                    ("LISA_TICKET", ticket_id.clone()),
+                                    ("LISA_REASON", "idle-without-artifact".to_string()),
+                                ];
+                                let notify_detail = format!(
+                                    "{} idle in {} without {}",
+                                    ticket_id, current_phase, artifact_name
+                                );
+                                self.fire_notify("attention", &notify_detail, &env);
+                            }
+                        }
                     }
                 }
 
@@ -961,6 +1140,11 @@ impl State {
 
         // Case 1: Mid-transition — send /clear
         if transition_state == TransitionState::WaitingForStop {
+            // Never /clear a pane blocked on a question — would discard the agent's
+            // session mid-question. Stay in WaitingForStop; retry once unblocked.
+            if self.is_pane_awaiting(pane_id) {
+                return;
+            }
             self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
             if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
                 slot.transition_state = TransitionState::WaitingForClear;
@@ -1074,6 +1258,11 @@ impl State {
             });
 
         if let Some(ticket_id) = action {
+            // Don't type the next-ticket prompt over a question. Leave the slot in
+            // WaitingForClear; the prompt goes out on a later tick once unblocked.
+            if self.is_pane_awaiting(pane_id) {
+                return;
+            }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let prompt = ticket_prompt(&host_ticket_dir, &ticket_id);
             self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
@@ -1129,6 +1318,11 @@ impl State {
         }
 
         for pane_id in stop_timeouts {
+            // Don't force a /clear over a question — skip this pane in the fallback;
+            // the transition resumes on a later tick once the agent is unblocked.
+            if self.is_pane_awaiting(pane_id) {
+                continue;
+            }
             self.log_activity(ActivityEvent::Warning {
                 message: format!(
                     "Stop signal timeout for pane {}, sending /clear anyway",
@@ -1143,6 +1337,10 @@ impl State {
         }
 
         for (pane_id, ticket_id) in clear_timeouts {
+            // Don't force the prompt over a question — skip; retry once unblocked.
+            if self.is_pane_awaiting(pane_id) {
+                continue;
+            }
             self.log_activity(ActivityEvent::Warning {
                 message: format!(
                     "Clear signal timeout for pane {}, sending prompt anyway",
@@ -1193,6 +1391,12 @@ impl State {
             .collect();
 
         for (ticket_id, pane_id) in candidates {
+            // Most acute clobber risk: a Review agent legitimately asking a question
+            // must not be prodded with a finish-up prompt over its question UI. Skip
+            // without marking finish_up_sent so it's re-evaluated once unblocked.
+            if self.is_pane_awaiting(pane_id) {
+                continue;
+            }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let host_work_dir = strip_host_prefix(&self.config.work_dir);
             let prompt = finish_up_prompt(&host_ticket_dir, &host_work_dir, &ticket_id);
@@ -1324,7 +1528,14 @@ impl State {
                 // mid-ticket. The budget itself is advisory — silence kills,
                 // budgets warn.
                 let silent_for = now.duration_since(t.last_activity).unwrap_or_default();
-                if silent_for >= hard_silence {
+                // Awaiting-human exemption (T-020-04): a pane blocked on an
+                // AskUserQuestion may be silent far longer than hard-silence while a
+                // human composes an answer. Never kill it — reclaiming mid-question
+                // is the exact failure S-020 exists to prevent. It falls into the
+                // warn branch instead, so it is still surfaced (warnings may log;
+                // only the kill is suppressed). The exemption clears with the flag
+                // on the pane's next heartbeat, restoring normal reclamation.
+                if silent_for >= hard_silence && !self.awaiting_human.contains(&t.pane_id) {
                     timed_out.push((tid.clone(), elapsed_secs, phase));
                 } else {
                     over_budget_active.push((tid.clone(), elapsed_secs, phase));
@@ -1374,11 +1585,18 @@ impl State {
         // Hard timeout: 2x the configured stuck threshold
         let hard_timeout = std::time::Duration::from_secs(self.config.stuck_threshold_secs * 2);
 
+        // Awaiting-human exemption (T-020-04): a pane blocked on an AskUserQuestion
+        // is intentionally silent while a human answers. Exclude it from stale
+        // reclamation so it is never killed mid-question. The marker on the
+        // dashboard (driven off this same set) keeps it visible; the exemption
+        // clears with the flag on the pane's next heartbeat.
+        let awaiting = &self.awaiting_human;
         let stale: Vec<TicketId> = self
             .threads
             .iter()
             .filter(|(_, t)| t.status == ThreadStatus::Running)
             .filter(|(_, t)| t.health(now, hard_timeout) == HealthStatus::Stuck)
+            .filter(|(_, t)| !awaiting.contains(&t.pane_id))
             .map(|(tid, _)| tid.clone())
             .collect();
 
@@ -1442,6 +1660,11 @@ impl State {
         // Consume heartbeat signals first so activity clocks are current
         // before any health or timeout decisions this tick.
         self.check_heartbeat_signals();
+
+        // Flag panes blocked on AskUserQuestion before any consumer can inject
+        // into them this tick (must precede check_idle_signals and the timeout
+        // fallbacks). Heartbeats above already cleared resumed panes.
+        self.check_awaiting_signals();
 
         // Check for new artifacts and advance phases before rebuilding DAG
         self.check_artifact_advances();
@@ -1547,6 +1770,25 @@ impl State {
         // Check for clean termination — all tickets done, no work remaining
         if self.check_all_done() {
             self.log_activity(ActivityEvent::AllTicketsDone);
+
+            // Notify the operator that the loop finished. Fires once per
+            // completion (timer not re-armed); re-fires if keep_working() resets
+            // `terminated` and the DAG later drains again.
+            let tickets_done = self
+                .dag
+                .tickets()
+                .filter(|t| t.phase == Phase::Done)
+                .count();
+            let mut env: Vec<(&str, String)> =
+                vec![("LISA_TICKETS_DONE", tickets_done.to_string())];
+            if let Some(start) = self.loop_started_at {
+                if let Ok(d) = std::time::SystemTime::now().duration_since(start) {
+                    env.push(("LISA_DURATION_SECS", d.as_secs().to_string()));
+                }
+            }
+            let detail = format!("{} tickets done", tickets_done);
+            self.fire_notify("complete", &detail, &env);
+
             self.terminated = true;
             // Don't re-arm the timer — loop is complete
             return;
@@ -2287,19 +2529,28 @@ impl ZellijPlugin for State {
         // Signal directory for idle signal detection
         self.signal_dir = host.join(".lisa/signals");
 
+        // Absolute host project root (run_command runs on the host, where the
+        // /host sandbox mount does not exist) and loop-start timestamp for
+        // LISA_DURATION_SECS on completion.
+        self.project_root = get_plugin_ids().initial_cwd;
+        self.loop_started_at = Some(std::time::SystemTime::now());
+
         // Subscribe to the events we need
         subscribe(&[
             EventType::PaneUpdate,
             EventType::PermissionRequestResult,
             EventType::Timer,
             EventType::Key,
+            EventType::RunCommandResult,
         ]);
 
         // Request permissions needed to write commands to agent terminal panes
+        // and to invoke the on-notify hook on the host (RunCommands).
         request_permission(&[
             PermissionType::WriteToStdin,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadApplicationState,
+            PermissionType::RunCommands,
         ]);
 
         // Initial DAG build with startup diagnostics
@@ -2394,6 +2645,25 @@ impl ZellijPlugin for State {
                 should_render = self.handle_key(key);
             }
 
+            Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
+                // Only our on-notify invocations carry the `lisa_notify` context
+                // key. Keep hook failures visible without spamming on success.
+                if let Some(notify_event) = context.get("lisa_notify") {
+                    match exit_code {
+                        Some(0) => self.log_activity(ActivityEvent::Info {
+                            message: format!("on-notify {} ok", notify_event),
+                        }),
+                        other => self.log_activity(ActivityEvent::Warning {
+                            message: format!(
+                                "on-notify {} failed (exit {:?})",
+                                notify_event, other
+                            ),
+                        }),
+                    }
+                    should_render = true;
+                }
+            }
+
             _ => {}
         }
 
@@ -2454,6 +2724,7 @@ impl State {
                             .as_secs(),
                     ),
                     slot_number,
+                    awaiting: self.is_pane_awaiting(t.pane_id),
                 }
             })
             .collect();
@@ -5100,6 +5371,355 @@ mod tests {
 
         // Verify: no idle alerts
         assert!(state.idle_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_build_notify_command_complete() {
+        let root = Path::new("/proj");
+        let extra = vec![
+            ("LISA_TICKETS_DONE", "3".to_string()),
+            ("LISA_DURATION_SECS", "120".to_string()),
+        ];
+        let (argv, env) = State::build_notify_command(root, "complete", "3 tickets done", &extra);
+
+        // argv: sh -c <guard> sh <event> <detail>
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-c");
+        assert!(argv[2].contains("if [ -x \"$LISA_HOOK\" ]"));
+        assert_eq!(argv[3], "sh");
+        assert_eq!(argv[4], "complete");
+        assert_eq!(argv[5], "3 tickets done");
+
+        assert_eq!(env.get("LISA_EVENT").unwrap(), "complete");
+        assert_eq!(env.get("LISA_PROJECT").unwrap(), "/proj");
+        assert_eq!(env.get("LISA_HOOK").unwrap(), "/proj/.lisa/hooks/on-notify");
+        assert_eq!(env.get("LISA_TICKETS_DONE").unwrap(), "3");
+        assert_eq!(env.get("LISA_DURATION_SECS").unwrap(), "120");
+    }
+
+    #[test]
+    fn test_build_notify_command_attention() {
+        let root = Path::new("/proj");
+        let extra = vec![
+            ("LISA_PANE_ID", "7".to_string()),
+            ("LISA_TICKET", "T-042".to_string()),
+            ("LISA_REASON", "idle-without-artifact".to_string()),
+        ];
+        let detail = "T-042 idle in research without research.md";
+        let (argv, env) = State::build_notify_command(root, "attention", detail, &extra);
+
+        assert_eq!(argv[4], "attention");
+        assert_eq!(argv[5], detail);
+
+        assert_eq!(env.get("LISA_EVENT").unwrap(), "attention");
+        assert_eq!(env.get("LISA_PANE_ID").unwrap(), "7");
+        assert_eq!(env.get("LISA_TICKET").unwrap(), "T-042");
+        assert_eq!(env.get("LISA_REASON").unwrap(), "idle-without-artifact");
+        assert_eq!(env.get("LISA_HOOK").unwrap(), "/proj/.lisa/hooks/on-notify");
+    }
+
+    #[test]
+    fn test_attention_debounce_add_skip_and_clear() {
+        let mut state = State::default();
+
+        // First stall for pane 5 → newly inserted (would fire).
+        assert!(state.notified_attention.insert(5));
+        // Repeated stall while still stalled → already present (suppressed).
+        assert!(!state.notified_attention.insert(5));
+
+        // A heartbeat clears the entry → a later re-stall can notify again.
+        state.notified_attention.remove(&5);
+        assert!(state.notified_attention.insert(5));
+    }
+
+    // --- T-020-03: awaiting-human suppression -------------------------------
+
+    #[test]
+    fn test_check_awaiting_signals_inserts_and_deletes() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-7.awaiting"), "2026-06-20T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+
+        state.check_awaiting_signals();
+
+        // Pane flagged and the signal file consumed (so it doesn't re-trigger).
+        assert!(state.is_pane_awaiting(7));
+        assert!(!signal_dir.join("pane-7.awaiting").exists());
+    }
+
+    #[test]
+    fn test_heartbeat_clears_awaiting() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-7.heartbeat"), "2026-06-20T00:00:00Z").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.awaiting_human.insert(7);
+
+        state.check_heartbeat_signals();
+
+        // A real tool call (heartbeat) means the question was answered.
+        assert!(!state.is_pane_awaiting(7));
+        assert!(!signal_dir.join("pane-7.heartbeat").exists());
+    }
+
+    #[test]
+    fn test_is_pane_awaiting_accessor() {
+        let mut state = State::default();
+        assert!(!state.is_pane_awaiting(3));
+        state.awaiting_human.insert(3);
+        assert!(state.is_pane_awaiting(3));
+        state.awaiting_human.remove(&3);
+        assert!(!state.is_pane_awaiting(3));
+    }
+
+    #[test]
+    fn test_stopped_signal_skips_when_awaiting() {
+        // A WaitingForStop pane blocked on a question must not be /clear-ed.
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForStop,
+            transition_started_at: Some(std::time::SystemTime::now()),
+            cooldown_until: None,
+            last_activity_at: None,
+        });
+        state.awaiting_human.insert(1);
+
+        // Would call send_line_to_pane("/clear", ..) (a zellij host call that
+        // panics natively) if the guard were missing — so reaching the assert
+        // proves the guard short-circuited.
+        state.handle_stopped_signal(1);
+
+        // No state-machine advance: still WaitingForStop, not WaitingForClear.
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForStop
+        );
+    }
+
+    #[test]
+    fn test_cleared_signal_skips_when_awaiting() {
+        // A WaitingForClear pane blocked on a question must not receive the prompt.
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForClear,
+            transition_started_at: Some(std::time::SystemTime::now()),
+            cooldown_until: None,
+            last_activity_at: None,
+        });
+        state.awaiting_human.insert(1);
+
+        state.handle_cleared_signal(1);
+
+        // Still WaitingForClear — the prompt was not sent, slot did not flip to Idle.
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForClear
+        );
+    }
+
+    #[test]
+    fn test_transition_timeouts_skip_when_awaiting() {
+        // A timed-out WaitingForStop pane that is quiet would normally be force
+        // /clear-ed; while awaiting it must be skipped, leaving state unchanged.
+        let mut state = State::default();
+        let long_ago = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(state.config.wind_down_secs + 100_000);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::WaitingForStop,
+            transition_started_at: Some(long_ago),
+            cooldown_until: None,
+            last_activity_at: Some(long_ago),
+        });
+        state.awaiting_human.insert(1);
+
+        state.check_transition_timeouts();
+
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForStop
+        );
+    }
+
+    #[test]
+    fn test_review_timeout_skips_when_awaiting() {
+        use lisa_core::types::Thread;
+
+        // A Review thread past timeout + quiet would get a finish-up prompt; while
+        // awaiting it must be skipped without being marked finish_up_sent.
+        let mut state = State::default();
+        let now = std::time::SystemTime::now();
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        thread.last_phase_change =
+            now - std::time::Duration::from_secs(state.config.review_timeout_secs + 100);
+        thread.last_activity =
+            now - std::time::Duration::from_secs(state.config.wind_down_secs + 100);
+        state.threads.insert("T-001".to_string(), thread);
+        state.awaiting_human.insert(1);
+
+        state.check_review_timeouts();
+
+        // Skipped: no finish-up prompt counted, so it re-evaluates once unblocked.
+        assert!(!state.finish_up_sent.contains("T-001"));
+    }
+
+    #[test]
+    fn test_session_timeout_skips_kill_when_awaiting() {
+        use lisa_core::types::Thread;
+
+        // Over budget AND silent past hard-silence — would normally be reclaimed.
+        let mut state = State::default();
+        let now = std::time::SystemTime::now();
+        let hard_silence = state.config.stuck_threshold_secs * 2;
+        let mut thread = Thread::new("T-001", 1);
+        thread.started_at =
+            now - std::time::Duration::from_secs(state.config.session_timeout_secs + 1000);
+        thread.last_activity = now - std::time::Duration::from_secs(hard_silence + 100);
+        thread.last_phase_change = thread.last_activity;
+        state.threads.insert("T-001".to_string(), thread);
+        state.awaiting_human.insert(1);
+
+        state.check_session_timeouts();
+
+        // Exempt: still present, not reclaimed.
+        assert!(state.threads.contains_key("T-001"));
+    }
+
+    #[test]
+    fn test_session_timeout_kills_after_flag_clears() {
+        use lisa_core::types::Thread;
+
+        // Identical fixture, but the pane is NOT awaiting — normal reclaim applies.
+        let mut state = State::default();
+        let now = std::time::SystemTime::now();
+        let hard_silence = state.config.stuck_threshold_secs * 2;
+        let mut thread = Thread::new("T-001", 1);
+        thread.started_at =
+            now - std::time::Duration::from_secs(state.config.session_timeout_secs + 1000);
+        thread.last_activity = now - std::time::Duration::from_secs(hard_silence + 100);
+        thread.last_phase_change = thread.last_activity;
+        state.threads.insert("T-001".to_string(), thread);
+        // awaiting_human empty → the only difference from the test above.
+
+        state.check_session_timeouts();
+
+        // Reclaimed: removed once the exemption no longer applies.
+        assert!(!state.threads.contains_key("T-001"));
+    }
+
+    #[test]
+    fn test_detect_stale_skips_when_awaiting() {
+        use lisa_core::types::Thread;
+
+        // Silent past the hard timeout — would normally be marked stale.
+        let mut state = State::default();
+        let now = std::time::SystemTime::now();
+        let hard_timeout = state.config.stuck_threshold_secs * 2;
+        let mut thread = Thread::new("T-001", 1);
+        thread.last_activity = now - std::time::Duration::from_secs(hard_timeout + 100);
+        state.threads.insert("T-001".to_string(), thread);
+        state.awaiting_human.insert(1);
+
+        state.detect_stale_threads();
+
+        // Exempt: still present.
+        assert!(state.threads.contains_key("T-001"));
+    }
+
+    #[test]
+    fn test_detect_stale_kills_after_flag_clears() {
+        use lisa_core::types::Thread;
+
+        // Identical fixture, no awaiting flag — stale reclamation applies.
+        let mut state = State::default();
+        let now = std::time::SystemTime::now();
+        let hard_timeout = state.config.stuck_threshold_secs * 2;
+        let mut thread = Thread::new("T-001", 1);
+        thread.last_activity = now - std::time::Duration::from_secs(hard_timeout + 100);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.detect_stale_threads();
+
+        // Reclaimed.
+        assert!(!state.threads.contains_key("T-001"));
+    }
+
+    #[test]
+    fn test_to_ui_state_marks_awaiting_thread() {
+        use lisa_core::types::Thread;
+
+        // Two running threads on two panes; only pane 1 is awaiting.
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+        });
+        state.agent_slots.push(AgentSlot {
+            pane_id: 2,
+            ticket_id: Some("T-002".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+        });
+        state
+            .threads
+            .insert("T-001".to_string(), Thread::new("T-001", 1));
+        state
+            .threads
+            .insert("T-002".to_string(), Thread::new("T-002", 2));
+        state.awaiting_human.insert(1);
+
+        let ui_state = state.to_ui_state();
+
+        // The UI marker is a pure projection of the awaiting_human set, so the
+        // exemption and the marker can never disagree.
+        let awaiting_ids: Vec<&str> = ui_state
+            .active_threads
+            .iter()
+            .filter(|t| t.awaiting)
+            .map(|t| t.ticket_id.as_str())
+            .collect();
+        assert_eq!(awaiting_ids, vec!["T-001"]);
+    }
+
+    #[test]
+    fn test_fire_notify_noop_when_project_root_empty() {
+        // Default State has an empty project_root; fire_notify must early-return
+        // (never reaching the host run_command stub) so native tests are safe.
+        let state = State::default();
+        assert!(state.project_root.as_os_str().is_empty());
+        state.fire_notify("complete", "noop", &[]); // must not panic
     }
 
     #[test]

@@ -209,7 +209,10 @@ pub const LISA_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Returns true (needs update) if parsing fails.
 pub fn version_is_stale(project_version: &str, current_version: &str) -> bool {
     fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
-        let parts: Vec<&str> = s.split('.').collect();
+        // Strip any pre-release / build-metadata suffix (e.g. "0.3.0-rc.1" or
+        // "0.3.0+build") so prerelease versions parse to their core triple.
+        let core = s.split(['-', '+']).next().unwrap_or(s);
+        let parts: Vec<&str> = core.split('.').collect();
         if parts.len() != 3 {
             return None;
         }

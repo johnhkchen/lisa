@@ -323,6 +323,11 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         ("on-stop.sh", templates::ON_STOP_HOOK),
         ("on-clear.sh", templates::ON_CLEAR_HOOK),
         ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
+        // Scaffolded as a non-executable `.sample`: the user opts in by copying
+        // it to `on-notify` and `chmod +x`. Deliberately excluded from the chmod
+        // loop below so the catch-all Notification hook's `test -x` guard stays
+        // inert until then.
+        ("on-notify.sample", templates::ON_NOTIFY_HOOK),
     ];
     for (name, content) in hook_scripts {
         let hook_path = root.join(format!(".lisa/hooks/{}", name));
@@ -646,9 +651,11 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
             Ok(content) => {
                 for (key, label) in [
                     ("idle_prompt", "Notification[idle_prompt]"),
+                    ("on-notify", "Notification[attention]"),
                     ("\"Stop\"", "Stop"),
                     ("\"SessionStart\"", "SessionStart[clear]"),
                     ("\"PostToolUse\"", "PostToolUse[heartbeat]"),
+                    ("AskUserQuestion", "PreToolUse[AskUserQuestion]"),
                 ] {
                     if !content.contains(key) {
                         diagnostics.push(ValidationDiagnostic {
@@ -671,8 +678,16 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         }
     }
 
-    // Hook scripts — on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh
-    for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh", "on-heartbeat.sh"] {
+    // Hook scripts — on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, on-notify.sample.
+    // The `.sample` is scaffolded non-executable (opt-in), so it is checked for
+    // existence but exempt from the executable-bit check.
+    for script in &[
+        "on-idle.sh",
+        "on-stop.sh",
+        "on-clear.sh",
+        "on-heartbeat.sh",
+        "on-notify.sample",
+    ] {
         let hook_path = root.join(format!(".lisa/hooks/{}", script));
         if !hook_path.exists() {
             diagnostics.push(ValidationDiagnostic {
@@ -681,7 +696,7 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
                 message: "not found. Run `lisa init` to create hooks.".to_string(),
                 severity: Severity::Error,
             });
-        } else {
+        } else if !script.ends_with(".sample") {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -938,12 +953,25 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   9 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, .lisa/.gitignore, settings.local.json)
+        //   10 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, on-notify.sample, .lisa/.gitignore, settings.local.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| !matches!(a, InitAction::Skip { .. }))
             .collect();
-        assert_eq!(creates.len(), 17);
+        assert_eq!(creates.len(), 18);
+    }
+
+    #[test]
+    fn test_plan_init_creates_on_notify_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        let created: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, InitAction::CreateFile { path, .. } if path.ends_with("on-notify.sample")))
+            .collect();
+        assert_eq!(created.len(), 1, "on-notify.sample should be scaffolded");
     }
 
     #[test]
@@ -1044,6 +1072,7 @@ mod tests {
         assert!(dir.path().join(".lisa/hooks/on-idle.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-stop.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-clear.sh").exists());
+        assert!(dir.path().join(".lisa/hooks/on-notify.sample").exists());
         assert!(dir.path().join(".lisa/signals").exists());
         assert!(dir.path().join(".lisa/.gitignore").exists());
         assert!(dir.path().join(".claude/settings.local.json").exists());
@@ -1088,6 +1117,23 @@ mod tests {
         // Check .lisa/.gitignore content
         let gitignore = fs::read_to_string(dir.path().join(".lisa/.gitignore")).unwrap();
         assert!(gitignore.contains("signals/"));
+
+        // on-notify.sample is scaffolded but NOT executable (opt-in).
+        let sample = fs::read_to_string(dir.path().join(".lisa/hooks/on-notify.sample")).unwrap();
+        assert!(sample.starts_with("#!/bin/sh"));
+        assert!(sample.contains("on-notify"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::metadata(dir.path().join(".lisa/hooks/on-notify.sample"))
+                .unwrap()
+                .permissions();
+            assert_eq!(
+                perms.mode() & 0o111,
+                0,
+                "on-notify.sample must not be executable"
+            );
+        }
     }
 
     #[test]
@@ -1166,6 +1212,12 @@ mod tests {
                 fs::set_permissions(root.join(format!(".lisa/hooks/{}", name)), perms).unwrap();
             }
         }
+        // on-notify.sample is required by validate but is non-executable (opt-in).
+        fs::write(
+            root.join(".lisa/hooks/on-notify.sample"),
+            templates::ON_NOTIFY_HOOK,
+        )
+        .unwrap();
     }
 
     /// Helper to create a minimal ready ticket in the given project root.
@@ -1949,6 +2001,54 @@ depends_on: [T-999]
             .filter(|d| d.severity == Severity::Error && d.path.contains("on-clear.sh"))
             .collect();
         assert_eq!(clear_errors.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_missing_pretooluse_binding() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
+        // Full hook infra, then overwrite settings with the five legacy bindings
+        // only (no PreToolUse[AskUserQuestion]).
+        write_hook_infrastructure(dir.path());
+        let legacy_settings = r#"{
+  "hooks": {
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh" }] }],
+    "SessionStart": [{ "matcher": "clear", "hooks": [{ "type": "command", "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh" }] }],
+    "Notification": [
+      { "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh" }] },
+      { "hooks": [{ "type": "command", "command": "test -x .lisa/hooks/on-notify || exit 0" }] }
+    ]
+  }
+}"#;
+        fs::write(
+            dir.path().join(".claude/settings.local.json"),
+            legacy_settings,
+        )
+        .unwrap();
+        write_ready_ticket(dir.path());
+
+        let result = validate(dir.path(), false);
+        let pretool_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.message.contains("PreToolUse[AskUserQuestion]")
+            })
+            .collect();
+        assert_eq!(
+            pretool_errors.len(),
+            1,
+            "missing AskUserQuestion binding should flag exactly one error"
+        );
     }
 
     #[cfg(unix)]

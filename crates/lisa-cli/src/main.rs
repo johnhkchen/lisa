@@ -1,6 +1,7 @@
 mod config;
 mod detect;
 mod doctor;
+mod hooks_guide;
 mod init;
 mod loop_cmd;
 mod setup_guide;
@@ -55,6 +56,8 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Output the hooks setup guide for agents configuring Claude Code hooks
+    HooksGuide,
     /// Check that all runtime dependencies are installed
     Doctor {
         /// Path to the project root (defaults to current directory)
@@ -117,6 +120,12 @@ fn main() {
         Commands::SetupGuide { path } => {
             let path = resolve_path(&path);
             if let Err(e) = setup_guide::run_setup_guide(&path) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::HooksGuide => {
+            if let Err(e) = hooks_guide::run_hooks_guide() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

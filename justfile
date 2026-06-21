@@ -98,3 +98,20 @@ init PATH:
 # Validate project setup
 validate PATH=".":
     cargo run -p lisa-cli -- validate --path {{PATH}}
+
+# S-020 interactive-gate dry run (T-020-05): set up an instrumented throwaway
+# project, run lisa loop against it, then print the block/resume evidence on exit.
+gate-test DEST="/tmp/lisa-gate-dryrun":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash docs/active/work/T-020-05/setup-gate-harness.sh {{DEST}}
+    echo ">>> launching lisa loop — call AskUserQuestion, watch for [AWAITING], answer it, then quit (q)"
+    cd {{DEST}}
+    {{justfile_directory()}}/target/release/lisa loop || true
+    echo ""
+    echo "===================== GATE EVIDENCE ====================="
+    echo "--- on-notify.log (expect: EVENT=attention LISA_REASON=question) ---"
+    cat .lisa/on-notify.log 2>/dev/null || echo "(empty)"
+    echo "--- trace.log (expect a 'heartbeat pane=N' line AFTER you answered) ---"
+    cat .lisa/trace.log 2>/dev/null || echo "(empty)"
+    echo "========================================================"
