@@ -67,11 +67,18 @@ On `complete` (the loop finished):
 
 On `attention` (a session needs you):
 
-| Variable       | Meaning                                                       |
-|----------------|---------------------------------------------------------------|
-| `LISA_PANE_ID` | the originating pane                                          |
-| `LISA_TICKET`  | ticket id, when known                                        |
-| `LISA_REASON`  | `idle-without-artifact` (stalled agent), `permission` (prompt), or `question` (agent asked you a question via `AskUserQuestion`) |
+| Variable               | Meaning                                                       |
+|------------------------|---------------------------------------------------------------|
+| `LISA_PANE_ID`         | the originating pane                                          |
+| `LISA_TICKET_ID`       | ticket the agent is working on, when known                   |
+| `LISA_REASON`          | `idle-without-artifact` (stalled agent), `permission` (prompt), or `question` (agent asked you a question via `AskUserQuestion`) |
+| `LISA_QUESTION_HEADER` | short label of the question (`question` reason only)         |
+
+For the `question` and `permission` reasons, the **full Claude Code hook JSON is
+piped to `on-notify` on stdin**, so you can extract anything (all questions, their
+options, `session_id`, `cwd`, …) with `sed`/`jq`: `payload=$(cat)`. `LISA_PROJECT`
+plus `LISA_TICKET_ID` tell you *which loop and ticket* the notification came from —
+useful when several loops run at once.
 
 (The plugin also sets `LISA_HOOK` to the resolved hook path for its own `test -x`
 guard; you can ignore it.)
@@ -108,8 +115,8 @@ Then edit `.lisa/hooks/on-notify` to do something. Example using ntfy.sh:
 ```sh
 #!/bin/sh
 case "$1" in
-  complete)  msg="lisa done: $LISA_TICKETS_DONE tickets in ${LISA_DURATION_SECS}s" ;;
-  attention) msg="lisa needs you ($LISA_REASON): $2" ;;
+  complete)  msg="lisa [$LISA_PROJECT] done: $LISA_TICKETS_DONE tickets in ${LISA_DURATION_SECS}s" ;;
+  attention) msg="lisa [$LISA_PROJECT] ${LISA_TICKET_ID:-?} needs you (${LISA_REASON}): $2" ;;
 esac
 curl -s -d "$msg" ntfy.sh/your-topic-here
 ```
@@ -179,7 +186,7 @@ If you cannot run `lisa init`, create these by hand.
          { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh" } ] }
        ],
        "PreToolUse": [
-         { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; test -x .lisa/hooks/on-notify && LISA_EVENT=attention LISA_REASON=question .lisa/hooks/on-notify attention \"$q\"" } ] }
+         { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); test -x .lisa/hooks/on-notify && printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$PWD\" LISA_QUESTION_HEADER=\"$hdr\" .lisa/hooks/on-notify attention \"$q\"" } ] }
        ],
        "Stop": [
          { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh" } ] }
@@ -189,7 +196,7 @@ If you cannot run `lisa init`, create these by hand.
        ],
        "Notification": [
          { "matcher": "idle_prompt", "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh" } ] },
-         { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) LISA_EVENT=attention LISA_REASON=permission .lisa/hooks/on-notify attention \"$in\" ;; esac" } ] }
+         { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$PWD\" .lisa/hooks/on-notify attention \"$in\" ;; esac" } ] }
        ]
      }
    }

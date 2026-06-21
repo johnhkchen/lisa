@@ -1055,7 +1055,7 @@ impl State {
                             if self.notified_attention.insert(pane_id) {
                                 let env: Vec<(&str, String)> = vec![
                                     ("LISA_PANE_ID", pane_id.to_string()),
-                                    ("LISA_TICKET", ticket_id.clone()),
+                                    ("LISA_TICKET_ID", ticket_id.clone()),
                                     ("LISA_REASON", "idle-without-artifact".to_string()),
                                 ];
                                 let notify_detail = format!(
@@ -5402,7 +5402,7 @@ mod tests {
         let root = Path::new("/proj");
         let extra = vec![
             ("LISA_PANE_ID", "7".to_string()),
-            ("LISA_TICKET", "T-042".to_string()),
+            ("LISA_TICKET_ID", "T-042".to_string()),
             ("LISA_REASON", "idle-without-artifact".to_string()),
         ];
         let detail = "T-042 idle in research without research.md";
@@ -5413,7 +5413,7 @@ mod tests {
 
         assert_eq!(env.get("LISA_EVENT").unwrap(), "attention");
         assert_eq!(env.get("LISA_PANE_ID").unwrap(), "7");
-        assert_eq!(env.get("LISA_TICKET").unwrap(), "T-042");
+        assert_eq!(env.get("LISA_TICKET_ID").unwrap(), "T-042");
         assert_eq!(env.get("LISA_REASON").unwrap(), "idle-without-artifact");
         assert_eq!(env.get("LISA_HOOK").unwrap(), "/proj/.lisa/hooks/on-notify");
     }

@@ -82,19 +82,24 @@ pub const ON_NOTIFY_HOOK: &str = r#"#!/bin/sh
 #
 # Environment (all events):
 #   LISA_EVENT    complete | attention
-#   LISA_PROJECT  absolute project root (you may `cd "$LISA_PROJECT"`)
+#   LISA_PROJECT  absolute project root (identifies which loop; you may `cd` to it)
 # complete:
 #   LISA_TICKETS_DONE   number of tickets completed
 #   LISA_DURATION_SECS  loop duration in seconds
 # attention:
-#   LISA_PANE_ID  the originating pane
-#   LISA_TICKET   ticket id, when known
-#   LISA_REASON   permission | idle-without-artifact
+#   LISA_REASON      question | permission | idle-without-artifact
+#   LISA_PANE_ID     the originating pane
+#   LISA_TICKET_ID   ticket the agent is working on, when known
+#   LISA_QUESTION_HEADER  short label of the question (question reason only)
+#
+# Payload on STDIN: for the question/permission reasons, the full Claude Code
+# hook JSON is piped to this script's stdin, so you can extract anything (e.g.
+# every question + its options) with sed/jq:  payload=$(cat)
 #
 # Example dispatch (uncomment and customise):
 # case "$1" in
-#   complete)  msg="lisa done: $LISA_TICKETS_DONE tickets in ${LISA_DURATION_SECS}s" ;;
-#   attention) msg="lisa needs you ($LISA_REASON): $2" ;;
+#   complete)  msg="lisa [$LISA_PROJECT] done: $LISA_TICKETS_DONE tickets in ${LISA_DURATION_SECS}s" ;;
+#   attention) msg="lisa [$LISA_PROJECT] ${LISA_TICKET_ID:-?} needs you (${LISA_REASON}): $2" ;;
 # esac
 # curl -s -d "$msg" ntfy.sh/your-topic-here
 
@@ -107,7 +112,7 @@ exit 0
 /// reads the payload from stdin once, skips `idle_prompt` payloads (already
 /// handled by on-idle.sh + the plugin), and otherwise invokes the user hook
 /// with LISA_EVENT/LISA_REASON set inline.
-const NOTIFY_ATTENTION_COMMAND: &str = "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) LISA_EVENT=attention LISA_REASON=permission .lisa/hooks/on-notify attention \"$in\" ;; esac";
+const NOTIFY_ATTENTION_COMMAND: &str = "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$PWD\" .lisa/hooks/on-notify attention \"$in\" ;; esac";
 
 /// Command for the `PreToolUse[AskUserQuestion]` hook. POSIX `sh` only (no jq,
 /// no bashisms). It (1) **unconditionally** writes `pane-$LISA_PANE_ID.awaiting`
@@ -118,7 +123,7 @@ const NOTIFY_ATTENTION_COMMAND: &str = "test -x .lisa/hooks/on-notify || exit 0;
 /// signal write must work even when the user never enabled `on-notify`. A question
 /// containing an escaped `\"` truncates the greedy-free `[^"]*` capture; that
 /// degrades to the generic detail, never a hard failure (design Q3).
-const NOTIFY_QUESTION_COMMAND: &str = "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; test -x .lisa/hooks/on-notify && LISA_EVENT=attention LISA_REASON=question .lisa/hooks/on-notify attention \"$q\"";
+const NOTIFY_QUESTION_COMMAND: &str = "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); test -x .lisa/hooks/on-notify && printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$PWD\" LISA_QUESTION_HEADER=\"$hdr\" .lisa/hooks/on-notify attention \"$q\"";
 
 /// Generate .claude/settings.local.json with Stop, SessionStart, Notification
 /// (idle_prompt + catch-all attention), PostToolUse heartbeat, and
@@ -144,7 +149,7 @@ pub fn settings_local_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; test -x .lisa/hooks/on-notify && LISA_EVENT=attention LISA_REASON=question .lisa/hooks/on-notify attention \"$q\""
+            "command": "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); test -x .lisa/hooks/on-notify && printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$PWD\" LISA_QUESTION_HEADER=\"$hdr\" .lisa/hooks/on-notify attention \"$q\""
           }
         ]
       }
@@ -184,7 +189,7 @@ pub fn settings_local_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) LISA_EVENT=attention LISA_REASON=permission .lisa/hooks/on-notify attention \"$in\" ;; esac"
+            "command": "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$PWD\" .lisa/hooks/on-notify attention \"$in\" ;; esac"
           }
         ]
       }
