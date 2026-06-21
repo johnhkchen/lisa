@@ -59,6 +59,12 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     // Clean Zellij's compiled plugin cache so it picks up the new WASM
     crate::doctor::clean_zellij_plugin_cache();
 
+    // Pre-grant the plugin's permissions so the dashboard renders without relying
+    // on Zellij's interactive permission prompt (which does not reliably complete
+    // in every environment — a fresh content-hashed plugin would otherwise show a
+    // blank pane). Best-effort; the prompt remains the fallback.
+    crate::doctor::pregrant_plugin_permissions(&wasm_path);
+
     // Generate KDL layout
     let layout = generate_layout(&wasm_path, config);
     let layout_path = root.join(".lisa-layout.kdl");

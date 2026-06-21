@@ -312,6 +312,62 @@ pub(crate) fn clean_zellij_plugin_cache() {
     }
 }
 
+/// Permissions the lisa plugin requests in its `request_permission` call
+/// (`lisa-plugin` `load()`). The pre-granted set MUST match these exactly, or
+/// Zellij will still prompt for the missing delta.
+const PLUGIN_PERMISSIONS: &[&str] = &[
+    "WriteToStdin",
+    "ChangeApplicationState",
+    "ReadApplicationState",
+    "RunCommands",
+];
+
+/// Pre-grant the lisa plugin's permissions in Zellij's `permissions.kdl`.
+///
+/// Zellij withholds plugin events and rendering until the plugin's requested
+/// permissions are granted — normally via an interactive prompt. That prompt does
+/// not reliably complete in every environment (the plugin pane renders blank with
+/// no confirmation). Because each `lisa loop` writes the plugin to a fresh
+/// content-hashed path Zellij has never granted, we write the grant directly so the
+/// plugin is authorized without depending on the prompt. Best-effort; on any IO
+/// error the loop proceeds (and falls back to the prompt). Returns true if the entry
+/// is present (already-granted or freshly written).
+pub(crate) fn pregrant_plugin_permissions_in(cache_dir: &Path, wasm_path: &Path) -> bool {
+    let perms_path = cache_dir.join("permissions.kdl");
+    let key = format!("\"{}\"", wasm_path.display());
+
+    let existing = std::fs::read_to_string(&perms_path).unwrap_or_default();
+    // Entry lines look like `"<path>" {`; the closing quote in `key` prevents a
+    // shorter hash path from prefix-matching a longer one.
+    if existing.lines().any(|l| l.trim_start().starts_with(&key)) {
+        return true; // already granted for this exact plugin path
+    }
+
+    let perms = PLUGIN_PERMISSIONS
+        .iter()
+        .map(|p| format!("    {p}\n"))
+        .collect::<String>();
+    let entry = format!("{key} {{\n{perms}}}\n");
+
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&entry);
+
+    if std::fs::create_dir_all(cache_dir).is_err() {
+        return false;
+    }
+    std::fs::write(&perms_path, content).is_ok()
+}
+
+/// Resolve the Zellij cache dir and pre-grant the lisa plugin's permissions.
+pub(crate) fn pregrant_plugin_permissions(wasm_path: &Path) {
+    if let Some(dir) = zellij_cache_dir() {
+        pregrant_plugin_permissions_in(&dir, wasm_path);
+    }
+}
+
 /// Run the doctor command: check all dependencies and report.
 pub fn run_doctor(root: &Path) -> Result<(), String> {
     let checks = build_checks();
@@ -667,5 +723,54 @@ mod tests {
         let nonexistent = dir.path().join("does-not-exist");
         let removed = clean_zellij_plugin_cache_in(&nonexistent);
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_pregrant_writes_all_requested_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = Path::new("/tmp/lisa-plugin-deadbeef.wasm");
+
+        assert!(pregrant_plugin_permissions_in(dir.path(), wasm));
+
+        let content = std::fs::read_to_string(dir.path().join("permissions.kdl")).unwrap();
+        assert!(content.contains("\"/tmp/lisa-plugin-deadbeef.wasm\" {"));
+        // The granted set must match exactly what the plugin requests.
+        for perm in PLUGIN_PERMISSIONS {
+            assert!(content.contains(perm), "missing permission {perm}");
+        }
+    }
+
+    #[test]
+    fn test_pregrant_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = Path::new("/tmp/lisa-plugin-deadbeef.wasm");
+
+        pregrant_plugin_permissions_in(dir.path(), wasm);
+        pregrant_plugin_permissions_in(dir.path(), wasm);
+
+        let content = std::fs::read_to_string(dir.path().join("permissions.kdl")).unwrap();
+        // Exactly one entry for this path, no duplicate block.
+        let count = content
+            .matches("\"/tmp/lisa-plugin-deadbeef.wasm\" {")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_pregrant_preserves_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let perms_path = dir.path().join("permissions.kdl");
+        std::fs::write(
+            &perms_path,
+            "\"/tmp/lisa-plugin-old.wasm\" {\n    WriteToStdin\n}\n",
+        )
+        .unwrap();
+
+        let wasm = Path::new("/tmp/lisa-plugin-new.wasm");
+        assert!(pregrant_plugin_permissions_in(dir.path(), wasm));
+
+        let content = std::fs::read_to_string(&perms_path).unwrap();
+        assert!(content.contains("lisa-plugin-old.wasm"));
+        assert!(content.contains("lisa-plugin-new.wasm"));
     }
 }
