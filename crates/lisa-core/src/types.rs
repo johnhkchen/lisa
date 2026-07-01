@@ -253,6 +253,23 @@ pub struct Ticket {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<String>,
 
+    /// Optional routing hint: which agent client should run this ticket
+    /// (`claude` | `codex`). Stored **raw and unvalidated** — an invalid value
+    /// must fall back to the loop default at spawn (never fail the ticket), and
+    /// the requested value is preserved so the substitution is visible in the
+    /// dashboard and the provenance ledger. Resolution lives in
+    /// [`crate::route::resolve_route`]. Absent → the loop default (S-026 /
+    /// T-026-01).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+
+    /// Optional routing hint: the model to run within the selected agent's
+    /// provider (opaque, provider-defined vocabulary). `None` → the provider's
+    /// own default model (today's behaviour). The adapter owns the model→flag
+    /// mapping; the resolver passes this through untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
     /// Path to the ticket file on disk
     #[serde(skip)]
     pub file_path: PathBuf,
@@ -276,6 +293,8 @@ impl Ticket {
             phase: Phase::default(),
             depends_on: Vec::new(),
             blocks: Vec::new(),
+            agent: None,
+            model: None,
             file_path: PathBuf::new(),
             content: String::new(),
         }
@@ -355,6 +374,29 @@ pub struct Thread {
     /// Current status of the thread
     #[serde(default)]
     pub status: ThreadStatus,
+
+    /// The agent client this run resolved to at spawn. Snapshotted here (rather
+    /// than re-read from config at teardown) so the provenance ledger records
+    /// what *actually* ran — correct today and forward-compatible with per-pane
+    /// routing (S-026), where the resolved client may differ per ticket.
+    #[serde(default)]
+    pub client: AgentClient,
+
+    /// Count of threads already running when this run was spawned (concurrency
+    /// at spawn). Captured for the provenance ledger (T-027-01).
+    #[serde(default)]
+    pub concurrency_at_spawn: usize,
+
+    /// The full `(provider, model)` route this thread was spawned with
+    /// (T-026-01), including the requested value and whether an invalid hint was
+    /// substituted for the loop default. Set at spawn from
+    /// [`crate::route::resolve_route`]; `None` for a freshly-constructed thread
+    /// and for threads persisted before routing existed. The dashboard reads it
+    /// to surface each pane's route; the provenance ledger reads it for
+    /// requested vs. actual. `client` above stays the authoritative "which agent
+    /// ran" and always equals `route.agent` when a route is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::route::ResolvedRoute>,
 }
 
 impl Thread {
@@ -369,6 +411,9 @@ impl Thread {
             last_phase_change: now,
             last_activity: now,
             status: ThreadStatus::Running,
+            client: AgentClient::default(),
+            concurrency_at_spawn: 0,
+            route: None,
         }
     }
 
@@ -529,6 +574,16 @@ pub struct PluginConfig {
     /// so this is the real host path.
     #[serde(default)]
     pub lisa_bin: Option<String>,
+
+    /// Optional per-provider concurrency sub-caps, keyed by agent client
+    /// (T-026-02). A provider with an entry may run at most that many concurrent
+    /// threads, *within* the global `max_threads` ceiling — a per-provider cap
+    /// never raises the global limit, it only carves it between providers'
+    /// separate auth/rate-limit pools. Absent (empty map) → only the global cap
+    /// applies, i.e. byte-for-byte the pre-routing behaviour. Enforced at
+    /// spawn-time slot assignment in the plugin scheduler.
+    #[serde(default)]
+    pub provider_caps: HashMap<AgentClient, usize>,
 }
 
 impl PluginConfig {
@@ -572,6 +627,7 @@ impl PluginConfig {
             wind_down_secs: Self::DEFAULT_WIND_DOWN_SECS,
             client: AgentClient::default(),
             lisa_bin: None,
+            provider_caps: HashMap::new(),
         }
     }
 
@@ -653,6 +709,21 @@ impl PluginConfig {
             }
         }
 
+        // Parse provider_cap_{client} keys (T-026-02). Lenient like `client`
+        // above: an unknown provider name, a non-numeric value, or a `0` cap is
+        // skipped rather than erroring — the plugin must never panic parsing its
+        // config map; `lisa validate` is the gate that surfaces bad caps.
+        let cap_prefix = "provider_cap_";
+        for (key, val) in config {
+            if let Some(name) = key.strip_prefix(cap_prefix) {
+                if let (Ok(client), Ok(cap)) = (AgentClient::parse(name), val.parse::<usize>()) {
+                    if cap > 0 {
+                        result.provider_caps.insert(client, cap);
+                    }
+                }
+            }
+        }
+
         result
     }
 
@@ -665,6 +736,13 @@ impl PluginConfig {
             .get(&phase)
             .copied()
             .unwrap_or(self.session_timeout_secs)
+    }
+
+    /// Returns the per-provider concurrency cap for `client`, or `None` when no
+    /// cap is configured for that provider (T-026-02). `None` means only the
+    /// global `max_threads` ceiling applies to that provider.
+    pub fn provider_cap_for(&self, client: AgentClient) -> Option<usize> {
+        self.provider_caps.get(&client).copied()
     }
 }
 
@@ -844,6 +922,55 @@ mod tests {
 
         thread.complete();
         assert_eq!(thread.status, ThreadStatus::Completed);
+    }
+
+    #[test]
+    fn test_thread_run_meta_defaults() {
+        let thread = Thread::new("T-001", 42);
+        assert_eq!(thread.client, AgentClient::default());
+        assert_eq!(thread.concurrency_at_spawn, 0);
+    }
+
+    #[test]
+    fn test_thread_deserializes_without_run_meta() {
+        // Older serialized threads (state dumps) predate client/concurrency; the
+        // #[serde(default)] fields must fill in rather than fail to parse.
+        let json = r#"{
+            "ticket_id": "T-001",
+            "pane_id": 3,
+            "current_phase": "research",
+            "started_at": 1719800000,
+            "last_phase_change": 1719800000,
+            "last_activity": 1719800000,
+            "status": "running"
+        }"#;
+        let thread: Thread = serde_json::from_str(json).unwrap();
+        assert_eq!(thread.client, AgentClient::default());
+        assert_eq!(thread.concurrency_at_spawn, 0);
+        assert_eq!(thread.ticket_id, "T-001");
+    }
+
+    #[test]
+    fn test_thread_route_serde_back_compat() {
+        use crate::route::ResolvedRoute;
+
+        // A legacy thread JSON without `route` deserialises to None.
+        let legacy = r#"{"ticket_id":"T-001","pane_id":1,"current_phase":"ready","started_at":0,"last_phase_change":0,"last_activity":0}"#;
+        let t: Thread = serde_json::from_str(legacy).unwrap();
+        assert_eq!(t.route, None);
+
+        // A thread carrying a route round-trips.
+        let mut t2 = Thread::new("T-002", 2);
+        t2.route = Some(ResolvedRoute {
+            agent: AgentClient::Codex,
+            model: Some("gpt-5".to_string()),
+            requested_agent: Some("codex".to_string()),
+            substituted: false,
+            note: None,
+        });
+        let json = serde_json::to_string(&t2).unwrap();
+        let back: Thread = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.route, t2.route);
     }
 
     #[test]
@@ -1150,6 +1277,56 @@ mod tests {
         let mut empty = BTreeMap::new();
         empty.insert("lisa_bin".to_string(), String::new());
         assert_eq!(PluginConfig::from_config_map(&empty).lisa_bin, None);
+    }
+
+    #[test]
+    fn test_provider_caps_default_empty() {
+        let config = PluginConfig::new();
+        assert!(config.provider_caps.is_empty());
+        assert_eq!(config.provider_cap_for(AgentClient::Claude), None);
+        assert_eq!(config.provider_cap_for(AgentClient::Codex), None);
+    }
+
+    #[test]
+    fn test_provider_cap_for_present() {
+        let mut config = PluginConfig::new();
+        config.provider_caps.insert(AgentClient::Codex, 8);
+        assert_eq!(config.provider_cap_for(AgentClient::Codex), Some(8));
+        // A provider without an entry still has no cap.
+        assert_eq!(config.provider_cap_for(AgentClient::Claude), None);
+    }
+
+    #[test]
+    fn test_provider_caps_from_map() {
+        let mut map = BTreeMap::new();
+        map.insert("provider_cap_codex".to_string(), "8".to_string());
+        map.insert("provider_cap_claude".to_string(), "4".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.provider_cap_for(AgentClient::Codex), Some(8));
+        assert_eq!(config.provider_cap_for(AgentClient::Claude), Some(4));
+        assert_eq!(config.provider_caps.len(), 2);
+    }
+
+    #[test]
+    fn test_provider_caps_from_map_ignores_bad_entries() {
+        let mut map = BTreeMap::new();
+        // Unknown provider name → skipped.
+        map.insert("provider_cap_gpt".to_string(), "8".to_string());
+        // Non-numeric value → skipped.
+        map.insert("provider_cap_claude".to_string(), "lots".to_string());
+        // Zero → skipped (a 0 cap would starve the provider forever).
+        map.insert("provider_cap_codex".to_string(), "0".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert!(config.provider_caps.is_empty());
+    }
+
+    #[test]
+    fn test_provider_caps_absent_from_map_is_empty() {
+        // A legacy config map without the keys yields an empty map.
+        let mut map = BTreeMap::new();
+        map.insert("max_threads".to_string(), "4".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert!(config.provider_caps.is_empty());
     }
 
     #[test]
