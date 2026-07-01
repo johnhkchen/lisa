@@ -14,10 +14,15 @@ Each ticket goes through five phases: Research, Design, Structure, Plan, Impleme
 
 ## Prerequisites
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — the AI coding assistant that does the work
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — the default AI coding assistant that does the work
 - [Zellij](https://zellij.dev/) — terminal multiplexer that hosts Lisa as a plugin
 
-After installing Lisa, run `lisa doctor` to verify everything is in place.
+Claude Code is the default and only required agent client. Lisa can alternatively
+drive [Codex](https://developers.openai.com/codex) — see
+[Codex client](#codex-client-experimental) below.
+
+After installing Lisa, run `lisa doctor` to verify everything is in place. `lisa
+doctor` checks the dependencies for your *selected* client (Claude by default).
 
 ## Install
 

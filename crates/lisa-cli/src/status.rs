@@ -7,7 +7,7 @@ use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
 pub fn run_status(root: &Path) -> Result<(), String> {
     // Load config to get ticket directory and scheduling settings
     let resolved = match config::load_config(root) {
-        Ok(validation) => config::resolve_config(&validation.config, None),
+        Ok(validation) => config::resolve_config(&validation.config, None, None),
         Err(_) => config::ResolvedConfig::default(),
     };
     let ticket_dir_rel = resolved.ticket_dir.clone();

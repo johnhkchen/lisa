@@ -23,13 +23,22 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         return run_dry(root, config);
     }
 
-    // Validate binary prerequisites (skip in dry-run — user may not have them installed)
-    crate::doctor::check_required_deps().map_err(|missing| {
+    // Validate binary prerequisites for the *selected* client (skip in dry-run —
+    // user may not have them installed)
+    crate::doctor::check_required_deps(config.client).map_err(|missing| {
         format!(
             "Missing required dependencies: {}\n\nRun `lisa doctor` for details and install instructions.",
             missing.join(", ")
         )
     })?;
+
+    // Codex runs unattended (`codex exec`), which blocks on the interactive
+    // directory-trust prompt unless the working tree is pre-seeded as trusted.
+    // Best-effort — mirrors `lisa doctor`; a failure here is not fatal (the
+    // operator can fall back to --bypass-sandbox).
+    if config.client == lisa_core::client::AgentClient::Codex {
+        crate::doctor::pregrant_codex_trust(root);
+    }
 
     // Check the WASM plugin is actually embedded (not a dev placeholder)
     if PLUGIN_WASM.is_empty() {
@@ -65,8 +74,14 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     // blank pane). Best-effort; the prompt remains the fallback.
     crate::doctor::pregrant_plugin_permissions(&wasm_path);
 
+    // Capture the absolute `lisa` binary path now (on the host, before exec) so
+    // the Codex adapter can invoke `<lisa> agent-exec …` without assuming `lisa`
+    // is on the pane shell's PATH. current_exe() failure degrades to the bare
+    // `lisa` (the plugin omits the key).
+    let lisa_bin = std::env::current_exe().ok();
+
     // Generate KDL layout
-    let layout = generate_layout(&wasm_path, config);
+    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), config);
     let layout_path = root.join(".lisa-layout.kdl");
     std::fs::write(&layout_path, &layout)
         .map_err(|e| format!("Failed to write layout to {}: {}", layout_path.display(), e))?;
@@ -154,7 +169,8 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
 
     // Show generated layout (using a placeholder WASM path)
     let wasm_path = std::env::temp_dir().join("lisa-plugin.wasm");
-    let layout = generate_layout(&wasm_path, config);
+    let lisa_bin = std::env::current_exe().ok();
+    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), config);
     println!();
     println!("Generated layout:");
     println!("{}", layout);
@@ -196,7 +212,7 @@ fn clean_stale_wasm_files(current_filename: &str) {
     }
 }
 
-fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
+fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedConfig) -> String {
     // Create 2x max_threads pane slots so transitions don't block scheduling.
     // Extra idle panes absorb new tickets while finishing panes wind down.
     let pane_count = config.max_threads * 2;
@@ -207,6 +223,14 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
         // resize, snapping focus back to the first pane.
         agent_panes.push_str("            pane\n");
     }
+
+    // The absolute `lisa` path (current_exe), for the Codex adapter's
+    // `<lisa> agent-exec …` lines. Emitted only when known — an absent key makes
+    // the plugin fall back to the bare `lisa` on the pane shell's PATH.
+    let lisa_bin_line = match lisa_bin {
+        Some(p) => format!("                lisa_bin \"{}\"\n", p.display()),
+        None => String::new(),
+    };
 
     format!(
         r#"layout {{
@@ -229,13 +253,15 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
                 review_timeout_secs "{review_timeout_secs}"
                 session_timeout_secs "{session_timeout_secs}"
                 wind_down_secs "{wind_down_secs}"
-            }}
+                client "{client}"
+{lisa_bin_line}            }}
         }}
     }}
 }}
 "#,
         agent_panes = agent_panes,
         wasm_path = wasm_path.display(),
+        lisa_bin_line = lisa_bin_line,
         ticket_dir = config.ticket_dir,
         story_dir = config.story_dir,
         work_dir = config.work_dir,
@@ -244,6 +270,7 @@ fn generate_layout(wasm_path: &Path, config: &ResolvedConfig) -> String {
         review_timeout_secs = config.review_timeout_secs,
         session_timeout_secs = config.session_timeout_secs,
         wind_down_secs = config.wind_down_secs,
+        client = config.client.as_str(),
     )
 }
 
@@ -291,7 +318,7 @@ mod tests {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let mut config = default_config();
         config.max_threads = 3;
-        let layout = generate_layout(&wasm_path, &config);
+        let layout = generate_layout(&wasm_path, None, &config);
 
         assert!(layout.contains("file:///tmp/lisa-plugin.wasm"));
         assert!(layout.contains("ticket_dir \"docs/active/tickets\""));
@@ -311,10 +338,46 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_layout_default_client_is_claude() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let config = default_config();
+        let layout = generate_layout(&wasm_path, None, &config);
+        assert!(layout.contains("client \"claude\""));
+    }
+
+    #[test]
+    fn test_generate_layout_codex_client() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let config = ResolvedConfig {
+            client: lisa_core::client::AgentClient::Codex,
+            ..default_config()
+        };
+        let layout = generate_layout(&wasm_path, None, &config);
+        assert!(layout.contains("client \"codex\""));
+    }
+
+    #[test]
+    fn test_generate_layout_emits_lisa_bin_when_supplied() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let config = default_config();
+        let bin = PathBuf::from("/opt/bin/lisa");
+        let layout = generate_layout(&wasm_path, Some(&bin), &config);
+        assert!(layout.contains("lisa_bin \"/opt/bin/lisa\""));
+    }
+
+    #[test]
+    fn test_generate_layout_omits_lisa_bin_when_absent() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let config = default_config();
+        let layout = generate_layout(&wasm_path, None, &config);
+        assert!(!layout.contains("lisa_bin"));
+    }
+
+    #[test]
     fn test_generate_layout_default_threads() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let config = default_config();
-        let layout = generate_layout(&wasm_path, &config);
+        let layout = generate_layout(&wasm_path, None, &config);
         assert!(layout.contains("max_threads \"2\""));
         // max_threads=2 should produce 4 pane lines (2x)
         let pane_count = layout.matches("            pane").count();
@@ -330,7 +393,7 @@ mod tests {
             work_dir: "custom/work".to_string(),
             ..default_config()
         };
-        let layout = generate_layout(&wasm_path, &config);
+        let layout = generate_layout(&wasm_path, None, &config);
         assert!(layout.contains("ticket_dir \"custom/tickets\""));
         assert!(layout.contains("story_dir  \"custom/stories\""));
         assert!(layout.contains("work_dir   \"custom/work\""));

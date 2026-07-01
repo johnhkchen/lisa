@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"th_failed_1"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"i1","item_type":"command_execution","command":"cargo build"}}
+{"type":"item.completed","item":{"id":"i1","item_type":"command_execution","command":"cargo build","exit_code":101}}
+{"type":"turn.failed","error":{"message":"build failed: unresolved import"}}

@@ -29,12 +29,23 @@ to a Claude Code event in `.claude/settings.local.json`:
 | `on-stop.sh`       | `Stop`                      | `.lisa/signals/pane-<id>.stopped`   | session ready for input |
 | `on-clear.sh`      | `SessionStart[clear]`       | `.lisa/signals/pane-<id>.cleared`   | context was cleared     |
 | `on-heartbeat.sh`  | `PostToolUse`               | `.lisa/signals/pane-<id>.heartbeat` | session actively working|
+| *(adapter)*        | Codex `turn.failed` / exit≠0| `.lisa/signals/pane-<id>.error`     | session failed          |
 
 Each script is POSIX `sh`, does `mkdir -p .lisa/signals`, and writes a UTC timestamp
 only when `$LISA_PANE_ID` is set (so it is inert outside a Lisa session). The
 **heartbeat** is the liveness primitive: the plugin reuses a pane only after a stretch
 of heartbeat *silence* — not on a stop/idle signal, which can fire before an agent is
 truly finished.
+
+The **`.error`** signal is part of the normalized core contract
+(`.heartbeat`/`.stopped`/`.error`) but is written by non-Claude *adapters* — the Codex
+wrapper emits it on `turn.failed` or a non-zero exit — not by the Claude Code hook
+scripts above (Claude sessions have no `.error` emitter today). On consuming it the
+plugin **fails the thread and releases its slot immediately** — surfacing a `✗ FAILED`
+alert and freeing the ticket for retry — rather than waiting for the silence clock to
+reclaim the pane ~40 minutes later. As with every signal, presence is what matters; any
+body (the wrapper may write the error message for human debugging) is ignored. An
+`.error` for an idle or unknown pane is consumed harmlessly.
 
 ## The `on-notify` hook (attention & completion notifications)
 

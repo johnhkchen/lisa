@@ -4,6 +4,7 @@
 //! as a DAG-driven concurrent scheduler. It manages Claude Code sessions for each ticket,
 //! tracks phase progress, and provides a live dashboard.
 
+mod adapter;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -11,6 +12,11 @@ use std::path::{Path, PathBuf};
 
 use zellij_tile::prelude::*;
 
+use adapter::{
+    resolve_adapter_or_native, FollowUp, FollowUpContext, ResetStrategy, SpawnContext,
+};
+
+use lisa_core::client::AgentClient;
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
 use lisa_core::ticket;
@@ -30,11 +36,16 @@ const STOP_SIGNAL_TIMEOUT_SECS: u64 = 60;
 /// the prompt is never injected into a session that is still working.
 const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 90;
 
-/// The prompt text sent to Claude Code for a ticket.
-fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
+/// The prompt text sent to an agent for a ticket.
+///
+/// `context_file` is the per-client project-context filename the agent should
+/// read (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex — see
+/// [`AgentClient::context_file`]). The prompt body is otherwise identical across
+/// clients, so it stays single-sourced here.
+pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, context_file: &str) -> String {
     let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
     format!(
-        "Read the ticket at {path}, CLAUDE.md, and docs/knowledge/rdspi-workflow.md. \
+        "Read the ticket at {path}, {context}, and docs/knowledge/rdspi-workflow.md. \
          Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
          (Research, Design, Structure, Plan, Implement, Review) without stopping between phases. \
          For each phase, write the artifact to docs/active/work/{id}/ then immediately continue to the next phase. \
@@ -43,6 +54,7 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
          After Review is complete (review.md written summarizing changes, test coverage, and open concerns), \
          simply stop — Lisa handles the rest.",
         path = ticket_path.display(),
+        context = context_file,
         id = ticket_id,
     )
 }
@@ -50,17 +62,17 @@ fn ticket_prompt(ticket_dir: &Path, ticket_id: &str) -> String {
 /// Build the full shell command to launch Claude Code in a fresh pane.
 /// Sets LISA_PANE_ID env var so the idle signal hook can identify the pane,
 /// and LISA_TICKET_ID for debugging/logging context.
-fn build_claude_command(ticket_dir: &Path, ticket_id: &str, pane_id: u32) -> String {
+pub(crate) fn build_claude_command(ticket_dir: &Path, ticket_id: &str, pane_id: u32) -> String {
     format!(
         "LISA_PANE_ID={} LISA_TICKET_ID={} claude --dangerously-skip-permissions \"{}\"",
         pane_id,
         ticket_id,
-        ticket_prompt(ticket_dir, ticket_id)
+        ticket_prompt(ticket_dir, ticket_id, AgentClient::Claude.context_file())
     )
 }
 
 /// The prompt text sent to a stuck Review session after the review timeout.
-fn finish_up_prompt(_ticket_dir: &Path, work_dir: &Path, ticket_id: &str) -> String {
+pub(crate) fn finish_up_prompt(_ticket_dir: &Path, work_dir: &Path, ticket_id: &str) -> String {
     let review_path = work_dir.join(ticket_id).join("review.md");
     format!(
         "You have been in the Review phase for a while. Please finish writing your review artifact at {}. \
@@ -226,6 +238,10 @@ pub struct State {
     /// Entries: (ticket_id, elapsed_secs, phase_at_timeout).
     /// Cleared when the ticket is rescheduled.
     timeout_alerts: Vec<(TicketId, u64, Phase)>,
+
+    /// Recent `.error`-signal reclaims for dashboard display.
+    /// Entries: (ticket_id, pane_id). Cleared when the ticket is rescheduled.
+    error_alerts: Vec<(TicketId, u32)>,
 
     /// Absolute host project root, captured from `get_plugin_ids().initial_cwd`
     /// in `load()`. Commands launched via `run_command` run on the host (where
@@ -564,22 +580,50 @@ impl State {
                 continue;
             }
 
+            // Resolve the adapter for this ticket at spawn time (per-pane seam;
+            // MVP → native Claude). The returned Box owns nothing from self.dag,
+            // so compute every command string before touching &mut self.
+            let adapter = resolve_adapter_or_native(self.dag.get_ticket(&ticket_id), self.config.client, self.config.lisa_bin.as_deref());
+            let ctx = SpawnContext {
+                ticket_dir: &host_ticket_dir,
+                ticket_id: &ticket_id,
+                pane_id,
+            };
+
             let launch_cmd;
             if self.agent_slots[slot_idx].has_session {
-                // Session reuse: the slot is idle (ticket_id was None), so
-                // Claude Code is already at its prompt. Send /clear directly
-                // and wait for the .cleared signal before sending the prompt.
-                // (The old WaitingForStop approach deadlocked because the
-                // previous session's .stopped signal was already consumed by
-                // check_transition_signals() earlier in the same poll_tick.)
-                self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
-                self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForClear;
-                self.agent_slots[slot_idx].transition_started_at =
-                    Some(std::time::SystemTime::now());
-                launch_cmd = ticket_prompt(&host_ticket_dir, &ticket_id);
+                // Session reuse. For the ClearHandshake adapter (native Claude):
+                // the slot is idle (ticket_id was None), so Claude Code is already
+                // at its prompt. Send /clear directly and wait for the .cleared
+                // signal before sending the prompt. (The old WaitingForStop
+                // approach deadlocked because the previous session's .stopped
+                // signal was already consumed by check_transition_signals()
+                // earlier in the same poll_tick.)
+                match adapter.reset_strategy() {
+                    ResetStrategy::ClearHandshake => {
+                        let reuse_prompt = adapter.reuse_prompt(&ctx);
+                        self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
+                        self.agent_slots[slot_idx].transition_state =
+                            TransitionState::WaitingForClear;
+                        self.agent_slots[slot_idx].transition_started_at =
+                            Some(std::time::SystemTime::now());
+                        launch_cmd = reuse_prompt;
+                    }
+                    // Reuse-as-fresh-exec (native Codex). The finished codex
+                    // process left the pane's shell at its prompt, so there is no
+                    // /clear handshake: type a fresh wrapper command for the new
+                    // ticket directly. WaitingForClear must not engage — leaving
+                    // transition_state untouched (Idle) keeps the .cleared/
+                    // clear-timeout machinery inert for this pane.
+                    ResetStrategy::FreshExec => {
+                        let cmd = adapter.launch_command(&ctx);
+                        self.send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
+                        launch_cmd = cmd;
+                    }
+                }
             } else {
-                // Fresh pane — launch Claude Code from the shell.
-                let cmd = build_claude_command(&host_ticket_dir, &ticket_id, pane_id);
+                // Fresh pane — launch the agent from the shell.
+                let cmd = adapter.launch_command(&ctx);
                 launch_cmd = cmd.clone();
                 self.send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
                 self.agent_slots[slot_idx].has_session = true;
@@ -614,8 +658,9 @@ impl State {
             }
             self.threads.insert(ticket_id.clone(), thread);
 
-            // Clear any stale timeout alert for this ticket (it's being rescheduled)
+            // Clear any stale timeout / error alert for this ticket (it's being rescheduled)
             self.timeout_alerts.retain(|(tid, _, _)| tid != &ticket_id);
+            self.error_alerts.retain(|(tid, _)| tid != &ticket_id);
 
             self.log_activity(ActivityEvent::SessionLaunch {
                 ticket_id: ticket_id.clone(),
@@ -1121,6 +1166,81 @@ impl State {
         }
     }
 
+    /// Scan for `pane-<id>.error` signal files and fail the owning thread promptly.
+    ///
+    /// Emitted by adapters (the Codex wrapper on `turn.failed` / non-zero exit,
+    /// T-023-01) — never by Claude Code hooks, so this consumer is inert for Claude
+    /// panes. On `.error` for a running thread it performs the same reclaim
+    /// `check_session_timeouts` does on silence, but immediately: fail the thread,
+    /// release its slot, remove it (so the ticket re-enters `get_ready_tickets` for
+    /// retry), and surface a `Failed` alert. For an idle/unknown pane the file is
+    /// consumed harmlessly (logged, no state change).
+    ///
+    /// Runs before `check_transition_timeouts` so an errored pane is failed, not
+    /// force-advanced by the transition-timeout fallback. Presence is the signal;
+    /// any body (the wrapper may write the error text for humans) is ignored.
+    fn check_error_signals(&mut self) {
+        let entries = match std::fs::read_dir(&self.signal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let pane_id = match path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("pane-"))
+                .and_then(|n| n.strip_suffix(".error"))
+                .and_then(|id| id.parse::<u32>().ok())
+            {
+                Some(id) => id,
+                None => continue,
+            };
+
+            // Read-and-delete: consume the signal regardless of outcome so it
+            // never re-triggers or accumulates.
+            let _ = std::fs::remove_file(&path);
+
+            // Resolve the running thread that owns this pane. `threads` (not
+            // `agent_slots`) is the authority on what is running; a slot binding can
+            // be stale mid-transition or already released.
+            let ticket_id = self
+                .threads
+                .iter()
+                .find(|(_, t)| {
+                    t.pane_id == pane_id
+                        && t.status == lisa_core::types::ThreadStatus::Running
+                })
+                .map(|(tid, _)| tid.clone());
+
+            match ticket_id {
+                Some(tid) => {
+                    if let Some(thread) = self.threads.get_mut(&tid) {
+                        thread.fail();
+                    }
+                    self.release_slot_for_ticket(&tid);
+                    self.threads.remove(&tid);
+                    self.error_alerts.push((tid.clone(), pane_id));
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "{} reported an error on pane {} — marked failed for retry",
+                            tid, pane_id
+                        ),
+                    });
+                }
+                None => {
+                    self.log_activity(ActivityEvent::Info {
+                        message: format!(
+                            "Error signal for pane {} with no running thread — ignored",
+                            pane_id
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     /// Handle a `.stopped` signal for the given pane.
     ///
     /// Two cases:
@@ -1264,7 +1384,14 @@ impl State {
                 return;
             }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-            let prompt = ticket_prompt(&host_ticket_dir, &ticket_id);
+            // Adapter owns the reuse prompt (native Claude → ticket_prompt).
+            let adapter = resolve_adapter_or_native(self.dag.get_ticket(&ticket_id), self.config.client, self.config.lisa_bin.as_deref());
+            let ctx = SpawnContext {
+                ticket_dir: &host_ticket_dir,
+                ticket_id: &ticket_id,
+                pane_id,
+            };
+            let prompt = adapter.reuse_prompt(&ctx);
             self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
 
             self.log_activity(ActivityEvent::Info {
@@ -1349,7 +1476,14 @@ impl State {
             });
             if let Some(tid) = &ticket_id {
                 let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-                let prompt = ticket_prompt(&host_ticket_dir, tid);
+                // Adapter owns the reuse prompt (native Claude → ticket_prompt).
+                let adapter = resolve_adapter_or_native(self.dag.get_ticket(tid), self.config.client, self.config.lisa_bin.as_deref());
+                let ctx = SpawnContext {
+                    ticket_dir: &host_ticket_dir,
+                    ticket_id: tid,
+                    pane_id,
+                };
+                let prompt = adapter.reuse_prompt(&ctx);
                 self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
             }
             if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
@@ -1399,8 +1533,29 @@ impl State {
             }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let host_work_dir = strip_host_prefix(&self.config.work_dir);
-            let prompt = finish_up_prompt(&host_ticket_dir, &host_work_dir, &ticket_id);
-            self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+            // Adapter owns the follow-up mechanism (native Claude → type the
+            // finish-up prompt into the live TUI; native Codex → type an
+            // `agent-exec --resume` wrapper line into the pane's shell, which the
+            // finished exec left at its prompt).
+            let adapter = resolve_adapter_or_native(self.dag.get_ticket(&ticket_id), self.config.client, self.config.lisa_bin.as_deref());
+            let follow_up = adapter.follow_up(&FollowUpContext {
+                ticket_dir: &host_ticket_dir,
+                work_dir: &host_work_dir,
+                ticket_id: &ticket_id,
+                pane_id,
+            });
+            match follow_up {
+                // Both variants reach the pane the same way — send_line_to_pane is
+                // the only pane I/O the WASM plugin has. The distinction is the
+                // string: a live-TUI prompt vs a shell command that re-launches
+                // codex. (SpawnCommand carries a full env-prefixed wrapper line.)
+                FollowUp::TypeIntoPane(prompt) => {
+                    self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
+                }
+                FollowUp::SpawnCommand(cmd) => {
+                    self.send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
+                }
+            }
             self.bump_pane_activity(pane_id);
 
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
@@ -1674,6 +1829,10 @@ impl State {
 
         // Process .stopped and .cleared signals for session transitions
         self.check_transition_signals();
+
+        // Fail panes that reported an error before the transition-timeout fallback
+        // can force-advance them (adapter-emitted; inert for Claude panes).
+        self.check_error_signals();
 
         // Fallback: force-advance stalled transitions
         self.check_transition_timeouts();
@@ -2829,6 +2988,16 @@ impl State {
             });
         }
 
+        // Append error-signal reclaims (adapter-emitted failures)
+        for (ticket_id, pane_id) in &self.error_alerts {
+            alerts.push(ui::HealthAlert {
+                ticket_id: ticket_id.clone(),
+                alert_type: ui::AlertType::Failed,
+                detail: format!("Session reported an error (pane {})", pane_id),
+                suggested_actions: vec!["Check pane output".to_string(), "Retry".to_string()],
+            });
+        }
+
         let slots: Vec<ui::SlotInfo> = self
             .agent_slots
             .iter()
@@ -3263,12 +3432,22 @@ mod tests {
     #[test]
     fn test_ticket_prompt_content() {
         let dir = Path::new("docs/active/tickets");
-        let prompt = ticket_prompt(dir, "T-024-03");
+        let prompt = ticket_prompt(dir, "T-024-03", AgentClient::Claude.context_file());
 
         assert!(prompt.contains("docs/active/tickets/T-024-03.md"));
         assert!(prompt.contains("CLAUDE.md"));
         assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
         assert!(prompt.contains("current phase"));
+    }
+
+    #[test]
+    fn test_ticket_prompt_uses_given_context_file() {
+        let dir = Path::new("docs/active/tickets");
+        // Codex's context file replaces CLAUDE.md in the shared prompt body.
+        let prompt = ticket_prompt(dir, "T-024-03", "AGENTS.md");
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(!prompt.contains("CLAUDE.md"));
+        assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
     }
 
     #[test]
@@ -7549,6 +7728,97 @@ mod tests {
         assert_eq!(ui_state.alerts[0].ticket_id, "T-001");
         assert_eq!(ui_state.alerts[0].alert_type, ui::AlertType::TimedOut);
         assert!(ui_state.alerts[0].detail.contains("32m"));
+    }
+
+    #[test]
+    fn test_check_error_signals_fails_running_thread() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.error"), "turn.failed: boom").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+        });
+        let thread = Thread::new("T-001", 1);
+        assert_eq!(thread.status, ThreadStatus::Running);
+        state.threads.insert("T-001".to_string(), thread);
+
+        state.check_error_signals();
+
+        // Signal consumed
+        assert!(!signal_dir.join("pane-1.error").exists());
+        // Thread removed (re-schedulable for retry)
+        assert!(state.threads.is_empty());
+        // Slot released but session kept alive
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        assert!(state.agent_slots[0].has_session);
+        // Alert surfaced
+        assert_eq!(state.error_alerts.len(), 1);
+        assert_eq!(state.error_alerts[0], ("T-001".to_string(), 1));
+        // Error logged
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Error { message } if message.contains("T-001") && message.contains("error")
+        )));
+    }
+
+    #[test]
+    fn test_check_error_signals_idle_pane_noop() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        // Error for pane 9, but the only running thread is on pane 1.
+        fs::write(signal_dir.join("pane-9.error"), "").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.threads.insert("T-001".to_string(), Thread::new("T-001", 1));
+
+        state.check_error_signals();
+
+        // Signal consumed even though it matched no running thread
+        assert!(!signal_dir.join("pane-9.error").exists());
+        // No state change
+        assert!(state.threads.contains_key("T-001"));
+        assert!(state.error_alerts.is_empty());
+        // Harmless info logged
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Info { message } if message.contains("pane 9") && message.contains("no running thread")
+        )));
+    }
+
+    #[test]
+    fn test_to_ui_state_includes_error_alerts() {
+        let mut state = State::default();
+        state.initialized = true;
+        state.error_alerts.push(("T-001".to_string(), 3));
+
+        let ui_state = state.to_ui_state();
+
+        assert_eq!(ui_state.alerts.len(), 1);
+        assert_eq!(ui_state.alerts[0].ticket_id, "T-001");
+        assert_eq!(ui_state.alerts[0].alert_type, ui::AlertType::Failed);
+        assert!(ui_state.alerts[0].detail.contains("pane 3"));
     }
 }
 

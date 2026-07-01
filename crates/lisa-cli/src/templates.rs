@@ -70,6 +70,22 @@ fi
 /// Gitignore content for the .lisa/ directory — ignores ephemeral signal files.
 pub const LISA_GITIGNORE: &str = "signals/\n";
 
+/// The `AGENTS.md` pointer file scaffolded by `lisa init`.
+///
+/// Codex auto-loads `AGENTS.md`; Claude Code auto-loads `CLAUDE.md` (codex-client
+/// doc 06 §AGENTS.md). To make the two impossible to drift, `AGENTS.md` carries
+/// no project body of its own — it points at `CLAUDE.md` as the single source of
+/// truth and repeats only the RDSPI workflow reference. A Codex session, told by
+/// its ticket prompt to read `AGENTS.md`, follows the pointer to `CLAUDE.md`.
+pub const AGENTS_MD: &str = "# AGENTS.md\n\
+\n\
+This project's agent context lives in [CLAUDE.md](CLAUDE.md) — the single source \
+of truth for every agent client (Claude Code reads `CLAUDE.md`; Codex reads this \
+`AGENTS.md`). Read `CLAUDE.md` first.\n\
+\n\
+The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is \
+injected into agent context by lisa automatically.\n";
+
 /// The on-notify hook SAMPLE, scaffolded as `.lisa/hooks/on-notify.sample`.
 /// User-owned attention/completion notification hook. It is deliberately a
 /// non-executable `.sample` so the `test -x` guards stay inert until the user
@@ -587,6 +603,18 @@ mod tests {
     #[test]
     fn test_lisa_gitignore_content() {
         assert!(LISA_GITIGNORE.contains("signals/"));
+    }
+
+    #[test]
+    fn test_agents_md_points_to_claude() {
+        // The pointer names CLAUDE.md as the source of truth and keeps the RDSPI
+        // reference, but carries no duplicated project body (so it cannot drift).
+        assert!(AGENTS_MD.contains("# AGENTS.md"));
+        assert!(AGENTS_MD.contains("CLAUDE.md"));
+        assert!(AGENTS_MD.contains("docs/knowledge/rdspi-workflow.md"));
+        // No build/source-layout sections copied from CLAUDE.md.
+        assert!(!AGENTS_MD.contains("Build and Test"));
+        assert!(!AGENTS_MD.contains("Source Layout"));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use lisa_core::client::AgentClient;
 
 use crate::config;
 
@@ -92,6 +94,16 @@ fn check_claude() -> CheckResult {
     }
 }
 
+fn check_codex() -> CheckResult {
+    match get_command_version("codex", &["--version"]) {
+        Some(version) => CheckResult::Found { version },
+        None => CheckResult::NotFound {
+            install_hint: "npm i -g @openai/codex\n    Or visit: https://developers.openai.com/codex"
+                .to_string(),
+        },
+    }
+}
+
 fn check_wasm_target() -> CheckResult {
     if !which("rustup") {
         return CheckResult::Skipped {
@@ -121,8 +133,16 @@ fn check_wasm_target() -> CheckResult {
     }
 }
 
-/// Build the list of dependency checks with real command execution.
-fn build_checks() -> Vec<DependencyCheck> {
+/// Build the list of dependency checks for the *selected* client.
+///
+/// zellij and the wasm target are client-independent; the agent binary checked
+/// is exactly the one the loop will drive (`claude --version` or
+/// `codex --version`), never both.
+fn build_checks(client: AgentClient) -> Vec<DependencyCheck> {
+    let (agent_name, agent_check): (&'static str, Box<dyn Fn() -> CheckResult>) = match client {
+        AgentClient::Claude => ("claude", Box::new(check_claude)),
+        AgentClient::Codex => ("codex", Box::new(check_codex)),
+    };
     vec![
         DependencyCheck {
             name: "zellij",
@@ -130,9 +150,9 @@ fn build_checks() -> Vec<DependencyCheck> {
             check: Box::new(check_zellij),
         },
         DependencyCheck {
-            name: "claude",
+            name: agent_name,
             required: true,
-            check: Box::new(check_claude),
+            check: agent_check,
         },
         DependencyCheck {
             name: "wasm target",
@@ -183,8 +203,8 @@ fn has_failures(reports: &[CheckReport]) -> bool {
 
 /// Check that all required runtime dependencies are present.
 /// Returns Ok(()) if all found, Err with list of missing dep names otherwise.
-pub(crate) fn check_required_deps() -> Result<(), Vec<String>> {
-    check_required_deps_inner(build_checks())
+pub(crate) fn check_required_deps(client: AgentClient) -> Result<(), Vec<String>> {
+    check_required_deps_inner(build_checks(client))
 }
 
 fn check_required_deps_inner(checks: Vec<DependencyCheck>) -> Result<(), Vec<String>> {
@@ -368,9 +388,75 @@ pub(crate) fn pregrant_plugin_permissions(wasm_path: &Path) {
     }
 }
 
+/// Resolve Codex's config home: `$CODEX_HOME` if set, else `~/.codex`.
+fn codex_home() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CODEX_HOME") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(Path::new(&home).join(".codex"))
+}
+
+/// Pre-seed directory trust so unattended `codex exec` does not block on the
+/// interactive trust prompt.
+///
+/// Writes a `[projects."<abs-working-tree>"] trust_level = "trusted"` block into
+/// `<codex_home>/config.toml` (the user-level file — a repo-local
+/// `.codex/config.toml` cannot carry trust). Best-effort and idempotent, modeled
+/// on [`pregrant_plugin_permissions_in`]: if a `[projects."<path>"]` header for
+/// this tree is already present the file is left untouched. Returns true if the
+/// trust entry is present (already-seeded or freshly written).
+///
+/// Per Codex issue #14345 this trust behaviour is version-volatile — the doctor
+/// surfaces the codex version alongside the seed rather than assuming it stable,
+/// and `--dangerously-bypass-approvals-and-sandbox` remains the escape hatch.
+pub(crate) fn pregrant_codex_trust_in(codex_home: &Path, work_tree: &Path) -> bool {
+    let config_path = codex_home.join("config.toml");
+    let header = format!("[projects.\"{}\"]", work_tree.display());
+
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == header) {
+        return true; // a projects block for this tree already exists
+    }
+
+    let entry = format!("{header}\ntrust_level = \"trusted\"\n");
+    let mut content = existing;
+    if !content.is_empty() {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n'); // blank line before the appended table
+    }
+    content.push_str(&entry);
+
+    if std::fs::create_dir_all(codex_home).is_err() {
+        return false;
+    }
+    std::fs::write(&config_path, content).is_ok()
+}
+
+/// Resolve `$CODEX_HOME` and pre-seed directory trust for `work_tree`.
+/// Returns the config.toml path on success (for reporting), None on failure.
+pub(crate) fn pregrant_codex_trust(work_tree: &Path) -> Option<PathBuf> {
+    let home = codex_home()?;
+    if pregrant_codex_trust_in(&home, work_tree) {
+        Some(home.join("config.toml"))
+    } else {
+        None
+    }
+}
+
 /// Run the doctor command: check all dependencies and report.
 pub fn run_doctor(root: &Path) -> Result<(), String> {
-    let checks = build_checks();
+    // Determine the selected client from .lisa.toml (defaults to Claude, so a
+    // project with no opt-in produces exactly today's output).
+    let client = config::load_config(root)
+        .map(|v| config::resolve_config(&v.config, None, None).client)
+        .unwrap_or_default();
+
+    let checks = build_checks(client);
     let mut reports = run_checks(checks);
 
     // Add project version check
@@ -400,6 +486,33 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
         }
     } else {
         output.push_str("  Could not determine Zellij cache directory.\n");
+    }
+
+    // Codex-only: pre-seed directory trust so unattended `codex exec` doesn't
+    // block on the interactive trust prompt. Best-effort; never a hard failure
+    // (the bypass flag is a valid fallback, and #14345 makes trust behaviour
+    // version-specific — hence the version note).
+    if client == AgentClient::Codex {
+        output.push_str("\n\nChecking Codex trust...\n\n");
+        match pregrant_codex_trust(root) {
+            Some(config_path) => {
+                output.push_str(&format!(
+                    "  Seeded trust_level=\"trusted\" for {}\n    in {}\n",
+                    root.display(),
+                    config_path.display()
+                ));
+                output.push_str(
+                    "    Note: Codex trust behaviour is version-specific (#14345); \
+                     re-run `lisa doctor` after `codex update`.\n",
+                );
+            }
+            None => {
+                output.push_str(
+                    "  Could not seed Codex directory trust (set CODEX_HOME/HOME, or run\n    \
+                     `codex exec` with --dangerously-bypass-approvals-and-sandbox).\n",
+                );
+            }
+        }
     }
 
     println!("{}", output);
@@ -633,6 +746,72 @@ mod tests {
             mock_skipped("wasm target", "rustup not found"),
         ];
         assert!(check_required_deps_inner(checks).is_ok());
+    }
+
+    #[test]
+    fn test_build_checks_claude_selects_claude() {
+        let names: Vec<&str> = build_checks(AgentClient::Claude)
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(names.contains(&"claude"));
+        assert!(!names.contains(&"codex"));
+        assert!(names.contains(&"zellij"));
+    }
+
+    #[test]
+    fn test_build_checks_codex_selects_codex() {
+        let names: Vec<&str> = build_checks(AgentClient::Codex)
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(names.contains(&"codex"));
+        assert!(!names.contains(&"claude"));
+        assert!(names.contains(&"zellij"));
+    }
+
+    #[test]
+    fn test_pregrant_codex_trust_writes_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = Path::new("/work/tree");
+        assert!(pregrant_codex_trust_in(dir.path(), work));
+
+        let content = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(content.contains("[projects.\"/work/tree\"]"));
+        assert!(content.contains("trust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn test_pregrant_codex_trust_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = Path::new("/work/tree");
+        pregrant_codex_trust_in(dir.path(), work);
+        pregrant_codex_trust_in(dir.path(), work);
+
+        let content = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let count = content.matches("[projects.\"/work/tree\"]").count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_pregrant_codex_trust_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "model = \"gpt-5\"\n").unwrap();
+
+        assert!(pregrant_codex_trust_in(dir.path(), Path::new("/work/tree")));
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("model = \"gpt-5\""));
+        assert!(content.contains("[projects.\"/work/tree\"]"));
+    }
+
+    #[test]
+    fn test_codex_home_honors_env() {
+        // Serialized implicitly: each assertion sets/removes the var in-scope.
+        std::env::set_var("CODEX_HOME", "/custom/codex");
+        assert_eq!(codex_home(), Some(PathBuf::from("/custom/codex")));
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[test]

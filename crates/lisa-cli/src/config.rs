@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use lisa_core::client::AgentClient;
 use lisa_core::types::PluginConfig;
 
 /// Top-level .lisa.toml structure.
@@ -12,6 +13,18 @@ pub struct LisaConfig {
     pub dirs: DirsConfig,
     #[serde(default)]
     pub scheduling: SchedulingConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// Agent client selection section (`[agent]`).
+///
+/// `client` is kept a raw `String` here so an invalid value surfaces as an
+/// actionable *validation* error (via [`validate_config`] / [`AgentClient::parse`])
+/// rather than a raw serde deserialize failure.
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentConfig {
+    pub client: Option<String>,
 }
 
 /// Directory configuration section.
@@ -45,6 +58,7 @@ pub struct ResolvedConfig {
     pub session_timeout_secs: u64,
     pub wind_down_secs: u64,
     pub phase_timeouts: std::collections::HashMap<String, u64>,
+    pub client: AgentClient,
 }
 
 impl Default for ResolvedConfig {
@@ -59,6 +73,7 @@ impl Default for ResolvedConfig {
             session_timeout_secs: PluginConfig::DEFAULT_SESSION_TIMEOUT_SECS,
             wind_down_secs: PluginConfig::DEFAULT_WIND_DOWN_SECS,
             phase_timeouts: std::collections::HashMap::new(),
+            client: AgentClient::default(),
         }
     }
 }
@@ -85,10 +100,29 @@ pub fn load_config(root: &Path) -> Result<ConfigValidation, String> {
 /// Merge config file values with CLI overrides.
 ///
 /// Precedence (lowest to highest): defaults < .lisa.toml < CLI flags.
-pub fn resolve_config(config: &LisaConfig, cli_max_threads: Option<usize>) -> ResolvedConfig {
+pub fn resolve_config(
+    config: &LisaConfig,
+    cli_max_threads: Option<usize>,
+    cli_client: Option<AgentClient>,
+) -> ResolvedConfig {
     let defaults = ResolvedConfig::default();
 
+    // Client precedence mirrors max_threads: --client > [agent].client > default.
+    // The config value has already been validated by `validate_config`; `.ok()`
+    // is a defensive fallback (an unparseable value degrades to the default
+    // rather than panicking here).
+    let client = cli_client
+        .or_else(|| {
+            config
+                .agent
+                .client
+                .as_deref()
+                .and_then(|s| AgentClient::parse(s).ok())
+        })
+        .unwrap_or(defaults.client);
+
     ResolvedConfig {
+        client,
         ticket_dir: config.dirs.tickets.clone().unwrap_or(defaults.ticket_dir),
         story_dir: config.dirs.stories.clone().unwrap_or(defaults.story_dir),
         work_dir: config.dirs.work.clone().unwrap_or(defaults.work_dir),
@@ -127,8 +161,9 @@ pub struct ConfigValidation {
 /// Returns the parsed config plus any warnings about unknown keys.
 /// Returns `Err` for parse failures or invalid values (e.g. max_threads = 0).
 pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
-    let known_top = &["version", "dirs", "scheduling"];
+    let known_top = &["version", "dirs", "scheduling", "agent"];
     let known_dirs = &["tickets", "stories", "work"];
+    let known_agent = &["client"];
     let known_scheduling = &[
         "max_threads",
         "auto_advance",
@@ -156,6 +191,14 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
             for key in dirs.keys() {
                 if !known_dirs.contains(&key.as_str()) {
                     warnings.push(format!("Unknown key in [dirs]: {}", key));
+                }
+            }
+        }
+
+        if let Some(toml::Value::Table(agent)) = table.get("agent") {
+            for key in agent.keys() {
+                if !known_agent.contains(&key.as_str()) {
+                    warnings.push(format!("Unknown key in [agent]: {}", key));
                 }
             }
         }
@@ -196,6 +239,9 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     // Semantic validation
     if config.scheduling.max_threads == Some(0) {
         return Err("max_threads must be at least 1".to_string());
+    }
+    if let Some(client) = &config.agent.client {
+        AgentClient::parse(client)?;
     }
 
     Ok(ConfigValidation { config, warnings })
@@ -240,6 +286,11 @@ version = "{}"
 tickets = "docs/active/tickets"
 stories = "docs/active/stories"
 work = "docs/active/work"
+
+[agent]
+# Which agent client the loop drives (default: claude). Set to "codex" to run
+# the Codex client; `lisa doctor` then checks the codex binary + directory trust.
+# client = "claude"
 
 [scheduling]
 max_threads = 2
@@ -331,7 +382,7 @@ max_threads = 8
     #[test]
     fn test_resolve_defaults() {
         let config = LisaConfig::default();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.ticket_dir, "docs/active/tickets");
         assert_eq!(resolved.story_dir, "docs/active/stories");
         assert_eq!(resolved.work_dir, "docs/active/work");
@@ -349,7 +400,7 @@ tickets = "custom/tickets"
 max_threads = 6
 "#;
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.ticket_dir, "custom/tickets");
         assert_eq!(resolved.story_dir, "docs/active/stories"); // default
         assert_eq!(resolved.max_threads, 6);
@@ -359,14 +410,14 @@ max_threads = 6
     fn test_resolve_cli_overrides_config_file() {
         let toml_str = "[scheduling]\nmax_threads = 6\n";
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
-        let resolved = resolve_config(&config, Some(3));
+        let resolved = resolve_config(&config, Some(3), None);
         assert_eq!(resolved.max_threads, 3); // CLI wins
     }
 
     #[test]
     fn test_resolve_cli_overrides_default() {
         let config = LisaConfig::default();
-        let resolved = resolve_config(&config, Some(10));
+        let resolved = resolve_config(&config, Some(10), None);
         assert_eq!(resolved.max_threads, 10);
     }
 
@@ -471,7 +522,7 @@ foo = 1
     #[test]
     fn test_resolve_review_timeout_default() {
         let config = LisaConfig::default();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.review_timeout_secs, 600);
     }
 
@@ -479,7 +530,7 @@ foo = 1
     fn test_resolve_review_timeout_from_config() {
         let toml_str = "[scheduling]\nreview_timeout_secs = 60\n";
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.review_timeout_secs, 60);
     }
 
@@ -500,7 +551,7 @@ foo = 1
     #[test]
     fn test_resolve_session_timeout_default() {
         let config = LisaConfig::default();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.session_timeout_secs, 3600);
     }
 
@@ -508,7 +559,7 @@ foo = 1
     fn test_resolve_session_timeout_from_config() {
         let toml_str = "[scheduling]\nsession_timeout_secs = 900\n";
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.session_timeout_secs, 900);
     }
 
@@ -564,7 +615,7 @@ research = 300
 implement = 1800
 "#;
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.phase_timeouts.get("research"), Some(&300));
         assert_eq!(resolved.phase_timeouts.get("implement"), Some(&1800));
     }
@@ -572,7 +623,7 @@ implement = 1800
     #[test]
     fn test_resolve_phase_timeouts_empty_default() {
         let config = LisaConfig::default();
-        let resolved = resolve_config(&config, None);
+        let resolved = resolve_config(&config, None, None);
         assert!(resolved.phase_timeouts.is_empty());
     }
 
@@ -601,6 +652,71 @@ compile = 1800
         assert_eq!(result.warnings.len(), 1);
         assert!(result.warnings[0].contains("compile"));
         assert!(result.warnings[0].contains("[scheduling.phase_timeouts]"));
+    }
+
+    #[test]
+    fn test_parse_agent_client() {
+        let toml_str = "[agent]\nclient = \"codex\"\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.agent.client, Some("codex".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_client_default_is_claude() {
+        let config = LisaConfig::default();
+        let resolved = resolve_config(&config, None, None);
+        assert_eq!(resolved.client, AgentClient::Claude);
+    }
+
+    #[test]
+    fn test_resolve_client_from_config() {
+        let toml_str = "[agent]\nclient = \"codex\"\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None, None);
+        assert_eq!(resolved.client, AgentClient::Codex);
+    }
+
+    #[test]
+    fn test_resolve_cli_client_overrides_config() {
+        let toml_str = "[agent]\nclient = \"codex\"\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None, Some(AgentClient::Claude));
+        assert_eq!(resolved.client, AgentClient::Claude); // CLI wins
+    }
+
+    #[test]
+    fn test_validate_invalid_client_is_error() {
+        let result = validate_config("[agent]\nclient = \"gpt\"\n");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("gpt"));
+        assert!(err.contains("claude") && err.contains("codex"));
+    }
+
+    #[test]
+    fn test_validate_valid_client_no_warning() {
+        let result = validate_config("[agent]\nclient = \"codex\"\n").unwrap();
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.config.agent.client, Some("codex".to_string()));
+    }
+
+    #[test]
+    fn test_validate_unknown_agent_key() {
+        let result = validate_config("[agent]\nprovider = \"x\"\n").unwrap();
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("provider"));
+        assert!(result.warnings[0].contains("[agent]"));
+    }
+
+    #[test]
+    fn test_default_config_toml_agent_example_is_inert() {
+        // The [agent] example ships commented, so a fresh config resolves to the
+        // default client (no accidental opt-in).
+        let content = default_config_toml();
+        let config: LisaConfig = toml::from_str(&content).unwrap();
+        assert_eq!(config.agent.client, None);
+        let resolved = resolve_config(&config, None, None);
+        assert_eq!(resolved.client, AgentClient::Claude);
     }
 
     #[test]

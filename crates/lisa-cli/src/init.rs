@@ -236,6 +236,23 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         });
     }
 
+    // AGENTS.md — Codex's native context file. A pointer to CLAUDE.md (single
+    // source of truth), scaffolded like CLAUDE.md: skip if present, never
+    // overwrite. Emitted unconditionally so switching to the Codex client is a
+    // one-line .lisa.toml edit with no re-scaffold; inert for Claude-only projects.
+    let agents_md_path = root.join("AGENTS.md");
+    if agents_md_path.exists() {
+        actions.push(InitAction::Skip {
+            path: agents_md_path,
+            reason: "already exists".to_string(),
+        });
+    } else {
+        actions.push(InitAction::CreateFile {
+            path: agents_md_path,
+            content: templates::AGENTS_MD.to_string(),
+        });
+    }
+
     // docs/knowledge/rdspi-workflow.md
     let workflow_path = root.join("docs/knowledge/rdspi-workflow.md");
     if workflow_path.exists() {
@@ -883,7 +900,7 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
 
     // On success, print config summary including timeout
     let resolved = match config::load_config(root) {
-        Ok(validation) => config::resolve_config(&validation.config, None),
+        Ok(validation) => config::resolve_config(&validation.config, None, None),
         Err(_) => config::ResolvedConfig::default(),
     };
     let timeout_str = if resolved.session_timeout_secs == 0 {
@@ -953,12 +970,12 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   10 files (CLAUDE.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, on-notify.sample, .lisa/.gitignore, settings.local.json)
+        //   11 files (CLAUDE.md, AGENTS.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, on-notify.sample, .lisa/.gitignore, settings.local.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| !matches!(a, InitAction::Skip { .. }))
             .collect();
-        assert_eq!(creates.len(), 18);
+        assert_eq!(creates.len(), 19);
     }
 
     #[test]
@@ -1063,6 +1080,12 @@ mod tests {
         assert!(claude_md.contains("test-project"));
         assert!(claude_md.contains("cargo build"));
 
+        // AGENTS.md is scaffolded as a pointer to CLAUDE.md.
+        assert!(dir.path().join("AGENTS.md").exists());
+        let agents_md = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents_md.contains("CLAUDE.md"));
+        assert!(agents_md.contains("docs/knowledge/rdspi-workflow.md"));
+
         // Check .lisa.toml content
         let lisa_toml = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
         assert!(lisa_toml.contains("max_threads"));
@@ -1157,6 +1180,25 @@ mod tests {
     }
 
     #[test]
+    fn test_run_init_never_overwrites_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test-project\"\n",
+        )
+        .unwrap();
+
+        // A user-authored AGENTS.md must be preserved (skip-if-exists, like CLAUDE.md).
+        fs::write(dir.path().join("AGENTS.md"), "my custom agents content").unwrap();
+
+        let result = run_init(dir.path(), false);
+        assert!(result.is_ok());
+
+        let agents_md = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert_eq!(agents_md, "my custom agents content");
+    }
+
+    #[test]
     fn test_run_init_updates_stale_lisa_toml() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1234,6 +1276,30 @@ mod tests {
 
         // Create minimal valid setup
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            "# RDSPI",
+        )
+        .unwrap();
+        write_hook_infrastructure(dir.path());
+        write_ready_ticket(dir.path());
+
+        let result = run_validate(dir.path(), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_both_context_files() {
+        // A project carrying both CLAUDE.md and AGENTS.md (as `lisa init` now
+        // scaffolds) validates clean — AGENTS.md is neither required nor rejected.
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join("AGENTS.md"), templates::AGENTS_MD).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();

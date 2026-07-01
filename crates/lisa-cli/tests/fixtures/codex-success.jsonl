@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"th_success_1"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"i1","item_type":"reasoning","summary":"Planning the change"}}
+{"type":"item.completed","item":{"id":"i1","item_type":"reasoning","summary":"Planning the change"}}
+{"type":"item.started","item":{"id":"i2","item_type":"command_execution","command":"cargo test --workspace"}}
+{"type":"item.completed","item":{"id":"i2","item_type":"command_execution","command":"cargo test --workspace","exit_code":0}}
+{"type":"item.completed","item":{"id":"i3","item_type":"file_change","changes":[{"path":"src/lib.rs"},{"path":"src/main.rs"}]}}
+{"type":"item.completed","item":{"id":"i4","item_type":"agent_message","text":"Done — the change compiles and tests pass."}}
+{"type":"turn.completed","usage":{"input_tokens":1200,"output_tokens":340}}

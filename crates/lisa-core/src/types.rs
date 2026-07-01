@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+
+use crate::client::AgentClient;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -511,6 +513,22 @@ pub struct PluginConfig {
     /// or two before sending a final message, so reuse is gated on sustained
     /// quiet rather than on any single signal.
     pub wind_down_secs: u64,
+
+    /// The agent client this loop drives by default (default: Claude). The
+    /// spawn-time adapter resolver reads this as the loop-level default; per-ticket
+    /// routing (S-026) will later override it per pane.
+    #[serde(default)]
+    pub client: AgentClient,
+
+    /// Absolute path to the `lisa` binary, captured at `lisa loop` time via
+    /// `current_exe()` and passed through the layout. The Codex adapter uses it to
+    /// build `<lisa> agent-exec …` launch lines without assuming `lisa` is on the
+    /// pane shell's PATH. `None` when the layout omits it (older layout, or
+    /// `current_exe()` failure) — the adapter falls back to the bare `lisa`. Not
+    /// `/host`-prefixed: the pane shell runs on the host, outside the WASI mount,
+    /// so this is the real host path.
+    #[serde(default)]
+    pub lisa_bin: Option<String>,
 }
 
 impl PluginConfig {
@@ -552,6 +570,8 @@ impl PluginConfig {
             session_timeout_secs: Self::DEFAULT_SESSION_TIMEOUT_SECS,
             phase_timeouts: HashMap::new(),
             wind_down_secs: Self::DEFAULT_WIND_DOWN_SECS,
+            client: AgentClient::default(),
+            lisa_bin: None,
         }
     }
 
@@ -602,6 +622,23 @@ impl PluginConfig {
         if let Some(wind_down) = config.get("wind_down_secs") {
             if let Ok(n) = wind_down.parse() {
                 result.wind_down_secs = n;
+            }
+        }
+
+        if let Some(client) = config.get("client") {
+            // Lenient: an unrecognized value keeps the default. CLI-side
+            // validation (`lisa validate`) is the gate; the plugin must never
+            // panic parsing its config map.
+            if let Ok(c) = AgentClient::parse(client) {
+                result.client = c;
+            }
+        }
+
+        if let Some(lisa_bin) = config.get("lisa_bin") {
+            // Empty string (layout emitted an unset value) is treated as absent so
+            // the Codex adapter falls back to the bare `lisa`.
+            if !lisa_bin.is_empty() {
+                result.lisa_bin = Some(lisa_bin.clone());
             }
         }
 
@@ -1074,6 +1111,45 @@ mod tests {
         assert_eq!(config.phase_timeouts.get(&Phase::Research), Some(&300));
         assert_eq!(config.phase_timeouts.get(&Phase::Implement), Some(&1800));
         assert_eq!(config.phase_timeouts.len(), 2);
+    }
+
+    #[test]
+    fn test_config_client_default() {
+        let config = PluginConfig::new();
+        assert_eq!(config.client, AgentClient::Claude);
+    }
+
+    #[test]
+    fn test_config_client_from_map() {
+        let mut map = BTreeMap::new();
+        map.insert("client".to_string(), "codex".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.client, AgentClient::Codex);
+    }
+
+    #[test]
+    fn test_config_client_bad_value_defaults_claude() {
+        let mut map = BTreeMap::new();
+        map.insert("client".to_string(), "bogus".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.client, AgentClient::Claude);
+    }
+
+    #[test]
+    fn test_config_lisa_bin_round_trip() {
+        assert_eq!(PluginConfig::new().lisa_bin, None);
+
+        let mut map = BTreeMap::new();
+        map.insert("lisa_bin".to_string(), "/opt/bin/lisa".to_string());
+        assert_eq!(
+            PluginConfig::from_config_map(&map).lisa_bin.as_deref(),
+            Some("/opt/bin/lisa")
+        );
+
+        // Empty string is treated as absent (layout emitted no path).
+        let mut empty = BTreeMap::new();
+        empty.insert("lisa_bin".to_string(), String::new());
+        assert_eq!(PluginConfig::from_config_map(&empty).lisa_bin, None);
     }
 
     #[test]

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Lisa notify hook (SAMPLE) — copy to on-notify and `chmod +x` to enable.
+#
+# Contract:  on-notify <event> [detail]      ($1 mirrors $LISA_EVENT)
+#
+# Environment (all events):
+#   LISA_EVENT    complete | attention
+#   LISA_PROJECT  absolute project root (identifies which loop; you may `cd` to it)
+# complete:
+#   LISA_TICKETS_DONE   number of tickets completed
+#   LISA_DURATION_SECS  loop duration in seconds
+# attention:
+#   LISA_REASON      question | permission | idle-without-artifact
+#   LISA_PANE_ID     the originating pane
+#   LISA_TICKET_ID   ticket the agent is working on, when known
+#   LISA_QUESTION_HEADER  short label of the question (question reason only)
+#
+# Payload on STDIN: for the question/permission reasons, the full Claude Code
+# hook JSON is piped to this script's stdin, so you can extract anything (e.g.
+# every question + its options) with sed/jq:  payload=$(cat)
+#
+# Example dispatch (uncomment and customise):
+# case "$1" in
+#   complete)  msg="lisa [$LISA_PROJECT] done: $LISA_TICKETS_DONE tickets in ${LISA_DURATION_SECS}s" ;;
+#   attention) msg="lisa [$LISA_PROJECT] ${LISA_TICKET_ID:-?} needs you (${LISA_REASON}): $2" ;;
+# esac
+# curl -s -d "$msg" ntfy.sh/your-topic-here
+
+exit 0

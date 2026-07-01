@@ -1,0 +1,11 @@
+You are working a small RDSPI-style ticket in a throwaway git repo. Do all of the
+following, using real tool calls (do not just describe them):
+
+1. Create a file `notes.md` containing a one-paragraph description of what a
+   directed acyclic graph (DAG) is.
+2. Run the shell command `ls -la` and report how many entries it printed.
+3. Read back `notes.md` and confirm its first line is a Markdown heading.
+4. Summarize what you did in two sentences, then stop.
+
+Keep it short. The point is to exercise file-read, file-write, and shell tool
+calls so the --json event stream contains real item activity.

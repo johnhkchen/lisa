@@ -1,3 +1,4 @@
+mod agent_exec;
 mod config;
 mod detect;
 mod doctor;
@@ -9,6 +10,7 @@ mod status;
 mod templates;
 
 use clap::{Parser, Subcommand};
+use lisa_core::client::AgentClient;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -66,6 +68,41 @@ enum Commands {
     },
     /// Print version information
     Version,
+    /// Run codex under lisa's signal/rendering wrapper (Codex client path).
+    ///
+    /// Reads LISA_PANE_ID / LISA_TICKET_ID from the environment (inherited from
+    /// the pane launch) for signal attribution. Runs `codex exec --json …`,
+    /// translates its event stream into `.lisa/signals/pane-<id>.*` files, and
+    /// renders the conversation to stdout (which is the pane).
+    AgentExec {
+        /// The prompt to send to codex.
+        prompt: String,
+
+        /// Resume this ticket's persisted thread (falls back to codex --last).
+        #[arg(long)]
+        resume: bool,
+
+        /// Codex binary to invoke.
+        #[arg(long, default_value = "codex")]
+        codex_bin: String,
+
+        /// Working tree passed to `codex -C`.
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+
+        /// Use `--dangerously-bypass-approvals-and-sandbox` instead of the
+        /// default `-a never -s workspace-write`.
+        #[arg(long)]
+        bypass_sandbox: bool,
+
+        /// Extra flag passed through to `codex exec` (repeatable).
+        #[arg(long = "codex-arg")]
+        codex_args: Vec<String>,
+
+        /// Signal directory (override for tests).
+        #[arg(long, default_value = ".lisa/signals")]
+        signal_dir: PathBuf,
+    },
     /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
     Loop {
         /// Path to the project root (defaults to current directory)
@@ -75,6 +112,10 @@ enum Commands {
         /// Maximum concurrent Claude sessions (overrides .lisa.toml)
         #[arg(long)]
         max_threads: Option<usize>,
+
+        /// Agent client to drive (claude | codex); overrides .lisa.toml [agent].client
+        #[arg(long)]
+        client: Option<String>,
 
         /// Show what would be done without launching zellij
         #[arg(long)]
@@ -95,6 +136,30 @@ fn main() {
         }
         Commands::Version => {
             println!("lisa {}", env!("CARGO_PKG_VERSION"));
+        }
+        Commands::AgentExec {
+            prompt,
+            resume,
+            codex_bin,
+            cwd,
+            bypass_sandbox,
+            codex_args,
+            signal_dir,
+        } => {
+            let cwd = resolve_path(&cwd);
+            let args = agent_exec::AgentExecArgs {
+                prompt,
+                resume,
+                codex_bin,
+                cwd,
+                bypass_sandbox,
+                codex_args,
+                signal_dir,
+            };
+            if let Err(e) = agent_exec::run_agent_exec(args) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
         Commands::Init { dry_run, path } => {
             let path = resolve_path(&path);
@@ -133,9 +198,19 @@ fn main() {
         Commands::Loop {
             path,
             max_threads,
+            client,
             dry_run,
         } => {
             let path = resolve_path(&path);
+            // Parse the --client override up front so an invalid value fails fast
+            // with an actionable message, before loading the project config.
+            let cli_client = match client.as_deref().map(AgentClient::parse).transpose() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let validation = match config::load_config(&path) {
                 Ok(v) => v,
                 Err(e) => {
@@ -146,7 +221,7 @@ fn main() {
             for w in &validation.warnings {
                 eprintln!("Warning: {}", w);
             }
-            let resolved = config::resolve_config(&validation.config, max_threads);
+            let resolved = config::resolve_config(&validation.config, max_threads, cli_client);
             if let Err(e) = loop_cmd::run_loop(&path, &resolved, dry_run) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
