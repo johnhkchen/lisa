@@ -4,7 +4,8 @@ story: S-020
 title: interactive-gate-harness
 type: task
 status: review
-phase: review
+priority: medium
+phase: done
 depends_on: [T-020-04]
 ---
 
