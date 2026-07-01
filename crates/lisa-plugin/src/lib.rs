@@ -12,13 +12,12 @@ use std::path::{Path, PathBuf};
 
 use zellij_tile::prelude::*;
 
-use adapter::{
-    resolve_adapter_or_native, FollowUp, FollowUpContext, ResetStrategy, SpawnContext,
-};
+use adapter::{resolve_adapter_or_native, FollowUp, FollowUpContext, ResetStrategy, SpawnContext};
 
 use lisa_core::client::AgentClient;
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
+use lisa_core::provenance::{self, ProvenanceRecord, Route, RunOutcome};
 use lisa_core::ticket;
 use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
 
@@ -62,11 +61,37 @@ pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, context_file: &s
 /// Build the full shell command to launch Claude Code in a fresh pane.
 /// Sets LISA_PANE_ID env var so the idle signal hook can identify the pane,
 /// and LISA_TICKET_ID for debugging/logging context.
-pub(crate) fn build_claude_command(ticket_dir: &Path, ticket_id: &str, pane_id: u32) -> String {
+///
+/// `lisa_bin` is the absolute `lisa` path (plugin config) exported as `LISA_BIN`
+/// so the `Stop` hook's `lisa capture-usage` (T-027-02) is reachable even when
+/// the pane shell lacks `lisa` on PATH — mirroring the Codex adapter's
+/// `lisa_bin` threading. `None`/empty omits the var entirely, keeping the launch
+/// line byte-for-byte the pre-capture command (the hook then falls back to a
+/// PATH `lisa`).
+pub(crate) fn build_claude_command(
+    ticket_dir: &Path,
+    ticket_id: &str,
+    pane_id: u32,
+    model: Option<&str>,
+    lisa_bin: Option<&str>,
+) -> String {
+    // The Claude adapter owns the model→flag mapping (`--model`). When no model
+    // is routed the flag is omitted, so the launch line is byte-for-byte the
+    // pre-routing command — the zero-regression path.
+    let model_flag = match model {
+        Some(m) => format!(" --model {}", m),
+        None => String::new(),
+    };
+    let lisa_bin_env = match lisa_bin.filter(|s| !s.is_empty()) {
+        Some(bin) => format!("LISA_BIN={} ", bin),
+        None => String::new(),
+    };
     format!(
-        "LISA_PANE_ID={} LISA_TICKET_ID={} claude --dangerously-skip-permissions \"{}\"",
+        "{}LISA_PANE_ID={} LISA_TICKET_ID={} claude --dangerously-skip-permissions{} \"{}\"",
+        lisa_bin_env,
         pane_id,
         ticket_id,
+        model_flag,
         ticket_prompt(ticket_dir, ticket_id, AgentClient::Claude.context_file())
     )
 }
@@ -122,6 +147,13 @@ struct AgentSlot {
     /// stop/idle signals alone are not trusted because agents often report
     /// stopped and then keep working for another minute or two.
     last_activity_at: Option<std::time::SystemTime>,
+    /// Which agent client last ran a session in this pane, or `None` for a fresh
+    /// pane that has never hosted one (T-026-02). Set at spawn and preserved
+    /// across reuse. Slot provider-affinity uses it so a pane is only reused by
+    /// the same provider — otherwise a Codex ticket could type a shell command
+    /// into a live Claude REPL (or a Claude ticket `/clear` a bare shell),
+    /// because the reuse reset strategy is chosen from the *incoming* ticket.
+    last_client: Option<AgentClient>,
 }
 
 /// What action the modal should perform on Enter.
@@ -214,6 +246,21 @@ pub struct State {
 
     /// Path to the idle signal directory (`.lisa/signals/` under /host/).
     signal_dir: PathBuf,
+
+    /// Path to the append-only provenance ledger (`.lisa/provenance.jsonl` under
+    /// /host/). One record is appended per ticket-run at teardown (T-027-01).
+    /// Empty until `load()` runs — a native test that does not set it skips the
+    /// write, so unrelated teardown-triggering tests never write to disk.
+    ledger_path: PathBuf,
+
+    /// Directory the Codex `agent-exec` wrapper writes usage artifacts into
+    /// (`.lisa/codex/` under /host/). Read at teardown for Codex tokens/cost.
+    codex_dir: PathBuf,
+
+    /// Directory the Claude `Stop` hook's `lisa capture-usage` writes usage
+    /// artifacts into (`.lisa/claude/` under /host/). Read at teardown for Claude
+    /// tokens (T-027-02); same `{ ..., usage }` shape as the Codex artifact.
+    claude_dir: PathBuf,
 
     /// Idle-without-artifact alerts detected during the current poll cycle.
     /// Cleared and re-populated each cycle by `check_idle_signals()`.
@@ -459,6 +506,7 @@ impl State {
                         transition_started_at: None,
                         cooldown_until: None,
                         last_activity_at: None,
+                        last_client: None,
                     });
                 }
             }
@@ -479,16 +527,46 @@ impl State {
     /// still making tool calls (heartbeats) or emitting stop/idle signals is
     /// never reused, even if its ticket was released — clearing a pane that is
     /// mid-task wastes the partial work and forces a repeat attempt.
-    fn find_idle_slot(&self) -> Option<usize> {
+    /// Find an idle slot eligible to host a session for the `want` provider.
+    ///
+    /// Provider-affinity (T-026-02): a slot qualifies only if it has never run a
+    /// session (`last_client == None`) or last ran the same provider. This keeps
+    /// the reuse reset strategy matched to the pane's real state and prevents
+    /// cross-provider mis-injection. Fresh panes are claimed by the first
+    /// provider to use them and then stick to it.
+    fn find_idle_slot(&self, want: AgentClient) -> Option<usize> {
         let now = std::time::SystemTime::now();
         let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
         self.agent_slots.iter().position(|s| {
             s.ticket_id.is_none()
+                && (s.last_client.is_none() || s.last_client == Some(want))
                 && s.cooldown_until.is_none_or(|until| now >= until)
                 && (!s.has_session
                     || s.last_activity_at
                         .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down))
         })
+    }
+
+    /// True if provider `client` is under its per-provider concurrency cap given
+    /// the currently running threads (T-026-02). The global `max_threads` ceiling
+    /// is enforced separately by the caller; this checks only the optional
+    /// per-provider sub-cap. No cap configured → always admits. `thread.client`
+    /// is the resolved agent snapshotted at spawn, so it is the authoritative
+    /// per-provider counter.
+    fn provider_under_cap(&self, client: AgentClient) -> bool {
+        match self.config.provider_cap_for(client) {
+            None => true,
+            Some(cap) => {
+                let running_for_provider = self
+                    .threads
+                    .values()
+                    .filter(|t| {
+                        t.status == lisa_core::types::ThreadStatus::Running && t.client == client
+                    })
+                    .count();
+                running_for_provider < cap
+            }
+        }
     }
 
     /// Mark a slot as idle when its ticket completes.
@@ -546,8 +624,23 @@ impl State {
                 }
             }
 
-            // Enforce concurrency cap: only max_threads tickets run at once.
-            // Extra pane slots exist for overlap during transitions.
+            // Resolve the adapter AND the route for this ticket at spawn time
+            // (per-pane routing seam, T-026-01): ticket `(agent, model)`
+            // frontmatter → loop default → native Claude. Resolved *before* the
+            // cap gates (T-026-02) so the per-provider cap and slot affinity can
+            // see the resolved agent. The returned Box owns nothing from
+            // self.dag, so it is safe to hold across the &mut self work below.
+            // The route is stored on the thread and drives the substitution log +
+            // dashboard surfacing below.
+            let (adapter, route) = resolve_adapter_or_native(
+                self.dag.get_ticket(&ticket_id),
+                self.config.client,
+                self.config.lisa_bin.as_deref(),
+            );
+
+            // Enforce the global concurrency cap: at most max_threads running
+            // threads across all providers. Extra pane slots exist for overlap
+            // during transitions.
             let running_count = self
                 .threads
                 .values()
@@ -558,8 +651,23 @@ impl State {
                 continue;
             }
 
-            // Find an idle slot
-            let slot_idx = match self.find_idle_slot() {
+            // Enforce the optional per-provider sub-cap (T-026-02): a provider
+            // with a configured cap may run at most that many concurrent threads,
+            // *within* the global ceiling. This keeps one provider's separate
+            // auth/rate-limit pool from being saturated when mixing providers.
+            // Absent cap → only the global gate applies (single-provider loops
+            // unchanged). Pure decision factored into `provider_under_cap` so it
+            // is unit-testable without Zellij host calls.
+            if !self.provider_under_cap(route.agent) {
+                unscheduled += 1;
+                continue;
+            }
+
+            // Find an idle slot with provider-affinity (T-026-02): only a fresh
+            // pane or one whose last session ran the same provider, so the reuse
+            // reset strategy (ClearHandshake vs FreshExec) always matches the
+            // pane's real state and never mis-injects across providers.
+            let slot_idx = match self.find_idle_slot(route.agent) {
                 Some(idx) => idx,
                 None => {
                     unscheduled += 1;
@@ -580,10 +688,6 @@ impl State {
                 continue;
             }
 
-            // Resolve the adapter for this ticket at spawn time (per-pane seam;
-            // MVP → native Claude). The returned Box owns nothing from self.dag,
-            // so compute every command string before touching &mut self.
-            let adapter = resolve_adapter_or_native(self.dag.get_ticket(&ticket_id), self.config.client, self.config.lisa_bin.as_deref());
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
@@ -630,11 +734,33 @@ impl State {
             }
 
             self.agent_slots[slot_idx].ticket_id = Some(ticket_id.clone());
+            // Stamp the provider that (re)claimed this pane so future scheduling
+            // keeps provider-affinity (T-026-02): a warm Claude REPL is reused
+            // only by Claude tickets, a codex-vacated shell only by Codex tickets.
+            self.agent_slots[slot_idx].last_client = Some(route.agent);
             // Sending input counts as pane activity — restarts the wind-down clock.
             self.agent_slots[slot_idx].last_activity_at = Some(std::time::SystemTime::now());
 
+            // Surface a routing substitution (T-026-01): an invalid ticket route
+            // fell back to the loop default. Logged here; also visible on the
+            // dashboard via the stored route and recorded in provenance.
+            if route.substituted {
+                if let Some(note) = &route.note {
+                    self.log_activity(ActivityEvent::Warning {
+                        message: format!("{}: {}", ticket_id, note),
+                    });
+                }
+            }
+
             // Create thread record with the ticket's current phase
             let mut thread = Thread::new(ticket_id.clone(), pane_id);
+            // Snapshot run provenance known only at spawn: the resolved route
+            // (T-026-01) and the concurrency at spawn (running_count, computed
+            // above, excludes this new thread). `client` mirrors the route's
+            // resolved agent — the authoritative "which agent ran" (T-027-01).
+            thread.client = route.agent;
+            thread.route = Some(route);
+            thread.concurrency_at_spawn = running_count;
             if let Some(ticket) = self.dag.get_ticket(&ticket_id) {
                 thread.current_phase = ticket.phase;
 
@@ -1209,8 +1335,7 @@ impl State {
                 .threads
                 .iter()
                 .find(|(_, t)| {
-                    t.pane_id == pane_id
-                        && t.status == lisa_core::types::ThreadStatus::Running
+                    t.pane_id == pane_id && t.status == lisa_core::types::ThreadStatus::Running
                 })
                 .map(|(tid, _)| tid.clone());
 
@@ -1219,6 +1344,7 @@ impl State {
                     if let Some(thread) = self.threads.get_mut(&tid) {
                         thread.fail();
                     }
+                    self.emit_provenance(&tid, RunOutcome::Failed);
                     self.release_slot_for_ticket(&tid);
                     self.threads.remove(&tid);
                     self.error_alerts.push((tid.clone(), pane_id));
@@ -1354,11 +1480,99 @@ impl State {
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
             thread.complete();
         }
+        self.emit_provenance(&ticket_id, RunOutcome::Done);
         self.release_slot_for_ticket(&ticket_id);
         self.threads.remove(&ticket_id);
 
         // DAG rebuild and scheduling happen in the normal poll_tick cycle
         // after check_transition_signals returns.
+    }
+
+    /// Append one provenance record for a finishing ticket-run (T-027-01).
+    ///
+    /// Called at each teardown site immediately **before** the thread is removed,
+    /// so the thread's spawn-time facts (client, concurrency, `started_at`,
+    /// `pane_id`) are still readable. Write-after by construction — the ticket
+    /// frontmatter was already updated by the caller; this only appends to the
+    /// ledger and never touches thread/slot state. A write error logs and is
+    /// swallowed (never fatal to the loop). A no-op when `ledger_path` is unset
+    /// (native tests that don't exercise the ledger).
+    fn emit_provenance(&mut self, ticket_id: &str, outcome: RunOutcome) {
+        if self.ledger_path.as_os_str().is_empty() {
+            return;
+        }
+        let Some(thread) = self.threads.get(ticket_id) else {
+            return;
+        };
+        let client = thread.client;
+        let started = provenance::system_time_to_epoch(thread.started_at);
+        let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
+        let route = Route::from_client(client);
+        let record = ProvenanceRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            ticket_id: ticket_id.to_string(),
+            outcome,
+            // requested == actual until per-pane routing (T-026-01) can differ them.
+            requested: route.clone(),
+            actual: route,
+            started_at: started,
+            ended_at: ended,
+            wall_clock_secs: ended.saturating_sub(started),
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            concurrency_at_spawn: thread.concurrency_at_spawn,
+            pane_id: thread.pane_id,
+        };
+        let (tokens_in, tokens_out, cost_usd) = self.read_usage(client, ticket_id);
+        let record = ProvenanceRecord {
+            tokens_in,
+            tokens_out,
+            cost_usd,
+            ..record
+        };
+        if let Err(e) = provenance::append_record(&self.ledger_path, &record) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("provenance write failed for {}: {}", ticket_id, e),
+            });
+        }
+    }
+
+    /// Read tokens/cost from a run's usage artifact, selecting the per-provider
+    /// directory by client:
+    /// - Codex → `.lisa/codex/<ticket>.usage.json` (written by `lisa agent-exec`).
+    /// - Claude → `.lisa/claude/<ticket>.usage.json` (written by the Stop hook's
+    ///   `lisa capture-usage`, T-027-02).
+    ///
+    /// Both writers emit the same `{ ..., usage: { input_tokens, output_tokens } }`
+    /// shape, so the read spine is shared. A run with no artifact (missing file,
+    /// bad JSON) yields all `None` — never fabricated. Claude carries no
+    /// `cost_usd`; that stays `None` (cost is derived downstream from tokens +
+    /// pricing, T-027-02 design).
+    fn read_usage(
+        &self,
+        client: AgentClient,
+        ticket_id: &str,
+    ) -> (Option<u64>, Option<u64>, Option<f64>) {
+        let dir = match client {
+            AgentClient::Codex => &self.codex_dir,
+            AgentClient::Claude => &self.claude_dir,
+        };
+        let path = dir.join(format!("{}.usage.json", ticket_id));
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return (None, None, None),
+        };
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return (None, None, None),
+        };
+        // The artifact is `{ key, thread_id, success, usage }`; the token/cost
+        // fields ride on the nested `usage` object.
+        match value.get("usage") {
+            Some(usage) if !usage.is_null() => provenance::extract_usage(usage),
+            _ => (None, None, None),
+        }
     }
 
     /// Handle a `.cleared` signal for the given pane.
@@ -1385,7 +1599,12 @@ impl State {
             }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             // Adapter owns the reuse prompt (native Claude → ticket_prompt).
-            let adapter = resolve_adapter_or_native(self.dag.get_ticket(&ticket_id), self.config.client, self.config.lisa_bin.as_deref());
+            // Reuse path only needs the adapter; the route is surfaced at spawn.
+            let (adapter, _route) = resolve_adapter_or_native(
+                self.dag.get_ticket(&ticket_id),
+                self.config.client,
+                self.config.lisa_bin.as_deref(),
+            );
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
@@ -1477,7 +1696,11 @@ impl State {
             if let Some(tid) = &ticket_id {
                 let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
                 // Adapter owns the reuse prompt (native Claude → ticket_prompt).
-                let adapter = resolve_adapter_or_native(self.dag.get_ticket(tid), self.config.client, self.config.lisa_bin.as_deref());
+                let (adapter, _route) = resolve_adapter_or_native(
+                    self.dag.get_ticket(tid),
+                    self.config.client,
+                    self.config.lisa_bin.as_deref(),
+                );
                 let ctx = SpawnContext {
                     ticket_dir: &host_ticket_dir,
                     ticket_id: tid,
@@ -1537,7 +1760,12 @@ impl State {
             // finish-up prompt into the live TUI; native Codex → type an
             // `agent-exec --resume` wrapper line into the pane's shell, which the
             // finished exec left at its prompt).
-            let adapter = resolve_adapter_or_native(self.dag.get_ticket(&ticket_id), self.config.client, self.config.lisa_bin.as_deref());
+            // Reuse path only needs the adapter; the route is surfaced at spawn.
+            let (adapter, _route) = resolve_adapter_or_native(
+                self.dag.get_ticket(&ticket_id),
+                self.config.client,
+                self.config.lisa_bin.as_deref(),
+            );
             let follow_up = adapter.follow_up(&FollowUpContext {
                 ticket_dir: &host_ticket_dir,
                 work_dir: &host_work_dir,
@@ -1714,6 +1942,7 @@ impl State {
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
             }
+            self.emit_provenance(&ticket_id, RunOutcome::TimedOut);
             self.release_slot_for_ticket(&ticket_id);
             self.threads.remove(&ticket_id);
             self.timeout_alerts
@@ -1760,6 +1989,7 @@ impl State {
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
             }
+            self.emit_provenance(&ticket_id, RunOutcome::Failed);
             self.release_slot_for_ticket(&ticket_id);
             self.threads.remove(&ticket_id);
             self.log_activity(ActivityEvent::Error {
@@ -1871,6 +2101,7 @@ impl State {
             if let Some(thread) = self.threads.get_mut(ticket_id) {
                 thread.complete();
             }
+            self.emit_provenance(ticket_id, RunOutcome::Done);
             self.release_slot_for_ticket(ticket_id);
             self.threads.remove(ticket_id);
             self.log_activity(ActivityEvent::ThreadExited {
@@ -2514,6 +2745,7 @@ impl State {
         if let Some(thread) = self.threads.get_mut(&tid) {
             thread.complete();
         }
+        self.emit_provenance(&tid, RunOutcome::Done);
         self.release_slot_for_ticket(&tid);
         self.threads.remove(&tid);
 
@@ -2687,6 +2919,11 @@ impl ZellijPlugin for State {
 
         // Signal directory for idle signal detection
         self.signal_dir = host.join(".lisa/signals");
+
+        // Provenance ledger + the Codex wrapper's usage-artifact directory.
+        self.ledger_path = host.join(".lisa/provenance.jsonl");
+        self.codex_dir = host.join(".lisa/codex");
+        self.claude_dir = host.join(".lisa/claude");
 
         // Absolute host project root (run_command runs on the host, where the
         // /host sandbox mount does not exist) and loop-start timestamp for
@@ -2884,6 +3121,9 @@ impl State {
                     ),
                     slot_number,
                     awaiting: self.is_pane_awaiting(t.pane_id),
+                    // Surface the pane's resolved (provider, model) route
+                    // (T-026-01). `None` for a thread spawned before routing.
+                    route: t.route.as_ref().map(|r| r.display_cell()),
                 }
             })
             .collect();
@@ -3312,13 +3552,16 @@ mod tests {
     #[test]
     fn test_build_claude_command() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-042-01", 7);
+        let cmd = build_claude_command(ticket_dir, "T-042-01", 7, None, None);
 
         assert!(cmd.starts_with(
             "LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "
         ));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
+        // No routed model → no --model flag (zero-regression: byte-for-byte the
+        // pre-routing launch line).
+        assert!(!cmd.contains("--model"));
         assert!(
             !cmd.ends_with('\r'),
             "Enter is now sent as a raw byte, not embedded in text"
@@ -3326,9 +3569,21 @@ mod tests {
     }
 
     #[test]
+    fn test_build_claude_command_with_model() {
+        let ticket_dir = Path::new("docs/active/tickets");
+        let cmd = build_claude_command(ticket_dir, "T-042-01", 7, Some("opus"), None);
+        // The Claude adapter maps a routed model to `--model`, placed after the
+        // permission flag and before the quoted prompt.
+        assert!(
+            cmd.contains("--dangerously-skip-permissions --model opus \""),
+            "got: {cmd}"
+        );
+    }
+
+    #[test]
     fn test_build_claude_command_includes_env_vars() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-042-01", 42);
+        let cmd = build_claude_command(ticket_dir, "T-042-01", 42, None, None);
 
         assert!(
             cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID=T-042-01 "),
@@ -3340,7 +3595,7 @@ mod tests {
     #[test]
     fn test_build_claude_command_includes_rdspi_reference() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-001", 1);
+        let cmd = build_claude_command(ticket_dir, "T-001", 1, None, None);
 
         assert!(
             cmd.contains("docs/knowledge/rdspi-workflow.md"),
@@ -3899,6 +4154,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.detect_stale_threads();
@@ -4004,6 +4260,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         state.release_slot_for_ticket(&"T-001".to_string());
         state.threads.remove("T-001");
@@ -4020,7 +4277,7 @@ mod tests {
             "Released slot should have a cooldown set"
         );
         assert!(
-            state.find_idle_slot().is_none(),
+            state.find_idle_slot(AgentClient::Claude).is_none(),
             "Slot should not be idle during cooldown"
         );
 
@@ -4048,9 +4305,10 @@ mod tests {
             // Cooldown already expired (set to 1 second ago)
             cooldown_until: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1)),
             last_activity_at: None,
+            last_client: None,
         });
         assert!(
-            state.find_idle_slot().is_some(),
+            state.find_idle_slot(AgentClient::Claude).is_some(),
             "Slot should be available after cooldown expires"
         );
     }
@@ -4068,9 +4326,10 @@ mod tests {
             // Cooldown expires 30 seconds from now
             cooldown_until: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(30)),
             last_activity_at: None,
+            last_client: None,
         });
         assert!(
-            state.find_idle_slot().is_none(),
+            state.find_idle_slot(AgentClient::Claude).is_none(),
             "Slot should not be available during cooldown"
         );
     }
@@ -4350,6 +4609,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.release_slot_for_ticket(&"T-001".to_string());
@@ -4376,6 +4636,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.release_slot_for_ticket(&"T-MISSING".to_string());
@@ -4447,6 +4708,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // First rebuild with empty last_phases — done ticket should be detected
@@ -4524,6 +4786,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         let changed = state.rebuild_dag();
@@ -4589,6 +4852,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         assert!(!state.threads.contains_key("T-001"));
 
@@ -4649,6 +4913,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Run the done-ticket detection logic (mirrors poll_tick)
@@ -4749,6 +5014,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.audit_threads();
@@ -4865,6 +5131,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Replicate the key mark_ticket_done operations (without schedule_ready_tickets)
@@ -5072,6 +5339,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 6,
@@ -5081,6 +5349,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Add health data
@@ -5233,6 +5502,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 43,
@@ -5242,6 +5512,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         let snapshot = state.format_snapshot();
@@ -5366,6 +5637,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Add running thread in implement phase
@@ -5447,6 +5719,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         let mut thread = Thread::new("T-001", 1);
@@ -5527,6 +5800,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Add running thread in research phase
@@ -5678,6 +5952,7 @@ mod tests {
             transition_started_at: Some(std::time::SystemTime::now()),
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         state.awaiting_human.insert(1);
 
@@ -5705,6 +5980,7 @@ mod tests {
             transition_started_at: Some(std::time::SystemTime::now()),
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         state.awaiting_human.insert(1);
 
@@ -5732,6 +6008,7 @@ mod tests {
             transition_started_at: Some(long_ago),
             cooldown_until: None,
             last_activity_at: Some(long_ago),
+            last_client: None,
         });
         state.awaiting_human.insert(1);
 
@@ -5861,6 +6138,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         state.agent_slots.push(AgentSlot {
             pane_id: 2,
@@ -5870,6 +6148,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         state
             .threads
@@ -5948,6 +6227,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         let mut thread = Thread::new("T-001", 1);
@@ -6027,6 +6307,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Running thread in Review phase
@@ -6098,6 +6379,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_idle_signals();
@@ -6150,6 +6432,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Add a PARKED thread (not running)
@@ -6326,6 +6609,7 @@ mod tests {
                 transition_started_at: None,
                 cooldown_until: None,
                 last_activity_at: None,
+                last_client: None,
             });
         }
 
@@ -6351,6 +6635,254 @@ mod tests {
         assert!(running >= state.config.max_threads);
         // Even though idle slots exist
         assert!(state.agent_slots.iter().any(|s| s.ticket_id.is_none()));
+    }
+
+    // ---- T-026-02: provider-aware concurrency ----
+
+    fn running_thread(id: &str, pane: u32, client: AgentClient) -> lisa_core::types::Thread {
+        let mut t = lisa_core::types::Thread::new(id, pane);
+        t.client = client;
+        t
+    }
+
+    fn fresh_slot(pane_id: u32, last_client: Option<AgentClient>) -> AgentSlot {
+        AgentSlot {
+            pane_id,
+            ticket_id: None,
+            has_session: last_client.is_some(),
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client,
+        }
+    }
+
+    #[test]
+    fn test_provider_under_cap_no_cap_always_admits() {
+        // No provider_caps configured → per-provider gate never blocks, even with
+        // many running threads of that provider (only the global cap applies).
+        let mut state = State::default();
+        for i in 0..5u32 {
+            state
+                .threads
+                .insert(format!("C-{i}"), running_thread(&format!("C-{i}"), 10 + i, AgentClient::Codex));
+        }
+        assert!(state.provider_under_cap(AgentClient::Codex));
+        assert!(state.provider_under_cap(AgentClient::Claude));
+    }
+
+    #[test]
+    fn test_provider_under_cap_blocks_one_provider_not_other() {
+        let mut state = State {
+            config: PluginConfig {
+                provider_caps: [(AgentClient::Codex, 2)].into_iter().collect(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        // Two running Codex threads == the Codex cap.
+        for i in 0..2u32 {
+            state
+                .threads
+                .insert(format!("C-{i}"), running_thread(&format!("C-{i}"), 10 + i, AgentClient::Codex));
+        }
+        assert!(!state.provider_under_cap(AgentClient::Codex), "codex is at its cap");
+        assert!(
+            state.provider_under_cap(AgentClient::Claude),
+            "claude has no cap and is unaffected"
+        );
+    }
+
+    #[test]
+    fn test_provider_under_cap_counts_only_matching_provider() {
+        let mut state = State {
+            config: PluginConfig {
+                provider_caps: [(AgentClient::Codex, 2)].into_iter().collect(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        // Three running Claude threads must NOT count against the Codex cap.
+        for i in 0..3u32 {
+            state
+                .threads
+                .insert(format!("A-{i}"), running_thread(&format!("A-{i}"), 10 + i, AgentClient::Claude));
+        }
+        assert!(
+            state.provider_under_cap(AgentClient::Codex),
+            "codex has zero running threads despite the claude load"
+        );
+    }
+
+    #[test]
+    fn test_find_idle_slot_provider_affinity() {
+        let mut state = State {
+            config: PluginConfig {
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        // Slot 0 last ran Claude; slot 1 is fresh (never hosted a session).
+        state.agent_slots.push(fresh_slot(10, Some(AgentClient::Claude)));
+        state.agent_slots.push(fresh_slot(11, None));
+
+        // Codex skips the Claude-affine slot and takes the fresh one.
+        assert_eq!(state.find_idle_slot(AgentClient::Codex), Some(1));
+        // Claude prefers the matching slot 0 (first eligible).
+        assert_eq!(state.find_idle_slot(AgentClient::Claude), Some(0));
+    }
+
+    #[test]
+    fn test_find_idle_slot_no_matching_provider_waits() {
+        let mut state = State {
+            config: PluginConfig {
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        // Only a Claude-affine slot is available.
+        state.agent_slots.push(fresh_slot(10, Some(AgentClient::Claude)));
+        // Codex finds no eligible slot → None (the ticket waits visibly; no crash,
+        // no cross-provider mis-injection).
+        assert_eq!(state.find_idle_slot(AgentClient::Codex), None);
+    }
+
+    #[test]
+    fn test_mixed_provider_stress_16() {
+        // The acceptance-criterion-2 stress artifact: 16 mixed agents with
+        // per-provider caps 8/8 under a global cap of 16, 32 slots. Drives the
+        // real spawn-gate decision functions (global count, provider_under_cap,
+        // find_idle_slot affinity) in the exact order schedule_ready_tickets uses,
+        // committing each admission as the scheduler would. Asserts every
+        // invariant the ticket names: global cap, per-provider caps, unique slot
+        // per thread, no cross-provider slot reuse, surplus stays unscheduled.
+        use lisa_core::types::ThreadStatus;
+
+        let mut state = State {
+            config: PluginConfig {
+                max_threads: 16,
+                wind_down_secs: 0,
+                provider_caps: [(AgentClient::Claude, 8), (AgentClient::Codex, 8)]
+                    .into_iter()
+                    .collect(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        for i in 0..32u32 {
+            state.agent_slots.push(fresh_slot(100 + i, None));
+        }
+
+        // Offer 16 Claude tickets then 16 Codex tickets — far more than can run.
+        // Claude fills its cap (8) while the global still has room, proving the
+        // per-provider cap binds independently of the global; Codex then fills to
+        // 16 total.
+        let offered: Vec<(String, AgentClient)> = (0..16)
+            .map(|i| (format!("A-{i}"), AgentClient::Claude))
+            .chain((0..16).map(|i| (format!("C-{i}"), AgentClient::Codex)))
+            .collect();
+
+        let mut admitted = 0usize;
+        let mut unscheduled = 0usize;
+        for (tid, want) in &offered {
+            let running_total = state
+                .threads
+                .values()
+                .filter(|t| t.status == ThreadStatus::Running)
+                .count();
+            if running_total >= state.config.max_threads {
+                unscheduled += 1;
+                continue;
+            }
+            if !state.provider_under_cap(*want) {
+                unscheduled += 1;
+                continue;
+            }
+            let slot_idx = match state.find_idle_slot(*want) {
+                Some(s) => s,
+                None => {
+                    unscheduled += 1;
+                    continue;
+                }
+            };
+            let pane_id = state.agent_slots[slot_idx].pane_id;
+            state.agent_slots[slot_idx].ticket_id = Some(tid.clone());
+            state.agent_slots[slot_idx].last_client = Some(*want);
+            state
+                .threads
+                .insert(tid.clone(), running_thread(tid, pane_id, *want));
+            admitted += 1;
+        }
+
+        let running = |c: AgentClient| {
+            state
+                .threads
+                .values()
+                .filter(|t| t.status == ThreadStatus::Running && t.client == c)
+                .count()
+        };
+        let total = running(AgentClient::Claude) + running(AgentClient::Codex);
+
+        assert_eq!(total, 16, "exactly the global cap of concurrent agents");
+        assert_eq!(running(AgentClient::Claude), 8, "claude per-provider cap");
+        assert_eq!(running(AgentClient::Codex), 8, "codex per-provider cap");
+        assert_eq!(admitted, 16);
+        assert_eq!(unscheduled, 16, "the surplus 16 tickets stay unscheduled, not dropped");
+
+        // No slot serves a provider other than the one stamped on it.
+        for slot in &state.agent_slots {
+            if let (Some(_), Some(last)) = (&slot.ticket_id, slot.last_client) {
+                let owner = state.threads.values().find(|t| t.pane_id == slot.pane_id);
+                assert_eq!(
+                    owner.map(|t| t.client),
+                    Some(last),
+                    "slot {} provider matches its running thread",
+                    slot.pane_id
+                );
+            }
+        }
+        // No two running threads share a pane (no slot leak / double-assignment).
+        let mut panes: Vec<u32> = state.threads.values().map(|t| t.pane_id).collect();
+        panes.sort_unstable();
+        let before = panes.len();
+        panes.dedup();
+        assert_eq!(panes.len(), before, "each running thread has a unique pane");
+    }
+
+    #[test]
+    fn test_signal_scan_cost_at_32_panes() {
+        // Signal-dir cost probe (T-026-02 findings / ticket note): populate the
+        // dir with ~32 panes' worth of mixed signal files and confirm one
+        // heartbeat scan consumes exactly the heartbeat files, leaving the rest.
+        // Documents the O(files) per-scan behaviour — poll_tick runs five such
+        // scans per tick, at the 5s POLL_INTERVAL_SECS cadence.
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let sigdir = dir.path().join("signals");
+        fs::create_dir_all(&sigdir).unwrap();
+        for pane in 0..32u32 {
+            fs::write(sigdir.join(format!("pane-{pane}.heartbeat")), "").unwrap();
+            fs::write(sigdir.join(format!("pane-{pane}.idle")), "").unwrap();
+        }
+        let mut state = State {
+            signal_dir: sigdir.clone(),
+            ..State::default()
+        };
+        state.check_heartbeat_signals();
+
+        let remaining: Vec<String> = fs::read_dir(&sigdir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining.len(), 32, "only the 32 idle files remain after the heartbeat scan");
+        assert!(
+            remaining.iter().all(|n| n.ends_with(".idle")),
+            "heartbeat scan leaves non-heartbeat signals untouched"
+        );
     }
 
     #[test]
@@ -6502,6 +7034,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         };
         assert_eq!(slot.transition_state, TransitionState::Idle);
     }
@@ -6527,6 +7060,7 @@ mod tests {
             transition_started_at: Some(std::time::SystemTime::now()),
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_transition_signals();
@@ -6569,6 +7103,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_transition_signals();
@@ -6605,6 +7140,7 @@ mod tests {
             transition_started_at: Some(std::time::SystemTime::now()),
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_transition_signals();
@@ -6644,6 +7180,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_transition_signals();
@@ -6687,6 +7224,7 @@ mod tests {
             ),
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_transition_timeouts();
@@ -6725,6 +7263,7 @@ mod tests {
             ),
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_transition_timeouts();
@@ -6754,6 +7293,7 @@ mod tests {
             ),
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_transition_timeouts();
@@ -6830,6 +7370,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         // Running thread in Review phase
@@ -7201,6 +7742,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_session_timeouts();
@@ -7366,6 +7908,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(700);
@@ -7396,16 +7939,17 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: Some(std::time::SystemTime::now()),
+            last_client: None,
         });
 
-        assert_eq!(state.find_idle_slot(), None);
+        assert_eq!(state.find_idle_slot(AgentClient::Claude), None);
 
         // Once the pane has been quiet past the wind-down period, it's eligible
         state.agent_slots[0].last_activity_at = Some(
             std::time::SystemTime::now()
                 - std::time::Duration::from_secs(state.config.wind_down_secs + 1),
         );
-        assert_eq!(state.find_idle_slot(), Some(0));
+        assert_eq!(state.find_idle_slot(AgentClient::Claude), Some(0));
     }
 
     #[test]
@@ -7421,9 +7965,10 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
-        assert_eq!(state.find_idle_slot(), Some(0));
+        assert_eq!(state.find_idle_slot(AgentClient::Claude), Some(0));
     }
 
     #[test]
@@ -7441,6 +7986,7 @@ mod tests {
             cooldown_until: None,
             // ...but the pane is still active, so the fallback must wait
             last_activity_at: Some(std::time::SystemTime::now()),
+            last_client: None,
         });
 
         state.check_transition_timeouts();
@@ -7574,6 +8120,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_session_timeouts();
@@ -7703,6 +8250,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
 
         state.check_session_timeouts();
@@ -7752,6 +8300,7 @@ mod tests {
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
+            last_client: None,
         });
         let thread = Thread::new("T-001", 1);
         assert_eq!(thread.status, ThreadStatus::Running);
@@ -7791,7 +8340,9 @@ mod tests {
             signal_dir: signal_dir.clone(),
             ..State::default()
         };
-        state.threads.insert("T-001".to_string(), Thread::new("T-001", 1));
+        state
+            .threads
+            .insert("T-001".to_string(), Thread::new("T-001", 1));
 
         state.check_error_signals();
 
@@ -7819,6 +8370,596 @@ mod tests {
         assert_eq!(ui_state.alerts[0].ticket_id, "T-001");
         assert_eq!(ui_state.alerts[0].alert_type, ui::AlertType::Failed);
         assert!(ui_state.alerts[0].detail.contains("pane 3"));
+    }
+
+    // --- T-024-01: Codex loop parity ----------------------------------------
+    //
+    // Composition tests: drive the real scheduler consumers under
+    // `client = Codex` with Codex-shaped signal files / artifacts, proving the
+    // parity mechanisms (already unit-tested in isolation by T-022-02 / T-023-01
+    // / T-023-02) behave correctly *together* as a Codex loop lifecycle. The
+    // scheduler consumes signal *files*, never JSON, so the whole scheduler side
+    // is reachable natively; the live `codex exec` spawn/stream is the manual
+    // remainder covered by `validate-codex-loop.sh`.
+
+    /// Build a `State` configured for a Codex loop, with a real 2-ticket DAG on
+    /// disk (`T-CDX-01`; `T-CDX-02` depends on it) and tempdir work/signal dirs.
+    /// Returns (state, tempdir) — keep the tempdir alive for the test's duration.
+    fn codex_state_with_dag() -> (State, tempfile::TempDir) {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-CDX-01.md"),
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        ).unwrap();
+        fs::write(
+            tickets_dir.join("T-CDX-02.md"),
+            "---\nid: T-CDX-02\ntitle: codex-b\ntype: task\nstatus: open\npriority: high\nphase: research\ndepends_on: [T-CDX-01]\n---\n\nBody\n",
+        ).unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let dag = Dag::from_tickets(tickets).unwrap();
+        let state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir,
+                client: AgentClient::Codex,
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+        (state, dir)
+    }
+
+    fn codex_slot(state: &mut State, pane_id: u32, ticket: &str) {
+        state.agent_slots.push(AgentSlot {
+            pane_id,
+            ticket_id: Some(ticket.to_string()),
+            has_session: true,
+            // FreshExec: a Codex slot is never in the WaitingForStop/Clear
+            // handshake — it sits Idle between execs.
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+    }
+
+    /// AC: phases advance on artifacts through all RDSPI phases — purely on
+    /// artifact presence, with *no* `.idle`/`.stopped` signal involved. This is
+    /// the parity load-bearer for Codex (which emits no `.idle`): advancement
+    /// rides `check_artifact_advances`.
+    #[test]
+    fn test_codex_dag_advances_all_phases_via_artifacts() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        let ticket_work = state.config.work_dir.join("T-CDX-01");
+        fs::create_dir_all(&ticket_work).unwrap();
+
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+
+        // Each artifact advances exactly one phase boundary. Implement→Review
+        // and Review→Done both ride review.md, so writing it cascades to Done in
+        // a single fixpoint pass — the full RDSPI walk.
+        let steps: &[(&str, Phase)] = &[
+            ("research.md", Phase::Design),
+            ("design.md", Phase::Structure),
+            ("structure.md", Phase::Plan),
+            ("plan.md", Phase::Implement),
+        ];
+        for (artifact, expected) in steps {
+            fs::write(ticket_work.join(artifact), "x").unwrap();
+            state.check_artifact_advances();
+            assert_eq!(
+                state.threads.get("T-CDX-01").unwrap().current_phase,
+                *expected,
+                "writing {artifact} should advance to {expected:?}"
+            );
+        }
+
+        // review.md at Implement cascades Implement→Review→Done.
+        fs::write(ticket_work.join("review.md"), "x").unwrap();
+        state.check_artifact_advances();
+        assert_eq!(
+            state.threads.get("T-CDX-01").unwrap().current_phase,
+            Phase::Done,
+            "review.md should cascade Implement→Review→Done"
+        );
+        let on_disk = fs::read_to_string(state.config.ticket_dir.join("T-CDX-01.md")).unwrap();
+        assert!(on_disk.contains("phase: done"), "ticket file: {on_disk}");
+
+        // No signal files were ever written — advancement was artifact-only.
+        assert!(state.signal_dir.read_dir().unwrap().next().is_none());
+    }
+
+    /// AC: `.stopped` at run end triggers Review auto-completion, dependencies
+    /// respected. Codex's `.stopped` lands on an Idle slot (FreshExec), so
+    /// `handle_stopped_signal` Case 2 fires; the dep guard blocks a dependent
+    /// ticket whose dependency is not yet Done.
+    #[test]
+    fn test_codex_stopped_auto_completes_review_respecting_deps() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        // Put T-CDX-01 (dep-free) into Review on disk and in the DAG.
+        let t1 = state.config.ticket_dir.join("T-CDX-01.md");
+        fs::write(
+            &t1,
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n\nBody\n",
+        ).unwrap();
+        // Dependent T-CDX-02 also into Review while its dep is NOT done.
+        let t2 = state.config.ticket_dir.join("T-CDX-02.md");
+        fs::write(
+            &t2,
+            "---\nid: T-CDX-02\ntitle: codex-b\ntype: task\nstatus: review\npriority: high\nphase: review\ndepends_on: [T-CDX-01]\n---\n\nBody\n",
+        ).unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap();
+        state.dag = Dag::from_tickets(tickets).unwrap();
+
+        codex_slot(&mut state, 1, "T-CDX-01");
+        codex_slot(&mut state, 2, "T-CDX-02");
+        let mut th1 = Thread::new("T-CDX-01", 1);
+        th1.current_phase = Phase::Review;
+        state.threads.insert("T-CDX-01".to_string(), th1);
+        let mut th2 = Thread::new("T-CDX-02", 2);
+        th2.current_phase = Phase::Review;
+        state.threads.insert("T-CDX-02".to_string(), th2);
+
+        // Negative first: T-CDX-02's dep (T-CDX-01) is not Done → guard blocks.
+        state.auto_complete_review("T-CDX-02".to_string(), 2);
+        assert!(
+            state.threads.contains_key("T-CDX-02"),
+            "dependent ticket must NOT auto-complete while its dep is open"
+        );
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::Error { message } if message.contains("dependencies are not all done")
+        )));
+        assert!(fs::read_to_string(&t2).unwrap().contains("phase: review"));
+
+        // Positive: T-CDX-01 is dep-free → `.stopped` on its Idle pane completes it.
+        state.handle_stopped_signal(1);
+        assert!(
+            !state.threads.contains_key("T-CDX-01"),
+            "dep-free Review ticket should auto-complete on .stopped"
+        );
+        assert!(state.agent_slots[0].ticket_id.is_none(), "slot released");
+        let done = fs::read_to_string(&t1).unwrap();
+        assert!(
+            done.contains("phase: done") && done.contains("status: done"),
+            "{done}"
+        );
+    }
+
+    /// AC: a long tool-free stretch does not false-trip stuck detection while
+    /// heartbeats flow — and a genuinely hung run IS reclaimed. Codex `item.*`
+    /// heartbeats reset the same activity clock Claude's PostToolUse heartbeats do.
+    #[test]
+    fn test_codex_heartbeat_honest_then_genuine_hang_reclaimed() {
+        use lisa_core::types::Thread;
+
+        // hard-silence bar = 2 × 600 = 1200s.
+        let mk = || {
+            let mut state = State {
+                config: PluginConfig {
+                    stuck_threshold_secs: 600,
+                    ..PluginConfig::new()
+                },
+                ..State::default()
+            };
+            codex_slot(&mut state, 1, "T-CDX-01");
+            state
+        };
+
+        // Honest: recent activity (a heartbeat 300s ago) — well under 1200s.
+        let mut honest = mk();
+        let mut alive = Thread::new("T-CDX-01", 1);
+        alive.current_phase = Phase::Implement;
+        alive.last_activity = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        honest.threads.insert("T-CDX-01".to_string(), alive);
+        honest.detect_stale_threads();
+        assert!(
+            honest.threads.contains_key("T-CDX-01"),
+            "a heartbeating session must never be reclaimed as stuck"
+        );
+        assert!(
+            honest.agent_slots[0].ticket_id.is_some(),
+            "slot stays bound"
+        );
+
+        // Genuine hang: silent 2000s > 1200s bar → reclaimed for retry.
+        let mut hung = mk();
+        let mut dead = Thread::new("T-CDX-01", 1);
+        dead.current_phase = Phase::Implement;
+        dead.last_activity = std::time::SystemTime::now() - std::time::Duration::from_secs(2000);
+        dead.last_phase_change = dead.last_activity;
+        hung.threads.insert("T-CDX-01".to_string(), dead);
+        hung.detect_stale_threads();
+        assert!(
+            hung.threads.is_empty(),
+            "a genuinely hung run must be reclaimed"
+        );
+        assert!(
+            hung.agent_slots[0].ticket_id.is_none(),
+            "slot released on reclaim"
+        );
+    }
+
+    /// AC: a forced failure (`turn.failed`/non-zero exit → `.error`) fails the
+    /// thread promptly and releases the slot — no waiting for 2× stuck-threshold
+    /// of silence. Framed under Codex config; the consumer is adapter-agnostic.
+    #[test]
+    fn test_codex_error_signal_fails_thread_promptly() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        fs::write(state.signal_dir.join("pane-1.error"), "turn.failed: boom").unwrap();
+        codex_slot(&mut state, 1, "T-CDX-01");
+        let thread = Thread::new("T-CDX-01", 1);
+        assert_eq!(thread.status, ThreadStatus::Running);
+        state.threads.insert("T-CDX-01".to_string(), thread);
+
+        state.check_error_signals();
+
+        assert!(
+            !state.signal_dir.join("pane-1.error").exists(),
+            "signal consumed"
+        );
+        assert!(
+            state.threads.is_empty(),
+            "thread failed + removed for retry"
+        );
+        assert!(state.agent_slots[0].ticket_id.is_none(), "slot released");
+        assert!(state.agent_slots[0].has_session, "session kept alive");
+        assert_eq!(state.error_alerts, vec![("T-CDX-01".to_string(), 1)]);
+    }
+
+    /// AC: the review-timeout finish-up path works via `agent-exec --resume`.
+    /// (a) the scheduler *takes* the finish-up path for a quiet, timed-out Codex
+    /// Review thread; (b) the Codex adapter's follow-up *is* an
+    /// `agent-exec --resume` line carrying the finish-up prompt.
+    #[test]
+    fn test_codex_review_timeout_finish_up_is_agent_exec_resume() {
+        use lisa_core::types::Thread;
+
+        // (a) path fires for a Codex Review thread past timeout + wind-down.
+        let mut state = State {
+            config: PluginConfig {
+                client: AgentClient::Codex,
+                lisa_bin: Some("/abs/lisa".to_string()),
+                review_timeout_secs: 10,
+                wind_down_secs: 180,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.current_phase = Phase::Review;
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(200);
+        thread.last_activity = thread.last_phase_change;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+
+        state.check_review_timeouts();
+        assert!(
+            state.finish_up_sent.contains("T-CDX-01"),
+            "finish-up path taken"
+        );
+        assert!(state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-CDX-01"
+        )));
+
+        // (b) the delivered line is `agent-exec --resume "<finish_up_prompt>"`.
+        let ticket_dir = Path::new("docs/active/tickets");
+        let work_dir = Path::new("docs/active/work");
+        let (adapter, _route) =
+            resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa"));
+        let follow_up = adapter.follow_up(&FollowUpContext {
+            ticket_dir,
+            work_dir,
+            ticket_id: "T-CDX-01",
+            pane_id: 1,
+        });
+        match follow_up {
+            FollowUp::SpawnCommand(cmd) => {
+                assert!(cmd.contains("agent-exec --resume \""), "cmd: {cmd}");
+                assert!(cmd.contains(&finish_up_prompt(ticket_dir, work_dir, "T-CDX-01")));
+                assert!(cmd.contains("LISA_PANE_ID=1 LISA_TICKET_ID=T-CDX-01 /abs/lisa"));
+            }
+            other => panic!("Codex follow-up must be SpawnCommand, got {other:?}"),
+        }
+    }
+
+    /// AC: the dashboard shows sane states throughout — no phantom "awaiting".
+    /// Codex never writes `.awaiting`, so `check_awaiting_signals` leaves the set
+    /// empty and `to_ui_state` projects `awaiting=false` for every Codex pane.
+    #[test]
+    fn test_codex_pane_never_phantom_awaiting() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        state.initialized = true;
+        // The entire Codex signal vocabulary sans `.error` — no `.awaiting`.
+        fs::write(state.signal_dir.join("pane-1.heartbeat"), "0").unwrap();
+        fs::write(state.signal_dir.join("pane-1.stopped"), "0").unwrap();
+        codex_slot(&mut state, 1, "T-CDX-01");
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.current_phase = Phase::Implement;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+
+        state.check_awaiting_signals();
+        state.check_heartbeat_signals();
+
+        assert!(
+            state.awaiting_human.is_empty(),
+            "no pane may be flagged awaiting"
+        );
+        assert!(!state.is_pane_awaiting(1));
+        let ui = state.to_ui_state();
+        let row = ui
+            .active_threads
+            .iter()
+            .find(|t| t.ticket_id == "T-CDX-01")
+            .expect("Codex thread should render as active");
+        assert!(
+            !row.awaiting,
+            "dashboard must not invent an awaiting state for Codex"
+        );
+    }
+
+    /// AC (mixed loop): signals are attributed per pane. Two running threads on
+    /// panes 1 and 2; a `.error` for pane 2 fails only that pane's thread, pane 1
+    /// untouched. (True single-loop client mixing is loop-wide-`client`-gated and
+    /// deferred to S-026; per-`pane-<id>` attribution is the guarantee that holds.)
+    #[test]
+    fn test_mixed_panes_error_attributed_per_pane() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        fs::write(state.signal_dir.join("pane-2.error"), "boom").unwrap();
+        codex_slot(&mut state, 1, "T-CDX-01");
+        codex_slot(&mut state, 2, "T-CDX-02");
+        state
+            .threads
+            .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
+        state
+            .threads
+            .insert("T-CDX-02".to_string(), Thread::new("T-CDX-02", 2));
+
+        state.check_error_signals();
+
+        assert!(
+            state.threads.contains_key("T-CDX-01"),
+            "pane-1 thread untouched"
+        );
+        assert!(
+            !state.threads.contains_key("T-CDX-02"),
+            "pane-2 thread failed"
+        );
+        assert!(
+            state.agent_slots[0].ticket_id.is_some(),
+            "pane-1 slot still bound"
+        );
+        assert!(
+            state.agent_slots[1].ticket_id.is_none(),
+            "pane-2 slot released"
+        );
+        assert_eq!(state.error_alerts, vec![("T-CDX-02".to_string(), 2)]);
+    }
+
+    // --- Provenance ledger (T-027-01) ---------------------------------------
+
+    /// Point `state` at a ledger + codex dir inside `dir`, and return the ledger
+    /// path so a test can read it back.
+    fn with_ledger(state: &mut State, dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let ledger = dir.path().join("provenance.jsonl");
+        state.ledger_path = ledger.clone();
+        state.codex_dir = dir.path().join("codex");
+        state.claude_dir = dir.path().join("claude");
+        ledger
+    }
+
+    fn read_ledger(path: &std::path::Path) -> Vec<lisa_core::provenance::ProvenanceRecord> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("ledger line parses"))
+            .collect()
+    }
+
+    /// AC: a record is emitted on terminal failure (`.error` reclaim), driven
+    /// end-to-end through the real teardown site — proves the call-site wiring.
+    #[test]
+    fn provenance_emitted_on_error_signal() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        fs::write(state.signal_dir.join("pane-2.error"), "boom").unwrap();
+        codex_slot(&mut state, 2, "T-CDX-02");
+        // A Codex-loop thread carries client=Codex (set at spawn, lib.rs:687); the
+        // manual construction here must match so the recorded route is codex.
+        let mut thread = Thread::new("T-CDX-02", 2);
+        thread.client = AgentClient::Codex;
+        state.threads.insert("T-CDX-02".to_string(), thread);
+
+        state.check_error_signals();
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records.len(), 1, "one record on failure");
+        assert_eq!(records[0].ticket_id, "T-CDX-02");
+        assert_eq!(records[0].outcome, RunOutcome::Failed);
+        assert_eq!(records[0].actual.method, "codex");
+        assert_eq!(records[0].actual.provider, "openai");
+        assert_eq!(
+            records[0].schema_version,
+            lisa_core::provenance::SCHEMA_VERSION
+        );
+    }
+
+    /// AC: retries/resets append additional records; nothing rewrites history.
+    #[test]
+    fn provenance_retry_appends_not_rewrites() {
+        use lisa_core::types::Thread;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+
+        // First run: completes.
+        state
+            .threads
+            .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
+        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+        state.threads.remove("T-CDX-01");
+
+        // Retry of the same ticket: fails.
+        state
+            .threads
+            .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
+        state.emit_provenance("T-CDX-01", RunOutcome::Failed);
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records.len(), 2, "retry appends a second record");
+        assert_eq!(records[0].outcome, RunOutcome::Done, "first record intact");
+        assert_eq!(records[1].outcome, RunOutcome::Failed);
+    }
+
+    /// AC: Codex tokens flow from the wrapper's usage artifact into the record.
+    #[test]
+    fn provenance_codex_usage_flows_into_record() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        fs::create_dir_all(&state.codex_dir).unwrap();
+        fs::write(
+            state.codex_dir.join("T-CDX-01.usage.json"),
+            r#"{"key":"T-CDX-01","thread_id":"abc","success":true,
+                "usage":{"input_tokens":120,"output_tokens":34}}"#,
+        )
+        .unwrap();
+
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.client = AgentClient::Codex;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records[0].tokens_in, Some(120));
+        assert_eq!(records[0].tokens_out, Some(34));
+        assert_eq!(
+            records[0].cost_usd, None,
+            "no cost field → null, never fabricated"
+        );
+    }
+
+    /// AC: Claude records carry null cost/tokens until T-027-02 (no artifact).
+    #[test]
+    fn provenance_claude_record_has_null_tokens() {
+        use lisa_core::types::Thread;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.client = AgentClient::Claude;
+        thread.concurrency_at_spawn = 3;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+
+        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records[0].tokens_in, None);
+        assert_eq!(records[0].tokens_out, None);
+        assert_eq!(records[0].cost_usd, None);
+        assert_eq!(records[0].actual.method, "claude");
+        assert_eq!(records[0].actual.provider, "anthropic");
+        assert_eq!(
+            records[0].concurrency_at_spawn, 3,
+            "spawn concurrency recorded"
+        );
+    }
+
+    /// T-027-02 AC: a Claude run's tokens flow from the `.lisa/claude` usage
+    /// artifact (written by the Stop hook's `capture-usage`) into the record;
+    /// `cost_usd` stays null (derived downstream, never fabricated).
+    #[test]
+    fn provenance_claude_usage_flows_into_record() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        fs::create_dir_all(&state.claude_dir).unwrap();
+        fs::write(
+            state.claude_dir.join("T-CDX-01.usage.json"),
+            r#"{"key":"T-CDX-01","usage":{"input_tokens":167,"output_tokens":37}}"#,
+        )
+        .unwrap();
+
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.client = AgentClient::Claude;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records[0].tokens_in, Some(167));
+        assert_eq!(records[0].tokens_out, Some(37));
+        assert_eq!(records[0].cost_usd, None, "Claude records no dollar cost");
+        assert_eq!(records[0].actual.method, "claude");
+    }
+
+    /// AC: the emission never touches agent-owned ticket frontmatter.
+    #[test]
+    fn provenance_does_not_touch_ticket_frontmatter() {
+        use lisa_core::types::Thread;
+
+        let (mut state, dir) = codex_state_with_dag();
+        with_ledger(&mut state, &dir);
+        let ticket_file = state.config.ticket_dir.join("T-CDX-01.md");
+        let before = std::fs::read(&ticket_file).unwrap();
+
+        state
+            .threads
+            .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
+        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+
+        let after = std::fs::read(&ticket_file).unwrap();
+        assert_eq!(before, after, "ticket frontmatter must be byte-identical");
+    }
+
+    /// A write with an unset ledger path (native tests / pre-load) is a no-op,
+    /// never a panic — so unrelated teardown-triggering tests don't hit disk.
+    #[test]
+    fn provenance_noop_when_ledger_unset() {
+        use lisa_core::types::Thread;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        // ledger_path deliberately left empty (State::default()).
+        assert!(state.ledger_path.as_os_str().is_empty());
+        state
+            .threads
+            .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
+        // Must not panic or write anywhere.
+        state.emit_provenance("T-CDX-01", RunOutcome::Done);
     }
 }
 
