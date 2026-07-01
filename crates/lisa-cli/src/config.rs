@@ -44,6 +44,12 @@ pub struct SchedulingConfig {
     pub session_timeout_secs: Option<u64>,
     pub wind_down_secs: Option<u64>,
     pub phase_timeouts: Option<std::collections::HashMap<String, u64>>,
+    /// Optional per-provider concurrency sub-caps (T-026-02), keyed by raw
+    /// client name (`claude` | `codex`). Kept as raw strings here so an invalid
+    /// provider name or a `0` cap surfaces as an actionable *validation* error
+    /// via [`validate_config`] rather than a raw serde failure, mirroring how
+    /// `[agent].client` is handled.
+    pub provider_caps: Option<std::collections::HashMap<String, usize>>,
 }
 
 /// Fully resolved configuration with all defaults applied.
@@ -59,6 +65,9 @@ pub struct ResolvedConfig {
     pub wind_down_secs: u64,
     pub phase_timeouts: std::collections::HashMap<String, u64>,
     pub client: AgentClient,
+    /// Resolved per-provider concurrency sub-caps, keyed by raw client name.
+    /// Empty when none configured (T-026-02).
+    pub provider_caps: std::collections::HashMap<String, usize>,
 }
 
 impl Default for ResolvedConfig {
@@ -74,6 +83,7 @@ impl Default for ResolvedConfig {
             wind_down_secs: PluginConfig::DEFAULT_WIND_DOWN_SECS,
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
+            provider_caps: std::collections::HashMap::new(),
         }
     }
 }
@@ -146,6 +156,7 @@ pub fn resolve_config(
             .wind_down_secs
             .unwrap_or(defaults.wind_down_secs),
         phase_timeouts: config.scheduling.phase_timeouts.clone().unwrap_or_default(),
+        provider_caps: config.scheduling.provider_caps.clone().unwrap_or_default(),
     }
 }
 
@@ -171,6 +182,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
         "session_timeout_secs",
         "wind_down_secs",
         "phase_timeouts",
+        "provider_caps",
     ];
 
     // Parse as generic Value to detect unknown keys
@@ -229,6 +241,18 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
                     }
                 }
             }
+
+            // Validate provider names in [scheduling.provider_caps] (T-026-02).
+            if let Some(toml::Value::Table(caps)) = sched.get("provider_caps") {
+                for key in caps.keys() {
+                    if !AgentClient::VALID.contains(&key.as_str()) {
+                        warnings.push(format!(
+                            "Unknown provider in [scheduling.provider_caps]: {}",
+                            key
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -242,6 +266,15 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     }
     if let Some(client) = &config.agent.client {
         AgentClient::parse(client)?;
+    }
+    // A per-provider cap of 0 would starve that provider forever; reject it with
+    // the same "at least 1" contract as max_threads (T-026-02).
+    if let Some(caps) = &config.scheduling.provider_caps {
+        for (name, cap) in caps {
+            if *cap == 0 {
+                return Err(format!("provider cap for '{}' must be at least 1", name));
+            }
+        }
     }
 
     Ok(ConfigValidation { config, warnings })
@@ -303,6 +336,13 @@ max_threads = 2
 # research = 300
 # design = 300
 # implement = 1800
+
+# Optional per-provider concurrency sub-caps (within the global max_threads
+# ceiling). Useful when mixing providers so one provider's rate-limit pool
+# isn't saturated. Omit for a single global cap.
+# [scheduling.provider_caps]
+# claude = 8
+# codex = 8
 "#
 }
 
@@ -717,6 +757,73 @@ compile = 1800
         assert_eq!(config.agent.client, None);
         let resolved = resolve_config(&config, None, None);
         assert_eq!(resolved.client, AgentClient::Claude);
+    }
+
+    #[test]
+    fn test_parse_provider_caps() {
+        let toml_str = r#"
+[scheduling.provider_caps]
+claude = 8
+codex = 4
+"#;
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let caps = config.scheduling.provider_caps.unwrap();
+        assert_eq!(caps.get("claude"), Some(&8));
+        assert_eq!(caps.get("codex"), Some(&4));
+    }
+
+    #[test]
+    fn test_resolve_provider_caps() {
+        let toml_str = r#"
+[scheduling.provider_caps]
+codex = 6
+"#;
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None, None);
+        assert_eq!(resolved.provider_caps.get("codex"), Some(&6));
+    }
+
+    #[test]
+    fn test_resolve_provider_caps_empty_default() {
+        let config = LisaConfig::default();
+        let resolved = resolve_config(&config, None, None);
+        assert!(resolved.provider_caps.is_empty());
+    }
+
+    #[test]
+    fn test_validate_provider_caps_known_no_warning() {
+        let toml_str = "[scheduling.provider_caps]\nclaude = 8\ncodex = 4\n";
+        let result = validate_config(toml_str).unwrap();
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_provider_caps_unknown_provider_warns() {
+        let toml_str = "[scheduling.provider_caps]\ngpt = 8\n";
+        let result = validate_config(toml_str).unwrap();
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("gpt"));
+        assert!(result.warnings[0].contains("[scheduling.provider_caps]"));
+    }
+
+    #[test]
+    fn test_validate_provider_cap_zero_errors() {
+        let result = validate_config("[scheduling.provider_caps]\ncodex = 0\n");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("codex"));
+        assert!(err.contains("at least 1"));
+    }
+
+    #[test]
+    fn test_default_config_toml_provider_caps_inert() {
+        // The provider_caps example ships commented, so a fresh config resolves
+        // to no caps (no accidental opt-in).
+        let content = default_config_toml();
+        let config: LisaConfig = toml::from_str(&content).unwrap();
+        assert!(config.scheduling.provider_caps.is_none());
+        let resolved = resolve_config(&config, None, None);
+        assert!(resolved.provider_caps.is_empty());
     }
 
     #[test]

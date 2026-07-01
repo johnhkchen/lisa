@@ -94,6 +94,9 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         config.max_threads,
         config.max_threads * 2
     );
+    if let Some(caps) = format_provider_caps(config) {
+        println!("  Provider caps: {}", caps);
+    }
     println!();
 
     // Exec zellij (replaces this process)
@@ -134,6 +137,9 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
         config.max_threads,
         config.max_threads * 2
     );
+    if let Some(caps) = format_provider_caps(config) {
+        println!("Provider caps: {}", caps);
+    }
     println!();
 
     // Show execution order (topological sort of non-done tickets)
@@ -212,6 +218,23 @@ fn clean_stale_wasm_files(current_filename: &str) {
     }
 }
 
+/// Format the per-provider caps for operator display (`claude=8, codex=4`),
+/// sorted for determinism. Returns `None` when no caps are configured so the
+/// caller can omit the line entirely (T-026-02).
+fn format_provider_caps(config: &ResolvedConfig) -> Option<String> {
+    if config.provider_caps.is_empty() {
+        return None;
+    }
+    let mut caps: Vec<(&String, &usize)> = config.provider_caps.iter().collect();
+    caps.sort_by(|a, b| a.0.cmp(b.0));
+    Some(
+        caps.iter()
+            .map(|(name, cap)| format!("{}={}", name, cap))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedConfig) -> String {
     // Create 2x max_threads pane slots so transitions don't block scheduling.
     // Extra idle panes absorb new tickets while finishing panes wind down.
@@ -231,6 +254,20 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
         Some(p) => format!("                lisa_bin \"{}\"\n", p.display()),
         None => String::new(),
     };
+
+    // Per-provider concurrency caps (T-026-02), emitted as `provider_cap_<name>`
+    // keys the plugin parses back into PluginConfig.provider_caps. Sorted for
+    // deterministic layout output. Empty map → no lines → layout byte-for-byte
+    // unchanged for single-provider (uncapped) loops.
+    let mut provider_cap_lines = String::new();
+    let mut caps: Vec<(&String, &usize)> = config.provider_caps.iter().collect();
+    caps.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, cap) in caps {
+        provider_cap_lines.push_str(&format!(
+            "                provider_cap_{} \"{}\"\n",
+            name, cap
+        ));
+    }
 
     format!(
         r#"layout {{
@@ -254,7 +291,7 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
                 session_timeout_secs "{session_timeout_secs}"
                 wind_down_secs "{wind_down_secs}"
                 client "{client}"
-{lisa_bin_line}            }}
+{provider_cap_lines}{lisa_bin_line}            }}
         }}
     }}
 }}
@@ -262,6 +299,7 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
         agent_panes = agent_panes,
         wasm_path = wasm_path.display(),
         lisa_bin_line = lisa_bin_line,
+        provider_cap_lines = provider_cap_lines,
         ticket_dir = config.ticket_dir,
         story_dir = config.story_dir,
         work_dir = config.work_dir,
@@ -354,6 +392,42 @@ mod tests {
         };
         let layout = generate_layout(&wasm_path, None, &config);
         assert!(layout.contains("client \"codex\""));
+    }
+
+    #[test]
+    fn test_generate_layout_emits_provider_caps() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let mut config = default_config();
+        config.provider_caps.insert("codex".to_string(), 8);
+        config.provider_caps.insert("claude".to_string(), 4);
+        let layout = generate_layout(&wasm_path, None, &config);
+        assert!(layout.contains("provider_cap_codex \"8\""));
+        assert!(layout.contains("provider_cap_claude \"4\""));
+        // Sorted deterministically: claude before codex.
+        let claude_at = layout.find("provider_cap_claude").unwrap();
+        let codex_at = layout.find("provider_cap_codex").unwrap();
+        assert!(claude_at < codex_at, "caps emitted in sorted order");
+    }
+
+    #[test]
+    fn test_generate_layout_omits_provider_caps_when_empty() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let config = default_config();
+        let layout = generate_layout(&wasm_path, None, &config);
+        // Byte-for-byte regression guard: uncapped loops emit no cap keys.
+        assert!(!layout.contains("provider_cap_"));
+    }
+
+    #[test]
+    fn test_format_provider_caps() {
+        let mut config = default_config();
+        assert_eq!(format_provider_caps(&config), None);
+        config.provider_caps.insert("codex".to_string(), 8);
+        config.provider_caps.insert("claude".to_string(), 4);
+        assert_eq!(
+            format_provider_caps(&config).as_deref(),
+            Some("claude=4, codex=8")
+        );
     }
 
     #[test]
