@@ -43,6 +43,7 @@ fn section_init(root: &Path) -> GuideSection {
          | Path | Purpose |\n\
          |------|--------|\n\
          | `CLAUDE.md` | Project context for Claude Code |\n\
+         | `AGENTS.md` | Codex's native context file (a pointer to CLAUDE.md — single source of truth) |\n\
          | `.lisa.toml` | Lisa configuration (`max_threads`, etc.) |\n\
          | `docs/knowledge/rdspi-workflow.md` | RDSPI workflow definition (injected into agent sessions) |\n\
          | `docs/active/tickets/` | Ticket files (YAML frontmatter markdown) |\n\
@@ -99,6 +100,8 @@ fn section_claude_md(_root: &Path, project: &DetectedProject) -> GuideSection {
          - Build, test, and lint commands\n\
          - Source layout overview\n\
          - Any project-specific conventions or architecture decisions\n\n\
+         Codex agents read the same content via the generated `AGENTS.md` pointer, \
+         so CLAUDE.md stays the single file to maintain.\n\n\
          Generated template:\n\n\
          ```markdown\n\
          {}\n\

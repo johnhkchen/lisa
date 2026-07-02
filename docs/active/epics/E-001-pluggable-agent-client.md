@@ -3,7 +3,7 @@ id: E-001
 title: pluggable-agent-client
 status: open
 priority: high
-stories: [S-021, S-022, S-023, S-024, S-025, S-026, S-027]
+stories: [S-021, S-022, S-023, S-024, S-025, S-026, S-027, S-028]
 ---
 
 # E-001: Pluggable Agent Client — add Codex, grow toward per-pane provider/model routing
@@ -346,6 +346,13 @@ product decisions; the *how* stays with each ticket's RDSPI cycle.
    orchestrator binary rather than as loose scripts (doc 06). Claude's hook
    scripts stay as they are (they run *inside* Claude Code's hook system,
    which a subcommand cannot replace).
+
+> **Post-implementation note (2026-07-01):** S-021→S-027 shipped without a live
+> `codex` binary on the host — all empirical verdicts are `[PROVISIONAL]` and
+> the live-loop checklist is unrun. **S-028 (codex-live-validation)** holds the
+> deferred empirical half as `status: blocked` tickets; start at
+> [`docs/knowledge/codex-day-runbook.md`](../../knowledge/codex-day-runbook.md)
+> when the Codex CLI is installed.
 
 ## Open questions to resolve (mostly during S-021)
 
