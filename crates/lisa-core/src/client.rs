@@ -97,7 +97,10 @@ mod tests {
     fn parse_unknown_is_actionable_error() {
         let err = AgentClient::parse("gpt").unwrap_err();
         assert!(err.contains("gpt"), "error names the bad value: {err}");
-        assert!(err.contains("claude") && err.contains("codex"), "lists valid: {err}");
+        assert!(
+            err.contains("claude") && err.contains("codex"),
+            "lists valid: {err}"
+        );
     }
 
     #[test]
@@ -114,7 +117,10 @@ mod tests {
 
     #[test]
     fn serde_is_lowercase() {
-        assert_eq!(serde_json::to_string(&AgentClient::Codex).unwrap(), "\"codex\"");
+        assert_eq!(
+            serde_json::to_string(&AgentClient::Codex).unwrap(),
+            "\"codex\""
+        );
         let parsed: AgentClient = serde_json::from_str("\"claude\"").unwrap();
         assert_eq!(parsed, AgentClient::Claude);
     }

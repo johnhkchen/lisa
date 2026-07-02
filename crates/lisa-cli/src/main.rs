@@ -1,4 +1,5 @@
 mod agent_exec;
+mod capture_usage;
 mod config;
 mod detect;
 mod doctor;
@@ -103,6 +104,13 @@ enum Commands {
         #[arg(long, default_value = ".lisa/signals")]
         signal_dir: PathBuf,
     },
+    /// Capture Claude session token usage from a Stop-hook payload on stdin,
+    /// writing `.lisa/claude/<ticket>.usage.json` for the provenance ledger.
+    CaptureUsage {
+        /// Project root the `.lisa/claude` artifact is written under.
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
     /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
     Loop {
         /// Path to the project root (defaults to current directory)
@@ -160,6 +168,12 @@ fn main() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
+        }
+        Commands::CaptureUsage { cwd } => {
+            // Best-effort: a hook must never fail the session. Errors (e.g. an
+            // unwritable `.lisa/claude`) are swallowed; tokens stay null.
+            let cwd = resolve_path(&cwd);
+            let _ = capture_usage::run_capture_usage(&cwd);
         }
         Commands::Init { dry_run, path } => {
             let path = resolve_path(&path);

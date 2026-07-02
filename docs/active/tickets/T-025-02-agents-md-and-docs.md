@@ -5,7 +5,7 @@ title: agents-md-and-docs
 type: task
 status: open
 priority: medium
-phase: implement
+phase: done
 depends_on: [T-023-02, T-025-01]
 ---
 

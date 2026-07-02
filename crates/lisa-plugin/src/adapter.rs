@@ -45,6 +45,7 @@
 use std::path::Path;
 
 use lisa_core::client::AgentClient;
+use lisa_core::route::{resolve_route, ResolvedRoute};
 use lisa_core::types::Ticket;
 
 use crate::{build_claude_command, finish_up_prompt, ticket_prompt};
@@ -147,11 +148,46 @@ pub(crate) trait AgentAdapter {
 /// Native Claude Code adapter: the depth + reliability anchor leg. Delegates to
 /// the existing free functions so its output is identical to the pre-adapter
 /// scheduler (the no-op proof).
-pub(crate) struct ClaudeCodeAdapter;
+///
+/// `model` is the routed model for this pane (T-026-01), mapped to Claude's
+/// `--model` flag; `None` runs Claude's default model — the pre-routing launch
+/// line, byte-for-byte.
+pub(crate) struct ClaudeCodeAdapter {
+    model: Option<String>,
+    /// Absolute `lisa` path (plugin config) exported as `LISA_BIN` on the launch
+    /// line so the Stop hook's `capture-usage` is reachable (T-027-02). `None`
+    /// omits the var (PATH fallback), keeping the pre-capture launch line.
+    lisa_bin: Option<String>,
+}
+
+impl ClaudeCodeAdapter {
+    /// Build a Claude adapter for the given routed model (`None` = provider
+    /// default) and `lisa` binary path (`None` = PATH fallback). The default
+    /// `ClaudeCodeAdapter` (via [`Default`]) carries neither, matching the
+    /// pre-routing/pre-capture behaviour.
+    pub(crate) fn new(model: Option<&str>, lisa_bin: Option<&str>) -> Self {
+        Self {
+            model: model.map(|s| s.to_string()),
+            lisa_bin: lisa_bin.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        }
+    }
+}
+
+impl Default for ClaudeCodeAdapter {
+    fn default() -> Self {
+        Self { model: None, lisa_bin: None }
+    }
+}
 
 impl AgentAdapter for ClaudeCodeAdapter {
     fn launch_command(&self, ctx: &SpawnContext) -> String {
-        build_claude_command(ctx.ticket_dir, ctx.ticket_id, ctx.pane_id)
+        build_claude_command(
+            ctx.ticket_dir,
+            ctx.ticket_id,
+            ctx.pane_id,
+            self.model.as_deref(),
+            self.lisa_bin.as_deref(),
+        )
     }
 
     fn reset_strategy(&self) -> ResetStrategy {
@@ -168,7 +204,11 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 
     fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
-        FollowUp::TypeIntoPane(finish_up_prompt(ctx.ticket_dir, ctx.work_dir, ctx.ticket_id))
+        FollowUp::TypeIntoPane(finish_up_prompt(
+            ctx.ticket_dir,
+            ctx.work_dir,
+            ctx.ticket_id,
+        ))
     }
 
     fn signals(&self) -> SignalCapabilities {
@@ -202,15 +242,33 @@ impl AgentAdapter for ClaudeCodeAdapter {
 /// the layout omits it (see [`CodexAdapter::new`]).
 pub(crate) struct CodexAdapter {
     lisa_bin: String,
+    /// The routed model for this pane (T-026-01), forwarded to the wrapper as
+    /// `--model <m>` (which the wrapper passes to `codex exec`). `None` runs
+    /// codex's default model.
+    model: Option<String>,
 }
 
 impl CodexAdapter {
     /// Build a Codex adapter. `lisa_bin` is the absolute `lisa` path from the
     /// plugin config; `None` (older layout / `current_exe()` failure) falls back
-    /// to the bare `lisa`, resolved on the pane shell's PATH.
-    pub(crate) fn new(lisa_bin: Option<&str>) -> Self {
+    /// to the bare `lisa`, resolved on the pane shell's PATH. `model` is the
+    /// routed model (`None` = codex default).
+    pub(crate) fn new(lisa_bin: Option<&str>, model: Option<&str>) -> Self {
         Self {
-            lisa_bin: lisa_bin.filter(|s| !s.is_empty()).unwrap_or("lisa").to_string(),
+            lisa_bin: lisa_bin
+                .filter(|s| !s.is_empty())
+                .unwrap_or("lisa")
+                .to_string(),
+            model: model.map(|s| s.to_string()),
+        }
+    }
+
+    /// The ` --model <m>` fragment for the `agent-exec` line, or empty when no
+    /// model is routed (the pre-routing wrapper line).
+    fn model_flag(&self) -> String {
+        match &self.model {
+            Some(m) => format!(" --model {}", m),
+            None => String::new(),
         }
     }
 
@@ -221,12 +279,17 @@ impl CodexAdapter {
     /// Claude line is — the RDSPI prompts contain no shell metacharacters.
     fn agent_exec_line(&self, ctx: &SpawnContext) -> String {
         format!(
-            "LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} {bin} agent-exec \"{prompt}\"",
+            "LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} {bin} agent-exec{model} \"{prompt}\"",
             pane = ctx.pane_id,
             ticket = ctx.ticket_id,
             bin = self.lisa_bin,
+            model = self.model_flag(),
             // Codex auto-loads AGENTS.md, not CLAUDE.md.
-            prompt = ticket_prompt(ctx.ticket_dir, ctx.ticket_id, AgentClient::Codex.context_file()),
+            prompt = ticket_prompt(
+                ctx.ticket_dir,
+                ctx.ticket_id,
+                AgentClient::Codex.context_file()
+            ),
         )
     }
 }
@@ -252,10 +315,11 @@ impl AgentAdapter for CodexAdapter {
         // Re-enter the persisted thread (`--resume`) with the finish-up prompt.
         // The pane shell re-launches codex; there is no live TUI to type into.
         let cmd = format!(
-            "LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} {bin} agent-exec --resume \"{prompt}\"",
+            "LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} {bin} agent-exec --resume{model} \"{prompt}\"",
             pane = ctx.pane_id,
             ticket = ctx.ticket_id,
             bin = self.lisa_bin,
+            model = self.model_flag(),
             prompt = finish_up_prompt(ctx.ticket_dir, ctx.work_dir, ctx.ticket_id),
         );
         FollowUp::SpawnCommand(cmd)
@@ -272,47 +336,62 @@ impl AgentAdapter for CodexAdapter {
     }
 }
 
-/// Map a selected client to its adapter.
+/// Map a resolved route to its adapter.
 ///
 /// `lisa_bin` is the absolute `lisa` path (plugin config) the Codex adapter needs
-/// to build `<lisa> agent-exec …` lines; it is unused by the Claude arm. Both
-/// native legs are now implemented — a `Codex` selection resolves to the real
-/// [`CodexAdapter`] (T-023-02).
-fn adapter_for_client(client: AgentClient, lisa_bin: Option<&str>) -> Box<dyn AgentAdapter> {
-    match client {
-        AgentClient::Claude => Box::new(ClaudeCodeAdapter),
-        AgentClient::Codex => Box::new(CodexAdapter::new(lisa_bin)),
+/// to build `<lisa> agent-exec …` lines; it is unused by the Claude arm. The
+/// route's `model` (T-026-01) is threaded into the adapter so the launch line
+/// carries the right model flag.
+fn adapter_for_route(route: &ResolvedRoute, lisa_bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    let model = route.model.as_deref();
+    match route.agent {
+        AgentClient::Claude => Box::new(ClaudeCodeAdapter::new(model, lisa_bin)),
+        AgentClient::Codex => Box::new(CodexAdapter::new(lisa_bin, model)),
     }
 }
 
-/// Resolve the adapter for a ticket **at spawn time**, given the loop-level
-/// default client and the absolute `lisa` binary path (for the Codex leg).
+/// Resolve the adapter **and the route** for a ticket at spawn time, given the
+/// loop-level default client and the absolute `lisa` binary path (Codex leg).
 ///
-/// This is the per-pane-resolvable selection seam (design thesis §7). The MVP
-/// ignores the ticket and resolves to `default_client`; story S-026 will read
-/// `(provider, model)` from the ticket here to override the default per pane,
-/// without changing any caller.
+/// This is the per-pane routing seam (S-026 / T-026-01): the ticket's
+/// `(agent, model)` frontmatter is resolved against the loop default via
+/// [`resolve_route`], and the resulting [`ResolvedRoute`] is returned alongside
+/// the adapter so the caller can surface a substituted fallback (log +
+/// dashboard) and record requested-vs-actual in provenance. With no routing
+/// hint and a Claude default this resolves byte-for-byte to the pre-routing
+/// native path.
 pub(crate) fn resolve_adapter(
     ticket: &Ticket,
     default_client: AgentClient,
     lisa_bin: Option<&str>,
-) -> Box<dyn AgentAdapter> {
-    let _ = ticket;
-    adapter_for_client(default_client, lisa_bin)
+) -> (Box<dyn AgentAdapter>, ResolvedRoute) {
+    let route = resolve_route(ticket, default_client);
+    let adapter = adapter_for_route(&route, lisa_bin);
+    (adapter, route)
 }
 
-/// Resolve the adapter for an optional ticket, falling back to the loop default
-/// client when the ticket is momentarily absent from the DAG (e.g. a mid-rebuild
-/// `.cleared`/timeout). With the default client (Claude) this is identical to the
-/// pre-adapter path, which always used the native prompt.
+/// Resolve the adapter and route for an optional ticket, falling back to the
+/// loop default when the ticket is momentarily absent from the DAG (e.g. a
+/// mid-rebuild `.cleared`/timeout). An absent ticket has no routing hint, so the
+/// route is the un-substituted loop default.
 pub(crate) fn resolve_adapter_or_native(
     ticket: Option<&Ticket>,
     default_client: AgentClient,
     lisa_bin: Option<&str>,
-) -> Box<dyn AgentAdapter> {
+) -> (Box<dyn AgentAdapter>, ResolvedRoute) {
     match ticket {
         Some(t) => resolve_adapter(t, default_client, lisa_bin),
-        None => adapter_for_client(default_client, lisa_bin),
+        None => {
+            let route = ResolvedRoute {
+                agent: default_client,
+                model: None,
+                requested_agent: None,
+                substituted: false,
+                note: None,
+            };
+            let adapter = adapter_for_route(&route, lisa_bin);
+            (adapter, route)
+        }
     }
 }
 
@@ -333,9 +412,31 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
-            ClaudeCodeAdapter.launch_command(&ctx),
-            build_claude_command(dir, "T-042-01", 7)
+            ClaudeCodeAdapter::default().launch_command(&ctx),
+            build_claude_command(dir, "T-042-01", 7, None, None)
         );
+    }
+
+    #[test]
+    fn native_launch_with_model_maps_flag() {
+        let dir = Path::new("docs/active/tickets");
+        let ctx = spawn_ctx(dir, "T-042-01", 7);
+        let cmd = ClaudeCodeAdapter::new(Some("opus"), None).launch_command(&ctx);
+        assert!(cmd.contains("--model opus"), "got: {cmd}");
+        assert_eq!(cmd, build_claude_command(dir, "T-042-01", 7, Some("opus"), None));
+    }
+
+    #[test]
+    fn native_launch_exports_lisa_bin_when_set() {
+        // T-027-02: a threaded lisa path becomes LISA_BIN so the Stop hook's
+        // capture-usage is reachable; without one the launch line is unchanged.
+        let dir = Path::new("docs/active/tickets");
+        let ctx = spawn_ctx(dir, "T-042-01", 7);
+        let with_bin = ClaudeCodeAdapter::new(None, Some("/abs/lisa")).launch_command(&ctx);
+        assert!(with_bin.starts_with("LISA_BIN=/abs/lisa LISA_PANE_ID=7"), "got: {with_bin}");
+        let without = ClaudeCodeAdapter::new(None, None).launch_command(&ctx);
+        assert!(!without.contains("LISA_BIN="), "got: {without}");
+        assert!(without.starts_with("LISA_PANE_ID=7"), "got: {without}");
     }
 
     #[test]
@@ -343,7 +444,7 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
-            ClaudeCodeAdapter.reuse_prompt(&ctx),
+            ClaudeCodeAdapter::default().reuse_prompt(&ctx),
             ticket_prompt(dir, "T-042-01", AgentClient::Claude.context_file())
         );
     }
@@ -359,20 +460,23 @@ mod tests {
             pane_id: 7,
         };
         assert_eq!(
-            ClaudeCodeAdapter.follow_up(&ctx),
+            ClaudeCodeAdapter::default().follow_up(&ctx),
             FollowUp::TypeIntoPane(finish_up_prompt(ticket_dir, work_dir, "T-042-01"))
         );
     }
 
     #[test]
     fn native_reset_is_clear_handshake() {
-        assert_eq!(ClaudeCodeAdapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(
+            ClaudeCodeAdapter::default().reset_strategy(),
+            ResetStrategy::ClearHandshake
+        );
     }
 
     #[test]
     fn native_signals_all_true() {
         assert_eq!(
-            ClaudeCodeAdapter.signals(),
+            ClaudeCodeAdapter::default().signals(),
             SignalCapabilities {
                 idle: true,
                 awaiting: true,
@@ -382,20 +486,20 @@ mod tests {
     }
 
     #[test]
-    fn resolver_returns_claude_for_any_ticket() {
+    fn resolver_returns_claude_default_for_unrouted_ticket() {
         let ticket = Ticket::new("T-001", "example");
-        assert_eq!(
-            resolve_adapter(&ticket, AgentClient::Claude, None).reset_strategy(),
-            ResetStrategy::ClearHandshake
-        );
+        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, None);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(route.agent, AgentClient::Claude);
+        assert!(!route.substituted);
     }
 
     #[test]
     fn resolver_or_native_handles_missing_ticket() {
-        assert_eq!(
-            resolve_adapter_or_native(None, AgentClient::Claude, None).reset_strategy(),
-            ResetStrategy::ClearHandshake
-        );
+        let (adapter, route) = resolve_adapter_or_native(None, AgentClient::Claude, None);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(route.agent, AgentClient::Claude);
+        assert!(!route.substituted);
     }
 
     #[test]
@@ -404,13 +508,66 @@ mod tests {
         // identified by its FreshExec reset strategy (no /clear handshake).
         let ticket = Ticket::new("T-002", "codex-example");
         assert_eq!(
-            resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa")).reset_strategy(),
+            resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"))
+                .0
+                .reset_strategy(),
             ResetStrategy::FreshExec
         );
         assert_eq!(
-            resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa")).reset_strategy(),
+            resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa"))
+                .0
+                .reset_strategy(),
             ResetStrategy::FreshExec
         );
+    }
+
+    // --- Per-ticket routing (T-026-01) --------------------------------------
+
+    #[test]
+    fn ticket_agent_overrides_loop_default() {
+        // A `agent: codex` ticket under a Claude loop default resolves to Codex.
+        let mut ticket = Ticket::new("T-003", "routed-codex");
+        ticket.agent = Some("codex".to_string());
+        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, Some("/abs/lisa"));
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::FreshExec);
+        assert_eq!(route.agent, AgentClient::Codex);
+        assert!(!route.substituted);
+    }
+
+    #[test]
+    fn invalid_ticket_agent_falls_back_and_is_flagged() {
+        // Invalid route → loop default (Codex here), substituted flag + note.
+        let mut ticket = Ticket::new("T-004", "bad-route");
+        ticket.agent = Some("gpt".to_string());
+        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"));
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::FreshExec);
+        assert_eq!(route.agent, AgentClient::Codex);
+        assert!(route.substituted);
+        assert!(route.note.unwrap().contains("gpt"));
+    }
+
+    #[test]
+    fn mixed_route_resolves_heterogeneous_adapters_in_one_loop() {
+        // The core S-026 promise: two tickets, same loop default, resolve to
+        // different adapters concurrently by their own frontmatter.
+        let mut a = Ticket::new("T-005", "on-codex");
+        a.agent = Some("codex".to_string());
+        a.model = Some("gpt-5".to_string());
+        let b = Ticket::new("T-006", "on-default"); // no hint → default
+
+        let (adapter_a, route_a) = resolve_adapter(&a, AgentClient::Claude, Some("/abs/lisa"));
+        let (adapter_b, route_b) = resolve_adapter(&b, AgentClient::Claude, Some("/abs/lisa"));
+
+        assert_eq!(adapter_a.reset_strategy(), ResetStrategy::FreshExec);
+        assert_eq!(adapter_b.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(route_a.agent, AgentClient::Codex);
+        assert_eq!(route_a.model.as_deref(), Some("gpt-5"));
+        assert_eq!(route_b.agent, AgentClient::Claude);
+
+        // The model flows into the launched command for the Codex pane.
+        let dir = Path::new("docs/active/tickets");
+        let cmd_a = adapter_a.launch_command(&spawn_ctx(dir, "T-005", 1));
+        assert!(cmd_a.contains("--model gpt-5"), "got: {cmd_a}");
     }
 
     // --- CodexAdapter (T-023-02) --------------------------------------------
@@ -419,7 +576,7 @@ mod tests {
     fn codex_launch_command_shape() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
-        let cmd = CodexAdapter::new(Some("/abs/lisa")).launch_command(&ctx);
+        let cmd = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
         assert!(cmd.starts_with("LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 /abs/lisa agent-exec "));
         assert!(cmd.contains("agent-exec \""));
         // The wrapped prompt is the shared RDSPI ticket prompt, verbatim — with
@@ -439,13 +596,26 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 1);
 
-        let codex_cmd = CodexAdapter::new(Some("/abs/lisa")).launch_command(&ctx);
+        let codex_cmd = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
         assert!(codex_cmd.contains("AGENTS.md"));
         assert!(!codex_cmd.contains("CLAUDE.md"));
 
-        let claude_cmd = ClaudeCodeAdapter.launch_command(&ctx);
+        let claude_cmd = ClaudeCodeAdapter::default().launch_command(&ctx);
         assert!(claude_cmd.contains("CLAUDE.md"));
         assert!(!claude_cmd.contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn codex_launch_with_model_emits_flag() {
+        // A routed model (T-026-01) is forwarded to the wrapper as `--model`,
+        // placed between `agent-exec` and the quoted prompt.
+        let dir = Path::new("docs/active/tickets");
+        let ctx = spawn_ctx(dir, "T-042-01", 7);
+        let cmd = CodexAdapter::new(Some("/abs/lisa"), Some("gpt-5")).launch_command(&ctx);
+        assert!(cmd.contains("agent-exec --model gpt-5 \""), "got: {cmd}");
+        // No model → no flag (pre-routing wrapper line).
+        let bare = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
+        assert!(!bare.contains("--model"), "got: {bare}");
     }
 
     #[test]
@@ -454,14 +624,14 @@ mod tests {
         // wrapper line as a launch (not a bare prompt into a live TUI).
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 3);
-        let a = CodexAdapter::new(Some("/abs/lisa"));
+        let a = CodexAdapter::new(Some("/abs/lisa"), None);
         assert_eq!(a.reuse_prompt(&ctx), a.launch_command(&ctx));
     }
 
     #[test]
     fn codex_reset_is_fresh_exec() {
         assert_eq!(
-            CodexAdapter::new(Some("/abs/lisa")).reset_strategy(),
+            CodexAdapter::new(Some("/abs/lisa"), None).reset_strategy(),
             ResetStrategy::FreshExec
         );
     }
@@ -476,7 +646,7 @@ mod tests {
             ticket_id: "T-042-01",
             pane_id: 9,
         };
-        match CodexAdapter::new(Some("/abs/lisa")).follow_up(&ctx) {
+        match CodexAdapter::new(Some("/abs/lisa"), None).follow_up(&ctx) {
             FollowUp::SpawnCommand(cmd) => {
                 assert!(cmd.contains("LISA_PANE_ID=9 LISA_TICKET_ID=T-042-01 /abs/lisa"));
                 assert!(cmd.contains("agent-exec --resume \""));
@@ -489,7 +659,7 @@ mod tests {
     #[test]
     fn codex_signals_all_false() {
         assert_eq!(
-            CodexAdapter::new(Some("/abs/lisa")).signals(),
+            CodexAdapter::new(Some("/abs/lisa"), None).signals(),
             SignalCapabilities {
                 idle: false,
                 awaiting: false,
@@ -504,7 +674,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-001", 1);
         // None and empty both degrade to the bare `lisa` (PATH lookup).
         for bin in [None, Some("")] {
-            let cmd = CodexAdapter::new(bin).launch_command(&ctx);
+            let cmd = CodexAdapter::new(bin, None).launch_command(&ctx);
             assert!(cmd.contains(" lisa agent-exec \""), "cmd: {cmd}");
         }
     }

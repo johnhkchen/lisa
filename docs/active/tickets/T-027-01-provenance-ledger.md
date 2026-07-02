@@ -5,7 +5,7 @@ title: provenance-ledger
 type: feature
 status: open
 priority: medium
-phase: ready
+phase: done
 depends_on: [T-023-02]
 ---
 

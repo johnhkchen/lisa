@@ -25,9 +25,19 @@ fi
 
 /// The on-stop hook script, called by Claude Code's Stop event.
 /// Fires when Claude finishes responding (ready for input).
+///
+/// Beyond writing the `.stopped` signal it forwards the Stop payload (piped on
+/// stdin, carrying `transcript_path`) to `lisa capture-usage`, which sums the
+/// session's token usage into `.lisa/claude/<ticket>.usage.json` for the
+/// provenance ledger (T-027-02). Stop fires per *turn*, not per tool call, so the
+/// heartbeat hook stays trivial; the artifact is overwritten each turn with the
+/// cumulative total and read by the plugin only write-after. Capture is
+/// best-effort — `${LISA_BIN:-lisa}` degrades to a PATH lookup and any failure is
+/// swallowed, leaving tokens null (never fabricated).
 pub const ON_STOP_HOOK: &str = r#"#!/bin/sh
 # Lisa stop signal hook — called by Claude Code when it finishes responding.
-# Writes a signal file so the plugin knows the pane is ready for input.
+# Writes a signal file so the plugin knows the pane is ready for input, and
+# captures session token usage for the provenance ledger (T-027-02).
 
 SIGNAL_DIR=".lisa/signals"
 mkdir -p "$SIGNAL_DIR"
@@ -35,6 +45,11 @@ mkdir -p "$SIGNAL_DIR"
 if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
 fi
+
+# Forward the Stop payload (stdin: includes transcript_path) to the usage
+# capturer. Best-effort: never fail the session if lisa is absent.
+in=$(cat)
+printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage 2>/dev/null || true
 "#;
 
 /// The on-clear hook script, called by Claude Code's SessionStart[clear] event.
@@ -845,5 +860,25 @@ mod tests {
     fn test_merge_hooks_invalid_json() {
         let result = merge_hooks("not json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn stop_hook_still_writes_stopped_and_captures_usage() {
+        // T-027-02: the Stop hook keeps writing the `.stopped` signal and now
+        // forwards its stdin payload to `lisa capture-usage`.
+        assert!(ON_STOP_HOOK.contains("pane-$LISA_PANE_ID.stopped"));
+        assert!(ON_STOP_HOOK.contains("capture-usage"));
+        assert!(ON_STOP_HOOK.contains("${LISA_BIN:-lisa}"));
+        // Reads stdin once (the Stop payload carries transcript_path).
+        assert!(ON_STOP_HOOK.contains("in=$(cat)"));
+    }
+
+    #[test]
+    fn heartbeat_hook_stays_trivial() {
+        // The ticket's constraint: PostToolUse capture must not grow. The
+        // heartbeat hook must not read stdin or invoke lisa.
+        assert!(!ON_HEARTBEAT_HOOK.contains("capture-usage"));
+        assert!(!ON_HEARTBEAT_HOOK.contains("$(cat)"));
+        assert!(ON_HEARTBEAT_HOOK.contains("pane-$LISA_PANE_ID.heartbeat"));
     }
 }

@@ -5,7 +5,7 @@ title: codex-parity-validation
 type: task
 status: open
 priority: medium
-phase: implement
+phase: done
 depends_on: [T-023-02]
 ---
 

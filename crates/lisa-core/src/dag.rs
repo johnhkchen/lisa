@@ -615,6 +615,8 @@ mod tests {
             phase,
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
             blocks: blocks.into_iter().map(|s| s.to_string()).collect(),
+            agent: None,
+            model: None,
             file_path: PathBuf::new(),
             content: String::new(),
         }

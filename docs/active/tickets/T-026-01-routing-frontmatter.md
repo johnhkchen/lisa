@@ -5,7 +5,7 @@ title: routing-frontmatter
 type: feature
 status: open
 priority: medium
-phase: ready
+phase: done
 depends_on: [T-024-01, T-025-01]
 ---
 

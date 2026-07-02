@@ -136,7 +136,68 @@ max_threads = 2
 | `dirs.tickets` | `docs/active/tickets` | Where Lisa reads ticket files |
 | `dirs.stories` | `docs/active/stories` | Where Lisa reads story files |
 | `dirs.work` | `docs/active/work` | Where phase artifacts are written |
-| `scheduling.max_threads` | `2` | Maximum concurrent Claude Code sessions |
+| `scheduling.max_threads` | `2` | Maximum concurrent agent sessions |
+| `agent.client` | `claude` | Which agent client the loop drives (`claude` or `codex`) |
+
+## Codex client (experimental)
+
+By default Lisa drives Claude Code. It can alternatively drive
+[Codex](https://developers.openai.com/codex), OpenAI's native agent CLI. Claude
+and Codex are the only supported clients today; broader protocol support (ACP) is
+future work, not available yet.
+
+**A project that never opts in behaves exactly as before** — the default is
+`claude`, and Claude Code's launch, prompt, and `lisa doctor` output are
+unchanged.
+
+### Selecting Codex
+
+Persistently, in `.lisa.toml`:
+
+```toml
+[agent]
+client = "codex"
+```
+
+Or per run, with a flag that overrides `.lisa.toml`:
+
+```bash
+lisa loop --client codex
+```
+
+Precedence is `--client` > `.lisa.toml [agent].client` > default (`claude`).
+
+### Prerequisites
+
+- The `codex` binary on `PATH`:
+
+  ```bash
+  npm i -g @openai/codex
+  ```
+
+- **Version pinning caveat.** Codex's CLI surface (flags, JSON event stream, trust
+  model) drifts between releases. Pin or track a known-good `codex` version;
+  Lisa's wrapper is validated against a specific version. `lisa doctor` reports the
+  installed `codex --version` so you can confirm what you're running.
+- **Directory trust.** Unattended `codex exec` blocks on an interactive
+  directory-trust prompt. When Codex is selected, `lisa doctor` and `lisa loop`
+  pre-seed `trust_level = "trusted"` for the project in `$CODEX_HOME/config.toml`
+  (default `~/.codex/config.toml`), best-effort. If seeding fails, the escape
+  hatch is running Codex with `--dangerously-bypass-approvals-and-sandbox`.
+
+Run `lisa doctor` after selecting Codex (and after every `codex` upgrade) to
+verify the binary, version, and trust seeding.
+
+### What runs in the pane
+
+A Codex ticket does not launch the Claude TUI. Instead Lisa types a
+`lisa agent-exec` command into the pane, which runs `codex exec --json` and
+translates Codex's event stream into the same `.lisa/signals/` files the scheduler
+consumes. Because there is no live TUI, reusing a pane for the next ticket is a
+fresh `codex exec` (not a `/clear` handshake), and Codex reads `AGENTS.md` for
+project context (Claude reads `CLAUDE.md`). `lisa init` scaffolds both files;
+`AGENTS.md` points at `CLAUDE.md` as the single source of truth, so they cannot
+drift.
 
 ## How It Works
 
@@ -181,7 +242,7 @@ docs/
 
 ### `lisa init`
 
-Scaffold a project for Lisa: creates ticket directories, `CLAUDE.md`, RDSPI workflow, hooks, and `.lisa.toml`.
+Scaffold a project for Lisa: creates ticket directories, `CLAUDE.md`, `AGENTS.md` (a pointer to `CLAUDE.md` for the Codex client), RDSPI workflow, hooks, and `.lisa.toml`.
 
 ```bash
 lisa init              # Initialize current directory
@@ -200,12 +261,13 @@ lisa validate --check-tools   # Also verify zellij and claude are on PATH
 
 ### `lisa loop`
 
-Launch a Zellij session with the Lisa plugin. Schedules and runs Claude Code sessions based on the ticket DAG.
+Launch a Zellij session with the Lisa plugin. Schedules and runs agent sessions based on the ticket DAG.
 
 ```bash
 lisa loop
-lisa loop --max-threads 4     # Override concurrent session limit
-lisa loop --dry-run            # Show what would launch without starting
+lisa loop --max-threads 4        # Override concurrent session limit
+lisa loop --client codex         # Drive Codex instead of Claude (overrides .lisa.toml)
+lisa loop --dry-run              # Show what would launch without starting
 ```
 
 ### `lisa status`
@@ -218,7 +280,10 @@ lisa status
 
 ### `lisa doctor`
 
-Verify that all runtime dependencies (Zellij, Claude Code, wasm32-wasip1 target) are installed.
+Verify that all runtime dependencies are installed. Checks the *selected* client's
+binary (`claude` or `codex`, per `.lisa.toml`) and reports its version, plus
+Zellij and the wasm32-wasip1 target. When Codex is selected it also pre-seeds
+directory trust for unattended `codex exec`.
 
 ```bash
 lisa doctor

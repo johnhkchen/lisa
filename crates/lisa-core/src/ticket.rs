@@ -165,6 +165,8 @@ fn parse_frontmatter_into_ticket(
     let mut phase: Option<Phase> = None;
     let mut depends_on: Vec<String> = Vec::new();
     let mut blocks: Vec<String> = Vec::new();
+    let mut agent: Option<String> = None;
+    let mut model: Option<String> = None;
 
     // Track which list field we're accumulating multiline items for.
     // YAML allows both inline `depends_on: [A, B]` and multiline:
@@ -222,6 +224,21 @@ fn parse_frontmatter_into_ticket(
                         blocks = parsed;
                     }
                 }
+                // Routing hints (T-026-01). Stored raw and unvalidated: an
+                // invalid `agent` must not fail the ticket — it falls back to the
+                // loop default at spawn (resolve_route), and the requested value
+                // is preserved for the dashboard + provenance. An empty value
+                // (e.g. a bare `agent:`) is treated as absent.
+                "agent" => {
+                    if !value.is_empty() {
+                        agent = Some(value.to_string());
+                    }
+                }
+                "model" => {
+                    if !value.is_empty() {
+                        model = Some(value.to_string());
+                    }
+                }
                 _ => {
                     // Ignore unknown fields for forward compatibility
                 }
@@ -247,6 +264,8 @@ fn parse_frontmatter_into_ticket(
         phase,
         depends_on,
         blocks,
+        agent,
+        model,
         content,
         file_path: path.to_path_buf(),
     })
@@ -971,6 +990,57 @@ This ticket has no blocks field at all.
         let path = Path::new("/test/ticket.md");
         let ticket = parse_ticket_content(content, path).unwrap();
         assert!(ticket.depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_parse_routing_fields_inline() {
+        let content = "---\nid: T-026-01\ntitle: routed\ntype: feature\nstatus: open\npriority: medium\nphase: ready\nagent: codex\nmodel: gpt-5\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert_eq!(ticket.agent.as_deref(), Some("codex"));
+        assert_eq!(ticket.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn test_parse_routing_fields_absent() {
+        // A ticket with no routing hints parses with both fields None.
+        let content = "---\nid: T-001\ntitle: unrouted\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert_eq!(ticket.agent, None);
+        assert_eq!(ticket.model, None);
+    }
+
+    #[test]
+    fn test_parse_invalid_agent_still_parses_raw() {
+        // An unknown agent value must NOT fail parsing — it is stored raw and
+        // validated (with fallback) at spawn. This is the "never fail the
+        // ticket" contract (epic Decision 3).
+        let content = "---\nid: T-001\ntitle: bad-agent\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: gpt\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert_eq!(ticket.agent.as_deref(), Some("gpt"));
+    }
+
+    #[test]
+    fn test_parse_empty_agent_treated_as_absent() {
+        let content = "---\nid: T-001\ntitle: bare\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent:\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert_eq!(ticket.agent, None);
+    }
+
+    #[test]
+    fn test_parse_routing_fields_coexist_with_multiline_depends_on() {
+        // The "inline + multiline" parsing criterion: routing scalars parse
+        // correctly alongside a multiline list block.
+        let content = "---\nid: T-002\ntitle: mixed\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: claude\nmodel: opus\ndepends_on:\n  - T-001\n  - T-000\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert_eq!(ticket.agent.as_deref(), Some("claude"));
+        assert_eq!(ticket.model.as_deref(), Some("opus"));
+        assert_eq!(ticket.depends_on.len(), 2);
+        assert!(ticket.depends_on.contains(&"T-000".to_string()));
     }
 
     #[test]

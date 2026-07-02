@@ -142,6 +142,11 @@ pub struct ActiveThread {
     /// "awaiting human" marker and is the same signal that exempts the pane
     /// from wall-clock reclamation, so the two can never disagree.
     pub awaiting: bool,
+    /// Pre-formatted `(provider, model)` route cell for this pane (T-026-01),
+    /// e.g. `claude`, `codex/gpt-5`, or `codex/gpt-5*` when the route was a
+    /// substituted fallback. `None` for a thread spawned before routing existed;
+    /// rendered as `—`.
+    pub route: Option<String>,
 }
 
 /// Represents a parked thread waiting for review
@@ -710,12 +715,13 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
         .map(|t| (t.slot_number, t))
         .collect();
 
-    // Header
+    // Header. AGENT surfaces each pane's resolved (provider, model) route
+    // (T-026-01); `—` when a thread predates routing.
     output.push(format!(
-        "{}{:<6} {:<12} {:<10} {:<14} {:<10}{}",
-        DIM, "SLOT", "TICKET", "PHASE", "STATUS", "TIME", RESET
+        "{}{:<6} {:<12} {:<10} {:<14} {:<14} {:<10}{}",
+        DIM, "SLOT", "TICKET", "PHASE", "AGENT", "STATUS", "TIME", RESET
     ));
-    output.push(format!("{}{}{}", DIM, "-".repeat(56), RESET));
+    output.push(format!("{}{}{}", DIM, "-".repeat(70), RESET));
 
     for slot in &state.slots {
         let slot_label = format!("[{}]", slot.slot_number);
@@ -731,29 +737,33 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
             } else {
                 (active.ticket_id.clone(), GREEN, "Running")
             };
+            let agent_cell = active.route.as_deref().unwrap_or("—");
             output.push(format!(
-                "{:<6} {:<12} {}{:<10}{} {}{:<14}{} {}",
+                "{:<6} {:<12} {}{:<10}{} {:<14} {}{:<14}{} {}",
                 slot_label,
                 ticket_cell,
                 phase_color,
                 active.phase.short_name(),
                 RESET,
+                agent_cell,
                 status_color,
                 status_text,
                 RESET,
                 elapsed,
             ));
         } else if let Some(parked) = parked_by_slot.get(&slot.slot_number) {
-            // Parked thread in this slot
+            // Parked thread in this slot. ParkedThread carries no route today, so
+            // the agent cell is `—` (the running row is where the route shows).
             let elapsed = format_time_since(parked.parked_at, state.current_time);
             let phase_color = parked.phase.color_code();
             output.push(format!(
-                "{:<6} {:<12} {}{:<10}{} {}{:<14}{} {}",
+                "{:<6} {:<12} {}{:<10}{} {:<14} {}{:<14}{} {}",
                 slot_label,
                 parked.ticket_id,
                 phase_color,
                 parked.phase.short_name(),
                 RESET,
+                "—",
                 YELLOW,
                 "Parked",
                 RESET,
@@ -762,14 +772,14 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
         } else if slot.transitioning {
             // Slot is winding down or in cooldown
             output.push(format!(
-                "{:<6} {}{:<12} {:<10} {:<14}{} —",
-                slot_label, DIM, "—", "—", "Winding Down", RESET,
+                "{:<6} {}{:<12} {:<10} {:<14} {:<14}{} —",
+                slot_label, DIM, "—", "—", "—", "Winding Down", RESET,
             ));
         } else {
             // Idle slot
             output.push(format!(
-                "{:<6} {}{:<12} {:<10} {:<14}{} —",
-                slot_label, DIM, "—", "—", "Idle", RESET,
+                "{:<6} {}{:<12} {:<10} {:<14} {:<14}{} —",
+                slot_label, DIM, "—", "—", "—", "Idle", RESET,
             ));
         }
     }
@@ -1313,6 +1323,7 @@ mod tests {
                 started_at: Duration::from_secs(60),
                 slot_number: 1,
                 awaiting: false,
+                route: None,
             }],
             parked_threads: vec![],
             activity_log: vec![
@@ -1423,6 +1434,7 @@ mod tests {
             started_at: Duration::from_secs(60),
             slot_number: 1,
             awaiting: true,
+            route: None,
         }];
         let mut output = Vec::new();
         render_threads(&state, &mut output);
@@ -1434,6 +1446,49 @@ mod tests {
             !full.contains("Running"),
             "an awaiting thread must not show Running status"
         );
+    }
+
+    #[test]
+    fn test_render_threads_surfaces_route() {
+        // T-026-01: the AGENT column shows each pane's (provider, model) route.
+        let mut state = PluginState::default();
+        state.slots = vec![
+            SlotInfo {
+                ticket_id: Some("T-001".to_string()),
+                slot_number: 1,
+                transitioning: false,
+            },
+            SlotInfo {
+                ticket_id: Some("T-002".to_string()),
+                slot_number: 2,
+                transitioning: false,
+            },
+        ];
+        state.active_threads = vec![
+            ActiveThread {
+                ticket_id: "T-001".to_string(),
+                phase: Phase::Research,
+                started_at: Duration::from_secs(30),
+                slot_number: 1,
+                awaiting: false,
+                route: Some("codex/gpt-5".to_string()),
+            },
+            ActiveThread {
+                ticket_id: "T-002".to_string(),
+                phase: Phase::Design,
+                started_at: Duration::from_secs(30),
+                slot_number: 2,
+                awaiting: false,
+                route: None,
+            },
+        ];
+        let mut output = Vec::new();
+        render_threads(&state, &mut output);
+        let full = output.join("\n");
+        assert!(full.contains("AGENT"), "AGENT column header missing");
+        assert!(full.contains("codex/gpt-5"), "routed pane's route missing");
+        // The unrouted pane shows a dash placeholder in the AGENT column.
+        assert!(full.contains('—'), "unrouted pane should show a dash");
     }
 
     #[test]
@@ -1867,6 +1922,7 @@ mod tests {
                 started_at: Duration::from_secs(100),
                 slot_number: 1,
                 awaiting: false,
+                route: None,
             }],
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-003".to_string(),
@@ -2244,6 +2300,7 @@ mod tests {
                     started_at: Duration::from_secs(100),
                     slot_number: 1,
                     awaiting: false,
+                    route: None,
                 },
                 ActiveThread {
                     ticket_id: "T-003-02".to_string(),
@@ -2251,6 +2308,7 @@ mod tests {
                     started_at: Duration::from_secs(100),
                     slot_number: 2,
                     awaiting: false,
+                    route: None,
                 },
             ],
             ..PluginState::default()
@@ -2293,6 +2351,7 @@ mod tests {
                 started_at: Duration::from_secs(50),
                 slot_number: 1,
                 awaiting: false,
+                route: None,
             }],
             ..PluginState::default()
         };
@@ -2373,6 +2432,7 @@ mod tests {
                 started_at: Duration::from_secs(50),
                 slot_number: 1,
                 awaiting: false,
+                route: None,
             }],
             ..PluginState::default()
         };
