@@ -54,3 +54,8 @@ unchanged.
   session — the checklist describes the forcing technique.
 - The harness is spike-scaffolding and may be deleted after verdicts are
   transcribed, but only once this ticket is done.
+- Known template gap to fold into the write-back: `LISA_GITIGNORE`
+  (`templates.rs`) ignores only `signals/`, but `.lisa/claude/` and
+  `.lisa/codex/` are runtime state too — an interactive session's Stop hook
+  committed a stray `last.usage.json` here (fixed for this repo in
+  `.lisa/.gitignore`, 2026-07-09).
