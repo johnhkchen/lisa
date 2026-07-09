@@ -8,6 +8,11 @@ stories: [S-021, S-022, S-023, S-024, S-025, S-026, S-027, S-028]
 
 # E-001: Pluggable Agent Client — add Codex, grow toward per-pane provider/model routing
 
+> **Archived 2026-07-09.** All build waves (0–5) shipped; the one outstanding
+> piece — live validation against a real `codex` binary (S-028) — is carried
+> forward by **S-029 / T-029-01** on the active board
+> (`docs/active/stories/S-029-codex-integration.md`).
+
 > ⭐ **PRIORITY / NORTH STAR.** The goal, rationale, and target architecture are in
 > **[08 · Design thesis & target architecture](../../knowledge/codex-client/08-design-thesis.md)
 > — read it first.** This epic is the *what*; the thesis is the *why*; the RDSPI

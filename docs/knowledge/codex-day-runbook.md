@@ -3,9 +3,10 @@
 > Written 2026-07-01, when the E-001 Codex client shipped **without a live
 > `codex` binary ever being run** — every empirical verdict is PROVISIONAL and
 > every live-loop check is pending. This is the start-here document for the day
-> the Codex CLI is set up. The work is ticketed as **S-028 / T-028-01 →
-> T-028-02**, checked in with `status: blocked` — flip them to `open` when you
-> start (step 2) so a loop can run them, or work through this runbook by hand.
+> the Codex CLI is set up. The work is ticketed as **S-029 / T-029-01**, one
+> consolidated `status: open` ticket (originally S-028 / T-028-01 → T-028-02,
+> archived 2026-07-09) — run it via `lisa loop`, or work through this runbook
+> by hand.
 
 ## What is and isn't proven
 
@@ -16,6 +17,23 @@
 | The five spike unknowns (env, `--json` fidelity, rendering, trust, resume) | ⚠️ **PROVISIONAL** | `docs/active/work/T-021-01/design.md` — probes never executed |
 | Live loop end-to-end (spawn→artifacts→done) | ⚠️ **pending** | `docs/active/work/T-024-01/checklist.md` rows 1–8 |
 | Provenance record with real Codex tokens | ⚠️ **pending** | no `.lisa/provenance.jsonl` exists yet |
+
+## Preflight — run a `lisa` that actually has the Codex client
+
+The E-001 code landed **after** the v0.3.0 release, so any packaged binary
+predates it: the brew formula (`johnhkchen/lisa/lisa`, stable 0.3.0) contains
+zero Codex code, and `/opt/homebrew/bin` shadows `~/.cargo/bin` on PATH.
+Before anything below:
+
+```bash
+just install          # builds the WASM plugin + cargo-installs the CLI
+lisa version          # must print 0.4.0-rc.1 (workspace version), not 0.3.0
+which lisa            # must resolve to ~/.cargo/bin/lisa
+```
+
+The brew keg stays installed but unlinked (`brew unlink lisa`; restore with
+`brew link lisa`). The formula gets its bump when v0.4.0 releases after this
+validation passes.
 
 ## Step 0 — install the pinned version
 
@@ -35,14 +53,14 @@ by writing `projects.<path>.trust_level = "trusted"` into
 `$CODEX_HOME/config.toml` — required so unattended `codex exec` never blocks on
 the trust prompt (open codex bug #14345 means `--yolo` alone is not enough).
 
-## Step 2 — unblock the tickets
+## Step 2 — check the board
 
-Flip `status: blocked` → `status: open` in:
+Done 2026-07-09: the S-028 pair was unblocked, then the whole pre-codex board
+was archived and superseded by one consolidated ticket, already `status: open`:
 
-- `docs/active/tickets/T-028-01-spike-harness-live-run.md`
-- `docs/active/tickets/T-028-02-live-loop-validation.md`
+- `docs/active/tickets/T-029-01-codex-runbook-live-run.md`
 
-Then `lisa validate && lisa loop` — or do steps 3–5 manually.
+`lisa validate && lisa loop` — or do steps 3–5 manually.
 
 ## Step 3 — run the spike harness (T-028-01; the go/no-go gate)
 
@@ -90,3 +108,19 @@ carry real `tokens`/usage from `turn.completed.usage` (schema:
   with real Codex token counts.
 - Any drift found (version, event names, trust behaviour) written back into
   docs/knowledge/codex-client/ and turned into tickets.
+
+## Status log
+
+- **2026-07-09** — first attempt. codex-cli **0.144.0** installed
+  (`/opt/homebrew/bin/codex`), logged in via ChatGPT. Drift from the pinned
+  `rust-v0.142.5` is live, so the probes double as the drift detector (step 0
+  note applies). The host's codex CLI was misbehaving; rebooting before the
+  harness run. Foundation set so the runbook can start at step 1 next time:
+  preflight done (workspace `0.4.0-rc.1`, fresh CLI via `just install`, brew
+  keg unlinked), S-028 tickets flipped to `open` (step 2 done), and
+  `AGENTS.md` added at the repo root. Later the same day the whole pre-codex
+  board (25 tickets, 11 stories, epic E-001) was archived to `docs/archive/`
+  and S-028 superseded by **S-029 / T-029-01**, a single consolidated
+  runbook-execution ticket. Work artifacts stayed in `docs/active/work/` —
+  the T-021-01 harness and T-024-01 checklist are this runbook's live
+  instruments; sweep them to the archive only after S-029 completes.

@@ -3,7 +3,7 @@ id: T-028-01
 story: S-028
 title: spike-harness-live-run
 type: spike
-status: blocked
+status: open
 priority: high
 phase: ready
 depends_on: []
@@ -11,9 +11,10 @@ depends_on: []
 
 ## Context
 
-> **BLOCKED until the Codex CLI is installed** (pinned target
-> `rust-v0.142.5`). Unblock by setting `status: open` — see
-> `docs/knowledge/codex-day-runbook.md` (steps 0–3).
+> **Unblocked 2026-07-09:** codex-cli **0.144.0** is installed and
+> authenticated (ChatGPT login). That drifts from the pinned research target
+> `rust-v0.142.5` — the probes are the drift detector; record the observed
+> drift per the AC. See `docs/knowledge/codex-day-runbook.md` (steps 0–3).
 
 The T-021-01 spike produced a turnkey probe harness
 (`docs/active/work/T-021-01/harness/run-all.sh`, probes q1–q5) but no codex

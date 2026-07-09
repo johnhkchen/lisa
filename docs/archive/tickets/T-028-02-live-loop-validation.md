@@ -3,7 +3,7 @@ id: T-028-02
 story: S-028
 title: live-loop-validation
 type: task
-status: blocked
+status: open
 priority: high
 phase: ready
 depends_on: [T-028-01]
@@ -11,9 +11,10 @@ depends_on: [T-028-01]
 
 ## Context
 
-> **BLOCKED until the Codex CLI is installed** and T-028-01's Q2 gate passes.
-> Unblock by setting `status: open` — see
-> `docs/knowledge/codex-day-runbook.md` (steps 4–5).
+> **Unblocked 2026-07-09** (codex-cli 0.144.0 installed). Still gated on
+> T-028-01's Q2 verdict via `depends_on` — the scheduler will not start this
+> before T-028-01 completes. See `docs/knowledge/codex-day-runbook.md`
+> (steps 4–5).
 
 Run the live half of the Codex parity validation that CI cannot reach: the
 T-024-01 checklist (`docs/active/work/T-024-01/checklist.md`, rows 1–8) via

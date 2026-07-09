@@ -6,6 +6,10 @@ status: open
 
 ## Codex live validation — retire the PROVISIONAL verdicts
 
+> **Superseded 2026-07-09 by S-029 / T-029-01**
+> (`docs/active/stories/S-029-codex-integration.md`) — archived unrun with
+> the rest of the E-001 board; scope carried over unchanged.
+
 The E-001 Codex client shipped fully tested against recorded event streams but
 has **never run against a real `codex` binary**: the T-021-01 spike's five
 verdicts are all `[PROVISIONAL]` (probes written, never executed), the
