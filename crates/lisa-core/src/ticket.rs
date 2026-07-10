@@ -234,10 +234,8 @@ fn parse_frontmatter_into_ticket(
                         agent = Some(value.to_string());
                     }
                 }
-                "model" => {
-                    if !value.is_empty() {
-                        model = Some(value.to_string());
-                    }
+                "model" if !value.is_empty() => {
+                    model = Some(value.to_string());
                 }
                 _ => {
                     // Ignore unknown fields for forward compatibility

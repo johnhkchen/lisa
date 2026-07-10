@@ -152,6 +152,7 @@ pub(crate) trait AgentAdapter {
 /// `model` is the routed model for this pane (T-026-01), mapped to Claude's
 /// `--model` flag; `None` runs Claude's default model — the pre-routing launch
 /// line, byte-for-byte.
+#[derive(Default)]
 pub(crate) struct ClaudeCodeAdapter {
     model: Option<String>,
     /// Absolute `lisa` path (plugin config) exported as `LISA_BIN` on the launch
@@ -169,15 +170,6 @@ impl ClaudeCodeAdapter {
         Self {
             model: model.map(|s| s.to_string()),
             lisa_bin: lisa_bin.filter(|s| !s.is_empty()).map(|s| s.to_string()),
-        }
-    }
-}
-
-impl Default for ClaudeCodeAdapter {
-    fn default() -> Self {
-        Self {
-            model: None,
-            lisa_bin: None,
         }
     }
 }
