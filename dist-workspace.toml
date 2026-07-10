@@ -17,3 +17,7 @@ install-path = "CARGO_HOME"
 tap = "johnhkchen/homebrew-lisa"
 formula = "lisa"
 publish-jobs = ["homebrew"]
+# Homebrew has a single current formula. Lisa releases release candidates from
+# main, so publish them deliberately instead of leaving the tap on an older
+# stable version.
+publish-prereleases = true
