@@ -25,16 +25,18 @@ hammered by all 16.
 
 ## Slot provider-affinity
 
-Panes are reused to avoid relaunch cost. The reuse *reset strategy* is chosen
-from the incoming ticket's adapter — `/clear` handshake for Claude (its REPL
-stays live), fresh `codex exec` for Codex (it exits to a shell). Reusing a pane
-across providers would therefore mis-inject: a Codex command typed into a live
-Claude REPL, or `/clear` sent to a bare shell.
+Both native clients stay live so same-provider reuse is cheap: Lisa sends
+`/clear`, waits for the clear hook, and injects the next ticket prompt. Each slot
+records `last_client`; a fresh pane or matching resident client is always the
+first choice.
 
-Fix: each slot records `last_client`, and `find_idle_slot(want)` returns only
-fresh panes or panes whose last session was the same provider. Panes partition by
-provider on first use. If a provider's matching panes are momentarily all busy,
-its ticket waits (visible: ready + idle_slots > 0), never mis-injects.
+Affinity is no longer permanent. If no compatible pane exists, Lisa may recycle
+a released pane belonging to the other provider. The pane must be idle, out of
+cooldown, signal-quiet for `wind_down_secs`, and not awaiting a human; an actively
+assigned pane is never recycled. Lisa sends `/exit` to the resident TUI, waits a
+grace period for the shell to return, then launches the incoming provider's full
+CLI command. A `WaitingForExit` transition reserves the pane between those two
+steps so another ticket cannot claim it.
 
 ## What breaks at high N — the realistic ceiling
 
@@ -58,9 +60,10 @@ external or soft:
    every 5 s is sub-millisecond on tmpfs. Measured, not assumed
    (`test_signal_scan_cost_at_32_panes`). Consolidating the five scans into one
    readdir/tick is a noted low-risk follow-up, not needed at the target regime.
-4. **Pane starvation under affinity.** If the provider mix shifts mid-loop, a
-   provider can find all its affine panes busy. `2×` overprovisioning + caps ≤
-   global keeps headroom in the target regime; a starved ticket waits visibly.
+4. **Temporary pane waits.** If every pane is actively assigned, the global
+   concurrency ceiling still makes new tickets wait; Lisa never evicts running
+   work. Once a mismatched pane is released and passes its wind-down guard, the
+   recycling transition prevents permanent affinity starvation.
 
 **Bottom line:** ~16 mixed agents is achievable with `max_threads = 16` + 8/8
 caps. The ceiling is set by provider rate limits and git commit serialization —
@@ -82,5 +85,4 @@ Seed 20+ independent tickets (no shared files — a shared-file collision is a
 missing DAG edge, not a concurrency bug), half routed `agent: codex`, half
 default/Claude. Run `lisa loop`. Watch for: git `index.lock` retry noise in agent
 panes, provider 429s in `.lisa/provenance.jsonl` (`requested` vs `actual`
-outcome), and the dashboard's `idle_slots` staying > 0 while tickets sit ready
-(the visible signature of a provider cap or pane-affinity wait).
+outcome), and brief `WaitingForExit` transitions when the provider mix shifts.

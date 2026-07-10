@@ -119,6 +119,14 @@ pub(crate) trait AgentAdapter {
     /// Command to launch a fresh session in an empty pane.
     fn launch_command(&self, ctx: &SpawnContext) -> String;
 
+    /// Slash command that gracefully exits the resident interactive client so
+    /// the pane's shell can launch a different provider. Both native clients
+    /// support `/exit`; keeping it on the adapter makes that contract explicit
+    /// and leaves room for future integrations to override it.
+    fn exit_command(&self) -> &'static str {
+        "/exit"
+    }
+
     /// How a slot that already has a session is reset before new work.
     fn reset_strategy(&self) -> ResetStrategy;
 
@@ -448,6 +456,12 @@ mod tests {
             ClaudeCodeAdapter::default().reset_strategy(),
             ResetStrategy::ClearHandshake
         );
+    }
+
+    #[test]
+    fn native_clients_support_common_exit_command() {
+        assert_eq!(ClaudeCodeAdapter::default().exit_command(), "/exit");
+        assert_eq!(CodexAdapter::new(None, None).exit_command(), "/exit");
     }
 
     #[test]

@@ -195,6 +195,11 @@ into the same `.lisa/signals/` files the scheduler consumes. A reused pane stays
 inside Codex: Lisa sends `/clear`, waits for the clear hook, then types the next
 ticket prompt. Review follow-ups are typed into the live composer too.
 
+In mixed-provider loops, Lisa prefers a pane already running the requested
+client. If all released panes belong to the other provider, it safely recycles
+one: `/exit` returns the pane to its shell, then Lisa launches the correct fresh
+CLI after a short grace period. Running or human-blocked panes are never evicted.
+
 Codex reads `AGENTS.md` for project context (Claude reads `CLAUDE.md`). `lisa
 init` scaffolds both files plus both clients' hook configuration; `AGENTS.md`
 points at `CLAUDE.md` as the single source of truth. Re-run `lisa init` in an

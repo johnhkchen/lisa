@@ -35,6 +35,12 @@ const STOP_SIGNAL_TIMEOUT_SECS: u64 = 60;
 /// the prompt is never injected into a session that is still working.
 const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 90;
 
+/// Grace period after submitting `/exit` before typing a fresh provider launch
+/// command into the returned shell. Enter itself is deferred by
+/// `ENTER_DELAY_SECS`; using a longer grace ensures the old TUI has fully torn
+/// down before the scheduler treats the pane as a shell again.
+const AGENT_EXIT_GRACE_SECS: u64 = 8;
+
 /// The prompt text sent to an agent for a ticket.
 ///
 /// `context_file` is the per-client project-context filename the agent should
@@ -133,7 +139,7 @@ struct AgentSlot {
     pane_id: u32,
     /// Which ticket is running in this slot (None = idle).
     ticket_id: Option<TicketId>,
-    /// Whether this slot has had a Claude Code session started in it.
+    /// Whether this slot currently hosts a resident agent session.
     has_session: bool,
     /// Transition state machine for session reuse handshake.
     transition_state: TransitionState,
@@ -147,12 +153,10 @@ struct AgentSlot {
     /// stop/idle signals alone are not trusted because agents often report
     /// stopped and then keep working for another minute or two.
     last_activity_at: Option<std::time::SystemTime>,
-    /// Which agent client last ran a session in this pane, or `None` for a fresh
-    /// pane that has never hosted one (T-026-02). Set at spawn and preserved
-    /// across reuse. Slot provider-affinity uses it so a pane is only reused by
-    /// the same provider — otherwise a Codex ticket could type a shell command
-    /// into a live Claude REPL (or a Claude ticket `/clear` a bare shell),
-    /// because the reuse reset strategy is chosen from the *incoming* ticket.
+    /// Which agent client owns (or is being launched into) this pane, or `None`
+    /// for a clean shell. Compatible tickets reuse the resident TUI via `/clear`;
+    /// an incoming ticket for the other provider first recycles it via `/exit`.
+    /// This prevents a fresh CLI command from being typed into the wrong TUI.
     last_client: Option<AgentClient>,
 }
 
@@ -166,9 +170,9 @@ enum ModalMode {
     QuitConfirm,
 }
 
-/// Per-slot state machine for session transitions.
-/// Gates `/clear` and prompt sends on hook-generated signal files
-/// (`.stopped` and `.cleared`) instead of blind timers.
+/// Per-slot state machine for session transitions. Same-provider reset is gated
+/// by hook-generated `.stopped`/`.cleared` signals; cross-provider recycling
+/// uses a bounded `/exit` grace period before launching at the shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TransitionState {
     /// No transition pending — slot is idle or running normally.
@@ -178,6 +182,18 @@ enum TransitionState {
     WaitingForStop,
     /// `/clear` sent, waiting for `.cleared` signal before sending the prompt.
     WaitingForClear,
+    /// `/exit` sent to a released session whose provider does not match the next
+    /// ticket. Once the grace period expires, launch the new provider at shell.
+    WaitingForExit,
+}
+
+/// How an idle pane can satisfy an incoming provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotSelection {
+    /// Fresh pane or a resident session already owned by the requested client.
+    Compatible(usize),
+    /// Quiet, released pane with a resident session from the other client.
+    Recycle(usize),
 }
 
 /// State for the modal overlay (mark-done, reset-ticket, or quit-confirm).
@@ -529,22 +545,49 @@ impl State {
     /// mid-task wastes the partial work and forces a repeat attempt.
     /// Find an idle slot eligible to host a session for the `want` provider.
     ///
-    /// Provider-affinity (T-026-02): a slot qualifies only if it has never run a
-    /// session (`last_client == None`) or last ran the same provider. This keeps
-    /// the reuse reset strategy matched to the pane's real state and prevents
-    /// cross-provider mis-injection. Fresh panes are claimed by the first
-    /// provider to use them and then stick to it.
+    /// Provider-affinity (T-026-02): a slot qualifies directly only if it has no
+    /// resident session or last ran the same provider. Cross-provider reuse is
+    /// handled separately by `find_slot_for_client`, which explicitly exits the
+    /// old TUI before launching the new one.
     fn find_idle_slot(&self, want: AgentClient) -> Option<usize> {
         let now = std::time::SystemTime::now();
         let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
         self.agent_slots.iter().position(|s| {
             s.ticket_id.is_none()
-                && (s.last_client.is_none() || s.last_client == Some(want))
+                && s.transition_state == TransitionState::Idle
+                && (!s.has_session || s.last_client.is_none() || s.last_client == Some(want))
                 && s.cooldown_until.is_none_or(|until| now >= until)
                 && (!s.has_session
                     || s.last_activity_at
                         .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down))
         })
+    }
+
+    /// Select a pane for `want`, preferring a compatible/fresh pane and falling
+    /// back to graceful recycling only when affinity would otherwise starve the
+    /// provider. A recyclable pane must be unassigned, idle, cooled down, quiet,
+    /// and still host a live session from the opposite provider. Running panes
+    /// are never candidates.
+    fn find_slot_for_client(&self, want: AgentClient) -> Option<SlotSelection> {
+        if let Some(idx) = self.find_idle_slot(want) {
+            return Some(SlotSelection::Compatible(idx));
+        }
+
+        let now = std::time::SystemTime::now();
+        let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
+        self.agent_slots
+            .iter()
+            .position(|s| {
+                s.ticket_id.is_none()
+                    && s.transition_state == TransitionState::Idle
+                    && s.has_session
+                    && s.last_client.is_some_and(|client| client != want)
+                    && !self.is_pane_awaiting(s.pane_id)
+                    && s.cooldown_until.is_none_or(|until| now >= until)
+                    && s.last_activity_at
+                        .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down)
+            })
+            .map(SlotSelection::Recycle)
     }
 
     /// True if provider `client` is under its per-provider concurrency cap given
@@ -569,16 +612,16 @@ impl State {
         }
     }
 
-    /// Mark a slot as idle when its ticket completes.
-    /// Keeps `has_session = true` so subsequent scheduling sends `/clear` + new
-    /// prompt into the already-running Claude Code session instead of relaunching.
+    /// Mark a slot as idle when its ticket completes. Keeps `has_session = true`
+    /// so the same provider can reuse the TUI via `/clear`, while the other
+    /// provider can explicitly recycle it via `/exit` after cooldown.
     fn release_slot_for_ticket(&mut self, ticket_id: &TicketId) {
         let mut released_pane: Option<u32> = None;
         for slot in &mut self.agent_slots {
             if slot.ticket_id.as_ref() == Some(ticket_id) {
                 released_pane = Some(slot.pane_id);
                 slot.ticket_id = None;
-                // has_session stays true — Claude Code is still running
+                // has_session stays true — the native agent TUI is still running
                 slot.cooldown_until = Some(
                     std::time::SystemTime::now()
                         + std::time::Duration::from_secs(self.config.wind_down_secs),
@@ -663,12 +706,13 @@ impl State {
                 continue;
             }
 
-            // Find an idle slot with provider-affinity (T-026-02): only a fresh
-            // pane or one whose last session ran the same provider, so the reuse
-            // reset strategy (ClearHandshake vs FreshExec) always matches the
-            // pane's real state and never mis-injects across providers.
-            let slot_idx = match self.find_idle_slot(route.agent) {
-                Some(idx) => idx,
+            // Prefer a fresh/provider-compatible pane. If every released pane is
+            // resident in the other client, select one for an explicit `/exit`
+            // recycle instead of starving this provider forever. Busy panes are
+            // excluded by `find_slot_for_client`.
+            let (slot_idx, recycle) = match self.find_slot_for_client(route.agent) {
+                Some(SlotSelection::Compatible(idx)) => (idx, false),
+                Some(SlotSelection::Recycle(idx)) => (idx, true),
                 None => {
                     unscheduled += 1;
                     continue;
@@ -695,7 +739,35 @@ impl State {
             };
 
             let launch_cmd;
-            if self.agent_slots[slot_idx].has_session {
+            if recycle {
+                // Cross-provider reuse must return to the pane's shell first.
+                // Resolve the resident adapter (not the incoming one) so future
+                // clients can own their graceful-exit spelling independently.
+                let resident_client = self.agent_slots[slot_idx]
+                    .last_client
+                    .expect("recyclable slot has a resident client");
+                let (resident_adapter, _) = resolve_adapter_or_native(
+                    None,
+                    resident_client,
+                    self.config.lisa_bin.as_deref(),
+                );
+                let exit_command = resident_adapter.exit_command();
+                let cmd = adapter.launch_command(&ctx);
+                launch_cmd = cmd;
+                self.send_line_to_pane(exit_command, PaneId::Terminal(pane_id));
+                self.agent_slots[slot_idx].has_session = false;
+                self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForExit;
+                self.agent_slots[slot_idx].transition_started_at =
+                    Some(std::time::SystemTime::now());
+                self.notified_attention.remove(&pane_id);
+                self.awaiting_human.remove(&pane_id);
+                self.log_activity(ActivityEvent::Info {
+                    message: format!(
+                        "Recycling pane {} from {} to {} via {}",
+                        pane_id, resident_client, route.agent, exit_command
+                    ),
+                });
+            } else if self.agent_slots[slot_idx].has_session {
                 // Session reuse. For the ClearHandshake adapter (native Claude):
                 // the slot is idle (ticket_id was None), so Claude Code is already
                 // at its prompt. Send /clear directly and wait for the .cleared
@@ -734,9 +806,9 @@ impl State {
             }
 
             self.agent_slots[slot_idx].ticket_id = Some(ticket_id.clone());
-            // Stamp the provider that (re)claimed this pane so future scheduling
-            // keeps provider-affinity (T-026-02): a warm Claude REPL is reused
-            // only by Claude tickets, a codex-vacated shell only by Codex tickets.
+            // Stamp the provider that claimed this pane. A compatible session is
+            // reused in-place; a recycled pane is reserved for this provider
+            // while WaitingForExit prevents any other scheduler claim.
             self.agent_slots[slot_idx].last_client = Some(route.agent);
             // Sending input counts as pane activity — restarts the wind-down clock.
             self.agent_slots[slot_idx].last_activity_at = Some(std::time::SystemTime::now());
@@ -1070,14 +1142,18 @@ impl State {
                     Err(_) => continue,
                 };
                 idle_pane_id = Some(pane_id);
+                // A transition reserves the slot for its next ticket before the
+                // next prompt/CLI is actually sent. Any idle signal arriving in
+                // that window belongs to the previous session and must not
+                // advance the newly assigned ticket.
+                let slot = match self.agent_slots.iter().find(|s| s.pane_id == pane_id) {
+                    Some(slot) if slot.transition_state == TransitionState::Idle => slot,
+                    _ => continue,
+                };
+                let assigned_ticket = slot.ticket_id.clone();
                 // An idle signal is recent life — restart the wind-down clock.
                 self.bump_pane_activity(pane_id);
-                match self
-                    .agent_slots
-                    .iter()
-                    .find(|s| s.pane_id == pane_id)
-                    .and_then(|s| s.ticket_id.clone())
-                {
+                match assigned_ticket {
                     Some(tid) => tid,
                     None => continue,
                 }
@@ -1625,7 +1701,7 @@ impl State {
         }
     }
 
-    /// Check for transition timeouts and force-advance stalled transitions.
+    /// Check for transition deadlines and advance stalled transitions.
     ///
     /// Prevents indefinite stalls if hooks fail to produce signal files.
     ///
@@ -1638,6 +1714,7 @@ impl State {
         let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
 
         // Collect actions to avoid borrow conflicts
+        let mut exit_ready: Vec<(u32, Option<TicketId>)> = Vec::new();
         let mut stop_timeouts: Vec<u32> = Vec::new();
         let mut clear_timeouts: Vec<(u32, Option<TicketId>)> = Vec::new();
 
@@ -1649,6 +1726,9 @@ impl State {
                     .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down);
 
                 match slot.transition_state {
+                    TransitionState::WaitingForExit if elapsed > AGENT_EXIT_GRACE_SECS => {
+                        exit_ready.push((slot.pane_id, slot.ticket_id.clone()));
+                    }
                     TransitionState::WaitingForStop
                         if elapsed > STOP_SIGNAL_TIMEOUT_SECS && quiet =>
                     {
@@ -1662,6 +1742,55 @@ impl State {
                     _ => {}
                 }
             }
+        }
+
+        for (pane_id, ticket_id) in exit_ready {
+            let Some(ticket_id) = ticket_id else {
+                // The pending ticket disappeared while the old client was
+                // exiting. Leave a clean shell available to either provider.
+                if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                    slot.transition_state = TransitionState::Idle;
+                    slot.transition_started_at = None;
+                    slot.has_session = false;
+                    slot.last_client = None;
+                }
+                continue;
+            };
+
+            // `/exit` is documented to return immediately; the grace period is
+            // deliberately longer than the deferred Enter delay. Any stale
+            // question/attention marker belonged to the exited client and must
+            // not suppress the fresh shell command.
+            self.awaiting_human.remove(&pane_id);
+            self.notified_attention.remove(&pane_id);
+
+            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
+            let (adapter, route) = resolve_adapter_or_native(
+                self.dag.get_ticket(&ticket_id),
+                self.config.client,
+                self.config.lisa_bin.as_deref(),
+            );
+            let ctx = SpawnContext {
+                ticket_dir: &host_ticket_dir,
+                ticket_id: &ticket_id,
+                pane_id,
+            };
+            let command = adapter.launch_command(&ctx);
+            self.send_line_to_pane(&command, PaneId::Terminal(pane_id));
+
+            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                slot.transition_state = TransitionState::Idle;
+                slot.transition_started_at = None;
+                slot.has_session = true;
+                slot.last_client = Some(route.agent);
+                slot.last_activity_at = Some(now);
+            }
+            self.log_activity(ActivityEvent::Info {
+                message: format!(
+                    "Pane {} exited previous client, launched {} for {}",
+                    pane_id, route.agent, ticket_id
+                ),
+            });
         }
 
         for pane_id in stop_timeouts {
@@ -6743,7 +6872,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_idle_slot_no_matching_provider_waits() {
+    fn test_find_idle_slot_rejects_mismatched_resident_provider() {
         let mut state = State {
             config: PluginConfig {
                 wind_down_secs: 0,
@@ -6755,9 +6884,70 @@ mod tests {
         state
             .agent_slots
             .push(fresh_slot(10, Some(AgentClient::Claude)));
-        // Codex finds no eligible slot → None (the ticket waits visibly; no crash,
-        // no cross-provider mis-injection).
+        // The direct-reuse helper rejects the mismatch. The higher-level
+        // find_slot_for_client helper turns this into an explicit recycle.
         assert_eq!(state.find_idle_slot(AgentClient::Codex), None);
+    }
+
+    #[test]
+    fn test_find_slot_for_client_recycles_when_all_idle_panes_have_other_provider() {
+        let mut state = State {
+            config: PluginConfig {
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        for pane_id in 10..14 {
+            state
+                .agent_slots
+                .push(fresh_slot(pane_id, Some(AgentClient::Claude)));
+        }
+
+        assert_eq!(
+            state.find_slot_for_client(AgentClient::Codex),
+            Some(SlotSelection::Recycle(0))
+        );
+    }
+
+    #[test]
+    fn test_find_slot_for_client_prefers_compatible_pane_over_recycling() {
+        let mut state = State {
+            config: PluginConfig {
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        state
+            .agent_slots
+            .push(fresh_slot(10, Some(AgentClient::Claude)));
+        state
+            .agent_slots
+            .push(fresh_slot(11, Some(AgentClient::Codex)));
+
+        assert_eq!(
+            state.find_slot_for_client(AgentClient::Codex),
+            Some(SlotSelection::Compatible(1))
+        );
+    }
+
+    #[test]
+    fn test_find_slot_for_client_never_recycles_running_pane() {
+        let mut state = State {
+            config: PluginConfig {
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        for pane_id in 10..14 {
+            let mut slot = fresh_slot(pane_id, Some(AgentClient::Claude));
+            slot.ticket_id = Some(format!("T-{pane_id}"));
+            state.agent_slots.push(slot);
+        }
+
+        assert_eq!(state.find_slot_for_client(AgentClient::Codex), None);
     }
 
     #[test]
@@ -7321,6 +7511,104 @@ mod tests {
             TransitionState::WaitingForStop
         );
         assert!(state.activity_log.is_empty());
+    }
+
+    #[test]
+    fn test_recycle_exit_grace_launches_fresh_incoming_client() {
+        let mut state = State {
+            config: PluginConfig {
+                client: AgentClient::Codex,
+                ticket_dir: std::path::PathBuf::from("/tmp/tickets"),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-RECYCLE".to_string()),
+            has_session: false,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+            ),
+            cooldown_until: None,
+            last_activity_at: None,
+            // Scheduling stamps the incoming provider while `/exit` is pending.
+            last_client: Some(AgentClient::Codex),
+        });
+
+        state.check_transition_timeouts();
+
+        let slot = &state.agent_slots[0];
+        assert_eq!(slot.transition_state, TransitionState::Idle);
+        assert!(slot.transition_started_at.is_none());
+        assert!(slot.has_session);
+        assert_eq!(slot.last_client, Some(AgentClient::Codex));
+        assert_eq!(state.pending_enters.len(), 1, "fresh launch queued Enter");
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Info { message }
+                if message.contains("launched codex") && message.contains("T-RECYCLE")
+        )));
+    }
+
+    #[test]
+    fn test_recycle_waits_for_exit_grace_before_launch() {
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-RECYCLE".to_string()),
+            has_session: false,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(std::time::SystemTime::now()),
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Codex),
+        });
+
+        state.check_transition_timeouts();
+
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert!(state.pending_enters.is_empty());
+    }
+
+    #[test]
+    fn test_recycle_discards_idle_signal_from_exiting_client() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "stale").unwrap();
+
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-RECYCLE".to_string()),
+            has_session: false,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(std::time::SystemTime::now()),
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Codex),
+        });
+        state.threads.insert(
+            "T-RECYCLE".to_string(),
+            running_thread("T-RECYCLE", 1, AgentClient::Codex),
+        );
+
+        state.check_idle_signals();
+
+        assert!(!signal_dir.join("pane-1.idle").exists());
+        assert!(state.agent_slots[0].last_activity_at.is_none());
+        assert!(state.idle_alerts.is_empty());
     }
 
     #[test]
