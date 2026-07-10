@@ -56,15 +56,15 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || (!github.event.pull_request && github.ref_name || '') }}
-      tag-flag: ${{ github.event_name == 'workflow_dispatch' && format('--tag={0}', inputs.tag) || (!github.event.pull_request && format('--tag={0}', github.ref_name) || '') }}
+      tag: ${{ github.event.inputs.tag || (!github.event.pull_request && github.ref_name || '') }}
+      tag-flag: ${{ github.event.inputs.tag && format('--tag={0}', github.event.inputs.tag) || (!github.event.pull_request && format('--tag={0}', github.ref_name) || '') }}
       publishing: ${{ !github.event.pull_request }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Install dist
@@ -125,7 +125,7 @@ jobs:
           git config --global core.longpaths true
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Install Rust non-interactively if not already installed
@@ -189,7 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
@@ -240,7 +240,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
