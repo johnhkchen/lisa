@@ -187,7 +187,11 @@ fn extract_thread_id(e: &Value) -> Option<String> {
             return Some(s.to_string());
         }
     }
-    if let Some(s) = e.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
+    if let Some(s) = e
+        .get("thread")
+        .and_then(|t| t.get("id"))
+        .and_then(Value::as_str)
+    {
         return Some(s.to_string());
     }
     e.get("id").and_then(Value::as_str).map(str::to_string)
@@ -203,7 +207,11 @@ fn extract_usage(e: &Value) -> Option<Value> {
 
 fn extract_error_message(e: &Value) -> Option<String> {
     // {error:{message}} | {error:"…"} | {message}
-    if let Some(m) = e.get("error").and_then(|x| x.get("message")).and_then(Value::as_str) {
+    if let Some(m) = e
+        .get("error")
+        .and_then(|x| x.get("message"))
+        .and_then(Value::as_str)
+    {
         return Some(m.to_string());
     }
     if let Some(s) = e.get("error").and_then(Value::as_str) {
@@ -249,7 +257,9 @@ fn render_event(event: &Value) -> Option<String> {
     match kind {
         "agent_message" | "assistant_message" | "message" => {
             if ty == "item.completed" {
-                item_text(item).map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+                item_text(item)
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
             } else {
                 None
             }
@@ -407,7 +417,10 @@ fn persist_run_artifacts(
     }
     fs::create_dir_all(codex_dir)?;
     if let Some(id) = thread_id {
-        fs::write(codex_dir.join(format!("{}.thread", key)), format!("{}\n", id))?;
+        fs::write(
+            codex_dir.join(format!("{}.thread", key)),
+            format!("{}\n", id),
+        )?;
     }
     let record = serde_json::json!({
         "key": key,
@@ -487,7 +500,9 @@ fn build_codex_argv(args: &AgentExecArgs, resolved_thread: Option<&str>) -> Vec<
 /// spawn/IO failure (e.g. codex not on PATH) is an `Err`.
 pub fn run_agent_exec(args: AgentExecArgs) -> Result<(), String> {
     let pane_id = std::env::var("LISA_PANE_ID").ok().filter(|s| !s.is_empty());
-    let ticket_id = std::env::var("LISA_TICKET_ID").ok().filter(|s| !s.is_empty());
+    let ticket_id = std::env::var("LISA_TICKET_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let codex_dir = args.cwd.join(".lisa").join("codex");
     let key = ticket_id
@@ -619,7 +634,9 @@ mod tests {
     fn item_events_are_heartbeats() {
         let mut t = Translator::default();
         for ty in ["item.started", "item.updated", "item.completed"] {
-            let eff = t.observe(&json!({"type": ty, "item": {"item_type": "command_execution", "command": "ls"}}));
+            let eff = t.observe(
+                &json!({"type": ty, "item": {"item_type": "command_execution", "command": "ls"}}),
+            );
             assert!(eff.heartbeat, "{} should heartbeat", ty);
         }
     }
@@ -681,7 +698,10 @@ mod tests {
     fn outcome_signal_sets() {
         assert_eq!(Outcome::Success.signals(), &[SignalKind::Stopped]);
         assert_eq!(
-            Outcome::Failure { message: "x".into() }.signals(),
+            Outcome::Failure {
+                message: "x".into()
+            }
+            .signals(),
             &[SignalKind::Error, SignalKind::Stopped]
         );
     }
@@ -770,10 +790,14 @@ mod tests {
         let usage = json!({"input_tokens": 5, "output_tokens": 6});
         persist_run_artifacts(&codex_dir, "T-999-01", Some("th_xyz"), Some(&usage), true).unwrap();
 
-        assert_eq!(read_thread_id(&codex_dir, "T-999-01").as_deref(), Some("th_xyz"));
-        let recorded: Value =
-            serde_json::from_str(&fs::read_to_string(codex_dir.join("T-999-01.usage.json")).unwrap())
-                .unwrap();
+        assert_eq!(
+            read_thread_id(&codex_dir, "T-999-01").as_deref(),
+            Some("th_xyz")
+        );
+        let recorded: Value = serde_json::from_str(
+            &fs::read_to_string(codex_dir.join("T-999-01.usage.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(recorded["usage"]["output_tokens"], 6);
         assert_eq!(recorded["success"], true);
     }

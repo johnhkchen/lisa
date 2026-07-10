@@ -89,7 +89,9 @@ fn usage_artifact(key: &str, u: &ClaudeUsage) -> Value {
 /// (`LISA_TICKET_ID` → `pane-<LISA_PANE_ID>` → `"last"`), so the plugin's reader
 /// finds `<ticket>.usage.json` under `.lisa/claude` exactly as under `.lisa/codex`.
 fn resolve_key() -> String {
-    let ticket = std::env::var("LISA_TICKET_ID").ok().filter(|s| !s.is_empty());
+    let ticket = std::env::var("LISA_TICKET_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
     let pane = std::env::var("LISA_PANE_ID").ok().filter(|s| !s.is_empty());
     ticket
         .or_else(|| pane.map(|p| format!("pane-{}", p)))
@@ -178,7 +180,10 @@ mod tests {
     fn artifact_shape_matches_extract_usage() {
         // The artifact's nested `usage` must be readable by the shared extractor
         // the plugin uses — this is the cross-crate contract.
-        let u = ClaudeUsage { input_tokens: 167, output_tokens: 37 };
+        let u = ClaudeUsage {
+            input_tokens: 167,
+            output_tokens: 37,
+        };
         let artifact = usage_artifact("T-027-02", &u);
         let usage = artifact.get("usage").unwrap();
         let (tin, tout, cost) = lisa_core::provenance::extract_usage(usage);

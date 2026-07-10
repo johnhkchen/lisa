@@ -98,8 +98,9 @@ fn check_codex() -> CheckResult {
     match get_command_version("codex", &["--version"]) {
         Some(version) => CheckResult::Found { version },
         None => CheckResult::NotFound {
-            install_hint: "npm i -g @openai/codex\n    Or visit: https://developers.openai.com/codex"
-                .to_string(),
+            install_hint:
+                "npm i -g @openai/codex\n    Or visit: https://developers.openai.com/codex"
+                    .to_string(),
         },
     }
 }

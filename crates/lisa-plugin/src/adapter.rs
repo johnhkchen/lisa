@@ -175,7 +175,10 @@ impl ClaudeCodeAdapter {
 
 impl Default for ClaudeCodeAdapter {
     fn default() -> Self {
-        Self { model: None, lisa_bin: None }
+        Self {
+            model: None,
+            lisa_bin: None,
+        }
     }
 }
 
@@ -423,7 +426,10 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = ClaudeCodeAdapter::new(Some("opus"), None).launch_command(&ctx);
         assert!(cmd.contains("--model opus"), "got: {cmd}");
-        assert_eq!(cmd, build_claude_command(dir, "T-042-01", 7, Some("opus"), None));
+        assert_eq!(
+            cmd,
+            build_claude_command(dir, "T-042-01", 7, Some("opus"), None)
+        );
     }
 
     #[test]
@@ -433,7 +439,10 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let with_bin = ClaudeCodeAdapter::new(None, Some("/abs/lisa")).launch_command(&ctx);
-        assert!(with_bin.starts_with("LISA_BIN=/abs/lisa LISA_PANE_ID=7"), "got: {with_bin}");
+        assert!(
+            with_bin.starts_with("LISA_BIN=/abs/lisa LISA_PANE_ID=7"),
+            "got: {with_bin}"
+        );
         let without = ClaudeCodeAdapter::new(None, None).launch_command(&ctx);
         assert!(!without.contains("LISA_BIN="), "got: {without}");
         assert!(without.starts_with("LISA_PANE_ID=7"), "got: {without}");

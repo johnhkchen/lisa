@@ -6664,9 +6664,10 @@ mod tests {
         // many running threads of that provider (only the global cap applies).
         let mut state = State::default();
         for i in 0..5u32 {
-            state
-                .threads
-                .insert(format!("C-{i}"), running_thread(&format!("C-{i}"), 10 + i, AgentClient::Codex));
+            state.threads.insert(
+                format!("C-{i}"),
+                running_thread(&format!("C-{i}"), 10 + i, AgentClient::Codex),
+            );
         }
         assert!(state.provider_under_cap(AgentClient::Codex));
         assert!(state.provider_under_cap(AgentClient::Claude));
@@ -6683,11 +6684,15 @@ mod tests {
         };
         // Two running Codex threads == the Codex cap.
         for i in 0..2u32 {
-            state
-                .threads
-                .insert(format!("C-{i}"), running_thread(&format!("C-{i}"), 10 + i, AgentClient::Codex));
+            state.threads.insert(
+                format!("C-{i}"),
+                running_thread(&format!("C-{i}"), 10 + i, AgentClient::Codex),
+            );
         }
-        assert!(!state.provider_under_cap(AgentClient::Codex), "codex is at its cap");
+        assert!(
+            !state.provider_under_cap(AgentClient::Codex),
+            "codex is at its cap"
+        );
         assert!(
             state.provider_under_cap(AgentClient::Claude),
             "claude has no cap and is unaffected"
@@ -6705,9 +6710,10 @@ mod tests {
         };
         // Three running Claude threads must NOT count against the Codex cap.
         for i in 0..3u32 {
-            state
-                .threads
-                .insert(format!("A-{i}"), running_thread(&format!("A-{i}"), 10 + i, AgentClient::Claude));
+            state.threads.insert(
+                format!("A-{i}"),
+                running_thread(&format!("A-{i}"), 10 + i, AgentClient::Claude),
+            );
         }
         assert!(
             state.provider_under_cap(AgentClient::Codex),
@@ -6725,7 +6731,9 @@ mod tests {
             ..State::default()
         };
         // Slot 0 last ran Claude; slot 1 is fresh (never hosted a session).
-        state.agent_slots.push(fresh_slot(10, Some(AgentClient::Claude)));
+        state
+            .agent_slots
+            .push(fresh_slot(10, Some(AgentClient::Claude)));
         state.agent_slots.push(fresh_slot(11, None));
 
         // Codex skips the Claude-affine slot and takes the fresh one.
@@ -6744,7 +6752,9 @@ mod tests {
             ..State::default()
         };
         // Only a Claude-affine slot is available.
-        state.agent_slots.push(fresh_slot(10, Some(AgentClient::Claude)));
+        state
+            .agent_slots
+            .push(fresh_slot(10, Some(AgentClient::Claude)));
         // Codex finds no eligible slot → None (the ticket waits visibly; no crash,
         // no cross-provider mis-injection).
         assert_eq!(state.find_idle_slot(AgentClient::Codex), None);
@@ -6830,7 +6840,10 @@ mod tests {
         assert_eq!(running(AgentClient::Claude), 8, "claude per-provider cap");
         assert_eq!(running(AgentClient::Codex), 8, "codex per-provider cap");
         assert_eq!(admitted, 16);
-        assert_eq!(unscheduled, 16, "the surplus 16 tickets stay unscheduled, not dropped");
+        assert_eq!(
+            unscheduled, 16,
+            "the surplus 16 tickets stay unscheduled, not dropped"
+        );
 
         // No slot serves a provider other than the one stamped on it.
         for slot in &state.agent_slots {
@@ -6878,7 +6891,11 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(remaining.len(), 32, "only the 32 idle files remain after the heartbeat scan");
+        assert_eq!(
+            remaining.len(),
+            32,
+            "only the 32 idle files remain after the heartbeat scan"
+        );
         assert!(
             remaining.iter().all(|n| n.ends_with(".idle")),
             "heartbeat scan leaves non-heartbeat signals untouched"
