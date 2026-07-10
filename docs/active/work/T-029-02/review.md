@@ -22,6 +22,8 @@ Claude follows the same shared path and retains its existing behavior.
   - adds a host-free due-entry selector;
   - gates Timer-event Enter delivery by deadline;
   - adds two regression tests.
+- `crates/lisa-plugin/src/ui.rs`
+  - initializes three test fixtures without post-default field reassignment.
 - `docs/active/stories/S-029-codex-integration.md`
   - lists the discovered release-candidate bug ticket.
 - `docs/active/tickets/T-029-02-codex-reuse-prompt-timer-race.md`
@@ -71,8 +73,8 @@ Codex second-ticket run in CI. The installed Codex 0.144.x PTY verification in
 properly delayed text-plus-Enter submission works. A final live loop is still a
 valuable release smoke check.
 
-`clippy --all-targets -D warnings` remains red on five pre-existing test-only
-style warnings outside this delta. The production plugin lint gate is green.
+The five pre-existing test-only Clippy warnings found during the initial pass
+were cleaned before release. `clippy --all-targets -D warnings` is green.
 
 ## Human review focus
 

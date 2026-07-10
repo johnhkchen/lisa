@@ -8649,8 +8649,10 @@ mod tests {
 
     #[test]
     fn test_to_ui_state_includes_timeout_alerts() {
-        let mut state = State::default();
-        state.initialized = true;
+        let mut state = State {
+            initialized: true,
+            ..State::default()
+        };
         state.timeout_alerts.push((
             "T-001".to_string(),
             1920, // 32 minutes
@@ -8747,8 +8749,10 @@ mod tests {
 
     #[test]
     fn test_to_ui_state_includes_error_alerts() {
-        let mut state = State::default();
-        state.initialized = true;
+        let mut state = State {
+            initialized: true,
+            ..State::default()
+        };
         state.error_alerts.push(("T-001".to_string(), 3));
 
         let ui_state = state.to_ui_state();

@@ -1422,20 +1422,22 @@ mod tests {
 
     #[test]
     fn test_render_threads_marks_awaiting() {
-        let mut state = PluginState::default();
-        state.slots = vec![SlotInfo {
-            ticket_id: Some("T-002".to_string()),
-            slot_number: 1,
-            transitioning: false,
-        }];
-        state.active_threads = vec![ActiveThread {
-            ticket_id: "T-002".to_string(),
-            phase: Phase::Design,
-            started_at: Duration::from_secs(60),
-            slot_number: 1,
-            awaiting: true,
-            route: None,
-        }];
+        let state = PluginState {
+            slots: vec![SlotInfo {
+                ticket_id: Some("T-002".to_string()),
+                slot_number: 1,
+                transitioning: false,
+            }],
+            active_threads: vec![ActiveThread {
+                ticket_id: "T-002".to_string(),
+                phase: Phase::Design,
+                started_at: Duration::from_secs(60),
+                slot_number: 1,
+                awaiting: true,
+                route: None,
+            }],
+            ..PluginState::default()
+        };
         let mut output = Vec::new();
         render_threads(&state, &mut output);
 
@@ -1451,37 +1453,39 @@ mod tests {
     #[test]
     fn test_render_threads_surfaces_route() {
         // T-026-01: the AGENT column shows each pane's (provider, model) route.
-        let mut state = PluginState::default();
-        state.slots = vec![
-            SlotInfo {
-                ticket_id: Some("T-001".to_string()),
-                slot_number: 1,
-                transitioning: false,
-            },
-            SlotInfo {
-                ticket_id: Some("T-002".to_string()),
-                slot_number: 2,
-                transitioning: false,
-            },
-        ];
-        state.active_threads = vec![
-            ActiveThread {
-                ticket_id: "T-001".to_string(),
-                phase: Phase::Research,
-                started_at: Duration::from_secs(30),
-                slot_number: 1,
-                awaiting: false,
-                route: Some("codex/gpt-5".to_string()),
-            },
-            ActiveThread {
-                ticket_id: "T-002".to_string(),
-                phase: Phase::Design,
-                started_at: Duration::from_secs(30),
-                slot_number: 2,
-                awaiting: false,
-                route: None,
-            },
-        ];
+        let state = PluginState {
+            slots: vec![
+                SlotInfo {
+                    ticket_id: Some("T-001".to_string()),
+                    slot_number: 1,
+                    transitioning: false,
+                },
+                SlotInfo {
+                    ticket_id: Some("T-002".to_string()),
+                    slot_number: 2,
+                    transitioning: false,
+                },
+            ],
+            active_threads: vec![
+                ActiveThread {
+                    ticket_id: "T-001".to_string(),
+                    phase: Phase::Research,
+                    started_at: Duration::from_secs(30),
+                    slot_number: 1,
+                    awaiting: false,
+                    route: Some("codex/gpt-5".to_string()),
+                },
+                ActiveThread {
+                    ticket_id: "T-002".to_string(),
+                    phase: Phase::Design,
+                    started_at: Duration::from_secs(30),
+                    slot_number: 2,
+                    awaiting: false,
+                    route: None,
+                },
+            ],
+            ..PluginState::default()
+        };
         let mut output = Vec::new();
         render_threads(&state, &mut output);
         let full = output.join("\n");
@@ -1502,20 +1506,22 @@ mod tests {
 
     #[test]
     fn test_render_threads_with_parked() {
-        let mut state = PluginState::default();
-        state.slots = vec![SlotInfo {
-            ticket_id: Some("T-003".to_string()),
-            slot_number: 1,
-            transitioning: false,
-        }];
-        state.parked_threads = vec![ParkedThread {
-            ticket_id: "T-003".to_string(),
-            phase: Phase::Review,
-            artifact_path: "docs/active/work/T-003/design.md".to_string(),
-            parked_at: Duration::from_secs(100),
-            slot_number: 1,
-        }];
-        state.current_time = Duration::from_secs(200);
+        let state = PluginState {
+            slots: vec![SlotInfo {
+                ticket_id: Some("T-003".to_string()),
+                slot_number: 1,
+                transitioning: false,
+            }],
+            parked_threads: vec![ParkedThread {
+                ticket_id: "T-003".to_string(),
+                phase: Phase::Review,
+                artifact_path: "docs/active/work/T-003/design.md".to_string(),
+                parked_at: Duration::from_secs(100),
+                slot_number: 1,
+            }],
+            current_time: Duration::from_secs(200),
+            ..PluginState::default()
+        };
 
         let mut output = Vec::new();
         render_threads(&state, &mut output);

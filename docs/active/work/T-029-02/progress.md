@@ -12,7 +12,7 @@
 | Focused tests | pass | 2 pending-enter tests; Codex reuse prompt adapter test |
 | Workspace suite | pass | CLI 242, core 145, plugin 234; 621 total, 0 failed |
 | WASM release build | pass | `cargo build -p lisa-plugin --target wasm32-wasip1 --release` |
-| Production Clippy | pass | `cargo clippy -p lisa-plugin -- -D warnings` |
+| All-target Clippy | pass | `cargo clippy -p lisa-plugin --all-targets -- -D warnings` |
 | Format/diff checks | pass | `cargo fmt --all -- --check`; `git diff --check` |
 
 ## Implementation notes
@@ -42,29 +42,21 @@ cargo test -p lisa-plugin pending_enter
 cargo test -p lisa-plugin codex_reuse
 cargo test --workspace
 cargo build -p lisa-plugin --target wasm32-wasip1 --release
-cargo clippy -p lisa-plugin -- -D warnings
+cargo clippy -p lisa-plugin --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
 ```
 
-## Clippy note
+## Clippy follow-up
 
-An additional `cargo clippy -p lisa-plugin --all-targets -- -D warnings` run
-reached five existing test-only `field_reassign_with_default` warnings:
-
-- three in `crates/lisa-plugin/src/ui.rs`;
-- two in older tests in `crates/lisa-plugin/src/lib.rs`.
-
-None is in the T-029-02 delta. The repository's established production plugin
-gate (`cargo clippy -p lisa-plugin -- -D warnings`) passes. Those unrelated test
-cleanups were deliberately left out of this release-candidate bug fix.
+The five test-only `field_reassign_with_default` warnings found during the first
+verification pass are fixed by initializing the affected `PluginState` and
+`State` fixtures in one expression. The stricter all-target Clippy gate now
+passes with warnings denied.
 
 ## Deviations from plan
 
-The plan named the stricter all-target Clippy gate. It exposed unrelated legacy
-test warnings, so verification used the production-target gate already used by
-prior Lisa work and recorded the all-target result above rather than expanding
-scope.
+None remaining. The user explicitly requested the legacy test warnings be
+cleaned before release, so the all-target gate is green for 0.4.0-rc.5.
 
-No commit was created. The user's existing untracked `.codex/` directory was
-not modified.
+The user's existing untracked `.codex/` directory was not modified.
