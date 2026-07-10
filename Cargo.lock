@@ -1557,7 +1557,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "lisa-cli"
-version = "0.4.0-rc.3"
+version = "0.4.0-rc.4"
 dependencies = [
  "clap 4.5.57",
  "lisa-core",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "lisa-core"
-version = "0.4.0-rc.3"
+version = "0.4.0-rc.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "lisa-plugin"
-version = "0.4.0-rc.3"
+version = "0.4.0-rc.4"
 dependencies = [
  "ascii-dag",
  "libc",
