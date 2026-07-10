@@ -371,13 +371,21 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         }
     }
 
-    // .lisa/.gitignore (ignores ephemeral signal files)
+    // .lisa/.gitignore (ignores ephemeral signal/session/usage files)
     let lisa_gitignore_path = root.join(".lisa/.gitignore");
     if lisa_gitignore_path.exists() {
-        actions.push(InitAction::Skip {
-            path: lisa_gitignore_path,
-            reason: "already exists".to_string(),
-        });
+        match fs::read_to_string(&lisa_gitignore_path) {
+            Ok(existing) if existing == templates::LISA_GITIGNORE => {
+                actions.push(InitAction::Skip {
+                    path: lisa_gitignore_path,
+                    reason: "already up to date".to_string(),
+                });
+            }
+            _ => actions.push(InitAction::UpdateFile {
+                path: lisa_gitignore_path,
+                content: templates::LISA_GITIGNORE.to_string(),
+            }),
+        }
     } else {
         actions.push(InitAction::CreateFile {
             path: lisa_gitignore_path,
@@ -427,6 +435,45 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         actions.push(InitAction::CreateFile {
             path: settings_path,
             content: templates::settings_local_json(),
+        });
+    }
+
+    // .codex/hooks.json — native Codex TUI lifecycle signals. Keep this separate
+    // from `.claude/settings.local.json`: both clients load their own native
+    // configuration while sharing the versioned `.lisa/hooks/*.sh` scripts.
+    let codex_hooks_path = root.join(".codex/hooks.json");
+    if codex_hooks_path.exists() {
+        match fs::read_to_string(&codex_hooks_path) {
+            Ok(content) => match templates::merge_codex_hooks(&content) {
+                Ok(merged) => {
+                    let old: Option<serde_json::Value> = serde_json::from_str(&content).ok();
+                    let new: Option<serde_json::Value> = serde_json::from_str(&merged).ok();
+                    if old == new {
+                        actions.push(InitAction::Skip {
+                            path: codex_hooks_path,
+                            reason: "already up to date".to_string(),
+                        });
+                    } else {
+                        actions.push(InitAction::UpdateFile {
+                            path: codex_hooks_path,
+                            content: merged,
+                        });
+                    }
+                }
+                Err(_) => actions.push(InitAction::Skip {
+                    path: codex_hooks_path,
+                    reason: "exists but JSON is malformed — add hooks manually".to_string(),
+                }),
+            },
+            Err(_) => actions.push(InitAction::Skip {
+                path: codex_hooks_path,
+                reason: "exists but unreadable — check permissions".to_string(),
+            }),
+        }
+    } else {
+        actions.push(InitAction::CreateFile {
+            path: codex_hooks_path,
+            content: templates::codex_hooks_json(),
         });
     }
 
@@ -585,6 +632,9 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
     let mut diagnostics: Vec<ValidationDiagnostic> = Vec::new();
     let mut ticket_count: usize = 0;
     let mut ready_count: usize = 0;
+    let selected_client = config::load_config(root)
+        .map(|v| config::resolve_config(&v.config, None, None).client)
+        .unwrap_or_default();
 
     // 1. Tool checks (optional)
     if check_tools {
@@ -596,11 +646,17 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
                 severity: Severity::Error,
             });
         }
-        if !crate::doctor::which("claude") {
+        let (agent, install) = match selected_client {
+            lisa_core::client::AgentClient::Claude => {
+                ("claude", "https://docs.anthropic.com/en/docs/claude-code")
+            }
+            lisa_core::client::AgentClient::Codex => ("codex", "npm i -g @openai/codex"),
+        };
+        if !crate::doctor::which(agent) {
             diagnostics.push(ValidationDiagnostic {
                 path: "(tools)".to_string(),
                 category: "config",
-                message: "`claude` not found on PATH. Install: https://docs.anthropic.com/en/docs/claude-code".to_string(),
+                message: format!("`{agent}` not found on PATH. Install: {install}"),
                 severity: Severity::Error,
             });
         }
@@ -691,6 +747,53 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
                     message: format!("could not read file: {}", e),
                     severity: Severity::Error,
                 });
+            }
+        }
+    }
+
+    // Native Codex TUI lifecycle hooks are required only when Codex is the
+    // configured loop client. Per-ticket Codex routing is checked by loop
+    // preflight after the DAG is loaded.
+    if selected_client == lisa_core::client::AgentClient::Codex {
+        let codex_hooks_path = root.join(".codex/hooks.json");
+        if !codex_hooks_path.exists() {
+            diagnostics.push(ValidationDiagnostic {
+                path: ".codex/hooks.json".to_string(),
+                category: "structure",
+                message: "not found. Run `lisa init` to create Codex hooks.".to_string(),
+                severity: Severity::Error,
+            });
+        } else {
+            match fs::read_to_string(&codex_hooks_path) {
+                Ok(content) => match templates::merge_codex_hooks(&content) {
+                    Ok(expected) => {
+                        let current: Option<serde_json::Value> =
+                            serde_json::from_str(&content).ok();
+                        let expected: Option<serde_json::Value> =
+                            serde_json::from_str(&expected).ok();
+                        if current != expected {
+                            diagnostics.push(ValidationDiagnostic {
+                                path: ".codex/hooks.json".to_string(),
+                                category: "config",
+                                message: "missing or stale Lisa lifecycle hooks. Run `lisa init`."
+                                    .to_string(),
+                                severity: Severity::Error,
+                            });
+                        }
+                    }
+                    Err(e) => diagnostics.push(ValidationDiagnostic {
+                        path: ".codex/hooks.json".to_string(),
+                        category: "config",
+                        message: e,
+                        severity: Severity::Error,
+                    }),
+                },
+                Err(e) => diagnostics.push(ValidationDiagnostic {
+                    path: ".codex/hooks.json".to_string(),
+                    category: "config",
+                    message: format!("could not read file: {e}"),
+                    severity: Severity::Error,
+                }),
             }
         }
     }
@@ -970,12 +1073,13 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   11 files (CLAUDE.md, AGENTS.md, rdspi-workflow.md, .lisa.toml, on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, on-notify.sample, .lisa/.gitignore, settings.local.json)
+        //   12 files (the project/context/config files, five shared hook files,
+        //   .lisa/.gitignore, Claude settings, and Codex hooks.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| !matches!(a, InitAction::Skip { .. }))
             .collect();
-        assert_eq!(creates.len(), 19);
+        assert_eq!(creates.len(), 20);
     }
 
     #[test]
@@ -1099,6 +1203,7 @@ mod tests {
         assert!(dir.path().join(".lisa/signals").exists());
         assert!(dir.path().join(".lisa/.gitignore").exists());
         assert!(dir.path().join(".claude/settings.local.json").exists());
+        assert!(dir.path().join(".codex/hooks.json").exists());
 
         // Check hook script content
         for (name, ext) in &[
@@ -1136,6 +1241,11 @@ mod tests {
         assert!(settings.contains("idle_prompt"));
         assert!(settings.contains("\"Stop\""));
         assert!(settings.contains("\"SessionStart\""));
+
+        let codex_hooks = fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
+        assert!(codex_hooks.contains("\"Stop\""));
+        assert!(codex_hooks.contains("\"SessionStart\""));
+        assert!(codex_hooks.contains("\"PostToolUse\""));
 
         // Check .lisa/.gitignore content
         let gitignore = fs::read_to_string(dir.path().join(".lisa/.gitignore")).unwrap();
@@ -2226,6 +2336,59 @@ depends_on: [T-999]
         assert!(claude_md.contains("my-rust-project"));
         assert!(claude_md.contains("(Rust)"));
         assert!(claude_md.contains("cargo build"));
+    }
+
+    #[test]
+    fn test_init_then_validate_roundtrip_codex_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"codex-project\"\n",
+        )
+        .unwrap();
+        run_init(dir.path(), false).unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            format!(
+                "version = \"{}\"\n\n[agent]\nclient = \"codex\"\n",
+                config::LISA_VERSION
+            ),
+        )
+        .unwrap();
+        write_ready_ticket(dir.path());
+
+        assert!(run_validate(dir.path(), false).is_ok());
+        let hooks = fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
+        assert!(hooks.contains("on-stop.sh"));
+        assert!(hooks.contains("on-clear.sh"));
+        assert!(hooks.contains("on-heartbeat.sh"));
+    }
+
+    #[test]
+    fn test_validate_codex_rejects_unrelated_hooks_with_same_event() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"codex-project\"\n",
+        )
+        .unwrap();
+        run_init(dir.path(), false).unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            format!(
+                "version = \"{}\"\n\n[agent]\nclient = \"codex\"\n",
+                config::LISA_VERSION
+            ),
+        )
+        .unwrap();
+        write_ready_ticket(dir.path());
+        fs::write(
+            dir.path().join(".codex/hooks.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"./mine.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert!(run_validate(dir.path(), false).is_err());
     }
 
     #[test]

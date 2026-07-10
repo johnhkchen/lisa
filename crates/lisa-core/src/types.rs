@@ -566,10 +566,9 @@ pub struct PluginConfig {
     pub client: AgentClient,
 
     /// Absolute path to the `lisa` binary, captured at `lisa loop` time via
-    /// `current_exe()` and passed through the layout. The Codex adapter uses it to
-    /// build `<lisa> agent-exec …` launch lines without assuming `lisa` is on the
-    /// pane shell's PATH. `None` when the layout omits it (older layout, or
-    /// `current_exe()` failure) — the adapter falls back to the bare `lisa`. Not
+    /// `current_exe()` and passed through the layout. Native adapters export it as
+    /// `LISA_BIN` so lifecycle hooks can invoke `lisa capture-usage` without a
+    /// PATH assumption. `None` falls back to bare `lisa`. Not
     /// `/host`-prefixed: the pane shell runs on the host, outside the WASI mount,
     /// so this is the real host path.
     #[serde(default)]

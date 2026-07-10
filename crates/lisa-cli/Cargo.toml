@@ -16,7 +16,7 @@ name = "lisa"
 path = "src/main.rs"
 
 [dependencies]
-lisa-core = { version = "0.4.0-rc.2", path = "../lisa-core" }
+lisa-core = { version = "0.4.0-rc.3", path = "../lisa-core" }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }

@@ -29,8 +29,8 @@
 //! # Vocabulary-only
 //!
 //! The resolver never interprets the model string; it passes it through so the
-//! adapter can map it to the right flag (`--model` for Claude, the model flag
-//! for the Codex wrapper). This keeps model vocabulary out of `lisa-core`.
+//! adapter can map it to the right provider-native `--model` flag. This keeps
+//! model vocabulary out of `lisa-core`.
 
 use serde::{Deserialize, Serialize};
 

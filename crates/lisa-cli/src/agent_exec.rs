@@ -463,8 +463,19 @@ pub struct AgentExecArgs {
 /// Build the argv passed to the codex binary. Pure, so it is unit-tested without
 /// spawning. `resolved_thread` is `Some(id)` for `--resume` with a known thread,
 /// `None` for a fresh run or a `--resume` that must fall back to `--last`.
+///
+/// `-a/--ask-for-approval` is a top-level codex option on 0.144.0: accepted
+/// before the `exec` subcommand, rejected after it (observed live 2026-07-09;
+/// the pinned research target 0.142.5 tolerated both positions). It must lead
+/// the argv.
 fn build_codex_argv(args: &AgentExecArgs, resolved_thread: Option<&str>) -> Vec<String> {
-    let mut argv: Vec<String> = vec!["exec".to_string()];
+    let mut argv: Vec<String> = Vec::new();
+
+    if !args.bypass_sandbox {
+        argv.push("-a".to_string());
+        argv.push("never".to_string());
+    }
+    argv.push("exec".to_string());
 
     if args.resume {
         argv.push("resume".to_string());
@@ -482,8 +493,6 @@ fn build_codex_argv(args: &AgentExecArgs, resolved_thread: Option<&str>) -> Vec<
     if args.bypass_sandbox {
         argv.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     } else {
-        argv.push("-a".to_string());
-        argv.push("never".to_string());
         argv.push("-s".to_string());
         argv.push("workspace-write".to_string());
     }
@@ -825,13 +834,23 @@ mod tests {
     #[test]
     fn argv_default_flags() {
         let argv = build_codex_argv(&base_args(), None);
-        assert_eq!(argv[0], "exec");
-        assert!(argv.contains(&"--json".to_string()));
-        assert!(argv.contains(&"--skip-git-repo-check".to_string()));
-        assert!(argv.windows(2).any(|w| w == ["-C", "/work"]));
-        assert!(argv.windows(2).any(|w| w == ["-a", "never"]));
-        assert!(argv.windows(2).any(|w| w == ["-s", "workspace-write"]));
-        assert_eq!(argv.last().unwrap(), "do the thing");
+        // Full positional shape — `-a never` precedes `exec` (top-level option
+        // on codex 0.144.0; rejected after the subcommand).
+        assert_eq!(
+            argv,
+            vec![
+                "-a",
+                "never",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                "/work",
+                "-s",
+                "workspace-write",
+                "do the thing",
+            ]
+        );
     }
 
     #[test]
@@ -839,6 +858,7 @@ mod tests {
         let mut a = base_args();
         a.bypass_sandbox = true;
         let argv = build_codex_argv(&a, None);
+        assert_eq!(argv[0], "exec");
         assert!(argv.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!argv.contains(&"never".to_string()));
     }
@@ -848,7 +868,7 @@ mod tests {
         let mut a = base_args();
         a.resume = true;
         let argv = build_codex_argv(&a, Some("th_prev"));
-        assert!(argv.windows(2).any(|w| w == ["resume", "th_prev"]));
+        assert_eq!(argv[..5], ["-a", "never", "exec", "resume", "th_prev"]);
     }
 
     #[test]

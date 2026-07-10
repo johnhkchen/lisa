@@ -23,19 +23,19 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 "#;
 
-/// The on-stop hook script, called by Claude Code's Stop event.
-/// Fires when Claude finishes responding (ready for input).
+/// The on-stop hook script, called by the native client's Stop event.
+/// Fires when Claude or Codex finishes responding (ready for input).
 ///
 /// Beyond writing the `.stopped` signal it forwards the Stop payload (piped on
 /// stdin, carrying `transcript_path`) to `lisa capture-usage`, which sums the
-/// session's token usage into `.lisa/claude/<ticket>.usage.json` for the
+/// session's token usage into the provider-specific usage artifact for the
 /// provenance ledger (T-027-02). Stop fires per *turn*, not per tool call, so the
 /// heartbeat hook stays trivial; the artifact is overwritten each turn with the
 /// cumulative total and read by the plugin only write-after. Capture is
 /// best-effort — `${LISA_BIN:-lisa}` degrades to a PATH lookup and any failure is
 /// swallowed, leaving tokens null (never fabricated).
 pub const ON_STOP_HOOK: &str = r#"#!/bin/sh
-# Lisa stop signal hook — called by Claude Code when it finishes responding.
+# Lisa stop signal hook — called when the native agent finishes responding.
 # Writes a signal file so the plugin knows the pane is ready for input, and
 # captures session token usage for the provenance ledger (T-027-02).
 
@@ -52,10 +52,10 @@ in=$(cat)
 printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage 2>/dev/null || true
 "#;
 
-/// The on-clear hook script, called by Claude Code's SessionStart[clear] event.
+/// The on-clear hook script, called by the native client's SessionStart[clear] event.
 /// Fires after /clear is processed (context cleared).
 pub const ON_CLEAR_HOOK: &str = r#"#!/bin/sh
-# Lisa clear signal hook — called by Claude Code after /clear is processed.
+# Lisa clear signal hook — called after /clear is processed.
 # Writes a signal file so the plugin knows context has been cleared.
 
 SIGNAL_DIR=".lisa/signals"
@@ -66,12 +66,12 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 "#;
 
-/// The heartbeat hook script, called by Claude Code's PostToolUse event.
+/// The heartbeat hook script, called by the native client's PostToolUse event.
 /// Fires after every tool call, proving the session is actively working.
 /// The plugin uses the absence of recent heartbeats — not stop/idle signals,
 /// which fire before agents truly finish — to decide a pane is safe to reuse.
 pub const ON_HEARTBEAT_HOOK: &str = r#"#!/bin/sh
-# Lisa heartbeat signal hook — called by Claude Code after each tool call.
+# Lisa heartbeat signal hook — called after each tool call.
 # Writes a signal file so the plugin knows this session is actively working.
 
 SIGNAL_DIR=".lisa/signals"
@@ -82,8 +82,9 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 "#;
 
-/// Gitignore content for the .lisa/ directory — ignores ephemeral signal files.
-pub const LISA_GITIGNORE: &str = "signals/\n";
+/// Gitignore content for `.lisa/` runtime state. Signal files and per-provider
+/// usage/session artifacts are machine-owned and must never enter the project DAG.
+pub const LISA_GITIGNORE: &str = "signals/\nclaude/\ncodex/\n";
 
 /// The `AGENTS.md` pointer file scaffolded by `lisa init`.
 ///
@@ -231,6 +232,53 @@ pub fn settings_local_json() -> String {
     .to_string()
 }
 
+/// Generate `.codex/hooks.json` for the native interactive Codex adapter.
+///
+/// Codex has no `idle_prompt` or `AskUserQuestion` hook equivalent, so the TUI
+/// installs only the lifecycle signals it can state truthfully: tool progress,
+/// turn completion, and `/clear` completion. The same versioned shell scripts
+/// serve both clients and attribute events through `LISA_PANE_ID`.
+pub fn codex_hooks_json() -> String {
+    r#"{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#
+    .to_string()
+}
+
 /// Ensure a single hook entry exists in the hooks object with the correct command.
 /// For hooks with a matcher (SessionStart, Notification), deduplication checks the matcher value.
 /// For hooks without a matcher (Stop), deduplication checks the command path.
@@ -276,16 +324,28 @@ fn ensure_hook(
 
     match found_idx {
         Some(idx) => {
-            // Entry exists — upgrade the command if it uses the old bare-path form
+            // Entry exists — upgrade Lisa's old bare-path command in place. A
+            // user hook may share the same matcher; keep it and append Lisa's
+            // command instead of treating the matcher alone as a duplicate.
             if let Some(hooks_arr) = arr[idx].get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                let mut lisa_hook_found = false;
                 for hook in hooks_arr.iter_mut() {
                     if let Some(cmd_val) = hook.get_mut("command") {
                         if let Some(existing) = cmd_val.as_str() {
-                            if existing.contains(script_path) && existing != command {
-                                *cmd_val = serde_json::json!(command);
+                            if existing.contains(script_path) {
+                                lisa_hook_found = true;
+                                if existing != command {
+                                    *cmd_val = serde_json::json!(command);
+                                }
                             }
                         }
                     }
+                }
+                if !lisa_hook_found {
+                    hooks_arr.push(serde_json::json!({
+                        "type": "command",
+                        "command": command
+                    }));
                 }
             }
         }
@@ -363,6 +423,41 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
         "PreToolUse",
         Some("AskUserQuestion"),
         NOTIFY_QUESTION_COMMAND,
+    );
+
+    serde_json::to_string_pretty(&root).map_err(|e| format!("failed to serialize JSON: {}", e))
+}
+
+/// Merge the native Codex lifecycle hooks into an existing `.codex/hooks.json`
+/// without disturbing user-owned hook groups.
+pub fn merge_codex_hooks(existing_json: &str) -> Result<String, String> {
+    let mut root: serde_json::Value = serde_json::from_str(existing_json)
+        .map_err(|e| format!("invalid JSON in hooks.json: {}", e))?;
+    let obj = root
+        .as_object_mut()
+        .ok_or("hooks.json root is not an object")?;
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or("hooks.json 'hooks' is not an object")?;
+
+    ensure_hook(
+        hooks_obj,
+        "Stop",
+        None,
+        "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "SessionStart",
+        Some("clear"),
+        "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "PostToolUse",
+        Some(".*"),
+        "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
     );
 
     serde_json::to_string_pretty(&root).map_err(|e| format!("failed to serialize JSON: {}", e))
@@ -616,8 +711,44 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_hooks_json_contains_native_tui_signals() {
+        let json = codex_hooks_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["hooks"]["Stop"].is_array());
+        assert!(parsed["hooks"]["PostToolUse"].is_array());
+        assert_eq!(parsed["hooks"]["PostToolUse"][0]["matcher"], ".*");
+        assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "clear");
+        assert!(json.contains("on-stop.sh"));
+        assert!(json.contains("on-clear.sh"));
+        assert!(json.contains("on-heartbeat.sh"));
+        assert!(!json.contains("idle_prompt"));
+        assert!(!json.contains("AskUserQuestion"));
+    }
+
+    #[test]
+    fn test_merge_codex_hooks_preserves_user_hooks_and_is_idempotent() {
+        let input = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"./mine.sh"}]}],"PostToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"./my-heartbeat.sh"}]}]}}"#;
+        let merged = merge_codex_hooks(input).unwrap();
+        assert!(merged.contains("./mine.sh"));
+        assert!(merged.contains("./my-heartbeat.sh"));
+        assert!(merged.contains("on-stop.sh"));
+        assert!(merged.contains("on-clear.sh"));
+        assert!(merged.contains("on-heartbeat.sh"));
+
+        let again = merge_codex_hooks(&merged).unwrap();
+        assert_eq!(again.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
+        assert_eq!(again.matches("test -x .lisa/hooks/on-clear.sh").count(), 1);
+        assert_eq!(
+            again.matches("test -x .lisa/hooks/on-heartbeat.sh").count(),
+            1
+        );
+    }
+
+    #[test]
     fn test_lisa_gitignore_content() {
         assert!(LISA_GITIGNORE.contains("signals/"));
+        assert!(LISA_GITIGNORE.contains("claude/"));
+        assert!(LISA_GITIGNORE.contains("codex/"));
     }
 
     #[test]

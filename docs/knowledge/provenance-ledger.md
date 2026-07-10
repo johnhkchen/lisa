@@ -48,9 +48,10 @@ Tokens/cost are populated only when a run's adapter surfaces them, and each
 provider's numbers mean subtly different things — record raw, segment by
 `actual.method` before comparing (T-027-02).
 
-- **Codex** runs read `turn.completed.usage` from the wrapper's
-  `.lisa/codex/<ticket>.usage.json` artifact (written by `lisa agent-exec`).
-  Tokens flow through as reported by `codex exec --json`; the exact
+- **Codex** runs read the last cumulative `token_count` from the native TUI
+  transcript named by the Stop hook and write `.lisa/codex/<ticket>.usage.json`.
+  The headless `lisa agent-exec` fallback can write the same artifact from
+  `turn.completed.usage`; the exact
   cached-vs-fresh split is provider-internal and not separated here. `cost_usd`
   is present only if that usage object carries a cost field.
 - **Claude** runs read `.lisa/claude/<ticket>.usage.json`, written by the `Stop`

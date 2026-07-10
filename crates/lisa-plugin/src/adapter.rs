@@ -29,15 +29,10 @@
 //! The trait is shaped so the two other planned integration methods drop in
 //! without changing this interface (epic E-001, Decision 4; design thesis §5):
 //!
-//! - **Native Codex** (`codex exec --json` wrapper, ticket T-023-02):
-//!   [`AgentAdapter::launch_command`] builds the `codex exec` invocation;
-//!   [`AgentAdapter::reset_strategy`] returns [`ResetStrategy::FreshExec`] because
-//!   Codex reuse is a fresh exec, not a `/clear` handshake;
-//!   [`AgentAdapter::follow_up`] returns [`FollowUp::SpawnCommand`] wrapping
-//!   `codex exec resume` (there is no live TUI to type into); and
-//!   [`AgentAdapter::signals`] reports that `.idle`/`.awaiting`/`.cleared` are not
-//!   emitted (they are Claude-only), so the scheduler treats their absence
-//!   correctly.
+//! - **Native Codex**: launches the official interactive TUI with an initial
+//!   prompt, reuses it through the same `/clear` handshake as Claude, and types
+//!   follow-ups into the live composer. Codex lifecycle hooks emit the normalized
+//!   `.heartbeat`/`.stopped`/`.cleared` files the scheduler already consumes.
 //! - **ACP** (Agent Client Protocol, future): a host-side bridge process writes
 //!   the same normalized signal files, so only `launch_command` (launch the
 //!   bridge) and `signals` differ; the rest of the shape is unchanged.
@@ -65,8 +60,8 @@ pub(crate) struct FollowUpContext<'a> {
     pub ticket_dir: &'a Path,
     pub work_dir: &'a Path,
     pub ticket_id: &'a str,
-    // Read by a future Codex SpawnCommand follow-up (T-023-02) to attribute the
-    // resumed exec to a pane; the native TUI follow-up does not need it.
+    // Retained for non-interactive/future bridge adapters that spawn a follow-up
+    // command rather than typing into a live TUI.
     #[allow(dead_code)]
     pub pane_id: u32,
 }
@@ -79,8 +74,7 @@ pub(crate) enum ResetStrategy {
     /// scheduler's `TransitionState` handshake implements.
     ClearHandshake,
     /// Reuse is a fresh launch; there is no in-place reset handshake, so the
-    /// `TransitionState` machine does not apply (native Codex, ACP).
-    // Consumed by T-023-02 (Codex); no adapter returns it in the MVP.
+    /// `TransitionState` machine does not apply (headless/ACP bridges).
     #[allow(dead_code)]
     FreshExec,
 }
@@ -90,8 +84,7 @@ pub(crate) enum ResetStrategy {
 pub(crate) enum FollowUp {
     /// Type the text into the live TUI, then submit (native Claude Code).
     TypeIntoPane(String),
-    /// Spawn a host command, e.g. `codex exec resume …` (native Codex, ACP).
-    // Consumed by T-023-02 (Codex); no adapter returns it in the MVP.
+    /// Spawn a host command for a headless or bridged follow-up.
     #[allow(dead_code)]
     SpawnCommand(String),
 }
@@ -100,10 +93,8 @@ pub(crate) enum FollowUp {
 /// `.heartbeat`/`.stopped`(/`.error`) core that every adapter must produce.
 ///
 /// A `false` field tells the scheduler it must not wait on or expect that
-/// signal from this adapter. `.idle`/`.awaiting`/`.cleared` are Claude-only; a
-/// Codex/ACP adapter reports `false` for the ones it does not emit so the
-/// scheduler treats their absence correctly (the `.error` consumer itself is
-/// ticket T-022-02).
+/// signal from this adapter. Codex emits `.cleared` but has no equivalent of
+/// Claude's `.idle`/`.awaiting` signals.
 // Declared here (with the native adapter reporting its set) as the
 // "expected-signal-set" seam; the behavioural consumer is the `.error` work in
 // T-022-02 and the Codex adapter in T-023-02, which read it to treat the absence
@@ -120,7 +111,7 @@ pub(crate) struct SignalCapabilities {
 }
 
 /// A pluggable agent client. Each integration *method* (native Claude Code,
-/// native Codex `exec` wrapper, future ACP bridge) implements this to supply the
+/// native Codex TUI, future ACP bridge) implements this to supply the
 /// behaviour that differs per method. See the [module docs](self) for how Codex
 /// and ACP fit this shape without redesign, and for the WASM constraint that
 /// makes every method return a description rather than perform I/O.
@@ -216,30 +207,21 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 }
 
-/// Native Codex adapter: drives the `lisa agent-exec` wrapper (T-023-01), which
-/// runs `codex exec --json` and writes lisa's signal files. Unlike the Claude
-/// leg there is no live TUI and no `/clear` handshake — every session is a fresh
-/// `agent-exec` invocation typed into the pane's shell, so:
+/// Native Codex adapter: launches the official interactive CLI so Codex panes
+/// have the same first-class chat experience as Claude panes.
 ///
-/// - [`Self::launch_command`] and [`Self::reuse_prompt`] both return the *same*
-///   full wrapper line (there is no "bare prompt" mode — a reused pane is at its
-///   shell prompt, not inside a running agent).
-/// - [`Self::reset_strategy`] is [`ResetStrategy::FreshExec`], so the scheduler's
-///   `WaitingForClear` machinery never engages for a Codex pane.
-/// - [`Self::follow_up`] is [`FollowUp::SpawnCommand`] wrapping
-///   `agent-exec --resume` (re-enters the persisted thread with the finish-up
-///   prompt) rather than typing into a live TUI.
-/// - [`Self::signals`] reports the Claude-only optional signals as absent.
-///
-/// `lisa_bin` is the absolute path to the `lisa` binary, captured at `lisa loop`
-/// time via `current_exe()` and threaded through the plugin config — the pane
-/// shell may not have `lisa` on its PATH. It falls back to the bare `lisa` when
-/// the layout omits it (see [`CodexAdapter::new`]).
+/// Lisa-generated Codex hooks mirror the Claude hook contract: `Stop` writes
+/// `.stopped`, `SessionStart[clear]` writes `.cleared`, and `PostToolUse` writes
+/// `.heartbeat`. That lets Codex use [`ResetStrategy::ClearHandshake`] and keeps
+/// the live TUI resident across tickets. `--dangerously-bypass-hook-trust` is
+/// scoped to this invocation because lisa generated the hook definitions. Agent
+/// command execution uses Codex's full-access/no-approval mode, matching the
+/// existing Claude `--dangerously-skip-permissions` contract and allowing the
+/// RDSPI workflow to commit through `.git`.
 pub(crate) struct CodexAdapter {
     lisa_bin: String,
-    /// The routed model for this pane (T-026-01), forwarded to the wrapper as
-    /// `--model <m>` (which the wrapper passes to `codex exec`). `None` runs
-    /// codex's default model.
+    /// The routed model for this pane (T-026-01), mapped to Codex's top-level
+    /// `--model <m>` option. `None` runs Codex's default model.
     model: Option<String>,
 }
 
@@ -258,8 +240,8 @@ impl CodexAdapter {
         }
     }
 
-    /// The ` --model <m>` fragment for the `agent-exec` line, or empty when no
-    /// model is routed (the pre-routing wrapper line).
+    /// The ` --model <m>` fragment for the interactive Codex line, or empty when
+    /// no model is routed.
     fn model_flag(&self) -> String {
         match &self.model {
             Some(m) => format!(" --model {}", m),
@@ -267,17 +249,19 @@ impl CodexAdapter {
         }
     }
 
-    /// The full wrapper shell line for a fresh (or reused) run of `ticket_id` on
-    /// `pane_id`. The env prefix mirrors `build_claude_command` so the wrapper
-    /// inherits `LISA_PANE_ID`/`LISA_TICKET_ID` for signal attribution and the
-    /// resume key. The prompt is wrapped in plain double quotes exactly as the
-    /// Claude line is — the RDSPI prompts contain no shell metacharacters.
-    fn agent_exec_line(&self, ctx: &SpawnContext) -> String {
+    /// The full interactive shell line for a fresh Codex TUI. The env prefix
+    /// gives lifecycle hooks pane/ticket attribution and tells `capture-usage`
+    /// to parse the Codex transcript into `.lisa/codex/`.
+    fn interactive_line(&self, ctx: &SpawnContext) -> String {
         format!(
-            "LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} {bin} agent-exec{model} \"{prompt}\"",
+            "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} \
+             codex --dangerously-bypass-approvals-and-sandbox \
+             --dangerously-bypass-hook-trust{model} \"{prompt}\" || \
+             {{ mkdir -p .lisa/signals; date -u +%Y-%m-%dT%H:%M:%SZ > \
+             .lisa/signals/pane-{pane}.error; }}",
+            bin = self.lisa_bin,
             pane = ctx.pane_id,
             ticket = ctx.ticket_id,
-            bin = self.lisa_bin,
             model = self.model_flag(),
             // Codex auto-loads AGENTS.md, not CLAUDE.md.
             prompt = ticket_prompt(
@@ -291,50 +275,42 @@ impl CodexAdapter {
 
 impl AgentAdapter for CodexAdapter {
     fn launch_command(&self, ctx: &SpawnContext) -> String {
-        self.agent_exec_line(ctx)
+        self.interactive_line(ctx)
     }
 
     fn reset_strategy(&self) -> ResetStrategy {
-        // Reuse is a fresh exec — the finished codex process leaves the pane's
-        // shell at its prompt, so there is nothing to `/clear`.
-        ResetStrategy::FreshExec
+        ResetStrategy::ClearHandshake
     }
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
-        // Identical to launch: reuse types a fresh wrapper command for the new
-        // ticket, not a bare prompt into a live TUI.
-        self.agent_exec_line(ctx)
+        ticket_prompt(
+            ctx.ticket_dir,
+            ctx.ticket_id,
+            AgentClient::Codex.context_file(),
+        )
     }
 
     fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
-        // Re-enter the persisted thread (`--resume`) with the finish-up prompt.
-        // The pane shell re-launches codex; there is no live TUI to type into.
-        let cmd = format!(
-            "LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} {bin} agent-exec --resume{model} \"{prompt}\"",
-            pane = ctx.pane_id,
-            ticket = ctx.ticket_id,
-            bin = self.lisa_bin,
-            model = self.model_flag(),
-            prompt = finish_up_prompt(ctx.ticket_dir, ctx.work_dir, ctx.ticket_id),
-        );
-        FollowUp::SpawnCommand(cmd)
+        FollowUp::TypeIntoPane(finish_up_prompt(
+            ctx.ticket_dir,
+            ctx.work_dir,
+            ctx.ticket_id,
+        ))
     }
 
     fn signals(&self) -> SignalCapabilities {
-        // The Codex `exec -a never` path emits only the core
-        // `.heartbeat`/`.stopped`/`.error` set — none of the Claude-only signals.
         SignalCapabilities {
             idle: false,
             awaiting: false,
-            cleared: false,
+            cleared: true,
         }
     }
 }
 
 /// Map a resolved route to its adapter.
 ///
-/// `lisa_bin` is the absolute `lisa` path (plugin config) the Codex adapter needs
-/// to build `<lisa> agent-exec …` lines; it is unused by the Claude arm. The
+/// `lisa_bin` is the absolute `lisa` path exported to lifecycle hooks so usage
+/// capture does not depend on the pane shell's PATH. The
 /// route's `model` (T-026-01) is threaded into the adapter so the launch line
 /// carries the right model flag.
 fn adapter_for_route(route: &ResolvedRoute, lisa_bin: Option<&str>) -> Box<dyn AgentAdapter> {
@@ -505,20 +481,20 @@ mod tests {
 
     #[test]
     fn resolver_codex_resolves_native_codex_adapter() {
-        // T-023-02: a Codex selection now resolves to the real CodexAdapter,
-        // identified by its FreshExec reset strategy (no /clear handshake).
+        // Codex now keeps a native TUI resident and participates in the same
+        // /clear handshake as Claude.
         let ticket = Ticket::new("T-002", "codex-example");
         assert_eq!(
             resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
-            ResetStrategy::FreshExec
+            ResetStrategy::ClearHandshake
         );
         assert_eq!(
             resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
-            ResetStrategy::FreshExec
+            ResetStrategy::ClearHandshake
         );
     }
 
@@ -530,7 +506,10 @@ mod tests {
         let mut ticket = Ticket::new("T-003", "routed-codex");
         ticket.agent = Some("codex".to_string());
         let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, Some("/abs/lisa"));
-        assert_eq!(adapter.reset_strategy(), ResetStrategy::FreshExec);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert!(adapter
+            .launch_command(&spawn_ctx(Path::new("docs/active/tickets"), "T-003", 1))
+            .contains(" codex "));
         assert_eq!(route.agent, AgentClient::Codex);
         assert!(!route.substituted);
     }
@@ -541,7 +520,7 @@ mod tests {
         let mut ticket = Ticket::new("T-004", "bad-route");
         ticket.agent = Some("gpt".to_string());
         let (adapter, route) = resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"));
-        assert_eq!(adapter.reset_strategy(), ResetStrategy::FreshExec);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
         assert_eq!(route.agent, AgentClient::Codex);
         assert!(route.substituted);
         assert!(route.note.unwrap().contains("gpt"));
@@ -559,7 +538,7 @@ mod tests {
         let (adapter_a, route_a) = resolve_adapter(&a, AgentClient::Claude, Some("/abs/lisa"));
         let (adapter_b, route_b) = resolve_adapter(&b, AgentClient::Claude, Some("/abs/lisa"));
 
-        assert_eq!(adapter_a.reset_strategy(), ResetStrategy::FreshExec);
+        assert_eq!(adapter_a.reset_strategy(), ResetStrategy::ClearHandshake);
         assert_eq!(adapter_b.reset_strategy(), ResetStrategy::ClearHandshake);
         assert_eq!(route_a.agent, AgentClient::Codex);
         assert_eq!(route_a.model.as_deref(), Some("gpt-5"));
@@ -578,8 +557,12 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
-        assert!(cmd.starts_with("LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 /abs/lisa agent-exec "));
-        assert!(cmd.contains("agent-exec \""));
+        assert!(cmd.starts_with(
+            "LISA_BIN=/abs/lisa LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 codex "
+        ));
+        assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(cmd.contains("--dangerously-bypass-hook-trust"));
+        assert!(cmd.contains(".lisa/signals/pane-7.error"));
         // The wrapped prompt is the shared RDSPI ticket prompt, verbatim — with
         // Codex's context file (AGENTS.md).
         assert!(cmd.contains(&ticket_prompt(
@@ -608,37 +591,38 @@ mod tests {
 
     #[test]
     fn codex_launch_with_model_emits_flag() {
-        // A routed model (T-026-01) is forwarded to the wrapper as `--model`,
-        // placed between `agent-exec` and the quoted prompt.
+        // A routed model (T-026-01) is forwarded to the interactive CLI.
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = CodexAdapter::new(Some("/abs/lisa"), Some("gpt-5")).launch_command(&ctx);
-        assert!(cmd.contains("agent-exec --model gpt-5 \""), "got: {cmd}");
+        assert!(cmd.contains("--model gpt-5 \""), "got: {cmd}");
         // No model → no flag (pre-routing wrapper line).
         let bare = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
         assert!(!bare.contains("--model"), "got: {bare}");
     }
 
     #[test]
-    fn codex_reuse_equals_launch_no_handshake() {
-        // Reuse-without-handshake: a reused Codex pane types the same fresh
-        // wrapper line as a launch (not a bare prompt into a live TUI).
+    fn codex_reuse_is_bare_prompt_for_live_tui() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 3);
         let a = CodexAdapter::new(Some("/abs/lisa"), None);
-        assert_eq!(a.reuse_prompt(&ctx), a.launch_command(&ctx));
+        assert_eq!(
+            a.reuse_prompt(&ctx),
+            ticket_prompt(dir, "T-042-01", AgentClient::Codex.context_file())
+        );
+        assert!(!a.reuse_prompt(&ctx).contains(" codex "));
     }
 
     #[test]
-    fn codex_reset_is_fresh_exec() {
+    fn codex_reset_is_clear_handshake() {
         assert_eq!(
             CodexAdapter::new(Some("/abs/lisa"), None).reset_strategy(),
-            ResetStrategy::FreshExec
+            ResetStrategy::ClearHandshake
         );
     }
 
     #[test]
-    fn codex_follow_up_is_spawn_resume() {
+    fn codex_follow_up_is_typed_into_live_tui() {
         let ticket_dir = Path::new("docs/active/tickets");
         let work_dir = Path::new("docs/active/work");
         let ctx = FollowUpContext {
@@ -647,24 +631,20 @@ mod tests {
             ticket_id: "T-042-01",
             pane_id: 9,
         };
-        match CodexAdapter::new(Some("/abs/lisa"), None).follow_up(&ctx) {
-            FollowUp::SpawnCommand(cmd) => {
-                assert!(cmd.contains("LISA_PANE_ID=9 LISA_TICKET_ID=T-042-01 /abs/lisa"));
-                assert!(cmd.contains("agent-exec --resume \""));
-                assert!(cmd.contains(&finish_up_prompt(ticket_dir, work_dir, "T-042-01")));
-            }
-            other => panic!("expected SpawnCommand, got {:?}", other),
-        }
+        assert_eq!(
+            CodexAdapter::new(Some("/abs/lisa"), None).follow_up(&ctx),
+            FollowUp::TypeIntoPane(finish_up_prompt(ticket_dir, work_dir, "T-042-01"))
+        );
     }
 
     #[test]
-    fn codex_signals_all_false() {
+    fn codex_signals_include_clear_handshake() {
         assert_eq!(
             CodexAdapter::new(Some("/abs/lisa"), None).signals(),
             SignalCapabilities {
                 idle: false,
                 awaiting: false,
-                cleared: false,
+                cleared: true,
             }
         );
     }
@@ -673,10 +653,10 @@ mod tests {
     fn codex_new_falls_back_to_bare_lisa() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-001", 1);
-        // None and empty both degrade to the bare `lisa` (PATH lookup).
+        // None and empty both degrade to a PATH-resolved `lisa` for hooks.
         for bin in [None, Some("")] {
             let cmd = CodexAdapter::new(bin, None).launch_command(&ctx);
-            assert!(cmd.contains(" lisa agent-exec \""), "cmd: {cmd}");
+            assert!(cmd.starts_with("LISA_BIN=lisa "), "cmd: {cmd}");
         }
     }
 }

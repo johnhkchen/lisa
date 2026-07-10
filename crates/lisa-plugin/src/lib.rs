@@ -253,8 +253,8 @@ pub struct State {
     /// write, so unrelated teardown-triggering tests never write to disk.
     ledger_path: PathBuf,
 
-    /// Directory the Codex `agent-exec` wrapper writes usage artifacts into
-    /// (`.lisa/codex/` under /host/). Read at teardown for Codex tokens/cost.
+    /// Directory native Codex usage capture (or the headless fallback) writes
+    /// artifacts into (`.lisa/codex/` under /host/).
     codex_dir: PathBuf,
 
     /// Directory the Claude `Stop` hook's `lisa capture-usage` writes usage
@@ -713,10 +713,10 @@ impl State {
                             Some(std::time::SystemTime::now());
                         launch_cmd = reuse_prompt;
                     }
-                    // Reuse-as-fresh-exec (native Codex). The finished codex
+                    // Reuse-as-fresh-exec (headless/bridge adapters). The prior
                     // process left the pane's shell at its prompt, so there is no
-                    // /clear handshake: type a fresh wrapper command for the new
-                    // ticket directly. WaitingForClear must not engage — leaving
+                    // /clear handshake: type a fresh command for the new ticket.
+                    // WaitingForClear must not engage — leaving
                     // transition_state untouched (Idle) keeps the .cleared/
                     // clear-timeout machinery inert for this pane.
                     ResetStrategy::FreshExec => {
@@ -1294,9 +1294,9 @@ impl State {
 
     /// Scan for `pane-<id>.error` signal files and fail the owning thread promptly.
     ///
-    /// Emitted by adapters (the Codex wrapper on `turn.failed` / non-zero exit,
-    /// T-023-01) — never by Claude Code hooks, so this consumer is inert for Claude
-    /// panes. On `.error` for a running thread it performs the same reclaim
+    /// Emitted by adapters (native Codex on non-zero TUI exit, the JSON fallback
+    /// on `turn.failed`, and future bridges) — never by Claude Code hooks, so this
+    /// consumer is inert for Claude panes. On `.error` for a running thread it performs the same reclaim
     /// `check_session_timeouts` does on silence, but immediately: fail the thread,
     /// release its slot, remove it (so the ticket re-enters `get_ready_tickets` for
     /// retry), and surface a `Failed` alert. For an idle/unknown pane the file is
@@ -1304,7 +1304,7 @@ impl State {
     ///
     /// Runs before `check_transition_timeouts` so an errored pane is failed, not
     /// force-advanced by the transition-timeout fallback. Presence is the signal;
-    /// any body (the wrapper may write the error text for humans) is ignored.
+    /// any body is ignored.
     fn check_error_signals(&mut self) {
         let entries = match std::fs::read_dir(&self.signal_dir) {
             Ok(entries) => entries,
@@ -1540,7 +1540,8 @@ impl State {
 
     /// Read tokens/cost from a run's usage artifact, selecting the per-provider
     /// directory by client:
-    /// - Codex → `.lisa/codex/<ticket>.usage.json` (written by `lisa agent-exec`).
+    /// - Codex → `.lisa/codex/<ticket>.usage.json` (written by the native Stop
+    ///   hook's `lisa capture-usage`, or by the JSON fallback).
     /// - Claude → `.lisa/claude/<ticket>.usage.json` (written by the Stop hook's
     ///   `lisa capture-usage`, T-027-02).
     ///
@@ -1756,10 +1757,9 @@ impl State {
             }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let host_work_dir = strip_host_prefix(&self.config.work_dir);
-            // Adapter owns the follow-up mechanism (native Claude → type the
-            // finish-up prompt into the live TUI; native Codex → type an
-            // `agent-exec --resume` wrapper line into the pane's shell, which the
-            // finished exec left at its prompt).
+            // Adapter owns the follow-up mechanism. Native Claude and Codex type
+            // the finish-up prompt into their live TUIs; headless/future bridges
+            // may instead return a full spawn command.
             // Reuse path only needs the adapter; the route is surfaced at spawn.
             let (adapter, _route) = resolve_adapter_or_native(
                 self.dag.get_ticket(&ticket_id),
@@ -1775,8 +1775,8 @@ impl State {
             match follow_up {
                 // Both variants reach the pane the same way — send_line_to_pane is
                 // the only pane I/O the WASM plugin has. The distinction is the
-                // string: a live-TUI prompt vs a shell command that re-launches
-                // codex. (SpawnCommand carries a full env-prefixed wrapper line.)
+                // string: a live-TUI prompt vs a shell command for a headless or
+                // bridged adapter.
                 FollowUp::TypeIntoPane(prompt) => {
                     self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
                 }
@@ -2920,7 +2920,7 @@ impl ZellijPlugin for State {
         // Signal directory for idle signal detection
         self.signal_dir = host.join(".lisa/signals");
 
-        // Provenance ledger + the Codex wrapper's usage-artifact directory.
+        // Provenance ledger + per-provider usage-artifact directories.
         self.ledger_path = host.join(".lisa/provenance.jsonl");
         self.codex_dir = host.join(".lisa/codex");
         self.claude_dir = host.join(".lisa/claude");
@@ -8440,8 +8440,8 @@ mod tests {
             pane_id,
             ticket_id: Some(ticket.to_string()),
             has_session: true,
-            // FreshExec: a Codex slot is never in the WaitingForStop/Clear
-            // handshake — it sits Idle between execs.
+            // A running/ready native TUI sits Idle. When the slot is reassigned,
+            // scheduling moves it through WaitingForClear before the next prompt.
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
@@ -8502,7 +8502,7 @@ mod tests {
     }
 
     /// AC: `.stopped` at run end triggers Review auto-completion, dependencies
-    /// respected. Codex's `.stopped` lands on an Idle slot (FreshExec), so
+    /// respected. Codex's `.stopped` lands on an Idle live-TUI slot, so
     /// `handle_stopped_signal` Case 2 fires; the dep guard blocks a dependent
     /// ticket whose dependency is not yet Done.
     #[test]
@@ -8645,12 +8645,9 @@ mod tests {
         assert_eq!(state.error_alerts, vec![("T-CDX-01".to_string(), 1)]);
     }
 
-    /// AC: the review-timeout finish-up path works via `agent-exec --resume`.
-    /// (a) the scheduler *takes* the finish-up path for a quiet, timed-out Codex
-    /// Review thread; (b) the Codex adapter's follow-up *is* an
-    /// `agent-exec --resume` line carrying the finish-up prompt.
+    /// AC: the review-timeout finish-up path types into the native Codex TUI.
     #[test]
-    fn test_codex_review_timeout_finish_up_is_agent_exec_resume() {
+    fn test_codex_review_timeout_finish_up_types_into_tui() {
         use lisa_core::types::Thread;
 
         // (a) path fires for a Codex Review thread past timeout + wind-down.
@@ -8681,7 +8678,7 @@ mod tests {
             ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-CDX-01"
         )));
 
-        // (b) the delivered line is `agent-exec --resume "<finish_up_prompt>"`.
+        // (b) the delivered value is the bare finish-up prompt for the composer.
         let ticket_dir = Path::new("docs/active/tickets");
         let work_dir = Path::new("docs/active/work");
         let (adapter, _route) =
@@ -8692,14 +8689,10 @@ mod tests {
             ticket_id: "T-CDX-01",
             pane_id: 1,
         });
-        match follow_up {
-            FollowUp::SpawnCommand(cmd) => {
-                assert!(cmd.contains("agent-exec --resume \""), "cmd: {cmd}");
-                assert!(cmd.contains(&finish_up_prompt(ticket_dir, work_dir, "T-CDX-01")));
-                assert!(cmd.contains("LISA_PANE_ID=1 LISA_TICKET_ID=T-CDX-01 /abs/lisa"));
-            }
-            other => panic!("Codex follow-up must be SpawnCommand, got {other:?}"),
-        }
+        assert_eq!(
+            follow_up,
+            FollowUp::TypeIntoPane(finish_up_prompt(ticket_dir, work_dir, "T-CDX-01"))
+        );
     }
 
     /// AC: the dashboard shows sane states throughout — no phantom "awaiting".
@@ -8859,7 +8852,7 @@ mod tests {
         assert_eq!(records[1].outcome, RunOutcome::Failed);
     }
 
-    /// AC: Codex tokens flow from the wrapper's usage artifact into the record.
+    /// AC: Codex tokens flow from its usage artifact into the record.
     #[test]
     fn provenance_codex_usage_flows_into_record() {
         use lisa_core::types::Thread;

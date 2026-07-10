@@ -3,6 +3,9 @@ members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.30.4"
+# The release workflow is deliberately extended with an auto-tag dispatch path.
+# Keep cargo-dist from replacing that supported customization during releases.
+allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell", "homebrew"]
 targets = [

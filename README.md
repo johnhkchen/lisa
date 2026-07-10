@@ -175,29 +175,34 @@ Precedence is `--client` > `.lisa.toml [agent].client` > default (`claude`).
   npm i -g @openai/codex
   ```
 
-- **Version pinning caveat.** Codex's CLI surface (flags, JSON event stream, trust
-  model) drifts between releases. Pin or track a known-good `codex` version;
-  Lisa's wrapper is validated against a specific version. `lisa doctor` reports the
-  installed `codex --version` so you can confirm what you're running.
-- **Directory trust.** Unattended `codex exec` blocks on an interactive
+- **Version pinning caveat.** Codex's CLI flags, hooks, and trust model can drift
+  between releases. `lisa doctor` reports the installed `codex --version` so you
+  can confirm what you're running.
+- **Directory trust.** A native Codex session can block on an interactive
   directory-trust prompt. When Codex is selected, `lisa doctor` and `lisa loop`
   pre-seed `trust_level = "trusted"` for the project in `$CODEX_HOME/config.toml`
-  (default `~/.codex/config.toml`), best-effort. If seeding fails, the escape
-  hatch is running Codex with `--dangerously-bypass-approvals-and-sandbox`.
+  (default `~/.codex/config.toml`), best-effort.
 
 Run `lisa doctor` after selecting Codex (and after every `codex` upgrade) to
 verify the binary, version, and trust seeding.
 
 ### What runs in the pane
 
-A Codex ticket does not launch the Claude TUI. Instead Lisa types a
-`lisa agent-exec` command into the pane, which runs `codex exec --json` and
-translates Codex's event stream into the same `.lisa/signals/` files the scheduler
-consumes. Because there is no live TUI, reusing a pane for the next ticket is a
-fresh `codex exec` (not a `/clear` handshake), and Codex reads `AGENTS.md` for
-project context (Claude reads `CLAUDE.md`). `lisa init` scaffolds both files;
-`AGENTS.md` points at `CLAUDE.md` as the single source of truth, so they cannot
-drift.
+A Codex ticket launches the official interactive Codex TUI with its initial RDSPI
+prompt, just as the Claude path launches Claude Code. Lisa-generated hooks in
+`.codex/hooks.json` translate `Stop`, `SessionStart[clear]`, and `PostToolUse`
+into the same `.lisa/signals/` files the scheduler consumes. A reused pane stays
+inside Codex: Lisa sends `/clear`, waits for the clear hook, then types the next
+ticket prompt. Review follow-ups are typed into the live composer too.
+
+Codex reads `AGENTS.md` for project context (Claude reads `CLAUDE.md`). `lisa
+init` scaffolds both files plus both clients' hook configuration; `AGENTS.md`
+points at `CLAUDE.md` as the single source of truth. Re-run `lisa init` in an
+existing project before its first native Codex loop.
+
+The lower-level `lisa agent-exec` / `codex exec --json` path remains available
+for diagnostics and explicitly headless automation, but `lisa loop` no longer
+uses its JSON renderer for Codex panes.
 
 ## How It Works
 

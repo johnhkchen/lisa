@@ -1,7 +1,22 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::config::ResolvedConfig;
 use crate::templates::PLUGIN_WASM;
+use lisa_core::client::AgentClient;
+
+/// Providers that may be scheduled in this loop: the loop default plus every
+/// valid per-ticket route. Preflight must cover all of them, not just the default.
+fn configured_clients(root: &Path, config: &ResolvedConfig) -> HashSet<AgentClient> {
+    let mut clients = HashSet::from([config.client]);
+    let ticket_dir = root.join(&config.ticket_dir);
+    if let Ok(tickets) = lisa_core::ticket::scan_tickets(&ticket_dir) {
+        for ticket in tickets {
+            clients.insert(lisa_core::route::resolve_route(&ticket, config.client).agent);
+        }
+    }
+    clients
+}
 
 /// Run the lisa loop: write embedded WASM, generate layout, exec zellij.
 ///
@@ -23,20 +38,31 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         return run_dry(root, config);
     }
 
-    // Validate binary prerequisites for the *selected* client (skip in dry-run —
-    // user may not have them installed)
-    crate::doctor::check_required_deps(config.client).map_err(|missing| {
-        format!(
-            "Missing required dependencies: {}\n\nRun `lisa doctor` for details and install instructions.",
-            missing.join(", ")
-        )
-    })?;
+    let clients = configured_clients(root, config);
 
-    // Codex runs unattended (`codex exec`), which blocks on the interactive
-    // directory-trust prompt unless the working tree is pre-seeded as trusted.
-    // Best-effort — mirrors `lisa doctor`; a failure here is not fatal (the
-    // operator can fall back to --bypass-sandbox).
-    if config.client == lisa_core::client::AgentClient::Codex {
+    // Validate every provider the DAG can route to (skip in dry-run — user may
+    // not have them installed). This matters for mixed Claude+Codex loops whose
+    // loop default names only one of the two binaries.
+    for client in &clients {
+        crate::doctor::check_required_deps(*client).map_err(|missing| {
+            format!(
+                "Missing dependencies for {client}: {}\n\nRun `lisa doctor` for details and install instructions.",
+                missing.join(", ")
+            )
+        })?;
+    }
+
+    // The native Codex TUI can stop at its directory-trust prompt before Lisa's
+    // injected ticket is handled, so pre-seed trust for every loop that may route
+    // to Codex. Best-effort — the launch command independently bypasses approval,
+    // sandbox, and generated-hook trust prompts for the managed pane.
+    if clients.contains(&AgentClient::Codex) {
+        if !root.join(".codex/hooks.json").exists() {
+            return Err(
+                "No .codex/hooks.json found for the native Codex TUI. Run `lisa init` first."
+                    .to_string(),
+            );
+        }
         crate::doctor::pregrant_codex_trust(root);
     }
 
@@ -75,9 +101,8 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     crate::doctor::pregrant_plugin_permissions(&wasm_path);
 
     // Capture the absolute `lisa` binary path now (on the host, before exec) so
-    // the Codex adapter can invoke `<lisa> agent-exec …` without assuming `lisa`
-    // is on the pane shell's PATH. current_exe() failure degrades to the bare
-    // `lisa` (the plugin omits the key).
+    // native agent hooks can invoke `lisa capture-usage` without assuming `lisa`
+    // is on the pane shell's PATH. current_exe() failure degrades to bare `lisa`.
     let lisa_bin = std::env::current_exe().ok();
 
     // Generate KDL layout
@@ -247,9 +272,8 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
         agent_panes.push_str("            pane\n");
     }
 
-    // The absolute `lisa` path (current_exe), for the Codex adapter's
-    // `<lisa> agent-exec …` lines. Emitted only when known — an absent key makes
-    // the plugin fall back to the bare `lisa` on the pane shell's PATH.
+    // The absolute `lisa` path (current_exe), exported by native adapters for
+    // lifecycle-hook usage capture. An absent key falls back to PATH.
     let lisa_bin_line = match lisa_bin {
         Some(p) => format!("                lisa_bin \"{}\"\n", p.display()),
         None => String::new(),
@@ -392,6 +416,30 @@ mod tests {
         };
         let layout = generate_layout(&wasm_path, None, &config);
         assert!(layout.contains("client \"codex\""));
+    }
+
+    #[test]
+    fn test_configured_clients_includes_mixed_ticket_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets = dir.path().join("docs/active/tickets");
+        std::fs::create_dir_all(&tickets).unwrap();
+        std::fs::write(
+            tickets.join("T-001.md"),
+            "---\nid: T-001\ntitle: routed\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: codex\n---\n",
+        )
+        .unwrap();
+
+        let clients = configured_clients(dir.path(), &default_config());
+        assert!(clients.contains(&AgentClient::Claude));
+        assert!(clients.contains(&AgentClient::Codex));
+    }
+
+    #[test]
+    fn test_configured_clients_single_provider_stays_single() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        let clients = configured_clients(dir.path(), &default_config());
+        assert_eq!(clients, HashSet::from([AgentClient::Claude]));
     }
 
     #[test]

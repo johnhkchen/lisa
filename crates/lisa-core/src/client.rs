@@ -25,7 +25,7 @@ pub enum AgentClient {
     /// anchor leg.
     #[default]
     Claude,
-    /// Native Codex (`codex exec --json` wrapper).
+    /// Native Codex interactive TUI with Lisa lifecycle hooks.
     Codex,
 }
 

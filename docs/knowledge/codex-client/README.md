@@ -13,6 +13,15 @@ per-pane provider/model routing** in `lisa loop`.
 *how* is left to the epic's tickets and their RDSPI cycles); doc 08 states the
 *what* and *why*.
 
+> **Implementation update (2026-07-09):** the wrapper recommendation below is
+> retained as the historical decision record, but it no longer describes Lisa's
+> default Codex path. A fresh spike against Codex 0.144.0 verified the native TUI
+> contract that the original 0.142.5 research treated as too risky: positional
+> prompt launch, inherited `LISA_PANE_ID` in Stop/SessionStart hooks, `/clear`
+> delivery, and delayed text-then-Enter follow-ups. Lisa now launches the native
+> TUI and keeps `agent-exec` as a headless fallback. See
+> [09 · Native-TUI parity decision](./09-native-tui-parity.md).
+
 Compiled 2026-07-01 from a multi-agent sweep: 5 readers over the lisa repo, 5 web
 researchers over official Codex docs + `openai/codex` issues, 6 adversarial
 verifiers on the highest-risk correspondences, and a synthesis pass. Codex facts
@@ -30,6 +39,7 @@ are pinned to stable **`rust-v0.142.5`**.
 | [06 · Off-the-shelf tooling](./06-off-the-shelf-tooling.md) | What we can **reuse**: SDKs/wrappers/renderers, orchestrator prior art, and **ACP** as a possible unified Claude+Codex client layer. Tactical vs. strategic tiers. |
 | [07 · Ecosystem viability](./07-ecosystem-viability.md) | **Strategic read.** Traction/backing/philosophy: what's a safe bet (MCP, AGENTS.md), the dying orchestrator middle, and lisa's DAG+hooks whitespace. |
 | [08 · Design thesis & target architecture](./08-design-thesis.md) | ⭐ **The goal.** The pain, the moat, the bet, and the three-leg adapter portfolio (native Claude + native Codex + ACP) + graduation rule. Read first. |
+| [09 · Native-TUI parity decision](./09-native-tui-parity.md) | **The 2026-07-09 reversal.** Root cause of the JSON-pane disparity, why the wrapper was originally chosen, live 0.144.0 evidence, and the remaining asymmetries. |
 
 > **ACP note (updated by later research):** docs 06/07 rated ACP "watch, don't bet."
 > The capability/trajectory deep-dive **upgrades** it — headless-viable today, with

@@ -69,12 +69,13 @@ enum Commands {
     },
     /// Print version information
     Version,
-    /// Run codex under lisa's signal/rendering wrapper (Codex client path).
+    /// Run Codex under Lisa's legacy JSON signal/rendering wrapper.
     ///
     /// Reads LISA_PANE_ID / LISA_TICKET_ID from the environment (inherited from
     /// the pane launch) for signal attribution. Runs `codex exec --json …`,
     /// translates its event stream into `.lisa/signals/pane-<id>.*` files, and
-    /// renders the conversation to stdout (which is the pane).
+    /// renders the conversation to stdout. `lisa loop` uses the native Codex TUI;
+    /// this remains available for diagnostics and headless automation.
     AgentExec {
         /// The prompt to send to codex.
         prompt: String,

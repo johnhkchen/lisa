@@ -1,16 +1,14 @@
-//! Claude-side token capture for the provenance ledger (T-027-02).
+//! Native-TUI token capture for the provenance ledger.
 //!
-//! The native analogue of the Codex wrapper's usage capture
-//! ([`crate::agent_exec`]'s `persist_run_artifacts`). Claude Code has no
-//! `codex exec --json` stream to read; the only per-session usage surface is the
-//! **transcript JSONL** at `transcript_path`, which the Stop-hook payload names.
+//! Both native clients expose a **transcript JSONL** at the `transcript_path`
+//! named by their Stop-hook payload. The headless Codex fallback separately
+//! captures usage from its JSON event stream.
 //!
-//! `lisa capture-usage` is invoked by the Claude `Stop` hook with that payload on
-//! stdin. It reads `transcript_path`, sums the per-message `message.usage` across
-//! the transcript, and writes `.lisa/claude/<key>.usage.json` in the same nested
-//! `{ ..., usage: { input_tokens, output_tokens } }` shape the plugin's reader
-//! and [`lisa_core::provenance::extract_usage`] already consume — so the Claude
-//! path reuses the Codex reader spine verbatim (T-027-02 design).
+//! `lisa capture-usage` is invoked by both native TUI `Stop` hooks. Claude
+//! transcripts carry per-assistant-message usage that must be summed. Codex
+//! rollouts carry cumulative `event_msg/token_count` records, so the last
+//! `total_token_usage` record wins. `LISA_AGENT_CLIENT=codex` selects the latter
+//! parser and `.lisa/codex/`; absence preserves the Claude behavior.
 //!
 //! Write-after and never-fabricate: Stop fires at *turn* boundaries (not per
 //! tool call — the heartbeat hook stays trivial), and the artifact is overwritten
@@ -27,7 +25,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// The Stop-hook stdin payload. Only `transcript_path` is required; everything
-/// else Claude Code sends (session_id, cwd, …) is ignored.
+/// else the native client sends (session_id, cwd, …) is ignored.
 #[derive(Debug, Deserialize)]
 struct StopPayload {
     #[serde(default)]
@@ -36,7 +34,7 @@ struct StopPayload {
 
 /// Summed, provider-native totals in the shape the plugin reader expects.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct ClaudeUsage {
+struct UsageTotals {
     /// All input-side tokens: fresh + cache-creation + cache-read (design Q3).
     input_tokens: u64,
     output_tokens: u64,
@@ -47,8 +45,8 @@ struct ClaudeUsage {
 /// Defensive against external drift: a non-parseable or non-assistant line is
 /// skipped, an absent token field counts as 0. Drift degrades to an under-count,
 /// never a crash or a fabricated value.
-fn sum_transcript_usage(jsonl: &str) -> ClaudeUsage {
-    let mut total = ClaudeUsage::default();
+fn sum_claude_transcript_usage(jsonl: &str) -> UsageTotals {
+    let mut total = UsageTotals::default();
     for line in jsonl.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -73,9 +71,38 @@ fn sum_transcript_usage(jsonl: &str) -> ClaudeUsage {
     total
 }
 
+/// Read the last cumulative token total from a Codex rollout transcript.
+fn codex_transcript_usage(jsonl: &str) -> UsageTotals {
+    let mut latest = UsageTotals::default();
+    for line in jsonl.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("event_msg")
+            || event.pointer("/payload/type").and_then(Value::as_str) != Some("token_count")
+        {
+            continue;
+        }
+        let Some(usage) = event.pointer("/payload/info/total_token_usage") else {
+            continue;
+        };
+        latest = UsageTotals {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        };
+    }
+    latest
+}
+
 /// Build the artifact JSON `{ key, usage: { input_tokens, output_tokens } }` —
 /// the same nested-`usage` shape `provenance::extract_usage` reads.
-fn usage_artifact(key: &str, u: &ClaudeUsage) -> Value {
+fn usage_artifact(key: &str, u: &UsageTotals) -> Value {
     serde_json::json!({
         "key": key,
         "usage": {
@@ -99,7 +126,7 @@ fn resolve_key() -> String {
 }
 
 /// Read the Stop-hook payload from stdin, sum the transcript's usage, and write
-/// `.lisa/claude/<key>.usage.json` under `cwd`. Best-effort throughout: any
+/// `.lisa/<client>/<key>.usage.json` under `cwd`. Best-effort throughout: any
 /// absent input returns `Ok(())` writing nothing.
 pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
     let mut stdin = String::new();
@@ -117,18 +144,25 @@ pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
         Ok(s) => s,
         Err(_) => return Ok(()), // transcript gone/unreadable → leave tokens null
     };
-    let usage = sum_transcript_usage(&jsonl);
+    let is_codex = std::env::var("LISA_AGENT_CLIENT").is_ok_and(|v| v == "codex");
+    let usage = if is_codex {
+        codex_transcript_usage(&jsonl)
+    } else {
+        sum_claude_transcript_usage(&jsonl)
+    };
     // Nothing observed → do not write a zero-token artifact (never fabricate a
     // "we measured 0" where we actually measured nothing).
-    if usage == ClaudeUsage::default() {
+    if usage == UsageTotals::default() {
         return Ok(());
     }
     let key = resolve_key();
-    let claude_dir = cwd.join(".lisa").join("claude");
-    std::fs::create_dir_all(&claude_dir)?;
+    let client_dir = cwd
+        .join(".lisa")
+        .join(if is_codex { "codex" } else { "claude" });
+    std::fs::create_dir_all(&client_dir)?;
     let artifact = usage_artifact(&key, &usage);
     std::fs::write(
-        claude_dir.join(format!("{}.usage.json", key)),
+        client_dir.join(format!("{}.usage.json", key)),
         serde_json::to_string_pretty(&artifact).unwrap_or_else(|_| "{}".to_string()),
     )
 }
@@ -145,7 +179,7 @@ mod tests {
 
     #[test]
     fn sums_all_input_classes_and_output() {
-        let u = sum_transcript_usage(TRANSCRIPT);
+        let u = sum_claude_transcript_usage(TRANSCRIPT);
         // input: (10+2+100) + (5+0+50) = 167 ; output: 30 + 7 = 37
         assert_eq!(u.input_tokens, 167);
         assert_eq!(u.output_tokens, 37);
@@ -154,24 +188,24 @@ mod tests {
     #[test]
     fn skips_malformed_and_non_assistant_lines() {
         let jsonl = "not json\n{\"type\":\"user\"}\n{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n";
-        let u = sum_transcript_usage(jsonl);
+        let u = sum_claude_transcript_usage(jsonl);
         assert_eq!(u.input_tokens, 4);
         assert_eq!(u.output_tokens, 1);
     }
 
     #[test]
     fn empty_or_no_assistant_is_zero() {
-        assert_eq!(sum_transcript_usage(""), ClaudeUsage::default());
+        assert_eq!(sum_claude_transcript_usage(""), UsageTotals::default());
         assert_eq!(
-            sum_transcript_usage("{\"type\":\"user\",\"message\":{}}\n"),
-            ClaudeUsage::default()
+            sum_claude_transcript_usage("{\"type\":\"user\",\"message\":{}}\n"),
+            UsageTotals::default()
         );
     }
 
     #[test]
     fn missing_token_fields_count_as_zero_not_crash() {
         let jsonl = "{\"type\":\"assistant\",\"message\":{\"usage\":{\"output_tokens\":9}}}\n";
-        let u = sum_transcript_usage(jsonl);
+        let u = sum_claude_transcript_usage(jsonl);
         assert_eq!(u.input_tokens, 0);
         assert_eq!(u.output_tokens, 9);
     }
@@ -180,7 +214,7 @@ mod tests {
     fn artifact_shape_matches_extract_usage() {
         // The artifact's nested `usage` must be readable by the shared extractor
         // the plugin uses — this is the cross-crate contract.
-        let u = ClaudeUsage {
+        let u = UsageTotals {
             input_tokens: 167,
             output_tokens: 37,
         };
@@ -191,5 +225,19 @@ mod tests {
         assert_eq!(tout, Some(37));
         assert_eq!(cost, None); // Claude records no dollar cost (design Q3)
         assert_eq!(artifact.get("key").unwrap(), "T-027-02");
+    }
+
+    #[test]
+    fn codex_uses_latest_cumulative_token_count() {
+        let jsonl = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"ignored"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"cached_input_tokens":8,"output_tokens":7}}}}"#;
+        assert_eq!(
+            codex_transcript_usage(jsonl),
+            UsageTotals {
+                input_tokens: 25,
+                output_tokens: 7,
+            }
+        );
     }
 }
