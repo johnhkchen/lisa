@@ -36,3 +36,4 @@ codex-cli **0.144.0**, logged in via ChatGPT. The pinned research target was
 ### Tickets
 
 - **T-029-01** — Execute the codex-day runbook: probes → live loop → provenance
+- **T-029-02** — Fix the timer race that drops reused-session Codex prompts

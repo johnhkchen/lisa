@@ -196,6 +196,16 @@ enum SlotSelection {
     Recycle(usize),
 }
 
+/// A deferred Enter keypress for text already written to a pane.
+///
+/// Zellij does not identify which requested timeout produced a `Timer` event,
+/// so every entry carries its own deadline. Unrelated scheduler timers may
+/// inspect this queue, but must not submit a line before `ready_at`.
+struct PendingEnter {
+    pane_id: PaneId,
+    ready_at: std::time::SystemTime,
+}
+
 /// State for the modal overlay (mark-done, reset-ticket, or quit-confirm).
 #[derive(Default)]
 struct MarkDoneModal {
@@ -288,7 +298,7 @@ pub struct State {
     /// Panes waiting for a deferred Enter keypress.
     /// Characters are sent immediately; Enter is sent after `ENTER_DELAY_SECS`
     /// so the TUI has time to commit the text to its input field.
-    pending_enters: VecDeque<PaneId>,
+    pending_enters: VecDeque<PendingEnter>,
 
     /// Ticket IDs that have already received a finish-up prompt (prevents re-sending).
     finish_up_sent: HashSet<TicketId>,
@@ -366,7 +376,11 @@ impl State {
             }
         }
         write_chars_to_pane_id(text, pane_id);
-        self.pending_enters.push_back(pane_id);
+        self.pending_enters.push_back(PendingEnter {
+            pane_id,
+            ready_at: std::time::SystemTime::now()
+                + std::time::Duration::from_secs_f64(ENTER_DELAY_SECS),
+        });
         set_timeout(ENTER_DELAY_SECS);
         self.pending_timer_count += 1;
     }
@@ -377,9 +391,28 @@ impl State {
         self.awaiting_human.contains(&pane_id)
     }
 
-    /// Send Enter to all panes that have been waiting for the deferred keypress.
-    fn flush_pending_enters(&mut self) {
-        while let Some(pane_id) = self.pending_enters.pop_front() {
+    /// Remove and return only Enter keypresses whose individual delay elapsed.
+    /// Future entries retain their order so an unrelated Timer event cannot
+    /// prematurely submit text that its TUI has not committed yet.
+    fn take_due_pending_enters(&mut self, now: std::time::SystemTime) -> Vec<PaneId> {
+        let mut due = Vec::new();
+        let mut future = VecDeque::new();
+
+        while let Some(pending) = self.pending_enters.pop_front() {
+            if now.duration_since(pending.ready_at).is_ok() {
+                due.push(pending.pane_id);
+            } else {
+                future.push_back(pending);
+            }
+        }
+
+        self.pending_enters = future;
+        due
+    }
+
+    /// Send Enter to panes whose deferred keypress deadlines have elapsed.
+    fn flush_pending_enters(&mut self, now: std::time::SystemTime) {
+        for pane_id in self.take_due_pending_enters(now) {
             write_to_pane_id(vec![13], pane_id); // Enter key
         }
     }
@@ -3155,10 +3188,10 @@ impl ZellijPlugin for State {
             }
 
             Event::Timer(_elapsed) => {
-                // Flush deferred Enter keypresses before polling.
-                // Each send_line_to_pane() schedules its own timer, so
-                // pending_enters may be non-empty on any timer tick.
-                self.flush_pending_enters();
+                // Each line has its own absolute deadline because Timer events
+                // carry no caller identity. An unrelated poll timer may inspect
+                // the queue, but cannot flush a freshly queued Codex prompt.
+                self.flush_pending_enters(std::time::SystemTime::now());
 
                 if self.timer_fired() {
                     self.poll_tick();
@@ -7230,6 +7263,55 @@ mod tests {
     // =========================================================================
     // Transition state machine tests (T-010-02)
     // =========================================================================
+
+    #[test]
+    fn test_unrelated_timer_does_not_flush_pending_enter_early() {
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let mut state = State::default();
+        state.pending_enters.push_back(PendingEnter {
+            pane_id: PaneId::Terminal(7),
+            ready_at: base + std::time::Duration::from_secs(2),
+        });
+
+        let early = state.take_due_pending_enters(base + std::time::Duration::from_secs(1));
+
+        assert!(early.is_empty(), "an unrelated timer must not submit early");
+        assert_eq!(state.pending_enters.len(), 1);
+
+        let due = state.take_due_pending_enters(base + std::time::Duration::from_secs(2));
+        assert_eq!(due, vec![PaneId::Terminal(7)]);
+        assert!(state.pending_enters.is_empty());
+    }
+
+    #[test]
+    fn test_pending_enters_keep_independent_deadlines_and_order() {
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let mut state = State::default();
+        state.pending_enters.extend([
+            PendingEnter {
+                pane_id: PaneId::Terminal(1),
+                ready_at: base + std::time::Duration::from_secs(1),
+            },
+            PendingEnter {
+                pane_id: PaneId::Terminal(2),
+                ready_at: base + std::time::Duration::from_secs(3),
+            },
+            PendingEnter {
+                pane_id: PaneId::Terminal(3),
+                ready_at: base + std::time::Duration::from_secs(2),
+            },
+        ]);
+
+        let due = state.take_due_pending_enters(base + std::time::Duration::from_secs(2));
+
+        assert_eq!(due, vec![PaneId::Terminal(1), PaneId::Terminal(3)]);
+        assert_eq!(state.pending_enters.len(), 1);
+        assert_eq!(state.pending_enters[0].pane_id, PaneId::Terminal(2));
+
+        let remaining = state.take_due_pending_enters(base + std::time::Duration::from_secs(3));
+        assert_eq!(remaining, vec![PaneId::Terminal(2)]);
+        assert!(state.pending_enters.is_empty());
+    }
 
     #[test]
     fn test_transition_state_default_is_idle() {
