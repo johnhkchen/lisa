@@ -18,6 +18,99 @@ use std::time::SystemTime;
 /// Type alias for ticket identifiers.
 pub type TicketId = String;
 
+/// Identifies one execution attempt for a ticket.
+///
+/// Attempt IDs are positive and strictly increase per ticket when leases are
+/// created through [`AttemptLease::mint`]. The complete `(ticket_id,
+/// attempt_id)` pair is the authority boundary: equal numeric attempt IDs for
+/// different tickets are unrelated.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AttemptLease {
+    /// The ticket this execution attempt may act for.
+    pub ticket_id: TicketId,
+    /// The positive, per-ticket generation of this execution attempt.
+    pub attempt_id: u64,
+}
+
+/// Why a successor [`AttemptLease`] could not be minted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptLeaseMintError {
+    /// The supplied predecessor belongs to a different ticket.
+    TicketMismatch {
+        /// The ticket requested for the new lease.
+        ticket_id: TicketId,
+        /// The ticket carried by the supplied predecessor.
+        previous_ticket_id: TicketId,
+    },
+    /// The previous attempt already used the largest representable ID.
+    AttemptIdExhausted {
+        /// The ticket whose attempt sequence is exhausted.
+        ticket_id: TicketId,
+    },
+}
+
+impl fmt::Display for AttemptLeaseMintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TicketMismatch {
+                ticket_id,
+                previous_ticket_id,
+            } => write!(
+                f,
+                "cannot mint lease for {ticket_id} from predecessor for {previous_ticket_id}"
+            ),
+            Self::AttemptIdExhausted { ticket_id } => {
+                write!(f, "attempt IDs are exhausted for {ticket_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AttemptLeaseMintError {}
+
+impl AttemptLease {
+    /// Mint the first lease for a ticket or the checked successor to its prior
+    /// lease.
+    ///
+    /// The first attempt is `1`. A predecessor from another ticket and a
+    /// predecessor at `u64::MAX` both fail closed so every successful successor
+    /// remains strictly greater than its predecessor.
+    pub fn mint(
+        ticket_id: impl Into<TicketId>,
+        previous: Option<&Self>,
+    ) -> Result<Self, AttemptLeaseMintError> {
+        let ticket_id = ticket_id.into();
+        let attempt_id = match previous {
+            None => 1,
+            Some(previous) if previous.ticket_id != ticket_id => {
+                return Err(AttemptLeaseMintError::TicketMismatch {
+                    ticket_id,
+                    previous_ticket_id: previous.ticket_id.clone(),
+                });
+            }
+            Some(previous) => previous.attempt_id.checked_add(1).ok_or_else(|| {
+                AttemptLeaseMintError::AttemptIdExhausted {
+                    ticket_id: ticket_id.clone(),
+                }
+            })?,
+        };
+
+        Ok(Self {
+            ticket_id,
+            attempt_id,
+        })
+    }
+
+    /// Return whether this lease exactly matches the authoritative current
+    /// lease.
+    ///
+    /// An absent current lease represents an unleased or revoked ticket and
+    /// rejects every candidate.
+    pub fn is_current(&self, current: Option<&Self>) -> bool {
+        current == Some(self)
+    }
+}
+
 /// The phase of work a ticket is currently in.
 ///
 /// Phases follow the RDSPIR workflow: Research -> Design -> Structure -> Plan -> Implement -> Review.
@@ -887,6 +980,70 @@ mod system_time_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attempt_lease_ids_are_strictly_monotonic_per_ticket() {
+        let a1 = AttemptLease::mint("T-A", None).unwrap();
+        let b1 = AttemptLease::mint("T-B", None).unwrap();
+        let a2 = AttemptLease::mint("T-A", Some(&a1)).unwrap();
+        let b2 = AttemptLease::mint("T-B", Some(&b1)).unwrap();
+        let a3 = AttemptLease::mint("T-A", Some(&a2)).unwrap();
+        let b3 = AttemptLease::mint("T-B", Some(&b2)).unwrap();
+
+        assert_eq!([a1.attempt_id, a2.attempt_id, a3.attempt_id], [1, 2, 3]);
+        assert_eq!([b1.attempt_id, b2.attempt_id, b3.attempt_id], [1, 2, 3]);
+        assert_ne!(a1, b1, "ticket identity is part of the lease");
+    }
+
+    #[test]
+    fn prior_attempt_lease_never_validates_as_current() {
+        let prior = AttemptLease::mint("T-A", None).unwrap();
+        assert!(prior.is_current(Some(&prior)));
+
+        let current = AttemptLease::mint("T-A", Some(&prior)).unwrap();
+
+        assert!(!prior.is_current(Some(&current)));
+        assert!(current.is_current(Some(&current)));
+        assert!(!prior.is_current(None));
+    }
+
+    #[test]
+    fn attempt_lease_current_check_requires_the_same_ticket() {
+        let a = AttemptLease::mint("T-A", None).unwrap();
+        let b = AttemptLease::mint("T-B", None).unwrap();
+
+        assert_eq!(a.attempt_id, b.attempt_id);
+        assert!(!a.is_current(Some(&b)));
+        assert!(!b.is_current(Some(&a)));
+    }
+
+    #[test]
+    fn attempt_lease_mint_rejects_a_different_ticket_predecessor() {
+        let previous = AttemptLease::mint("T-A", None).unwrap();
+
+        assert_eq!(
+            AttemptLease::mint("T-B", Some(&previous)),
+            Err(AttemptLeaseMintError::TicketMismatch {
+                ticket_id: "T-B".to_string(),
+                previous_ticket_id: "T-A".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn attempt_lease_mint_rejects_attempt_id_exhaustion() {
+        let previous = AttemptLease {
+            ticket_id: "T-A".to_string(),
+            attempt_id: u64::MAX,
+        };
+
+        assert_eq!(
+            AttemptLease::mint("T-A", Some(&previous)),
+            Err(AttemptLeaseMintError::AttemptIdExhausted {
+                ticket_id: "T-A".to_string(),
+            })
+        );
+    }
 
     #[test]
     fn test_phase_next() {
