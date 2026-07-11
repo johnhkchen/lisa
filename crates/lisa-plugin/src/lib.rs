@@ -5,6 +5,7 @@
 //! tracks phase progress, and provides a live dashboard.
 
 mod adapter;
+mod pane_name;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -20,6 +21,7 @@ use lisa_core::diagnostics;
 use lisa_core::provenance::{self, ProvenanceRecord, Route, RunOutcome};
 use lisa_core::ticket;
 use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId, TicketStatus};
+use pane_name::{format_pane_name, PaneName};
 
 /// How often (in seconds) the plugin rescans ticket files to detect phase changes.
 const POLL_INTERVAL_SECS: f64 = 5.0;
@@ -272,6 +274,10 @@ pub struct State {
     /// Populated on first PaneUpdate after permissions are granted.
     agent_slots: Vec<AgentSlot>,
 
+    /// Last pane name applied by Lisa, keyed by physical terminal pane ID.
+    /// Used to suppress redundant Zellij rename operations across scheduler polls.
+    last_pane_names: HashMap<u32, String>,
+
     /// Snapshot of ticket phases from last DAG build, for change detection.
     last_phases: HashMap<TicketId, Phase>,
 
@@ -380,6 +386,47 @@ pub struct State {
 
 impl State {
     const MAX_ACTIVITY_LOG: usize = 100;
+
+    /// Apply a terminal-pane name only when it differs from Lisa's last value.
+    ///
+    /// The cache is updated before the host call because Zellij's rename API has
+    /// no acknowledgement. This also gives native tests an observable record of
+    /// rename intent while the host shim is a no-op.
+    fn rename_slot(&mut self, pane_id: u32, name: String) -> bool {
+        if !self.agent_slots.iter().any(|slot| slot.pane_id == pane_id)
+            || self.last_pane_names.get(&pane_id) == Some(&name)
+        {
+            return false;
+        }
+
+        self.last_pane_names.insert(pane_id, name.clone());
+        rename_terminal_pane(pane_id, name);
+        true
+    }
+
+    /// Give newly discovered, unassigned panes their initial idle names once
+    /// ChangeApplicationState permission is available.
+    fn name_unnamed_idle_slots(&mut self) {
+        let unnamed: Vec<(u32, Option<AgentClient>)> = self
+            .agent_slots
+            .iter()
+            .filter(|slot| {
+                slot.ticket_id.is_none() && !self.last_pane_names.contains_key(&slot.pane_id)
+            })
+            .map(|slot| {
+                let resident_agent = if slot.has_session {
+                    slot.last_client
+                } else {
+                    None
+                };
+                (slot.pane_id, resident_agent)
+            })
+            .collect();
+
+        for (pane_id, resident_agent) in unnamed {
+            self.rename_slot(pane_id, format_pane_name(PaneName::Idle { resident_agent }));
+        }
+    }
 
     /// Set a timer and track it so we can avoid re-arming when duplicates are pending.
     fn arm_timer(&mut self, secs: f64) {
@@ -805,9 +852,11 @@ impl State {
             return;
         }
 
+        let mut discovered_panes = Vec::new();
         for panes in pane_manifest.panes.values() {
             for pane in panes {
                 if !pane.is_plugin {
+                    discovered_panes.push(pane.id);
                     self.agent_slots.push(AgentSlot {
                         pane_id: pane.id,
                         ticket_id: None,
@@ -820,6 +869,10 @@ impl State {
                     });
                 }
             }
+        }
+
+        if self.permissions_granted && !discovered_panes.is_empty() {
+            self.name_unnamed_idle_slots();
         }
 
         if !self.agent_slots.is_empty() {
@@ -910,23 +963,34 @@ impl State {
     /// so the same provider can reuse the TUI via `/clear`, while the other
     /// provider can explicitly recycle it via `/exit` after cooldown.
     fn release_slot_for_ticket(&mut self, ticket_id: &TicketId) {
-        let mut released_pane: Option<u32> = None;
+        let mut released_pane: Option<(u32, String)> = None;
         for slot in &mut self.agent_slots {
             if slot.ticket_id.as_ref() == Some(ticket_id) {
-                released_pane = Some(slot.pane_id);
                 slot.ticket_id = None;
                 // has_session stays true — the native agent TUI is still running
                 slot.cooldown_until = Some(
                     std::time::SystemTime::now()
                         + std::time::Duration::from_secs(self.config.wind_down_secs),
                 );
+                let resident_agent = if slot.has_session {
+                    slot.last_client
+                } else {
+                    None
+                };
+                released_pane = Some((
+                    slot.pane_id,
+                    format_pane_name(PaneName::Idle { resident_agent }),
+                ));
                 break;
             }
         }
         match released_pane {
-            Some(pane_id) => self.log_activity(ActivityEvent::Info {
-                message: format!("Released slot #{} for {}", pane_id, ticket_id),
-            }),
+            Some((pane_id, idle_name)) => {
+                self.rename_slot(pane_id, idle_name);
+                self.log_activity(ActivityEvent::Info {
+                    message: format!("Released slot #{} for {}", pane_id, ticket_id),
+                });
+            }
             None => self.log_activity(ActivityEvent::Info {
                 message: format!("No slot found for {}", ticket_id),
             }),
@@ -1031,6 +1095,20 @@ impl State {
                 ticket_id: &ticket_id,
                 pane_id,
             };
+
+            // Replace any previous ticket/idle title before the first lifecycle
+            // input for this assignment (/exit, /clear, or a fresh launch).
+            let ticket_title = self
+                .dag
+                .get_ticket(&ticket_id)
+                .map(|ticket| ticket.title.clone())
+                .unwrap_or_else(|| "untitled".to_string());
+            let assigned_name = format_pane_name(PaneName::Assigned {
+                agent: route.agent,
+                ticket_id: &ticket_id,
+                title: &ticket_title,
+            });
+            self.rename_slot(pane_id, assigned_name);
 
             let launch_cmd;
             if recycle {
@@ -1980,6 +2058,12 @@ impl State {
                     slot.has_session = false;
                     slot.last_client = None;
                 }
+                self.rename_slot(
+                    pane_id,
+                    format_pane_name(PaneName::Idle {
+                        resident_agent: None,
+                    }),
+                );
                 continue;
             };
 
@@ -3289,6 +3373,7 @@ impl ZellijPlugin for State {
         match event {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permissions_granted = true;
+                self.name_unnamed_idle_slots();
                 // Start the poll timer
                 self.arm_timer(POLL_INTERVAL_SECS);
                 // Try to schedule immediately if slots are already discovered
@@ -6974,6 +7059,135 @@ mod tests {
         }
     }
 
+    fn pane_name_schedule_state(
+        requested_agent: &str,
+        default_agent: AgentClient,
+        resident_agent: Option<AgentClient>,
+    ) -> (State, tempfile::TempDir) {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-NAME.md"),
+            format!(
+                "---\nid: T-NAME\ntitle: pane lifecycle\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: {requested_agent}\n---\n"
+            ),
+        )
+        .unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                client: default_agent,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.push(fresh_slot(10, resident_agent));
+        (state, dir)
+    }
+
+    #[test]
+    fn test_pane_title_rename_gate_deduplicates() {
+        let mut state = State::default();
+        state.agent_slots.push(fresh_slot(10, None));
+
+        assert!(state.rename_slot(10, "lisa · idle".to_string()));
+        assert!(!state.rename_slot(10, "lisa · idle".to_string()));
+        assert!(state.rename_slot(10, "codex · idle".to_string()));
+        assert_eq!(
+            state.last_pane_names.get(&10).map(String::as_str),
+            Some("codex · idle")
+        );
+        assert!(!state.rename_slot(99, "lisa · idle".to_string()));
+        assert!(!state.last_pane_names.contains_key(&99));
+    }
+
+    #[test]
+    fn test_pane_title_fresh_launch_uses_actual_fallback_route() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("not-a-provider", AgentClient::Codex, None);
+
+        state.schedule_ready_tickets();
+
+        assert_eq!(
+            state.last_pane_names.get(&10).map(String::as_str),
+            Some("codex · T-NAME · pane lifecycle")
+        );
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert!(state.agent_slots[0].has_session);
+        assert_eq!(state.threads["T-NAME"].client, AgentClient::Codex);
+    }
+
+    #[test]
+    fn test_pane_title_same_provider_reuse_replaces_stale_name() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        state
+            .last_pane_names
+            .insert(10, "codex · T-OLD · old work".to_string());
+
+        state.schedule_ready_tickets();
+
+        assert_eq!(
+            state.last_pane_names.get(&10).map(String::as_str),
+            Some("codex · T-NAME · pane lifecycle")
+        );
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForClear
+        );
+    }
+
+    #[test]
+    fn test_pane_title_cross_provider_switch_uses_incoming_provider() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Claude));
+        state
+            .last_pane_names
+            .insert(10, "claude · idle".to_string());
+
+        state.schedule_ready_tickets();
+
+        assert_eq!(
+            state.last_pane_names.get(&10).map(String::as_str),
+            Some("codex · T-NAME · pane lifecycle")
+        );
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
+    }
+
+    #[test]
+    fn test_pane_title_release_reflects_resident_or_empty_slot() {
+        let mut state = State::default();
+        let mut codex = fresh_slot(10, Some(AgentClient::Codex));
+        codex.ticket_id = Some("T-CODEX".to_string());
+        let mut shell = fresh_slot(11, None);
+        shell.ticket_id = Some("T-SHELL".to_string());
+        state.agent_slots.extend([codex, shell]);
+
+        state.release_slot_for_ticket(&"T-CODEX".to_string());
+        state.release_slot_for_ticket(&"T-SHELL".to_string());
+
+        assert_eq!(
+            state.last_pane_names.get(&10).map(String::as_str),
+            Some("codex · idle")
+        );
+        assert_eq!(
+            state.last_pane_names.get(&11).map(String::as_str),
+            Some("lisa · idle")
+        );
+    }
+
     #[test]
     fn test_provider_under_cap_no_cap_always_admits() {
         // No provider_caps configured → per-provider gate never blocks, even with
@@ -7810,6 +8024,37 @@ mod tests {
             TransitionState::WaitingForExit
         );
         assert!(state.pending_enters.is_empty());
+    }
+
+    #[test]
+    fn test_pane_title_missing_recycle_ticket_restores_empty_shell_idle() {
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            has_session: false,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+            ),
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Codex),
+        });
+        state
+            .last_pane_names
+            .insert(1, "codex · T-GONE · removed".to_string());
+
+        state.check_transition_timeouts();
+
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(!state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, None);
+        assert_eq!(
+            state.last_pane_names.get(&1).map(String::as_str),
+            Some("lisa · idle")
+        );
     }
 
     #[test]
@@ -9492,6 +9737,10 @@ mod tests {
         thread.current_phase = Phase::Review;
         state.threads.insert("T-CDX-01".to_string(), thread);
         codex_slot(&mut state, 1, "T-CDX-01");
+        state.agent_slots[0].last_client = Some(AgentClient::Codex);
+        state
+            .last_pane_names
+            .insert(1, "codex · T-CDX-01 · codex-a".to_string());
 
         state.check_artifact_advances();
 
@@ -9515,6 +9764,10 @@ mod tests {
         assert!(!state.pending_completions.contains_key("T-CDX-01"));
         assert!(!state.threads.contains_key("T-CDX-01"));
         assert!(state.agent_slots[0].ticket_id.is_none());
+        assert_eq!(
+            state.last_pane_names.get(&1).map(String::as_str),
+            Some("codex · idle")
+        );
         let ticket = state.dag.get_ticket(&"T-CDX-01".to_string()).unwrap();
         assert_eq!(ticket.phase, Phase::Done);
         assert_eq!(ticket.status, TicketStatus::Done);
@@ -9541,6 +9794,9 @@ mod tests {
         state.threads.insert("T-CDX-01".to_string(), thread);
         codex_slot(&mut state, 1, "T-CDX-01");
         state.agent_slots[0].last_client = Some(AgentClient::Codex);
+        state
+            .last_pane_names
+            .insert(1, "codex · T-CDX-01 · codex-a".to_string());
 
         state.mark_ticket_done("T-CDX-01");
         assert!(matches!(
@@ -9557,6 +9813,11 @@ mod tests {
         assert!(!state.pending_completions.contains_key("T-CDX-01"));
         assert!(state.threads.contains_key("T-CDX-01"));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-CDX-01"));
+        assert_eq!(
+            state.last_pane_names.get(&1).map(String::as_str),
+            Some("codex · T-CDX-01 · codex-a"),
+            "failed completion must retain the assigned pane title"
+        );
         assert!(!state
             .dag
             .get_ready_tickets()
@@ -9583,6 +9844,10 @@ mod tests {
         state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
         assert!(!state.threads.contains_key("T-CDX-01"));
         assert!(state.agent_slots[0].ticket_id.is_none());
+        assert_eq!(
+            state.last_pane_names.get(&1).map(String::as_str),
+            Some("codex · idle")
+        );
         assert!(state
             .dag
             .get_ready_tickets()
