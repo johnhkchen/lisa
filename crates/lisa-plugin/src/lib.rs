@@ -19,7 +19,7 @@ use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
 use lisa_core::provenance::{self, ProvenanceRecord, Route, RunOutcome};
 use lisa_core::ticket;
-use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId};
+use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId, TicketStatus};
 
 /// How often (in seconds) the plugin rescans ticket files to detect phase changes.
 const POLL_INTERVAL_SECS: f64 = 5.0;
@@ -187,6 +187,24 @@ enum TransitionState {
     WaitingForExit,
 }
 
+/// Diagnostic origin for a request to durably complete a ticket. Every origin
+/// enters the same completion transaction and result publisher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionSource {
+    Artifact,
+    Idle,
+    Stopped(u32),
+    Manual,
+    ObservedDone,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCompletion {
+    prior_phase: Phase,
+    prior_status: TicketStatus,
+    source: CompletionSource,
+}
+
 /// How an idle pane can satisfy an incoming provider request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotSelection {
@@ -337,6 +355,11 @@ pub struct State {
     /// silence clock (reclaim exemption is T-020-04, not here).
     awaiting_human: HashSet<u32>,
 
+    /// Ticket completion transactions awaiting an attributed host-command
+    /// result. While present, freshly scanned Done frontmatter is masked from
+    /// the in-memory DAG so no scheduler consequence can publish early.
+    pending_completions: HashMap<TicketId, PendingCompletion>,
+
     /// When the loop started, used to compute `LISA_DURATION_SECS` on `complete`.
     loop_started_at: Option<std::time::SystemTime>,
 }
@@ -473,6 +496,223 @@ impl State {
         run_command_with_env_variables_and_cwd(&argv_refs, env, self.project_root.clone(), context);
     }
 
+    fn repository_relative_path(&self, path: &Path) -> Result<PathBuf, String> {
+        if let Ok(relative) = path.strip_prefix("/host") {
+            if !relative.as_os_str().is_empty() {
+                return Ok(relative.to_path_buf());
+            }
+        }
+        if !self.project_root.as_os_str().is_empty() {
+            if let Ok(relative) = path.strip_prefix(&self.project_root) {
+                if !relative.as_os_str().is_empty() {
+                    return Ok(relative.to_path_buf());
+                }
+            }
+        }
+        if path.is_relative() && !path.as_os_str().is_empty() {
+            return Ok(path.to_path_buf());
+        }
+        Err(format!(
+            "path {} is not relative to the Lisa project root",
+            path.display()
+        ))
+    }
+
+    fn build_completion_command(
+        &self,
+        ticket_id: &str,
+        ticket_file: &Path,
+    ) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+        let lisa_bin = self
+            .config
+            .lisa_bin
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "lisa_bin is not configured".to_string())?;
+        if self.project_root.as_os_str().is_empty() {
+            return Err("project root is not available".to_string());
+        }
+        let ticket_file = self.repository_relative_path(ticket_file)?;
+        let work_dir = self.repository_relative_path(&self.config.work_dir.join(ticket_id))?;
+        let argv = vec![
+            lisa_bin.to_string(),
+            "complete-ticket".to_string(),
+            "--path".to_string(),
+            self.project_root.display().to_string(),
+            "--ticket-id".to_string(),
+            ticket_id.to_string(),
+            "--message".to_string(),
+            format!("Complete {ticket_id}"),
+            "--ticket-file".to_string(),
+            ticket_file.display().to_string(),
+            "--work-dir".to_string(),
+            work_dir.display().to_string(),
+        ];
+        let mut context = BTreeMap::new();
+        context.insert("lisa_completion".to_string(), ticket_id.to_string());
+        Ok((argv, context))
+    }
+
+    /// Enter the single commit-gated completion state machine.
+    fn request_completion(&mut self, ticket_id: TicketId, source: CompletionSource) -> bool {
+        if self.pending_completions.contains_key(&ticket_id) {
+            return false;
+        }
+        if !self.dag.all_dependencies_done(&ticket_id) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Cannot complete {}: its dependencies are not all done",
+                    ticket_id
+                ),
+            });
+            return false;
+        }
+        let (ticket_file, ticket_phase, ticket_status) = match self.dag.get_ticket(&ticket_id) {
+            Some(ticket) if !ticket.file_path.as_os_str().is_empty() => {
+                (ticket.file_path.clone(), ticket.phase, ticket.status)
+            }
+            _ => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Cannot find file for {} during completion", ticket_id),
+                });
+                return false;
+            }
+        };
+        let prior_phase = self
+            .threads
+            .get(&ticket_id)
+            .map(|thread| thread.current_phase)
+            .filter(|phase| *phase != Phase::Done)
+            .unwrap_or(ticket_phase);
+        let prior_status = if prior_phase != Phase::Done && ticket_status == TicketStatus::Done {
+            TicketStatus::Open
+        } else {
+            ticket_status
+        };
+
+        self.pending_completions.insert(
+            ticket_id.clone(),
+            PendingCompletion {
+                prior_phase,
+                prior_status,
+                source,
+            },
+        );
+
+        let (argv, context) = match self.build_completion_command(&ticket_id, &ticket_file) {
+            Ok(command) => command,
+            Err(error) => {
+                #[cfg(test)]
+                {
+                    let _ = error;
+                    return true;
+                }
+                #[cfg(not(test))]
+                {
+                    self.pending_completions.remove(&ticket_id);
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!("Cannot start completion for {ticket_id}: {error}"),
+                    });
+                    return false;
+                }
+            }
+        };
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_command_with_env_variables_and_cwd(
+            &argv_refs,
+            BTreeMap::new(),
+            self.project_root.clone(),
+            context,
+        );
+        self.log_activity(ActivityEvent::Info {
+            message: format!("Completion commit pending for {ticket_id} ({source:?})"),
+        });
+        true
+    }
+
+    fn is_commit_id(output: &[u8]) -> bool {
+        let value = String::from_utf8_lossy(output);
+        let value = value.trim();
+        matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn handle_completion_result(
+        &mut self,
+        ticket_id: &str,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) {
+        let pending = match self.pending_completions.get(ticket_id).copied() {
+            Some(pending) => pending,
+            None => return,
+        };
+        if exit_code != Some(0) || !Self::is_commit_id(&stdout) {
+            self.pending_completions.remove(ticket_id);
+            self.rebuild_dag();
+            let detail = String::from_utf8_lossy(&stderr);
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion commit failed for {} ({:?}, exit {:?}): {}. Ticket remains recoverable for retry",
+                    ticket_id,
+                    pending.source,
+                    exit_code,
+                    if detail.trim().is_empty() {
+                        "no error output"
+                    } else {
+                        detail.trim()
+                    }
+                ),
+            });
+            return;
+        }
+
+        self.pending_completions.remove(ticket_id);
+        self.rebuild_dag();
+        let ticket_id_owned = ticket_id.to_string();
+        let durable_done = self
+            .dag
+            .get_ticket(&ticket_id_owned)
+            .map(|ticket| ticket.phase == Phase::Done && ticket.status == TicketStatus::Done)
+            .unwrap_or(false);
+        if !durable_done {
+            self.pending_completions
+                .insert(ticket_id.to_string(), pending);
+            self.rebuild_dag();
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion command succeeded for {} but durable Done frontmatter could not be verified; scheduler state remains blocked",
+                    ticket_id
+                ),
+            });
+            return;
+        }
+
+        self.log_activity(ActivityEvent::PhaseCompleted {
+            ticket_id: ticket_id.to_string(),
+            phase: pending.prior_phase,
+        });
+        self.log_activity(ActivityEvent::TicketPhaseChanged {
+            ticket_id: ticket_id.to_string(),
+            old_phase: pending.prior_phase,
+            new_phase: Phase::Done,
+        });
+        self.log_activity(ActivityEvent::Info {
+            message: format!(
+                "Completion commit verified for {} at {}",
+                ticket_id,
+                String::from_utf8_lossy(&stdout).trim()
+            ),
+        });
+        if let Some(thread) = self.threads.get_mut(ticket_id) {
+            thread.complete();
+        }
+        self.emit_provenance(ticket_id, RunOutcome::Done);
+        self.release_slot_for_ticket(&ticket_id_owned);
+        self.threads.remove(ticket_id);
+        self.schedule_ready_tickets();
+    }
+
     fn log_activity(&mut self, event: ActivityEvent) {
         self.activity_log.push(event);
         if self.activity_log.len() > Self::MAX_ACTIVITY_LOG {
@@ -483,7 +723,7 @@ impl State {
     /// Scan tickets directory and rebuild the DAG.
     /// Returns true if any ticket phases changed since last build.
     fn rebuild_dag(&mut self) -> bool {
-        let tickets = match ticket::scan_tickets(&self.config.ticket_dir) {
+        let mut tickets = match ticket::scan_tickets(&self.config.ticket_dir) {
             Ok(tickets) => tickets,
             Err(e) => {
                 self.log_activity(ActivityEvent::Error {
@@ -492,6 +732,13 @@ impl State {
                 return false;
             }
         };
+
+        for scanned in &mut tickets {
+            if let Some(pending) = self.pending_completions.get(&scanned.id) {
+                scanned.phase = pending.prior_phase;
+                scanned.status = pending.prior_status;
+            }
+        }
 
         let ticket_count = tickets.len();
 
@@ -922,6 +1169,9 @@ impl State {
             .iter()
             .filter_map(|slot| {
                 let tid = slot.ticket_id.as_ref()?;
+                if self.pending_completions.contains_key(tid) {
+                    return None;
+                }
                 let is_done = self
                     .dag
                     .get_ticket(tid)
@@ -995,6 +1245,11 @@ impl State {
                     Some(p) => p,
                     None => continue,
                 };
+
+                if next_phase == Phase::Done {
+                    self.request_completion(ticket_id.clone(), CompletionSource::Artifact);
+                    continue;
+                }
 
                 // Update the ticket file on disk
                 let file_path = self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
@@ -1241,29 +1496,7 @@ impl State {
                     // won't catch this transition.
                     let review_path = self.config.work_dir.join(&ticket_id).join("review.md");
                     if review_path.exists() {
-                        if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Done) {
-                            self.log_activity(ActivityEvent::Error {
-                                message: format!(
-                                    "Failed to advance {} review→done: {}",
-                                    ticket_id, e
-                                ),
-                            });
-                            continue;
-                        }
-
-                        self.log_activity(ActivityEvent::PhaseCompleted {
-                            ticket_id: ticket_id.clone(),
-                            phase: Phase::Review,
-                        });
-                        self.log_activity(ActivityEvent::TicketPhaseChanged {
-                            ticket_id: ticket_id.clone(),
-                            old_phase: Phase::Review,
-                            new_phase: Phase::Done,
-                        });
-
-                        if let Some(thread) = self.threads.get_mut(&ticket_id) {
-                            thread.current_phase = Phase::Done;
-                        }
+                        self.request_completion(ticket_id.clone(), CompletionSource::Idle);
                     }
                 }
 
@@ -1284,6 +1517,11 @@ impl State {
                             Some(p) => p,
                             None => continue,
                         };
+
+                        if next_phase == Phase::Done {
+                            self.request_completion(ticket_id.clone(), CompletionSource::Idle);
+                            continue;
+                        }
 
                         let file_path =
                             self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
@@ -1533,68 +1771,9 @@ impl State {
         }
     }
 
-    /// Auto-complete a Review-phase ticket by marking it Done.
-    ///
-    /// Updates the ticket file on disk, completes the thread, releases the slot,
-    /// rebuilds the DAG, and schedules any newly-ready tickets.
+    /// Route a stopped Review session through commit-gated completion.
     fn auto_complete_review(&mut self, ticket_id: TicketId, pane_id: u32) {
-        let file_path = match self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone()) {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => {
-                self.log_activity(ActivityEvent::Error {
-                    message: format!("Cannot find file for {} during auto-complete", ticket_id),
-                });
-                return;
-            }
-        };
-
-        // Guard: don't auto-complete if direct dependencies aren't done
-        if !self.dag.all_dependencies_done(&ticket_id) {
-            self.log_activity(ActivityEvent::Error {
-                message: format!(
-                    "Cannot auto-complete {}: its dependencies are not all done",
-                    ticket_id
-                ),
-            });
-            return;
-        }
-
-        if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Done) {
-            self.log_activity(ActivityEvent::Error {
-                message: format!("Failed to auto-complete {} phase: {}", ticket_id, e),
-            });
-            return;
-        }
-
-        if let Err(e) =
-            ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Done)
-        {
-            self.log_activity(ActivityEvent::Error {
-                message: format!("Failed to auto-complete {} status: {}", ticket_id, e),
-            });
-        }
-
-        self.log_activity(ActivityEvent::TicketPhaseChanged {
-            ticket_id: ticket_id.clone(),
-            old_phase: Phase::Review,
-            new_phase: Phase::Done,
-        });
-        self.log_activity(ActivityEvent::Info {
-            message: format!(
-                "Auto-completed {} (Review → Done) on pane #{}",
-                ticket_id, pane_id
-            ),
-        });
-
-        if let Some(thread) = self.threads.get_mut(&ticket_id) {
-            thread.complete();
-        }
-        self.emit_provenance(&ticket_id, RunOutcome::Done);
-        self.release_slot_for_ticket(&ticket_id);
-        self.threads.remove(&ticket_id);
-
-        // DAG rebuild and scheduling happen in the normal poll_tick cycle
-        // after check_transition_signals returns.
+        self.request_completion(ticket_id, CompletionSource::Stopped(pane_id));
     }
 
     /// Append one provenance record for a finishing ticket-run (T-027-01).
@@ -2173,6 +2352,9 @@ impl State {
             .threads
             .keys()
             .filter(|tid| {
+                if self.pending_completions.contains_key(*tid) {
+                    return false;
+                }
                 self.dag
                     .get_ticket(tid)
                     .map(|t| t.phase == Phase::Done)
@@ -2243,9 +2425,9 @@ impl State {
 
         self.rebuild_dag();
 
-        // Unconditionally check for tickets that moved to Done — mark their
-        // threads complete and release slots. This must not be gated behind
-        // change detection; if detection misses a transition, slots get stuck.
+        // Externally observed Done still enters the same commit transaction.
+        // The pending mask prevents this path from publishing while a command
+        // result is outstanding.
         let done_tickets: Vec<TicketId> = self
             .threads
             .iter()
@@ -2259,17 +2441,8 @@ impl State {
             .map(|(tid, _)| tid.clone())
             .collect();
 
-        for ticket_id in &done_tickets {
-            if let Some(thread) = self.threads.get_mut(ticket_id) {
-                thread.complete();
-            }
-            self.emit_provenance(ticket_id, RunOutcome::Done);
-            self.release_slot_for_ticket(ticket_id);
-            self.threads.remove(ticket_id);
-            self.log_activity(ActivityEvent::ThreadExited {
-                ticket_id: ticket_id.clone(),
-                exit_code: Some(0),
-            });
+        for ticket_id in done_tickets {
+            self.request_completion(ticket_id, CompletionSource::ObservedDone);
         }
 
         // Defensive reconciliation: catch phase changes from external edits or
@@ -2849,71 +3022,9 @@ impl State {
         };
     }
 
-    /// Mark a ticket as done by updating its frontmatter on disk.
+    /// Request manual completion through the same isolated transaction.
     fn mark_ticket_done(&mut self, ticket_id: &str) {
-        let tid = ticket_id.to_string();
-        let file_path = match self.dag.get_ticket(&tid).map(|t| t.file_path.clone()) {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => {
-                self.log_activity(ActivityEvent::Error {
-                    message: format!("Cannot find file for {}", ticket_id),
-                });
-                return;
-            }
-        };
-
-        // Guard: don't mark done if direct dependencies aren't done
-        if !self.dag.all_dependencies_done(&tid) {
-            self.log_activity(ActivityEvent::Error {
-                message: format!(
-                    "Cannot mark {} done: its dependencies are not all done",
-                    ticket_id
-                ),
-            });
-            return;
-        }
-
-        let old_phase = self
-            .dag
-            .get_ticket(&tid)
-            .map(|t| t.phase)
-            .unwrap_or(Phase::Ready);
-
-        // Update phase to done
-        if let Err(e) = ticket::update_ticket_phase(&file_path, Phase::Done) {
-            self.log_activity(ActivityEvent::Error {
-                message: format!("Failed to mark {} done: {}", ticket_id, e),
-            });
-            return;
-        }
-
-        // Also update status to done
-        if let Err(e) =
-            ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Done)
-        {
-            self.log_activity(ActivityEvent::Error {
-                message: format!("Failed to update {} status: {}", ticket_id, e),
-            });
-            // Phase already changed, continue anyway
-        }
-
-        self.log_activity(ActivityEvent::TicketPhaseChanged {
-            ticket_id: tid.clone(),
-            old_phase,
-            new_phase: Phase::Done,
-        });
-
-        // Release any slot occupied by this ticket and remove the thread
-        if let Some(thread) = self.threads.get_mut(&tid) {
-            thread.complete();
-        }
-        self.emit_provenance(&tid, RunOutcome::Done);
-        self.release_slot_for_ticket(&tid);
-        self.threads.remove(&tid);
-
-        // Rebuild DAG immediately so dependents become ready
-        self.rebuild_dag();
-        self.schedule_ready_tickets();
+        self.request_completion(ticket_id.to_string(), CompletionSource::Manual);
     }
 
     /// Open the reset modal with tickets that are in non-ready, non-done phases.
@@ -3203,7 +3314,12 @@ impl ZellijPlugin for State {
                 should_render = self.handle_key(key);
             }
 
-            Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
+            Event::RunCommandResult(exit_code, stdout, stderr, context) => {
+                if let Some(ticket_id) = context.get("lisa_completion") {
+                    self.handle_completion_result(ticket_id, exit_code, stdout, stderr);
+                    should_render = true;
+                    return should_render;
+                }
                 // Only our on-notify invocations carry the `lisa_notify` context
                 // key. Keep hook failures visible without spamming on success.
                 if let Some(notify_event) = context.get("lisa_notify") {
@@ -4015,15 +4131,16 @@ mod tests {
 
         state.check_artifact_advances();
 
-        // review.md also satisfies the Review→Done transition, so the loop
-        // should advance all the way: Implement→Review→Done
+        // review.md advances Implement→Review, then starts commit-gated
+        // completion without publishing Done.
         let thread = state.threads.get("T-002").unwrap();
-        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
+        assert!(state.pending_completions.contains_key("T-002"));
 
-        // Ticket file should be updated to done
+        // Ticket remains Review until the native transaction prepares Done.
         let updated = fs::read_to_string(tickets_dir.join("T-002.md")).unwrap();
-        assert!(updated.contains("phase: done"));
+        assert!(updated.contains("phase: review"));
     }
 
     #[test]
@@ -4070,13 +4187,14 @@ mod tests {
 
         state.check_artifact_advances();
 
-        // Should advance all the way from Research to Done in one call
+        // Should catch up to Review and then wait for the commit result.
         let thread = state.threads.get("T-005").unwrap();
-        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
+        assert!(state.pending_completions.contains_key("T-005"));
 
         let updated = fs::read_to_string(tickets_dir.join("T-005.md")).unwrap();
-        assert!(updated.contains("phase: done"));
+        assert!(updated.contains("phase: review"));
     }
 
     #[test]
@@ -4164,17 +4282,17 @@ mod tests {
 
         state.check_artifact_advances();
 
-        // Thread should advance to Done
+        // Thread and disk remain Review while the commit is pending.
         let thread = state.threads.get("T-001").unwrap();
-        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
+        assert!(state.pending_completions.contains_key("T-001"));
 
-        // Ticket file should be updated
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(updated.contains("phase: done"));
+        assert!(updated.contains("phase: review"));
 
-        // Activity log should show phase transition
-        assert!(state.activity_log.iter().any(|e| matches!(
+        // Done transition is not logged before commit success.
+        assert!(!state.activity_log.iter().any(|e| matches!(
             e,
             ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
             if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
@@ -5255,10 +5373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_done_removes_thread() {
-        // Tests the thread removal logic from mark_ticket_done without calling
-        // schedule_ready_tickets() (which uses zellij host functions).
-        // We replicate the key mark_ticket_done operations manually.
+    fn test_mark_done_keeps_thread_and_slot_until_commit_result() {
         use lisa_core::types::Thread;
         use std::fs;
 
@@ -5296,28 +5411,13 @@ mod tests {
             last_client: None,
         });
 
-        // Replicate the key mark_ticket_done operations (without schedule_ready_tickets)
-        let tid = "T-001".to_string();
-        let file_path = state
-            .dag
-            .get_ticket(&tid)
-            .map(|t| t.file_path.clone())
-            .unwrap();
-        lisa_core::ticket::update_ticket_phase(&file_path, Phase::Done).unwrap();
+        state.mark_ticket_done("T-001");
 
-        if let Some(thread) = state.threads.get_mut(&tid) {
-            thread.complete();
-        }
-        state.release_slot_for_ticket(&tid);
-        state.threads.remove(&tid);
-
-        // Thread should be removed
-        assert!(!state.threads.contains_key("T-001"));
-        // Slot should be released
-        assert!(state.agent_slots[0].ticket_id.is_none());
-        // Ticket file updated
+        assert!(state.pending_completions.contains_key("T-001"));
+        assert!(state.threads.contains_key("T-001"));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(content.contains("phase: done"));
+        assert!(content.contains("phase: implement"));
     }
 
     #[test]
@@ -5891,22 +5991,23 @@ mod tests {
         // Run idle signal check
         state.check_idle_signals();
 
-        // Verify: thread advanced all the way to Done
+        // Verify: Review is published locally, while Done awaits the commit.
         let thread = state.threads.get("T-001").unwrap();
-        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
+        assert!(state.pending_completions.contains_key("T-001"));
 
-        // Verify: ticket file updated to done
+        // Verify: ticket file has not published Done.
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(updated.contains("phase: done"));
+        assert!(updated.contains("phase: review"));
 
-        // Verify: activity log has both transitions
+        // Verify: only Implement completion is published before commit success.
         assert!(state.activity_log.iter().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { phase, .. }
             if *phase == Phase::Implement
         )));
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(!state.activity_log.iter().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { phase, .. }
             if *phase == Phase::Review
@@ -6479,20 +6580,21 @@ mod tests {
 
         state.check_idle_signals();
 
-        // Thread should advance to Done
+        // Thread remains Review while completion commit is pending.
         let thread = state.threads.get("T-001").unwrap();
-        assert_eq!(thread.current_phase, Phase::Done);
+        assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
+        assert!(state.pending_completions.contains_key("T-001"));
 
         // Signal file cleaned up
         assert!(!state.signal_dir.join("pane-1.idle").exists());
 
-        // Ticket file updated
+        // Ticket file remains non-Done until native preparation.
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(updated.contains("phase: done"));
+        assert!(updated.contains("phase: review"));
 
-        // Activity log
-        assert!(state.activity_log.iter().any(|e| matches!(
+        // Review completion is not published early.
+        assert!(!state.activity_log.iter().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { ticket_id, phase }
             if ticket_id == "T-001" && *phase == Phase::Review
@@ -7768,49 +7870,18 @@ mod tests {
         // Directly call auto_complete_review
         state.auto_complete_review("T-001".to_string(), 1);
 
-        // Thread should be removed
-        assert!(
-            !state.threads.contains_key("T-001"),
-            "Thread should be removed after auto-complete"
-        );
+        // Nothing publishes until the native transaction result succeeds.
+        assert!(state.threads.contains_key("T-001"));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
+        assert!(state.pending_completions.contains_key("T-001"));
+        assert!(!state.activity_log.iter().any(|e| matches!(
+            e,
+            ActivityEvent::TicketPhaseChanged { new_phase, .. } if *new_phase == Phase::Done
+        )));
 
-        // Slot should be released
-        assert_eq!(
-            state.agent_slots[0].ticket_id, None,
-            "Slot should be released after auto-complete"
-        );
-
-        // Activity log: TicketPhaseChanged Review → Done
-        assert!(
-            state.activity_log.iter().any(|e| matches!(
-                e,
-                ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
-                if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
-            )),
-            "Should log TicketPhaseChanged Review → Done"
-        );
-
-        // Activity log: Info with "Auto-completed"
-        assert!(
-            state.activity_log.iter().any(|e| matches!(
-                e,
-                ActivityEvent::Info { message } if message.contains("Auto-completed")
-            )),
-            "Should log auto-complete info message"
-        );
-
-        // Ticket file updated on disk
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(
-            content.contains("phase: done"),
-            "Ticket phase should be done, got: {}",
-            content
-        );
-        assert!(
-            content.contains("status: done"),
-            "Ticket status should be done, got: {}",
-            content
-        );
+        assert!(content.contains("phase: review"), "{content}");
+        assert!(content.contains("status: review"), "{content}");
     }
 
     #[test]
@@ -8860,16 +8931,17 @@ mod tests {
             );
         }
 
-        // review.md at Implement cascades Implement→Review→Done.
+        // review.md reaches Review and starts commit-gated completion.
         fs::write(ticket_work.join("review.md"), "x").unwrap();
         state.check_artifact_advances();
         assert_eq!(
             state.threads.get("T-CDX-01").unwrap().current_phase,
-            Phase::Done,
-            "review.md should cascade Implement→Review→Done"
+            Phase::Review,
+            "review.md should reach Review before the completion commit"
         );
+        assert!(state.pending_completions.contains_key("T-CDX-01"));
         let on_disk = fs::read_to_string(state.config.ticket_dir.join("T-CDX-01.md")).unwrap();
-        assert!(on_disk.contains("phase: done"), "ticket file: {on_disk}");
+        assert!(on_disk.contains("phase: review"), "ticket file: {on_disk}");
 
         // No signal files were ever written — advancement was artifact-only.
         assert!(state.signal_dir.read_dir().unwrap().next().is_none());
@@ -8921,16 +8993,14 @@ mod tests {
         )));
         assert!(fs::read_to_string(&t2).unwrap().contains("phase: review"));
 
-        // Positive: T-CDX-01 is dep-free → `.stopped` on its Idle pane completes it.
+        // Positive: the dep-free ticket enters the shared pending transaction.
         state.handle_stopped_signal(1);
-        assert!(
-            !state.threads.contains_key("T-CDX-01"),
-            "dep-free Review ticket should auto-complete on .stopped"
-        );
-        assert!(state.agent_slots[0].ticket_id.is_none(), "slot released");
+        assert!(state.threads.contains_key("T-CDX-01"));
+        assert!(state.pending_completions.contains_key("T-CDX-01"));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-CDX-01"));
         let done = fs::read_to_string(&t1).unwrap();
         assert!(
-            done.contains("phase: done") && done.contains("status: done"),
+            done.contains("phase: review") && done.contains("status: review"),
             "{done}"
         );
     }
@@ -9344,6 +9414,131 @@ mod tests {
             .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
         // Must not panic or write anywhere.
         state.emit_provenance("T-CDX-01", RunOutcome::Done);
+    }
+
+    #[test]
+    fn artifact_completion_publishes_only_after_verified_commit_result() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        let ticket_path = state.config.ticket_dir.join("T-CDX-01.md");
+        fs::write(
+            &ticket_path,
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: review\npriority: high\nphase: review\nagent: codex\n---\n\nBody\n",
+        )
+        .unwrap();
+        fs::create_dir_all(state.config.work_dir.join("T-CDX-01")).unwrap();
+        fs::write(
+            state.config.work_dir.join("T-CDX-01/review.md"),
+            "# Review\n",
+        )
+        .unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap();
+        state.dag = Dag::from_tickets(tickets).unwrap();
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+        codex_slot(&mut state, 1, "T-CDX-01");
+
+        state.check_artifact_advances();
+
+        assert!(state.pending_completions.contains_key("T-CDX-01"));
+        assert!(state.threads.contains_key("T-CDX-01"));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-CDX-01"));
+        assert!(fs::read_to_string(&ticket_path)
+            .unwrap()
+            .contains("phase: review"));
+
+        lisa_core::ticket::update_ticket_done(&ticket_path).unwrap();
+        state.rebuild_dag();
+        assert_eq!(
+            state.dag.get_ticket(&"T-CDX-01".to_string()).unwrap().phase,
+            Phase::Review,
+            "pending Done must be masked from scheduler state"
+        );
+
+        state.handle_completion_result("T-CDX-01", Some(0), vec![b'a'; 40], Vec::new());
+
+        assert!(!state.pending_completions.contains_key("T-CDX-01"));
+        assert!(!state.threads.contains_key("T-CDX-01"));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        let ticket = state.dag.get_ticket(&"T-CDX-01".to_string()).unwrap();
+        assert_eq!(ticket.phase, Phase::Done);
+        assert_eq!(ticket.status, TicketStatus::Done);
+    }
+
+    #[test]
+    fn failed_manual_completion_retries_without_early_release_or_duplicate_provenance() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        let ticket_path = state.config.ticket_dir.join("T-CDX-01.md");
+        fs::write(
+            &ticket_path,
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: review\npriority: high\nphase: review\nagent: codex\n---\n\nBody\n",
+        )
+        .unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap();
+        state.dag = Dag::from_tickets(tickets).unwrap();
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.current_phase = Phase::Review;
+        thread.client = AgentClient::Codex;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+        codex_slot(&mut state, 1, "T-CDX-01");
+        state.agent_slots[0].last_client = Some(AgentClient::Codex);
+
+        state.mark_ticket_done("T-CDX-01");
+        assert!(matches!(
+            state.pending_completions.get("T-CDX-01").map(|p| p.source),
+            Some(CompletionSource::Manual)
+        ));
+        state.handle_completion_result(
+            "T-CDX-01",
+            Some(1),
+            Vec::new(),
+            b"identity unavailable".to_vec(),
+        );
+
+        assert!(!state.pending_completions.contains_key("T-CDX-01"));
+        assert!(state.threads.contains_key("T-CDX-01"));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-CDX-01"));
+        assert!(!state
+            .dag
+            .get_ready_tickets()
+            .contains(&"T-CDX-02".to_string()));
+        assert!(!ledger.exists(), "failed attempts must not emit provenance");
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message }
+                if message.contains("identity unavailable") && message.contains("recoverable")
+        )));
+
+        state.mark_ticket_done("T-CDX-01");
+        lisa_core::ticket::update_ticket_done(&ticket_path).unwrap();
+        state.rebuild_dag();
+        assert_eq!(
+            state.dag.get_ticket(&"T-CDX-01".to_string()).unwrap().phase,
+            Phase::Review
+        );
+        assert!(!state
+            .dag
+            .get_ready_tickets()
+            .contains(&"T-CDX-02".to_string()));
+
+        state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
+        assert!(!state.threads.contains_key("T-CDX-01"));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        assert!(state
+            .dag
+            .get_ready_tickets()
+            .contains(&"T-CDX-02".to_string()));
+        assert_eq!(read_ledger(&ledger).len(), 1);
+
+        state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
+        assert_eq!(read_ledger(&ledger).len(), 1);
     }
 }
 
