@@ -18,7 +18,7 @@ in the same continuous RDSPI pass.
 
 ## In progress
 
-- [ ] Run workspace/WASM release verification and write Review handoff.
+- [x] Review handoff written.
 
 ## Remaining
 
@@ -27,9 +27,9 @@ in the same continuous RDSPI pass.
 - [x] Route every Done trigger through the state machine.
 - [x] Add automatic, timeout/finish-up, manual, reused Codex, dependent, and
   provenance regressions.
-- [ ] Run focused/workspace/WASM/Clippy verification.
-- [ ] Commit meaningful units with exact path scope.
-- [ ] Write Review handoff.
+- [x] Run focused/workspace/WASM/Clippy verification.
+- [x] Commit meaningful units with exact path scope.
+- [x] Write Review handoff.
 
 ## Implementation completed
 
@@ -67,6 +67,43 @@ in the same continuous RDSPI pass.
   frontmatter helper and tests.
 - `52da2643d4cd9c6d73ada3074fa84b55efae91ee` — native atomic completion
   command and process regressions.
+- `e85b31348082cfc55b0f61f79c0bda2f5acdc332` — plugin completion state
+  machine, routed triggers, regressions, and pre-review RDSPI artifacts.
+- `b8903cd64b4d88bd88a27240809d3db313088550` — compensating rollback for
+  failures after the completion commit advances `HEAD`.
+- `ef5aa39eb93ef05f00583e0b4d8777bdf222561c` — idempotent verification for
+  externally committed Done tickets.
+
+## Final verification
+
+- `cargo test -p lisa-core ticket::tests`: 32 passed at focused checkpoint.
+- `cargo test -p lisa-cli commit_transaction`: 12 passed after final edge-case
+  coverage.
+- `cargo test -p lisa-plugin`: 236 passed.
+- `cargo clippy -p lisa-plugin --all-targets -- -D warnings`: passed.
+- `cargo clippy -p lisa-cli --bin lisa -- -D warnings`: passed.
+- `cargo build -p lisa-plugin --target wasm32-wasip1 --release`: passed.
+- `cargo test --workspace`: passed.
+- Final `just check`: passed:
+  - WASM development check passed;
+  - 267 CLI tests passed;
+  - 147 core tests passed;
+  - 236 plugin tests passed;
+  - doc tests passed.
+- `git diff --check` on ticket-owned work artifacts: passed.
+
+## Final deviations and corrections
+
+- The design initially treated T-031-01 post-ref cleanup errors as an inherited
+  ambiguity. Self-review identified that restoring non-Done working bytes over
+  an advanced Done commit would make retries unsafe. The transaction now
+  compensates by rolling back `HEAD` and reconciling exact ticket paths before
+  reporting failure; a process test covers the rollback boundary.
+- Externally committed Done tickets were initially routed to `complete-ticket`
+  but could return "no changes" forever. The command now verifies clean explicit
+  ticket/work paths and returns the current commit ID as an idempotent success.
+- Lisa automatically advanced the ticket phase while artifacts appeared. This
+  session did not edit the ticket's phase or status fields.
 
 ## Deviations
 
