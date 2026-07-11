@@ -1,0 +1,10 @@
+{
+  "session_id": "019b2a2e-0df8-79d1-a20f-d1c78fd9860b",
+  "transcript_path": "/Users/example/.codex/sessions/2026/07/11/rollout-retry.jsonl",
+  "cwd": "/Users/example/swe/repos/lisa",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-5.4",
+  "permission_mode": "bypassPermissions",
+  "turn_id": "turn-previous-generation",
+  "prompt": "Retry the ticket at docs/active/tickets/T-033-01-02.md.\nLISA_ASSIGNMENT {\"ticket_id\":\"T-033-01-02\",\"generation\":41}"
+}

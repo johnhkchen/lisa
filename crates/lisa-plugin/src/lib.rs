@@ -5,6 +5,7 @@
 //! tracks phase progress, and provides a live dashboard.
 
 mod adapter;
+mod codex_ack;
 mod pane_name;
 mod ui;
 

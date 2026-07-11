@@ -1,0 +1,9 @@
+{
+  "session_id": "019b2a2e-0df8-79d1-a20f-d1c78fd9860b",
+  "transcript_path": "/Users/example/.codex/sessions/2026/07/11/rollout-cleared.jsonl",
+  "cwd": "/Users/example/swe/repos/lisa",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-5.4",
+  "permission_mode": "bypassPermissions",
+  "source": "clear"
+}
