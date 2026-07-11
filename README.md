@@ -260,6 +260,21 @@ lisa init --dry-run    # Preview what would be created
 lisa init --path ../other-project
 ```
 
+Re-running `lisa init` is conservative. Lisa replaces a static workflow or hook
+template only when its exact contents match a known Lisa version; customized,
+unreadable, or otherwise unclassifiable files are preserved and shown as safety
+skips. Structured TOML and JSON targets keep their format-aware merge behavior
+and preserve unrelated project settings.
+
+`.lisa/.gitignore` has a stricter append-only contract: init preserves every
+existing line in place and adds only missing Lisa-required rules. Project rules
+are never deleted, reordered, or rewritten.
+
+Both dry runs and real runs label creates, updates, no-ops, and safety skips. A
+successful real run also prints `Files changed`, the exact set of files whose
+contents it created or updated. Inspect those reported files before your next
+commit.
+
 ### `lisa validate`
 
 Check that tickets parse correctly, the DAG has no cycles or missing dependencies, and the project structure is sound.

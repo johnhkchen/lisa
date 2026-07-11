@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -180,7 +181,8 @@ pub enum InitAction {
     CreateDir(PathBuf),
     CreateFile { path: PathBuf, content: String },
     UpdateFile { path: PathBuf, content: String },
-    Skip { path: PathBuf, reason: String },
+    NoOp { path: PathBuf, reason: String },
+    SafetySkip { path: PathBuf, reason: String },
 }
 
 impl fmt::Display for InitAction {
@@ -189,7 +191,10 @@ impl fmt::Display for InitAction {
             InitAction::CreateDir(path) => write!(f, "  create  {}/", path.display()),
             InitAction::CreateFile { path, .. } => write!(f, "  create  {}", path.display()),
             InitAction::UpdateFile { path, .. } => write!(f, "  update  {}", path.display()),
-            InitAction::Skip { path, reason } => {
+            InitAction::NoOp { path, reason } => {
+                write!(f, "  no-op   {} ({})", path.display(), reason)
+            }
+            InitAction::SafetySkip { path, reason } => {
                 write!(f, "  skip    {} ({})", path.display(), reason)
             }
         }
@@ -208,7 +213,7 @@ fn plan_owned_template(path: PathBuf, current: &str, known_prior: &[&str]) -> In
     }
 
     match fs::read_to_string(&path) {
-        Ok(existing) if existing == current => InitAction::Skip {
+        Ok(existing) if existing == current => InitAction::NoOp {
             path,
             reason: "already up to date".to_string(),
         },
@@ -216,11 +221,56 @@ fn plan_owned_template(path: PathBuf, current: &str, known_prior: &[&str]) -> In
             path,
             content: current.to_string(),
         },
-        Ok(_) => InitAction::Skip {
+        Ok(_) => InitAction::SafetySkip {
             path,
             reason: "preserved: content is not a known Lisa template".to_string(),
         },
-        Err(_) => InitAction::Skip {
+        Err(_) => InitAction::SafetySkip {
+            path,
+            reason: "preserved: existing file is unreadable".to_string(),
+        },
+    }
+}
+
+/// Plan an append-only update to Lisa's nested gitignore. Existing bytes are
+/// retained as an immutable prefix; only required rules that are absent after
+/// trimming harmless surrounding whitespace are appended.
+fn plan_append_only_gitignore(path: PathBuf, required: &str) -> InitAction {
+    if !path.exists() {
+        return InitAction::CreateFile {
+            path,
+            content: required.to_string(),
+        };
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(existing) => {
+            let existing_rules: Vec<&str> = existing.lines().map(str::trim).collect();
+            let missing: Vec<&str> = required
+                .lines()
+                .map(str::trim)
+                .filter(|rule| !rule.is_empty() && !existing_rules.contains(rule))
+                .collect();
+
+            if missing.is_empty() {
+                return InitAction::NoOp {
+                    path,
+                    reason: "already up to date".to_string(),
+                };
+            }
+
+            let mut content = existing;
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            for rule in missing {
+                content.push_str(rule);
+                content.push('\n');
+            }
+
+            InitAction::UpdateFile { path, content }
+        }
+        Err(_) => InitAction::SafetySkip {
             path,
             reason: "preserved: existing file is unreadable".to_string(),
         },
@@ -244,7 +294,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     for dir in &dirs {
         let path = root.join(dir);
         if path.exists() {
-            actions.push(InitAction::Skip {
+            actions.push(InitAction::NoOp {
                 path,
                 reason: "already exists".to_string(),
             });
@@ -256,7 +306,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     // CLAUDE.md
     let claude_md_path = root.join("CLAUDE.md");
     if claude_md_path.exists() {
-        actions.push(InitAction::Skip {
+        actions.push(InitAction::NoOp {
             path: claude_md_path,
             reason: "already exists".to_string(),
         });
@@ -273,7 +323,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     // one-line .lisa.toml edit with no re-scaffold; inert for Claude-only projects.
     let agents_md_path = root.join("AGENTS.md");
     if agents_md_path.exists() {
-        actions.push(InitAction::Skip {
+        actions.push(InitAction::NoOp {
             path: agents_md_path,
             reason: "already exists".to_string(),
         });
@@ -310,7 +360,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                 let updated = upsert_missing_config_keys(&with_version);
 
                 if updated == existing {
-                    actions.push(InitAction::Skip {
+                    actions.push(InitAction::NoOp {
                         path: config_path,
                         reason: "already up to date".to_string(),
                     });
@@ -322,7 +372,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                 }
             }
             Err(_) => {
-                actions.push(InitAction::Skip {
+                actions.push(InitAction::SafetySkip {
                     path: config_path,
                     reason: "exists but unreadable".to_string(),
                 });
@@ -340,7 +390,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     for dir in &hook_dirs {
         let path = root.join(dir);
         if path.exists() {
-            actions.push(InitAction::Skip {
+            actions.push(InitAction::NoOp {
                 path,
                 reason: "already exists".to_string(),
             });
@@ -388,10 +438,9 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
 
     // .lisa/.gitignore (ignores ephemeral signal/session/usage files)
     let lisa_gitignore_path = root.join(".lisa/.gitignore");
-    actions.push(plan_owned_template(
+    actions.push(plan_append_only_gitignore(
         lisa_gitignore_path,
         templates::LISA_GITIGNORE,
-        templates::LEGACY_LISA_GITIGNORES,
     ));
 
     // .claude/settings.local.json (Stop, SessionStart, Notification hooks)
@@ -406,7 +455,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                         let old: Option<serde_json::Value> = serde_json::from_str(&content).ok();
                         let new: Option<serde_json::Value> = serde_json::from_str(&merged).ok();
                         if old == new {
-                            actions.push(InitAction::Skip {
+                            actions.push(InitAction::NoOp {
                                 path: settings_path,
                                 reason: "already up to date".to_string(),
                             });
@@ -418,7 +467,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                         }
                     }
                     Err(_) => {
-                        actions.push(InitAction::Skip {
+                        actions.push(InitAction::SafetySkip {
                             path: settings_path,
                             reason: "exists but JSON is malformed — add hooks manually".to_string(),
                         });
@@ -426,7 +475,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                 }
             }
             Err(_) => {
-                actions.push(InitAction::Skip {
+                actions.push(InitAction::SafetySkip {
                     path: settings_path,
                     reason: "exists but unreadable — check permissions".to_string(),
                 });
@@ -450,7 +499,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                     let old: Option<serde_json::Value> = serde_json::from_str(&content).ok();
                     let new: Option<serde_json::Value> = serde_json::from_str(&merged).ok();
                     if old == new {
-                        actions.push(InitAction::Skip {
+                        actions.push(InitAction::NoOp {
                             path: codex_hooks_path,
                             reason: "already up to date".to_string(),
                         });
@@ -461,12 +510,12 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
                         });
                     }
                 }
-                Err(_) => actions.push(InitAction::Skip {
+                Err(_) => actions.push(InitAction::SafetySkip {
                     path: codex_hooks_path,
                     reason: "exists but JSON is malformed — add hooks manually".to_string(),
                 }),
             },
-            Err(_) => actions.push(InitAction::Skip {
+            Err(_) => actions.push(InitAction::SafetySkip {
                 path: codex_hooks_path,
                 reason: "exists but unreadable — check permissions".to_string(),
             }),
@@ -481,44 +530,72 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     actions
 }
 
-/// Execute the init command
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileMutationKind {
+    Created,
+    Updated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileMutation {
+    kind: FileMutationKind,
+    path: PathBuf,
+}
+
+fn write_init_line(out: &mut impl Write, args: fmt::Arguments<'_>) -> Result<(), String> {
+    writeln!(out, "{args}").map_err(|e| format!("Failed to write init output: {e}"))
+}
+
+/// Execute the init command, writing user-facing output to stdout.
 pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    run_init_with_writer(root, dry_run, &mut out)
+}
+
+/// Internal init entry point with injectable output for end-to-end reporting
+/// tests. Planning remains complete before any filesystem mutation.
+fn run_init_with_writer(root: &Path, dry_run: bool, out: &mut impl Write) -> Result<(), String> {
     if !root.exists() {
         return Err(format!("Path does not exist: {}", root.display()));
     }
 
     // Step 1: Detect project type
     let project = detect_project(root);
-    println!(
-        "Detected project: {} ({})",
-        project.name,
-        match &project.project_type {
-            crate::detect::ProjectType::Rust => "Rust",
-            crate::detect::ProjectType::Node => "Node.js",
-            crate::detect::ProjectType::Go => "Go",
-            crate::detect::ProjectType::Python => "Python",
-            crate::detect::ProjectType::Unknown => "unknown",
-        }
-    );
-    println!();
+    write_init_line(
+        out,
+        format_args!(
+            "Detected project: {} ({})",
+            project.name,
+            match &project.project_type {
+                crate::detect::ProjectType::Rust => "Rust",
+                crate::detect::ProjectType::Node => "Node.js",
+                crate::detect::ProjectType::Go => "Go",
+                crate::detect::ProjectType::Python => "Python",
+                crate::detect::ProjectType::Unknown => "unknown",
+            }
+        ),
+    )?;
+    write_init_line(out, format_args!(""))?;
 
     // Step 2: Plan actions
     let actions = plan_init_actions(root, &project);
 
     // Step 3: Print the plan
-    println!("Planned actions:");
+    write_init_line(out, format_args!("Planned actions:"))?;
     for action in &actions {
-        println!("{}", action);
+        write_init_line(out, format_args!("{action}"))?;
     }
-    println!();
+    write_init_line(out, format_args!(""))?;
 
     // Step 4: Dry run stops here
     if dry_run {
-        println!("Dry run complete. No changes made.");
+        write_init_line(out, format_args!("Dry run complete. No changes made."))?;
         return Ok(());
     }
 
     // Step 5: Execute
+    let mut mutations = Vec::new();
     for action in &actions {
         match action {
             InitAction::CreateDir(path) => {
@@ -533,22 +610,31 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
                 }
                 fs::write(path, content)
                     .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+                mutations.push(FileMutation {
+                    kind: FileMutationKind::Created,
+                    path: path.clone(),
+                });
             }
             InitAction::UpdateFile { path, content } => {
                 fs::write(path, content)
                     .map_err(|e| format!("Failed to update {}: {}", path.display(), e))?;
+                mutations.push(FileMutation {
+                    kind: FileMutationKind::Updated,
+                    path: path.clone(),
+                });
             }
-            InitAction::Skip { .. } => {}
+            InitAction::NoOp { .. } | InitAction::SafetySkip { .. } => {}
         }
     }
 
-    // Make hook scripts executable on Unix
+    // Make only active hook scripts written by this run executable. A no-op or
+    // safety-skipped project hook is left completely untouched.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh", "on-heartbeat.sh"] {
             let hook_path = root.join(format!(".lisa/hooks/{}", script));
-            if hook_path.exists() {
+            if mutations.iter().any(|mutation| mutation.path == hook_path) {
                 let perms = fs::Permissions::from_mode(0o755);
                 fs::set_permissions(&hook_path, perms).map_err(|e| {
                     format!(
@@ -561,12 +647,41 @@ pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
         }
     }
 
-    println!("Initialization complete.");
-    println!();
-    println!("Next steps:");
-    println!("  1. Create tickets in docs/active/tickets/");
-    println!("  2. Run `lisa validate` to check readiness");
-    println!("  3. Run `lisa loop` to start scheduling");
+    write_init_line(out, format_args!("Initialization complete."))?;
+    write_init_line(out, format_args!(""))?;
+    write_init_line(out, format_args!("Files changed:"))?;
+    if mutations.is_empty() {
+        write_init_line(out, format_args!("  none"))?;
+    } else {
+        for mutation in &mutations {
+            let label = match mutation.kind {
+                FileMutationKind::Created => "created",
+                FileMutationKind::Updated => "updated",
+            };
+            write_init_line(
+                out,
+                format_args!("  {label:<8} {}", mutation.path.display()),
+            )?;
+        }
+    }
+    write_init_line(out, format_args!(""))?;
+    write_init_line(out, format_args!("Next steps:"))?;
+    write_init_line(
+        out,
+        format_args!("  1. Inspect the files reported above before your next commit"),
+    )?;
+    write_init_line(
+        out,
+        format_args!("  2. Create tickets in docs/active/tickets/"),
+    )?;
+    write_init_line(
+        out,
+        format_args!("  3. Run `lisa validate` to check readiness"),
+    )?;
+    write_init_line(
+        out,
+        format_args!("  4. Run `lisa loop` to start scheduling"),
+    )?;
 
     Ok(())
 }
@@ -1065,6 +1180,7 @@ fn print_diagnostics(result: &ValidationResult) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     #[test]
     fn test_plan_init_actions_empty_dir() {
@@ -1078,7 +1194,7 @@ mod tests {
         //   .lisa/.gitignore, Claude settings, and Codex hooks.json)
         let creates: Vec<_> = actions
             .iter()
-            .filter(|a| !matches!(a, InitAction::Skip { .. }))
+            .filter(|a| matches!(a, InitAction::CreateDir(_) | InitAction::CreateFile { .. }))
             .collect();
         assert_eq!(creates.len(), 20);
     }
@@ -1107,7 +1223,7 @@ mod tests {
         // CLAUDE.md should be skipped
         let skipped: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("CLAUDE.md")))
+            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with("CLAUDE.md")))
             .collect();
         assert_eq!(skipped.len(), 1);
     }
@@ -1747,7 +1863,7 @@ depends_on: [T-999]
         // An arbitrary difference is not evidence that this is a Lisa template.
         let preserved_hook: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with("on-idle.sh") && reason == "preserved: content is not a known Lisa template"))
+            .filter(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with("on-idle.sh") && reason == "preserved: content is not a known Lisa template"))
             .collect();
         assert_eq!(preserved_hook.len(), 1);
 
@@ -1782,7 +1898,7 @@ depends_on: [T-999]
         // on-idle.sh should be skipped (already up to date)
         let skipped_hook: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("on-idle.sh")))
+            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with("on-idle.sh")))
             .collect();
         assert_eq!(skipped_hook.len(), 1);
     }
@@ -1809,7 +1925,7 @@ depends_on: [T-999]
 
         let skipped_settings: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("settings.local.json")))
+            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with("settings.local.json")))
             .collect();
         assert_eq!(skipped_settings.len(), 1);
     }
@@ -1902,7 +2018,7 @@ depends_on: [T-999]
 
         let skipped: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with(".lisa.toml")))
+            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with(".lisa.toml")))
             .collect();
         assert_eq!(skipped.len(), 1);
     }
@@ -1990,7 +2106,7 @@ depends_on: [T-999]
 
         let preserved: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with("rdspi-workflow.md") && reason == "preserved: content is not a known Lisa template"))
+            .filter(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with("rdspi-workflow.md") && reason == "preserved: content is not a known Lisa template"))
             .collect();
         assert_eq!(preserved.len(), 1);
     }
@@ -2010,7 +2126,7 @@ depends_on: [T-999]
 
         let skipped: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::Skip { path, .. } if path.ends_with("rdspi-workflow.md")))
+            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with("rdspi-workflow.md")))
             .collect();
         assert_eq!(skipped.len(), 1);
     }
@@ -2032,11 +2148,7 @@ depends_on: [T-999]
         ] {
             fs::write(dir.path().join(format!(".lisa/hooks/{name}")), content).unwrap();
         }
-        fs::write(
-            dir.path().join(".lisa/.gitignore"),
-            templates::LEGACY_LISA_GITIGNORES[0],
-        )
-        .unwrap();
+        fs::write(dir.path().join(".lisa/.gitignore"), "signals/\n").unwrap();
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
@@ -2095,14 +2207,168 @@ depends_on: [T-999]
             ".gitignore",
         ] {
             assert!(
-                actions.iter().any(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason == "already up to date")),
+                actions.iter().any(|a| matches!(a, InitAction::NoOp { path, reason } if path.ends_with(name) && reason == "already up to date")),
                 "current {name} should be a no-op"
             );
         }
     }
 
     #[test]
-    fn test_init_preserves_project_modified_plain_text_byte_for_byte() {
+    fn test_append_only_gitignore_handles_spacing_newlines_and_idempotence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".gitignore");
+
+        fs::write(&path, "signals/").unwrap();
+        let action = plan_append_only_gitignore(path.clone(), templates::LISA_GITIGNORE);
+        let merged = match action {
+            InitAction::UpdateFile { content, .. } => content,
+            other => panic!("expected append-only update, got {other:?}"),
+        };
+        assert_eq!(merged, "signals/\nclaude/\ncodex/\n");
+        assert!(merged.starts_with("signals/"));
+
+        fs::write(&path, &merged).unwrap();
+        assert!(matches!(
+            plan_append_only_gitignore(path.clone(), templates::LISA_GITIGNORE),
+            InitAction::NoOp { reason, .. } if reason == "already up to date"
+        ));
+
+        let spaced = "  signals/  \n\tclaude/\t\ncodex/";
+        fs::write(&path, spaced).unwrap();
+        assert!(matches!(
+            plan_append_only_gitignore(path, templates::LISA_GITIGNORE),
+            InitAction::NoOp { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            spaced
+        );
+    }
+
+    #[test]
+    fn test_append_only_gitignore_preserves_unreadable_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".gitignore");
+        let original = [0xff, 0xfe, b'\n'];
+        fs::write(&path, original).unwrap();
+
+        assert!(matches!(
+            plan_append_only_gitignore(path.clone(), templates::LISA_GITIGNORE),
+            InitAction::SafetySkip { reason, .. }
+                if reason == "preserved: existing file is unreadable"
+        ));
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_init_output_categories_and_mutation_report_match_write_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial_output = Vec::new();
+        run_init_with_writer(dir.path(), false, &mut initial_output).unwrap();
+
+        let agents_path = dir.path().join("AGENTS.md");
+        let gitignore_path = dir.path().join(".lisa/.gitignore");
+        let workflow_path = dir.path().join("docs/knowledge/rdspi-workflow.md");
+        let skipped_hook_path = dir.path().join(".lisa/hooks/on-idle.sh");
+        fs::remove_file(&agents_path).unwrap();
+        fs::write(&gitignore_path, "signals/\nhooks/ntfy-topic\n").unwrap();
+        fs::write(&skipped_hook_path, "#!/bin/sh\n# project-owned\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&skipped_hook_path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+        let file_paths: Vec<PathBuf> = actions
+            .iter()
+            .filter_map(|action| match action {
+                InitAction::CreateFile { path, .. }
+                | InitAction::UpdateFile { path, .. }
+                | InitAction::NoOp { path, .. }
+                | InitAction::SafetySkip { path, .. }
+                    if !path.is_dir() =>
+                {
+                    Some(path.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let before: Vec<(PathBuf, Option<Vec<u8>>)> = file_paths
+            .iter()
+            .map(|path| (path.clone(), fs::read(path).ok()))
+            .collect();
+
+        let mut dry_output = Vec::new();
+        run_init_with_writer(dir.path(), true, &mut dry_output).unwrap();
+        let dry_output = String::from_utf8(dry_output).unwrap();
+        assert!(dry_output.contains("  create  "));
+        assert!(dry_output.contains("  update  "));
+        assert!(dry_output.contains("  no-op   "));
+        assert!(dry_output.contains("  skip    "));
+        assert!(dry_output.contains("Dry run complete. No changes made."));
+        assert!(!agents_path.exists());
+        assert_eq!(
+            fs::read_to_string(&gitignore_path).unwrap(),
+            "signals/\nhooks/ntfy-topic\n"
+        );
+
+        let mut real_output = Vec::new();
+        run_init_with_writer(dir.path(), false, &mut real_output).unwrap();
+        let real_output = String::from_utf8(real_output).unwrap();
+        let actual_changed: Vec<PathBuf> = before
+            .iter()
+            .filter_map(|(path, old)| (fs::read(path).ok() != *old).then(|| path.clone()))
+            .collect();
+        assert_eq!(
+            actual_changed,
+            vec![agents_path.clone(), gitignore_path.clone()]
+        );
+
+        let report = real_output
+            .split_once("Files changed:\n")
+            .unwrap()
+            .1
+            .split_once("\nNext steps:")
+            .unwrap()
+            .0;
+        assert_eq!(
+            report,
+            format!(
+                "  created  {}\n  updated  {}\n",
+                agents_path.display(),
+                gitignore_path.display()
+            )
+        );
+        assert!(!report.contains(&workflow_path.display().to_string()));
+        assert!(!report.contains(&skipped_hook_path.display().to_string()));
+        assert!(
+            real_output.contains("  1. Inspect the files reported above before your next commit")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&skipped_hook_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o640, "safety-skipped hook mode changed");
+        }
+
+        let mut second_output = Vec::new();
+        run_init_with_writer(dir.path(), false, &mut second_output).unwrap();
+        let second_output = String::from_utf8(second_output).unwrap();
+        assert!(second_output.contains("Files changed:\n  none\n"));
+        assert_eq!(
+            fs::read_to_string(gitignore_path).unwrap(),
+            "signals/\nhooks/ntfy-topic\nclaude/\ncodex/\n"
+        );
+    }
+
+    #[test]
+    fn test_init_preserves_vend_customizations_and_secret_ignore_rule() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
@@ -2120,21 +2386,41 @@ depends_on: [T-999]
             templates::ON_NOTIFY_HOOK
         );
         let gitignore = "signals/\nhooks/ntfy-topic\n";
-        let fixtures = [
+        let preserved_fixtures = [
             ("docs/knowledge/rdspi-workflow.md", workflow.as_bytes()),
             (".lisa/hooks/on-stop.sh", stop_hook.as_bytes()),
             (".lisa/hooks/on-notify.sample", notify_sample.as_bytes()),
-            (".lisa/.gitignore", gitignore.as_bytes()),
         ];
-        for (path, content) in fixtures {
+        for (path, content) in preserved_fixtures {
             fs::write(dir.path().join(path), content).unwrap();
         }
+        fs::write(dir.path().join(".lisa/.gitignore"), gitignore).unwrap();
+        fs::write(dir.path().join(".lisa/hooks/ntfy-topic"), "secret-topic").unwrap();
+
+        let git_init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(git_init.success());
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
-        for path in fixtures.map(|(path, _)| path) {
-            assert!(actions.iter().any(|a| matches!(a, InitAction::Skip { path: action_path, reason } if action_path == &dir.path().join(path) && reason == "preserved: content is not a known Lisa template")));
+        for path in preserved_fixtures.map(|(path, _)| path) {
+            assert!(actions.iter().any(|a| matches!(a, InitAction::SafetySkip { path: action_path, reason } if action_path == &dir.path().join(path) && reason == "preserved: content is not a known Lisa template")));
         }
+        let planned_gitignore = actions.iter().find_map(|action| match action {
+            InitAction::UpdateFile { path, content }
+                if path == &dir.path().join(".lisa/.gitignore") =>
+            {
+                Some(content)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            planned_gitignore.map(String::as_str),
+            Some("signals/\nhooks/ntfy-topic\nclaude/\ncodex/\n")
+        );
         assert_eq!(
             fs::read(dir.path().join("docs/knowledge/rdspi-workflow.md")).unwrap(),
             workflow.as_bytes()
@@ -2142,13 +2428,33 @@ depends_on: [T-999]
 
         run_init(dir.path(), false).unwrap();
 
-        for (path, content) in fixtures {
+        for (path, content) in preserved_fixtures {
             assert_eq!(
                 fs::read(dir.path().join(path)).unwrap(),
                 content,
                 "{path} changed during real init"
             );
         }
+        let upgraded_gitignore = fs::read_to_string(dir.path().join(".lisa/.gitignore")).unwrap();
+        assert_eq!(
+            upgraded_gitignore,
+            "signals/\nhooks/ntfy-topic\nclaude/\ncodex/\n"
+        );
+
+        let ignored = Command::new("git")
+            .args(["check-ignore", ".lisa/hooks/ntfy-topic"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            ignored.status.success(),
+            "notification secret should remain ignored: {}",
+            String::from_utf8_lossy(&ignored.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(ignored.stdout).unwrap().trim(),
+            ".lisa/hooks/ntfy-topic"
+        );
     }
 
     #[test]
@@ -2167,7 +2473,7 @@ depends_on: [T-999]
         let actions = plan_init_actions(dir.path(), &project);
 
         for name in &["rdspi-workflow.md", "on-stop.sh"] {
-            assert!(actions.iter().any(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason == "preserved: existing file is unreadable")));
+            assert!(actions.iter().any(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with(name) && reason == "preserved: existing file is unreadable")));
             assert!(!actions
                 .iter()
                 .any(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(name))));
@@ -2192,7 +2498,7 @@ depends_on: [T-999]
         let actions = plan_init_actions(dir.path(), &project);
 
         for name in &["settings.local.json", "hooks.json"] {
-            assert!(actions.iter().any(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason.contains("JSON is malformed"))));
+            assert!(actions.iter().any(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with(name) && reason.contains("JSON is malformed"))));
             assert!(!actions
                 .iter()
                 .any(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(name))));
@@ -2258,7 +2564,7 @@ depends_on: [T-999]
         ] {
             let preserved: Vec<_> = actions
                 .iter()
-                .filter(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason == "preserved: content is not a known Lisa template"))
+                .filter(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with(name) && reason == "preserved: content is not a known Lisa template"))
                 .collect();
             assert_eq!(preserved.len(), 1, "{} should be preserved", name);
         }

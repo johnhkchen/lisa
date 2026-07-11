@@ -6,7 +6,8 @@
 - Design complete.
 - Structure complete.
 - Plan complete.
-- Implementation in progress.
+- Implementation complete.
+- Review verification in progress.
 
 ## Completed
 
@@ -16,22 +17,48 @@
 - Selected explicit `NoOp` and `SafetySkip` action categories.
 - Selected a writer-injected execution path and successful-write mutation record.
 - Defined the combined vend workflow plus `hooks/ntfy-topic` Git regression.
+- Split ordinary no-ops from safety skips in `InitAction` and its display.
+- Added `plan_append_only_gitignore`, preserving existing bytes as an exact prefix
+  and appending only missing trimmed rules in template order.
+- Removed the now-unused legacy whole-file gitignore ownership constant.
+- Added writer-injected `run_init_with_writer` while retaining the public stdout
+  wrapper.
+- Added a successful-write record and final `Files changed` report with created
+  versus updated labels.
+- Limited executable-bit changes to active hook files created or updated by the
+  current run; skipped project hooks are untouched.
+- Revised the vend fixture to keep workflow/hook customizations, append required
+  ignore rules, and verify `hooks/ntfy-topic` with `git check-ignore`.
+- Added edge coverage for missing trailing newline, harmless spacing,
+  idempotence, invalid UTF-8, all four output categories, exact before/after
+  write-set reporting, and skipped-hook mode preservation.
+- Documented the ownership, append-only, mutation-report, and pre-commit
+  inspection contracts in README.
+
+## Verification so far
+
+- `cargo check -p lisa-cli`: passed after production implementation.
+- Focused init tests: 68 passed, 0 failed.
+- `cargo fmt --all`: completed.
 
 ## Remaining
 
-- Refactor action categories.
-- Implement and test append-only gitignore planning.
-- Revise the combined field fixture and verify `git check-ignore`.
-- Add writer capture and exact mutation report.
-- Align active-hook chmod with files written by the run.
-- Update README.
-- Run focused and full verification.
+- Run full CLI and workspace verification.
+- Run `just check` and diff validation.
+- Commit implementation units.
 - Write `review.md`.
 
 ## Deviations
 
-None.
+### Combined implementation unit
+
+The action-category refactor, append-only planner, and mutation reporting landed
+in one working unit before the first implementation commit. They share exhaustive
+enum matches and end-to-end output tests, so separating them would have required
+an intentionally incomplete intermediate state. The phase artifacts remain a
+separate earlier commit.
 
 ## Commits
 
-Pending.
+- `a2a85fc` — research, design, structure, plan, and initial progress artifacts.
+- Implementation commit pending final focused verification.

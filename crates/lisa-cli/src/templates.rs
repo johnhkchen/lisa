@@ -130,8 +130,6 @@ fi
 /// usage/session artifacts are machine-owned and must never enter the project DAG.
 pub const LISA_GITIGNORE: &str = "signals/\nclaude/\ncodex/\n";
 
-pub(crate) const LEGACY_LISA_GITIGNORES: &[&str] = &["signals/\n"];
-
 /// The `AGENTS.md` pointer file scaffolded by `lisa init`.
 ///
 /// Codex auto-loads `AGENTS.md`; Claude Code auto-loads `CLAUDE.md` (codex-client
