@@ -2319,7 +2319,8 @@ depends_on: [T-999]
         let real_output = String::from_utf8(real_output).unwrap();
         let actual_changed: Vec<PathBuf> = before
             .iter()
-            .filter_map(|(path, old)| (fs::read(path).ok() != *old).then(|| path.clone()))
+            .filter(|(path, old)| fs::read(path).ok() != *old)
+            .map(|(path, _)| path.clone())
             .collect();
         assert_eq!(
             actual_changed,

@@ -7,7 +7,7 @@
 - Structure complete.
 - Plan complete.
 - Implementation complete.
-- Review verification in progress.
+- Review verification complete.
 
 ## Completed
 
@@ -40,13 +40,22 @@
 - `cargo check -p lisa-cli`: passed after production implementation.
 - Focused init tests: 68 passed, 0 failed.
 - `cargo fmt --all`: completed.
+- Full `cargo test -p lisa-cli`: 251 passed, 0 failed.
+- Full `cargo test --workspace`: 630 passed, 0 failed
+  (251 CLI, 145 core, 234 plugin; doc-tests passed).
+- `just check`: passed, including the `wasm32-wasip1` plugin check and all 630
+  workspace tests.
+- `git diff --check`: passed before final review.
+- The final test-only clippy cleanup was rechecked with its focused mutation
+  report regression: 1 passed, 0 failed.
+- Warning-strict CLI clippy reaches one pre-existing
+  `needless_borrows_for_generic_args` diagnostic in the stale-version test near
+  `init.rs:2032`. T-030-01 already documented this baseline issue. No clippy
+  diagnostic remains in code or tests introduced by T-030-02.
 
 ## Remaining
 
-- Run full CLI and workspace verification.
-- Run `just check` and diff validation.
-- Commit implementation units.
-- Write `review.md`.
+- None. Review artifact is complete.
 
 ## Deviations
 
@@ -61,4 +70,7 @@ separate earlier commit.
 ## Commits
 
 - `a2a85fc` — research, design, structure, plan, and initial progress artifacts.
-- Implementation commit pending final focused verification.
+- `8796cca` — append-only gitignore merge, action categories, exact mutation
+  report, regressions, and README contract.
+- Final review/handoff commit contains the test-only clippy cleanup and completed
+  progress/review artifacts.
