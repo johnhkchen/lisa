@@ -7577,6 +7577,92 @@ mod tests {
         (state, dir)
     }
 
+    fn consecutive_reuse_state(
+        provider: AgentClient,
+        ticket_prefix: &str,
+        pane_ids: &[u32],
+    ) -> (State, tempfile::TempDir) {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        let provider_name = match provider {
+            AgentClient::Claude => "claude",
+            AgentClient::Codex => "codex",
+        };
+        for sequence in 1..=10 {
+            let ticket_id = format!("{ticket_prefix}-{sequence:02}");
+            fs::write(
+                tickets_dir.join(format!("{ticket_id}.md")),
+                format!(
+                    "---\nid: {ticket_id}\ntitle: consecutive reuse {sequence:02}\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: {provider_name}\n---\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                client: provider,
+                max_threads: pane_ids.len(),
+                wind_down_secs: 0,
+                assignment_ack_timeout_secs: 1,
+                ..PluginConfig::new()
+            },
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.extend(
+            pane_ids
+                .iter()
+                .map(|pane_id| fresh_slot(*pane_id, Some(provider))),
+        );
+        (state, dir)
+    }
+
+    fn refresh_fixture_dag(state: &mut State) {
+        let tickets = lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap();
+        state.dag = Dag::from_tickets(tickets).unwrap();
+    }
+
+    fn active_ticket_panes(state: &State) -> Vec<(TicketId, u32)> {
+        let mut active: Vec<(TicketId, u32)> = state
+            .agent_slots
+            .iter()
+            .filter_map(|slot| {
+                slot.ticket_id
+                    .as_ref()
+                    .map(|ticket_id| (ticket_id.clone(), slot.pane_id))
+            })
+            .collect();
+        active.sort();
+        active
+    }
+
+    fn acknowledge_assignment(
+        state: &mut State,
+        pane_id: u32,
+        ticket_id: &str,
+        generation: u64,
+    ) -> bool {
+        let payload = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "consecutive reuse proof",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id,
+                    generation,
+                },
+            ),
+        });
+        state.acknowledge_codex_assignment(pane_id, &payload.to_string())
+    }
+
     #[test]
     fn test_pane_title_rename_gate_deduplicates() {
         let mut state = State::default();
@@ -8148,6 +8234,236 @@ timeout\n\
         );
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
         assert!(state.seat_is_owned(10));
+    }
+
+    #[test]
+    fn test_consecutive_reused_panes_resolve_codex_ack_or_fallback_and_preserve_claude() {
+        let (mut codex, _codex_dir) =
+            consecutive_reuse_state(AgentClient::Codex, "T-CODEX", &[10, 11]);
+        let mut codex_tickets = std::collections::HashSet::new();
+        let mut codex_panes = std::collections::HashSet::new();
+        let mut ack_then_owned = 0usize;
+        let mut timeout_then_fallback = 0usize;
+
+        for _round in 0..5 {
+            codex.schedule_ready_tickets();
+            let active = active_ticket_panes(&codex);
+            assert_eq!(active.len(), 2, "each round must reuse both Codex panes");
+
+            for (ticket_id, pane_id) in &active {
+                let sequence: usize = ticket_id.rsplit('-').next().unwrap().parse().unwrap();
+                assert_eq!(
+                    codex
+                        .agent_slots
+                        .iter()
+                        .find(|slot| slot.pane_id == *pane_id)
+                        .map(|slot| slot.transition_state),
+                    Some(TransitionState::WaitingForClear),
+                    "native Codex reuses the shared clear transport handshake"
+                );
+                assert!(matches!(
+                    codex.seat_assignment(*pane_id),
+                    Some(SeatAssignmentState::AssignedPendingAck {
+                        ack_deadline: None,
+                        ..
+                    })
+                ));
+                codex.handle_cleared_signal(*pane_id);
+                let (original_generation, original_deadline) = match codex.seat_assignment(*pane_id)
+                {
+                    Some(SeatAssignmentState::AssignedPendingAck {
+                        generation,
+                        ack_deadline: Some(deadline),
+                    }) => (generation, deadline),
+                    other => panic!(
+                        "{ticket_id} on pane {pane_id} must begin pending ack, got {other:?}"
+                    ),
+                };
+                assert!(!codex.seat_is_owned(*pane_id));
+
+                let (outcome, fallback_launches) = if sequence == 6 {
+                    // Deterministically lose the original generation's acceptance.
+                    // Its exact finite deadline must start one fresh attempt.
+                    codex.check_assignment_ack_timeouts_at(original_deadline);
+                    let recovery_generation = match codex.seat_assignment(*pane_id) {
+                        Some(SeatAssignmentState::Recovering {
+                            generation,
+                            ack_deadline: None,
+                        }) => generation,
+                        other => panic!(
+                            "{ticket_id} must enter unowned recovery after lost ack, got {other:?}"
+                        ),
+                    };
+                    assert_ne!(recovery_generation, original_generation);
+                    assert!(!codex.seat_is_owned(*pane_id));
+                    assert_eq!(
+                        codex
+                            .agent_slots
+                            .iter()
+                            .find(|slot| slot.pane_id == *pane_id)
+                            .and_then(|slot| slot.ticket_id.as_deref()),
+                        Some(ticket_id.as_str())
+                    );
+
+                    let slot = codex
+                        .agent_slots
+                        .iter_mut()
+                        .find(|slot| slot.pane_id == *pane_id)
+                        .unwrap();
+                    slot.transition_started_at = Some(
+                        std::time::SystemTime::now()
+                            - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+                    );
+                    let activity_before_fallback = codex.activity_log.len();
+                    codex.check_transition_timeouts();
+                    let fallback_launches = codex.activity_log[activity_before_fallback..]
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                ActivityEvent::SessionLaunch {
+                                    ticket_id: launched_ticket,
+                                    ..
+                                } if launched_ticket == ticket_id
+                            )
+                        })
+                        .count();
+                    assert_eq!(fallback_launches, 1, "one fresh fallback is allowed");
+                    assert!(matches!(
+                        codex.seat_assignment(*pane_id),
+                        Some(SeatAssignmentState::Recovering {
+                            generation,
+                            ack_deadline: Some(_),
+                        }) if generation == recovery_generation
+                    ));
+                    assert!(acknowledge_assignment(
+                        &mut codex,
+                        *pane_id,
+                        ticket_id,
+                        recovery_generation,
+                    ));
+                    timeout_then_fallback += 1;
+                    ("timeout-then-fallback", fallback_launches)
+                } else {
+                    assert!(acknowledge_assignment(
+                        &mut codex,
+                        *pane_id,
+                        ticket_id,
+                        original_generation,
+                    ));
+                    ack_then_owned += 1;
+                    ("ack-then-owned", 0)
+                };
+
+                assert_eq!(
+                    codex.seat_assignment(*pane_id),
+                    Some(SeatAssignmentState::Owned)
+                );
+                assert!(codex.seat_is_owned(*pane_id));
+                assert!(codex_tickets.insert(ticket_id.clone()));
+                codex_panes.insert(*pane_id);
+                println!(
+                    "T0330302|assignment|provider=codex|sequence={sequence:02}|ticket={ticket_id}|pane={pane_id}|generation={original_generation}|outcome={outcome}|fallback_launches={fallback_launches}|final=owned|silent_stall=false"
+                );
+            }
+
+            for (ticket_id, pane_id) in active {
+                codex.threads.get_mut(&ticket_id).unwrap().complete();
+                let ticket_path = codex.dag.get_ticket(&ticket_id).unwrap().file_path.clone();
+                ticket::update_ticket_phase(&ticket_path, Phase::Done).unwrap();
+                codex.release_slot_for_ticket(&ticket_id);
+                let slot = codex
+                    .agent_slots
+                    .iter()
+                    .find(|slot| slot.pane_id == pane_id)
+                    .unwrap();
+                assert_eq!(slot.ticket_id, None);
+                assert!(slot.has_session);
+                assert_eq!(slot.last_client, Some(AgentClient::Codex));
+                assert_eq!(codex.seat_assignment(pane_id), None);
+            }
+            refresh_fixture_dag(&mut codex);
+        }
+
+        assert_eq!(codex_tickets.len(), 10);
+        assert_eq!(codex_panes, std::collections::HashSet::from([10, 11]));
+        assert_eq!(ack_then_owned, 9);
+        assert_eq!(timeout_then_fallback, 1);
+        assert!(codex.error_alerts.is_empty());
+
+        let (mut claude, _claude_dir) =
+            consecutive_reuse_state(AgentClient::Claude, "T-CLAUDE", &[20, 21]);
+        let mut claude_tickets = std::collections::HashSet::new();
+        let mut claude_panes = std::collections::HashSet::new();
+
+        for _round in 0..5 {
+            claude.schedule_ready_tickets();
+            let active = active_ticket_panes(&claude);
+            assert_eq!(active.len(), 2, "each round must reuse both Claude panes");
+
+            for (ticket_id, pane_id) in &active {
+                let sequence: usize = ticket_id.rsplit('-').next().unwrap().parse().unwrap();
+                assert_eq!(
+                    claude
+                        .agent_slots
+                        .iter()
+                        .find(|slot| slot.pane_id == *pane_id)
+                        .map(|slot| slot.transition_state),
+                    Some(TransitionState::WaitingForClear),
+                    "Claude must retain its clear handshake"
+                );
+                assert_eq!(
+                    claude.seat_assignment(*pane_id),
+                    Some(SeatAssignmentState::Owned)
+                );
+                assert!(claude.seat_is_owned(*pane_id));
+                assert_eq!(claude.active_assignment_generation(*pane_id), None);
+
+                claude.handle_cleared_signal(*pane_id);
+                assert_eq!(
+                    claude
+                        .agent_slots
+                        .iter()
+                        .find(|slot| slot.pane_id == *pane_id)
+                        .map(|slot| slot.transition_state),
+                    Some(TransitionState::Idle)
+                );
+                assert_eq!(
+                    claude.seat_assignment(*pane_id),
+                    Some(SeatAssignmentState::Owned)
+                );
+                assert!(claude.seat_is_owned(*pane_id));
+                assert!(claude_tickets.insert(ticket_id.clone()));
+                claude_panes.insert(*pane_id);
+                println!(
+                    "T0330302|assignment|provider=claude|sequence={sequence:02}|ticket={ticket_id}|pane={pane_id}|generation=none|outcome=clear-then-owned-unchanged|fallback_launches=0|final=owned|silent_stall=false"
+                );
+            }
+
+            for (ticket_id, pane_id) in active {
+                claude.threads.get_mut(&ticket_id).unwrap().complete();
+                let ticket_path = claude.dag.get_ticket(&ticket_id).unwrap().file_path.clone();
+                ticket::update_ticket_phase(&ticket_path, Phase::Done).unwrap();
+                claude.release_slot_for_ticket(&ticket_id);
+                let slot = claude
+                    .agent_slots
+                    .iter()
+                    .find(|slot| slot.pane_id == pane_id)
+                    .unwrap();
+                assert_eq!(slot.ticket_id, None);
+                assert!(slot.has_session);
+                assert_eq!(slot.last_client, Some(AgentClient::Claude));
+                assert_eq!(claude.seat_assignment(pane_id), None);
+            }
+            refresh_fixture_dag(&mut claude);
+        }
+
+        assert_eq!(claude_tickets.len(), 10);
+        assert_eq!(claude_panes, std::collections::HashSet::from([20, 21]));
+        assert!(claude.error_alerts.is_empty());
+        println!(
+            "T0330302|summary|codex=10|ack_then_owned={ack_then_owned}|timeout_then_fallback={timeout_then_fallback}|claude=10|silent_stalls=0"
+        );
     }
 
     #[test]
