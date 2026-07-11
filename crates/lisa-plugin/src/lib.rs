@@ -955,13 +955,10 @@ impl State {
         // begins after submission rather than expiring while text is unsubmitted.
         let wait = std::time::Duration::from_secs(self.config.assignment_ack_timeout_secs)
             .saturating_add(std::time::Duration::from_secs_f64(ENTER_DELAY_SECS));
-        let deadline = now
-            .checked_add(wait)
-            .unwrap_or_else(|| {
-                now + std::time::Duration::from_secs(
-                    PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
-                ) + std::time::Duration::from_secs_f64(ENTER_DELAY_SECS)
-            });
+        let deadline = now.checked_add(wait).unwrap_or_else(|| {
+            now + std::time::Duration::from_secs(PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS)
+                + std::time::Duration::from_secs_f64(ENTER_DELAY_SECS)
+        });
         let Some(current) = self.seat_assignment(pane_id) else {
             return false;
         };
@@ -7674,6 +7671,185 @@ mod tests {
             "duplicate acknowledgment cannot perform a second transition"
         );
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
+    }
+
+    #[test]
+    fn test_dropped_post_prompt_ack_reproduces_open_loop_stall_and_recovers_boundedly() {
+        let (mut state, dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        state.config.assignment_ack_timeout_secs = 1;
+        state.signal_dir = dir.path().join("signals");
+        std::fs::create_dir_all(&state.signal_dir).unwrap();
+
+        state.schedule_ready_tickets();
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::AssignedPendingAck {
+                generation: 1,
+                ack_deadline: None,
+            }),
+            "the acceptance clock starts only after the reused-seat prompt is sent"
+        );
+
+        state.handle_cleared_signal(10);
+        let first_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::AssignedPendingAck {
+                generation: 1,
+                ack_deadline: Some(deadline),
+            }) => deadline,
+            other => panic!("expected armed original assignment, got {other:?}"),
+        };
+
+        // Reproduce the field failure at its real transport seam: Codex accepted
+        // the tagged prompt, but the pane-scoped event vanished before Lisa's
+        // scanner could consume it.
+        let acceptance = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "assigned work",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-NAME",
+                    generation: 1,
+                },
+            ),
+        });
+        let ack_path = state.signal_dir.join("pane-10.ack");
+        std::fs::write(&ack_path, acceptance.to_string()).unwrap();
+        assert!(
+            ack_path.exists(),
+            "matching acceptance event was materialized"
+        );
+        std::fs::remove_file(&ack_path).unwrap();
+        state.check_codex_ack_signals();
+
+        // Before explicit assignment truth, these reservation and transport
+        // facts were the fire-and-forget success contract. With the event gone,
+        // they describe an apparent owner that could wait silently forever.
+        let legacy_open_loop_would_claim_ownership_without_ack =
+            state.agent_slots[0].ticket_id.as_deref() == Some("T-NAME")
+                && state.agent_slots[0].has_session
+                && state.agent_slots[0].transition_state == TransitionState::Idle
+                && state
+                    .threads
+                    .get("T-NAME")
+                    .is_some_and(|thread| thread.status == lisa_core::types::ThreadStatus::Running)
+                && !ack_path.exists();
+        assert!(
+            legacy_open_loop_would_claim_ownership_without_ack,
+            "the old open-loop contract must reproduce owned-without-ack stall facts"
+        );
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::AssignedPendingAck {
+                generation: 1,
+                ack_deadline: Some(first_deadline),
+            }),
+            "a dropped event cannot promote the acknowledgment-gated seat"
+        );
+        assert!(!state.seat_is_owned(10));
+        assert!(!state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Info { message }
+                if message.contains("acknowledged its Codex assignment")
+        )));
+
+        state.check_assignment_ack_timeouts_at(first_deadline);
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Recovering {
+                generation: 2,
+                ack_deadline: None,
+            }),
+            "the first finite boundary must abandon the unacknowledged generation"
+        );
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert!(!state.seat_is_owned(10));
+
+        state.agent_slots[0].transition_started_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+        );
+        state.check_transition_timeouts();
+        let recovery_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Recovering {
+                generation: 2,
+                ack_deadline: Some(deadline),
+            }) => deadline,
+            other => panic!("expected armed recovery assignment, got {other:?}"),
+        };
+        let recovery_launches = state
+            .activity_log
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
+                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                )
+            })
+            .count();
+        assert_eq!(
+            recovery_launches, 1,
+            "one fresh fallback for the same ticket"
+        );
+        assert!(!state.seat_is_owned(10));
+
+        state.check_transition_timeouts();
+        let launches_after_repeat = state
+            .activity_log
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
+                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                )
+            })
+            .count();
+        assert_eq!(
+            launches_after_repeat, 1,
+            "repeated polls cannot turn recovery into an unbounded launch loop"
+        );
+
+        // Drop the recovery acceptance as well. Its own finite boundary must
+        // surface an actionable failure rather than recreating the silent stall.
+        state.check_assignment_ack_timeouts_at(recovery_deadline);
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::RecoveryFailed)
+        );
+        assert!(!state.seat_is_owned(10));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert_eq!(
+            state.threads["T-NAME"].status,
+            lisa_core::types::ThreadStatus::Failed
+        );
+        assert!(state.error_alerts.contains(&("T-NAME".to_string(), 10)));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message }
+                if message.contains("recovery failed") && message.contains("reset the ticket")
+        )));
+
+        state.check_assignment_ack_timeouts_at(
+            recovery_deadline + std::time::Duration::from_secs(60),
+        );
+        let final_launches = state
+            .activity_log
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
+                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                )
+            })
+            .count();
+        assert_eq!(final_launches, 1);
     }
 
     #[test]
