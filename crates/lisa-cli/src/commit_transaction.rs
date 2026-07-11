@@ -201,6 +201,25 @@ fn normalize_includes(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, CommitTransac
     Ok(normalized.into_iter().collect())
 }
 
+fn has_done_frontmatter(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    let Some(after_opening) = trimmed.strip_prefix("---") else {
+        return false;
+    };
+    let Some(closing) = after_opening.find("\n---") else {
+        return false;
+    };
+    let frontmatter = &after_opening[..closing];
+    let mut phase_done = false;
+    let mut status_done = false;
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        phase_done |= line == "phase: done";
+        status_done |= line == "status: done";
+    }
+    phase_done && status_done
+}
+
 struct TransactionLock {
     file: File,
     path: PathBuf,
@@ -671,6 +690,36 @@ pub(crate) fn complete_ticket(
         ))
     })?;
 
+    let already_done = std::str::from_utf8(&original).is_ok_and(has_done_frontmatter);
+    if already_done {
+        let repo = Repository::discover(&request.repo_root)?;
+        let mut status_args: Vec<&OsStr> = vec![
+            OsStr::new("status"),
+            OsStr::new("--porcelain"),
+            OsStr::new("-z"),
+            OsStr::new("--"),
+        ];
+        status_args.extend(includes.iter().map(|path| path.as_os_str()));
+        let status = repo.git(None, "verify already completed ticket paths", status_args)?;
+        if status.stdout.is_empty() {
+            let head = repo.git(
+                None,
+                "verify already completed ticket commit",
+                [
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--verify"),
+                    OsStr::new("HEAD"),
+                ],
+            )?;
+            let commit_id = output_string("verify already completed ticket commit", &head)?;
+            return Ok(CommitTransactionResult {
+                previous_commit_id: commit_id.clone(),
+                commit_id,
+                committed_paths: Vec::new(),
+            });
+        }
+    }
+
     lisa_core::ticket::update_ticket_done(&ticket_path).map_err(|e| {
         CommitTransactionError::new(format!(
             "cannot prepare completion frontmatter for {}: {e}",
@@ -1115,5 +1164,31 @@ mod tests {
                 .stdout,
             foreign_before.stdout
         );
+    }
+
+    #[test]
+    fn already_committed_done_ticket_returns_verified_head_without_new_commit() {
+        let repo = GitRepo::new();
+        let ticket = "docs/active/tickets/T-031-02.md";
+        repo.write(
+            ticket,
+            "---\nid: T-031-02\ntitle: done\ntype: task\nstatus: done\npriority: high\nphase: done\n---\nBody\n",
+        );
+        repo.write("docs/active/work/T-031-02/review.md", "# Review\n");
+        repo.base_commit();
+        let head = repo.git_string(["rev-parse", "HEAD"]);
+
+        let result = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-031-02".to_string(),
+            message: "Complete T-031-02".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from("docs/active/work/T-031-02"),
+        })
+        .unwrap();
+
+        assert_eq!(result.commit_id, head);
+        assert!(result.committed_paths.is_empty());
+        assert_eq!(repo.git_string(["rev-list", "--count", "HEAD"]), "1");
     }
 }
