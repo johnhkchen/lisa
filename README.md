@@ -10,7 +10,7 @@ When you have a set of interdependent tasks — a feature broken into tickets, a
 
 Lisa runs as a [Zellij](https://zellij.dev/) plugin. It reads your tickets, computes a dependency graph, and spawns Claude Code sessions for every ticket whose dependencies are satisfied. A dashboard shows what's running, what's queued, and what's done. When a ticket finishes, Lisa checks what it unblocked and schedules the next wave.
 
-Each ticket goes through five phases: Research, Design, Structure, Plan, Implement. Every phase produces a short artifact (~200 lines) that serves as both a review checkpoint and crash recovery. If a session dies mid-work, the latest artifact plus the ticket is enough to seed a new session at the right phase.
+Each ticket goes through six phases: Research, Design, Structure, Plan, Implement, Review. Every phase produces a short artifact (~200 lines) that serves as both a review checkpoint and crash recovery. If a session dies mid-work, the latest artifact plus the ticket is enough to seed a new session at the right phase.
 
 ## Prerequisites
 
@@ -213,15 +213,37 @@ uses its JSON renderer for Codex panes.
 
 ### Workflow
 
-Every ticket passes through five phases in order:
+Every ticket passes through six phases in order:
 
 1. **Research** — Map the relevant codebase. What exists, where, how it connects.
 2. **Design** — Explore options, evaluate tradeoffs, choose an approach with rationale.
 3. **Structure** — Define file-level changes, module boundaries, public interfaces.
 4. **Plan** — Sequence implementation steps with testing strategy.
-5. **Implement** — Execute the plan, commit incrementally, track progress.
+5. **Implement** — Execute the plan, commit meaningful ticket-owned units through Lisa's isolated transaction, track progress.
+6. **Review** — Summarize changes, test coverage, and open concerns, then wait for Lisa to confirm completion.
 
 Each phase produces a ~200-line artifact in `docs/active/work/{ticket-id}/`. These are review checkpoints — catching a bad design at 200 lines is cheaper than catching it at 2,000 lines of wrong code.
+
+### Atomic completion
+
+Agents never use the shared ordinary Git index as a handoff. During Implement,
+each meaningful source unit is committed with `lisa commit-ticket` and exact
+repository-relative `--include` paths; ordinary `git add`, broad `git add -A`,
+and ordinary `git commit` are outside the generated workflow. Existing staged
+entries owned by a human or another tool remain staged and cannot enter a ticket
+commit.
+
+After `review.md` is written, the agent stays on that ticket. Lisa prepares both
+Done frontmatter fields and commits the ticket plus its work artifacts through
+the same isolated transaction. The seat is released, provenance is published,
+and dependents become eligible only after Lisa receives and verifies that commit
+receipt.
+
+If the completion transaction fails, Lisa fails closed: it keeps the ticket in
+Review, retains the provider seat, leaves dependents blocked, and surfaces the
+Git error. Repair the reported exact-path conflict or repository condition; a
+later stop/idle signal or manual completion action can retry without sweeping
+foreign staged work into the ticket.
 
 ### Scheduling
 
@@ -229,7 +251,12 @@ Tickets declare dependencies via the `depends_on` field. Lisa computes a DAG, to
 
 ### Concurrency
 
-Multiple Claude Code sessions work in parallel on the same branch. Commit serialization is handled via file locking — sessions don't need to coordinate with each other. If two tickets modify the same files, that's a missing dependency edge in the DAG.
+Multiple Claude and Codex sessions work in parallel on the same branch. Lisa's
+ticket commands serialize ref movement and build commits in isolated alternate
+indexes, so the shared ordinary index is never a ticket mailbox. Sessions do not
+coordinate commit timing, but they must declare exact owned paths. If two tickets
+modify the same files, that is a missing dependency edge in the DAG; transaction
+isolation is a safety boundary, not a substitute for correct dependencies.
 
 ## Project Layout
 

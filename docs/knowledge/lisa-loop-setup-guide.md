@@ -321,15 +321,31 @@ When lisa starts, it reads every ticket file and builds the dependency graph. Ti
 
 ### Agent Lifecycle
 
-Each Claude Code session follows this lifecycle:
+Each Claude or Codex session follows this lifecycle:
 
 1. **Session opens.** Lisa runs `claude --dangerously-skip-permissions` in a new zellij pane, pointed at the ticket.
-2. **Agent reads context.** The agent reads the ticket file, `CLAUDE.md`, and `docs/rdspi-workflow.md`. The ticket tells it what to do. CLAUDE.md provides project-specific context (build commands, source layout). The workflow file defines the RDSPI phases and artifact format.
-3. **Agent works through phases.** Starting from the ticket's current `phase`, the agent produces the artifact for each phase, updates the ticket's `phase` field in its frontmatter, and proceeds.
+2. **Agent reads context.** The agent reads the real ticket file, its provider context (`CLAUDE.md` or `AGENTS.md`), and `docs/knowledge/rdspi-workflow.md`. The ticket tells it what to do; the context file supplies project build/layout guidance; the workflow defines phase artifacts and the atomic Git contract.
+3. **Agent works through phases.** Starting from the ticket's current `phase`, the agent produces the artifact for each phase. Lisa detects each artifact and advances phase frontmatter; the agent does not edit phase or status.
 4. **Review points.** After Research and Design (by default), the agent parks -- it has produced its artifact and waits for human review. Lisa detects this and marks the thread as parked on the dashboard.
-5. **Human reviews.** You read the artifact (`docs/active/work/T-XXX-XX/research.md` or `design.md`). If it looks good, advance the ticket's phase in its frontmatter and the agent continues. If it needs changes, leave feedback in the session.
-6. **Implementation.** The agent follows its plan, commits incrementally, and tracks progress in `progress.md`.
-7. **Completion.** The agent sets the ticket's phase to `done`. Lisa marks the thread as completed, recomputes the DAG, and spawns sessions for any tickets that are now unblocked.
+5. **Human reviews.** You read the artifact (`docs/active/work/T-XXX-XX/research.md` or `design.md`). Lisa has already recorded the artifact-driven phase transition; do not edit phase/status for the normal flow. If changes are needed, leave feedback in the session; otherwise let the configured continuation/auto-advance behavior proceed.
+6. **Implementation.** The agent follows its plan, tracks progress in `progress.md`, and commits meaningful ticket-owned units only through `lisa commit-ticket` with exact repository-relative `--include` paths. It does not stage ticket work in the ordinary Git index.
+7. **Completion.** The agent writes `review.md` and waits. Lisa prepares phase/status Done and commits the ticket plus all work artifacts through its isolated transaction. Only a verified commit receipt completes the thread, releases its provider seat, and unblocks dependents.
+
+### Atomic completion and recovery
+
+Lisa constructs ticket commits in an alternate Git index while holding the
+repository's Lisa commit lock. A pre-existing staged file owned by a human or
+another tool remains byte-for-byte staged and is excluded from the ticket
+commit. Generated agent instructions prohibit ordinary `git add`, broad
+`git add -A`, ordinary `git commit`, and staged handoff between commands.
+
+Completion is fail-closed. If the final transaction cannot commit, reconcile,
+or verify its exact paths, Lisa keeps the ticket in Review, retains the current
+Claude/Codex seat, emits no Done provenance, and leaves dependents blocked. Read
+the dashboard/activity Git error, repair the reported path overlap, lock, author
+configuration, or repository state, then let the normal stopped/idle signal (or
+the manual completion action) retry. Do not work around the failure by staging
+the ticket in the ordinary index.
 
 ### Review Points
 
@@ -350,7 +366,8 @@ docs/active/work/T-001-01/
 ├── design.md        # ~200 lines: options, tradeoffs, decision
 ├── structure.md     # ~200 lines: file-level blueprint
 ├── plan.md          # ~200 lines: sequenced implementation steps
-└── progress.md      # Updated during implementation
+├── progress.md      # Updated during implementation
+└── review.md        # Completed changes, coverage, and open concerns
 ```
 
 Each artifact is a standalone document. You can read any of them without needing to look at the session. They serve three purposes:
