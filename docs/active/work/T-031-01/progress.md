@@ -31,11 +31,11 @@ and Structure in this continuous RDSPI pass.
 
 ## In progress
 
-- [ ] Inspect final diff and create an exact-path incremental commit.
+- [x] Review handoff written.
 
 ## Remaining
 
-- [ ] Inspect final diff and write `review.md`.
+- None. The final exact-path documentation/test commit follows this update.
 
 ## Deviations
 
@@ -46,7 +46,8 @@ and Structure in this continuous RDSPI pass.
 
 ## Verification completed
 
-- `cargo test -p lisa-cli commit_transaction`: 7 passed.
+- `cargo test -p lisa-cli commit_transaction`: initially 7 passed; a subsequent
+  explicit commit-failure regression brings the final focused total to 8.
 - `cargo clippy -p lisa-cli --bin lisa -- -D warnings`: passed.
 - `cargo test --workspace`: passed (262 CLI, 145 core, 234 plugin tests).
 - `just check`: passed, including `wasm32-wasip1` plugin check and all workspace
@@ -71,3 +72,10 @@ The repository contains unrelated modified and untracked user files. Any
 incremental commit must be exact-path scoped and must not consume or rewrite
 those changes. Source implementation will be verified before deciding whether a
 safe incremental commit is appropriate.
+
+The implementation and pre-review artifacts were committed through the new
+transaction itself as `4d5b0d890012262e57d69e75b331c9780962235e`. Inspection of
+that commit's path list confirmed it contains only `Cargo.lock`, the CLI
+dependency/entry point, the new transaction module, and T-031-01 work artifacts.
+The ordinary index remained empty and unrelated working-tree files remained
+outside the commit.

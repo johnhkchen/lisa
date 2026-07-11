@@ -791,6 +791,37 @@ mod tests {
     }
 
     #[test]
+    fn commit_failure_is_actionable_and_leaves_head_and_index_usable() {
+        let repo = GitRepo::new();
+        repo.write("ticket.txt", "base\n");
+        repo.base_commit();
+        repo.write("ticket.txt", "changed\n");
+        repo.git(["config", "user.name", ""]);
+        let head = repo.git_string(["rev-parse", "HEAD"]);
+
+        let error = commit_ticket(repo.request(&["ticket.txt"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("create ticket commit"), "{error}");
+        assert!(error.contains("empty ident name"), "{error}");
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
+        assert_eq!(repo.git_string(["diff", "--cached", "--name-only"]), "");
+        assert_eq!(
+            repo.git_string(["status", "--short", "--", "ticket.txt"]),
+            "M ticket.txt"
+        );
+
+        let git_dir = repo.git_string(["rev-parse", "--absolute-git-dir"]);
+        assert!(fs::read_dir(git_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("lisa-ticket-index-")
+        }));
+    }
+
+    #[test]
     fn invalid_repository_is_actionable() {
         let temp = tempfile::tempdir().unwrap();
         let error = commit_ticket(CommitTransactionRequest {
