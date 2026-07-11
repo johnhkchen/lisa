@@ -4027,6 +4027,29 @@ impl State {
             })
             .collect();
 
+        let seat_assignment_statuses = self
+            .agent_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                self.seat_assignment(slot.pane_id).map(|assignment| {
+                    let status = match assignment {
+                        SeatAssignmentState::AssignedPendingAck { .. } => {
+                            ui::SeatAssignmentStatus::AssignedPendingAck
+                        }
+                        SeatAssignmentState::Owned => ui::SeatAssignmentStatus::Owned,
+                        SeatAssignmentState::Recovering { .. } => {
+                            ui::SeatAssignmentStatus::Recovering
+                        }
+                        SeatAssignmentState::RecoveryFailed => {
+                            ui::SeatAssignmentStatus::RecoveryFailed
+                        }
+                    };
+                    (i + 1, status)
+                })
+            })
+            .collect();
+
         ui::PluginState {
             tickets,
             active_threads,
@@ -4034,6 +4057,7 @@ impl State {
             activity_log,
             alerts,
             slots,
+            seat_assignment_statuses,
             current_time: Duration::from_secs(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -7589,6 +7613,83 @@ mod tests {
             "a fresh Codex launch retains the existing immediate ownership contract"
         );
         assert!(state.seat_is_owned(10));
+    }
+
+    fn dashboard_thread_row(state: &State, ticket_id: &str) -> String {
+        let ui_state = state.to_ui_state();
+        let mut lines = Vec::new();
+        ui::render_threads(&ui_state, &mut lines);
+        let row = lines
+            .iter()
+            .find(|line| line.contains(ticket_id))
+            .expect("ticket row should be present");
+
+        let mut visible = String::new();
+        let mut chars = row.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' && chars.next_if_eq(&'[').is_some() {
+                for code in chars.by_ref() {
+                    if code == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                visible.push(ch);
+            }
+        }
+        let visible = visible.trim_end();
+        let (row, _elapsed) = visible
+            .rsplit_once(' ')
+            .expect("active dashboard row should end with elapsed time");
+        format!("{row} <elapsed>")
+    }
+
+    #[test]
+    fn test_dashboard_snapshot_shows_recycled_codex_handoff_states() {
+        let (mut acknowledged, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        acknowledged.schedule_ready_tickets();
+        let pending_row = dashboard_thread_row(&acknowledged, "T-NAME");
+
+        let matching = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "new work",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-NAME",
+                    generation: 1,
+                },
+            ),
+        });
+        assert!(acknowledged.acknowledge_codex_assignment(10, &matching.to_string()));
+        let owned_row = dashboard_thread_row(&acknowledged, "T-NAME");
+
+        let (mut timed_out, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        timed_out.config.assignment_ack_timeout_secs = 1;
+        timed_out.schedule_ready_tickets();
+        timed_out.handle_cleared_signal(10);
+        let deadline = match timed_out.seat_assignment(10) {
+            Some(SeatAssignmentState::AssignedPendingAck {
+                ack_deadline: Some(deadline),
+                ..
+            }) => deadline,
+            other => panic!("expected armed pending assignment, got {other:?}"),
+        };
+        timed_out.check_assignment_ack_timeouts_at(deadline);
+        let recovering_row = dashboard_thread_row(&timed_out, "T-NAME");
+
+        let snapshot =
+            format!("pending\n{pending_row}\nowned\n{owned_row}\ntimeout\n{recovering_row}");
+        assert_eq!(
+            snapshot,
+            "pending\n\
+[1]    T-NAME       RES        codex          assigned-pending-ack <elapsed>\n\
+owned\n\
+[1]    T-NAME       RES        codex          owned                <elapsed>\n\
+timeout\n\
+[1]    T-NAME       RES        codex          recovering           <elapsed>"
+        );
     }
 
     #[test]

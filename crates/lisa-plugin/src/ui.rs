@@ -181,6 +181,35 @@ pub struct HealthAlert {
     pub suggested_actions: Vec<String>,
 }
 
+/// Scheduler-owned seat assignment state reduced to dashboard semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatAssignmentStatus {
+    AssignedPendingAck,
+    Owned,
+    Recovering,
+    RecoveryFailed,
+}
+
+impl SeatAssignmentStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AssignedPendingAck => "assigned-pending-ack",
+            Self::Owned => "owned",
+            Self::Recovering => "recovering",
+            Self::RecoveryFailed => "recovery-failed",
+        }
+    }
+
+    fn color(self) -> &'static str {
+        match self {
+            Self::AssignedPendingAck => YELLOW,
+            Self::Owned => GREEN,
+            Self::Recovering => BRIGHT_YELLOW,
+            Self::RecoveryFailed => RED,
+        }
+    }
+}
+
 /// Information about an agent pane slot for dashboard display.
 #[derive(Debug, Clone)]
 pub struct SlotInfo {
@@ -272,6 +301,8 @@ pub struct PluginState {
     pub activity_log: Vec<ActivityEntry>,
     pub alerts: Vec<HealthAlert>,
     pub slots: Vec<SlotInfo>,
+    /// Explicit scheduler-owned assignment states keyed by dashboard slot.
+    pub seat_assignment_statuses: HashMap<usize, SeatAssignmentStatus>,
     pub current_time: Duration,
     pub modal: ModalState,
     /// Whether scheduling of new tickets is paused.
@@ -289,6 +320,7 @@ impl Default for PluginState {
             activity_log: Vec::new(),
             alerts: Vec::new(),
             slots: Vec::new(),
+            seat_assignment_statuses: HashMap::new(),
             current_time: Duration::ZERO,
             modal: ModalState::default(),
             paused: false,
@@ -692,9 +724,9 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
 
 /// Render a unified thread table consolidating slot, active, and parked thread info.
 ///
-/// Slot-centric: one row per slot with stable layout. Status column indicates
-/// whether the slot is Running, Parked, Winding Down, or Idle.
-fn render_threads(state: &PluginState, output: &mut Vec<String>) {
+/// Slot-centric: one row per slot with stable layout. Status includes explicit
+/// assignment state plus Awaiting, Running, Parked, Winding Down, and Idle.
+pub(crate) fn render_threads(state: &PluginState, output: &mut Vec<String>) {
     output.push(format!("{}{}=== Threads ==={}", BOLD, GREEN, RESET));
     output.push(String::new());
 
@@ -718,10 +750,10 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
     // Header. AGENT surfaces each pane's resolved (provider, model) route
     // (T-026-01); `—` when a thread predates routing.
     output.push(format!(
-        "{}{:<6} {:<12} {:<10} {:<14} {:<14} {:<10}{}",
+        "{}{:<6} {:<12} {:<10} {:<14} {:<20} {:<10}{}",
         DIM, "SLOT", "TICKET", "PHASE", "AGENT", "STATUS", "TIME", RESET
     ));
-    output.push(format!("{}{}{}", DIM, "-".repeat(70), RESET));
+    output.push(format!("{}{}{}", DIM, "-".repeat(76), RESET));
 
     for slot in &state.slots {
         let slot_label = format!("[{}]", slot.slot_number);
@@ -732,14 +764,25 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
             // marked here — an exempt-but-invisible pane is the bad state to avoid.
             let elapsed = format_time_since(active.started_at, state.current_time);
             let phase_color = active.phase.color_code();
-            let (ticket_cell, status_color, status_text) = if active.awaiting {
-                (format!("{} [AWAITING]", active.ticket_id), CYAN, "Awaiting")
+            let ticket_cell = if active.awaiting {
+                format!("{} [AWAITING]", active.ticket_id)
             } else {
-                (active.ticket_id.clone(), GREEN, "Running")
+                active.ticket_id.clone()
+            };
+            let (status_color, status_text) = if active.awaiting {
+                (CYAN, "Awaiting")
+            } else if let Some(assignment) = state
+                .seat_assignment_statuses
+                .get(&slot.slot_number)
+                .copied()
+            {
+                (assignment.color(), assignment.label())
+            } else {
+                (GREEN, "Running")
             };
             let agent_cell = active.route.as_deref().unwrap_or("—");
             output.push(format!(
-                "{:<6} {:<12} {}{:<10}{} {:<14} {}{:<14}{} {}",
+                "{:<6} {:<12} {}{:<10}{} {:<14} {}{:<20}{} {}",
                 slot_label,
                 ticket_cell,
                 phase_color,
@@ -757,7 +800,7 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
             let elapsed = format_time_since(parked.parked_at, state.current_time);
             let phase_color = parked.phase.color_code();
             output.push(format!(
-                "{:<6} {:<12} {}{:<10}{} {:<14} {}{:<14}{} {}",
+                "{:<6} {:<12} {}{:<10}{} {:<14} {}{:<20}{} {}",
                 slot_label,
                 parked.ticket_id,
                 phase_color,
@@ -772,13 +815,13 @@ fn render_threads(state: &PluginState, output: &mut Vec<String>) {
         } else if slot.transitioning {
             // Slot is winding down or in cooldown
             output.push(format!(
-                "{:<6} {}{:<12} {:<10} {:<14} {:<14}{} —",
+                "{:<6} {}{:<12} {:<10} {:<14} {:<20}{} —",
                 slot_label, DIM, "—", "—", "—", "Winding Down", RESET,
             ));
         } else {
             // Idle slot
             output.push(format!(
-                "{:<6} {}{:<12} {:<10} {:<14} {:<14}{} —",
+                "{:<6} {}{:<12} {:<10} {:<14} {:<20}{} —",
                 slot_label, DIM, "—", "—", "—", "Idle", RESET,
             ));
         }
@@ -1344,6 +1387,7 @@ mod tests {
             ],
             alerts: Vec::new(),
             slots: Vec::new(),
+            seat_assignment_statuses: HashMap::new(),
             current_time: Duration::from_secs(120),
             modal: ModalState::default(),
             paused: false,
@@ -1962,6 +2006,7 @@ mod tests {
             ],
             alerts: Vec::new(),
             slots: Vec::new(),
+            seat_assignment_statuses: HashMap::new(),
             current_time: Duration::from_secs(200),
             modal: ModalState::default(),
             paused: false,
