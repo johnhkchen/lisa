@@ -2271,7 +2271,7 @@ depends_on: [T-999]
             InitAction::UpdateFile { content, .. } => content,
             other => panic!("expected append-only update, got {other:?}"),
         };
-        assert_eq!(merged, "signals/\nclaude/\ncodex/\n");
+        assert_eq!(merged, "signals/\nattempts/\nclaude/\ncodex/\n");
         assert!(merged.starts_with("signals/"));
 
         fs::write(&path, &merged).unwrap();
@@ -2280,7 +2280,7 @@ depends_on: [T-999]
             InitAction::NoOp { reason, .. } if reason == "already up to date"
         ));
 
-        let spaced = "  signals/  \n\tclaude/\t\ncodex/";
+        let spaced = "  signals/  \n attempts/ \n\tclaude/\t\ncodex/";
         fs::write(&path, spaced).unwrap();
         assert!(matches!(
             plan_append_only_gitignore(path, templates::LISA_GITIGNORE),
@@ -2411,7 +2411,7 @@ depends_on: [T-999]
         assert!(second_output.contains("Files changed:\n  none\n"));
         assert_eq!(
             fs::read_to_string(gitignore_path).unwrap(),
-            "signals/\nhooks/ntfy-topic\nclaude/\ncodex/\n"
+            "signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\n"
         );
     }
 
@@ -2467,7 +2467,7 @@ depends_on: [T-999]
         });
         assert_eq!(
             planned_gitignore.map(String::as_str),
-            Some("signals/\nhooks/ntfy-topic\nclaude/\ncodex/\n")
+            Some("signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\n")
         );
         assert_eq!(
             fs::read(dir.path().join("docs/knowledge/rdspi-workflow.md")).unwrap(),
@@ -2486,7 +2486,7 @@ depends_on: [T-999]
         let upgraded_gitignore = fs::read_to_string(dir.path().join(".lisa/.gitignore")).unwrap();
         assert_eq!(
             upgraded_gitignore,
-            "signals/\nhooks/ntfy-topic\nclaude/\ncodex/\n"
+            "signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\n"
         );
 
         let ignored = Command::new("git")

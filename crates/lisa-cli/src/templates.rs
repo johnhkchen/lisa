@@ -106,6 +106,25 @@ fi
 /// which fire before agents truly finish — to decide a pane is safe to reuse.
 pub const ON_HEARTBEAT_HOOK: &str = r#"#!/bin/sh
 # Lisa heartbeat signal hook — called after each tool call.
+# Copies the scheduler-owned attempt lease into an atomic liveness signal.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    marker="$SIGNAL_DIR/pane-$LISA_PANE_ID.lease"
+    tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat.tmp.$$"
+    if [ -r "$marker" ] && cp "$marker" "$tmp"; then
+        mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
+    else
+        rm -f "$tmp"
+    fi
+fi
+"#;
+
+pub(crate) const LEGACY_ON_HEARTBEAT_HOOKS: &[&str] = &[
+    r#"#!/bin/sh
+# Lisa heartbeat signal hook — called after each tool call.
 # Writes a signal file so the plugin knows this session is actively working.
 
 SIGNAL_DIR=".lisa/signals"
@@ -114,9 +133,8 @@ mkdir -p "$SIGNAL_DIR"
 if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
 fi
-"#;
-
-pub(crate) const LEGACY_ON_HEARTBEAT_HOOKS: &[&str] = &[r#"#!/bin/sh
+"#,
+    r#"#!/bin/sh
 # Lisa heartbeat signal hook — called by Claude Code after each tool call.
 # Writes a signal file so the plugin knows this session is actively working.
 
@@ -126,7 +144,8 @@ mkdir -p "$SIGNAL_DIR"
 if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
 fi
-"#];
+"#,
+];
 
 /// The native Codex `UserPromptSubmit` hook. It preserves the complete JSON
 /// payload for the plugin's ticket/generation detector and publishes it with an
@@ -152,7 +171,7 @@ pub(crate) const LEGACY_ON_ACK_HOOKS: &[&str] = &[];
 
 /// Gitignore content for `.lisa/` runtime state. Signal files and per-provider
 /// usage/session artifacts are machine-owned and must never enter the project DAG.
-pub const LISA_GITIGNORE: &str = "signals/\nclaude/\ncodex/\n";
+pub const LISA_GITIGNORE: &str = "signals/\nattempts/\nclaude/\ncodex/\n";
 
 /// The `AGENTS.md` pointer file scaffolded by `lisa init`.
 ///
@@ -733,6 +752,8 @@ mod tests {
         assert!(ON_HEARTBEAT_HOOK.contains("LISA_PANE_ID"));
         assert!(ON_HEARTBEAT_HOOK.contains(".lisa/signals"));
         assert!(ON_HEARTBEAT_HOOK.contains(".heartbeat"));
+        assert!(ON_HEARTBEAT_HOOK.contains(".lease"));
+        assert!(ON_HEARTBEAT_HOOK.contains("mv \"$tmp\""));
     }
 
     #[test]
@@ -1110,5 +1131,6 @@ mod tests {
         assert!(!ON_HEARTBEAT_HOOK.contains("capture-usage"));
         assert!(!ON_HEARTBEAT_HOOK.contains("$(cat)"));
         assert!(ON_HEARTBEAT_HOOK.contains("pane-$LISA_PANE_ID.heartbeat"));
+        assert!(ON_HEARTBEAT_HOOK.contains("pane-$LISA_PANE_ID.lease"));
     }
 }

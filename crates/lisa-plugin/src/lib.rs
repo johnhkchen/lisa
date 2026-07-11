@@ -52,7 +52,12 @@ const AGENT_EXIT_GRACE_SECS: u64 = 8;
 /// read (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex — see
 /// [`AgentClient::context_file`]). The prompt body is otherwise identical across
 /// clients, so it stays single-sourced here.
-pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, context_file: &str) -> String {
+pub(crate) fn ticket_prompt(
+    ticket_dir: &Path,
+    ticket_id: &str,
+    context_file: &str,
+    artifact_dir: &Path,
+) -> String {
     let ticket_path = lisa_core::ticket::scan_tickets(ticket_dir)
         .ok()
         .and_then(|tickets| {
@@ -67,7 +72,9 @@ pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, context_file: &s
         "Read the ticket at {path}, {context}, and docs/knowledge/rdspi-workflow.md. \
          Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
          (Research, Design, Structure, Plan, Implement, Review) without stopping between phases. \
-         For each phase, write the artifact to docs/active/work/{id}/ then immediately continue to the next phase. \
+         For each phase, write the artifact to {artifact_dir}/ then immediately continue to the next phase. \
+         This directory is private to your current attempt; Lisa publishes admitted artifacts to \
+         docs/active/work/{id}/ after verifying your lease. Do not write phase artifacts directly to that shared path. \
          Do NOT update the ticket's phase or status fields in the frontmatter — \
          Lisa detects your artifacts and handles all phase transitions automatically. \
          During Implement, commit each meaningful ticket-owned source unit only with \
@@ -79,6 +86,7 @@ pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, context_file: &s
         path = ticket_path.display(),
         context = context_file,
         id = ticket_id,
+        artifact_dir = artifact_dir.display(),
     )
 }
 
@@ -98,6 +106,7 @@ pub(crate) fn build_claude_command(
     pane_id: u32,
     model: Option<&str>,
     lisa_bin: Option<&str>,
+    artifact_dir: &Path,
 ) -> String {
     // The Claude adapter owns the model→flag mapping (`--model`). When no model
     // is routed the flag is omitted, so the launch line is byte-for-byte the
@@ -116,13 +125,22 @@ pub(crate) fn build_claude_command(
         pane_id,
         ticket_id,
         model_flag,
-        ticket_prompt(ticket_dir, ticket_id, AgentClient::Claude.context_file())
+        ticket_prompt(
+            ticket_dir,
+            ticket_id,
+            AgentClient::Claude.context_file(),
+            artifact_dir,
+        )
     )
 }
 
 /// The prompt text sent to a stuck Review session after the review timeout.
-pub(crate) fn finish_up_prompt(_ticket_dir: &Path, work_dir: &Path, ticket_id: &str) -> String {
-    let review_path = work_dir.join(ticket_id).join("review.md");
+pub(crate) fn finish_up_prompt(
+    _ticket_dir: &Path,
+    artifact_dir: &Path,
+    _ticket_id: &str,
+) -> String {
+    let review_path = artifact_dir.join("review.md");
     format!(
         "You have been in the Review phase for a while. Please finish writing your review artifact at {}. \
          It should cover: what changes were made, files created/modified/deleted, test coverage, \
@@ -403,6 +421,10 @@ pub struct State {
     /// Path to the idle signal directory (`.lisa/signals/` under /host/).
     signal_dir: PathBuf,
 
+    /// Scheduler-owned, ignored staging root for attempt-attributed workflow
+    /// artifacts (`.lisa/attempts/` under /host/).
+    attempt_dir: PathBuf,
+
     /// Path to the append-only provenance ledger (`.lisa/provenance.jsonl` under
     /// /host/). One record is appended per ticket-run at teardown (T-027-01).
     /// Empty until `load()` runs — a native test that does not set it skips the
@@ -669,6 +691,159 @@ impl State {
             "path {} is not relative to the Lisa project root",
             path.display()
         ))
+    }
+
+    /// Private workflow directory for one execution attempt. Production uses
+    /// `.lisa/attempts`; the fallback keeps directly-constructed native tests
+    /// deterministic without requiring `load()`.
+    fn attempt_work_dir(&self, lease: &AttemptLease) -> PathBuf {
+        let root = if self.attempt_dir.as_os_str().is_empty() {
+            self.config.work_dir.join(".attempts")
+        } else {
+            self.attempt_dir.clone()
+        };
+        root.join(&lease.ticket_id)
+            .join(lease.attempt_id.to_string())
+            .join("work")
+    }
+
+    fn pane_attempt_lease(&self, pane_id: u32) -> Option<AttemptLease> {
+        self.agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id)
+            .and_then(|slot| slot.attempt_lease.clone())
+    }
+
+    /// Resolve the artifact directory for a prompt addressed to one pane. Real
+    /// scheduled attempts must have an exact current lease. The canonical
+    /// fallback supports pre-lease unit fixtures only when no authority exists.
+    fn prompt_artifact_dir(&self, ticket_id: &str, pane_id: u32) -> Option<PathBuf> {
+        match self.pane_attempt_lease(pane_id) {
+            Some(lease)
+                if lease.ticket_id == ticket_id
+                    && lease.is_current(self.current_leases.get(ticket_id)) =>
+            {
+                Some(self.attempt_work_dir(&lease))
+            }
+            None if !self.current_leases.contains_key(ticket_id) => {
+                Some(self.config.work_dir.join(ticket_id))
+            }
+            _ => None,
+        }
+    }
+
+    /// Publish the marker immediately before delivering this attempt's prompt
+    /// or launch. Deferring until after `/clear` or `/exit` prevents the
+    /// predecessor process from copying a successor identity during handoff.
+    fn publish_prompt_lease_marker(&self, ticket_id: &str, pane_id: u32) -> Result<(), String> {
+        match self.pane_attempt_lease(pane_id) {
+            Some(lease)
+                if lease.ticket_id == ticket_id
+                    && lease.is_current(self.current_leases.get(ticket_id)) =>
+            {
+                self.write_pane_lease_marker(pane_id, &lease)
+            }
+            None if !self.current_leases.contains_key(ticket_id) => Ok(()),
+            _ => Err(format!(
+                "pane {pane_id} does not carry the current lease for {ticket_id}"
+            )),
+        }
+    }
+
+    /// Publish the lease marker copied by native heartbeat hooks. The rename is
+    /// same-directory and atomic, so consumers never observe partial JSON.
+    fn write_pane_lease_marker(&self, pane_id: u32, lease: &AttemptLease) -> Result<(), String> {
+        if self.signal_dir.as_os_str().is_empty() {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err("signal directory is not configured".to_string());
+        }
+        let signal_dir = self.signal_dir.clone();
+        std::fs::create_dir_all(&signal_dir).map_err(|error| {
+            format!(
+                "cannot create signal directory {}: {error}",
+                signal_dir.display()
+            )
+        })?;
+        let destination = signal_dir.join(format!("pane-{pane_id}.lease"));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = signal_dir.join(format!(
+            "pane-{pane_id}.lease.tmp.{}-{nonce}",
+            lease.attempt_id
+        ));
+        let body = serde_json::to_vec(lease)
+            .map_err(|error| format!("cannot serialize attempt lease: {error}"))?;
+        std::fs::write(&temporary, body).map_err(|error| {
+            format!(
+                "cannot write pane lease marker {}: {error}",
+                temporary.display()
+            )
+        })?;
+        if let Err(error) = std::fs::rename(&temporary, &destination) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!(
+                "cannot publish pane lease marker {}: {error}",
+                destination.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit one phase artifact. Leased attempts publish only from their
+    /// private staging directory after exact current-lease validation. The
+    /// unleased branch exists solely for historical fixtures with no authority
+    /// registered for the ticket.
+    fn admit_artifact(
+        &self,
+        ticket_id: &str,
+        candidate: Option<&AttemptLease>,
+        artifact_name: &str,
+    ) -> Result<bool, String> {
+        let canonical_dir = self.config.work_dir.join(ticket_id);
+        let canonical = canonical_dir.join(artifact_name);
+        let Some(lease) = candidate else {
+            return Ok(!self.current_leases.contains_key(ticket_id) && canonical.exists());
+        };
+        if lease.ticket_id != ticket_id || !lease.is_current(self.current_leases.get(ticket_id)) {
+            return Err(format!(
+                "attempt {:?} does not hold the current lease for {ticket_id}",
+                lease
+            ));
+        }
+
+        let staged = self.attempt_work_dir(lease).join(artifact_name);
+        if !staged.is_file() {
+            return Ok(false);
+        }
+        let body = std::fs::read(&staged).map_err(|error| {
+            format!("cannot read staged artifact {}: {error}", staged.display())
+        })?;
+        std::fs::create_dir_all(&canonical_dir).map_err(|error| {
+            format!(
+                "cannot create canonical artifact directory {}: {error}",
+                canonical_dir.display()
+            )
+        })?;
+        let temporary =
+            canonical_dir.join(format!(".{artifact_name}.attempt-{}.tmp", lease.attempt_id));
+        std::fs::write(&temporary, body).map_err(|error| {
+            format!(
+                "cannot write canonical artifact temporary {}: {error}",
+                temporary.display()
+            )
+        })?;
+        if let Err(error) = std::fs::rename(&temporary, &canonical) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!(
+                "cannot publish canonical artifact {}: {error}",
+                canonical.display()
+            ));
+        }
+        Ok(true)
     }
 
     fn build_completion_command(
@@ -1221,7 +1396,6 @@ impl State {
                 ack_deadline: None,
             },
         );
-
         // This TUI is explicitly abandoned. Its old question/attention markers
         // must not suppress the graceful exit command for the fresh fallback.
         self.awaiting_human.remove(&pane_id);
@@ -1630,16 +1804,33 @@ impl State {
             self.current_leases
                 .insert(ticket_id.clone(), attempt_lease.clone());
 
+            if !reused_seat {
+                if let Err(error) = self.write_pane_lease_marker(pane_id, &attempt_lease) {
+                    self.revoke_current_lease(&ticket_id);
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "Cannot dispatch {}: failed to publish attempt marker: {}",
+                            ticket_id, error
+                        ),
+                    });
+                    unscheduled += 1;
+                    continue;
+                }
+            }
+
             let assignment_generation = if route.agent == AgentClient::Codex && reused_seat {
                 Some(attempt_lease.attempt_id)
             } else {
                 None
             };
 
+            let artifact_dir = strip_host_prefix(&self.attempt_work_dir(&attempt_lease));
+
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                artifact_dir: &artifact_dir,
                 assignment_generation,
             };
 
@@ -1881,6 +2072,20 @@ impl State {
             let mut advanced_any = false;
 
             for (ticket_id, current_phase, source_lease) in running {
+                // progress.md is a living Implement artifact: publish current
+                // bytes for durability/review, but never use it as a phase edge.
+                if current_phase == Phase::Implement {
+                    if let Err(error) =
+                        self.admit_artifact(&ticket_id, source_lease.as_ref(), "progress.md")
+                    {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Rejected progress publication for {}: {}",
+                                ticket_id, error
+                            ),
+                        });
+                    }
+                }
                 // Determine which artifact signals completion of this phase.
                 // Implement uses review.md instead of progress.md (living doc).
                 let artifact_name = if current_phase == Phase::Implement {
@@ -1892,9 +2097,18 @@ impl State {
                     }
                 };
 
-                let artifact_path = self.config.work_dir.join(&ticket_id).join(artifact_name);
-                if !artifact_path.exists() {
-                    continue;
+                match self.admit_artifact(&ticket_id, source_lease.as_ref(), artifact_name) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Rejected artifact publication for {}: {}",
+                                ticket_id, error
+                            ),
+                        });
+                        continue;
+                    }
                 }
 
                 // Compute next phase (always Some for phases with artifacts)
@@ -1993,7 +2207,25 @@ impl State {
                 None => continue,
             };
 
+            let candidate = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|body| serde_json::from_str::<AttemptLease>(&body).ok());
             let _ = std::fs::remove_file(&path);
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            let admitted = self
+                .agent_slots
+                .iter()
+                .find(|slot| slot.pane_id == pane_id)
+                .is_some_and(|slot| {
+                    slot.ticket_id.as_deref() == Some(candidate.ticket_id.as_str())
+                        && slot.attempt_lease.as_ref() == Some(&candidate)
+                        && candidate.is_current(self.current_leases.get(&candidate.ticket_id))
+                });
+            if !admitted {
+                continue;
+            }
             self.bump_pane_activity(pane_id);
             // A heartbeat proves genuine progress — clear any attention debounce
             // so a pane that resumes and later re-stalls can notify again.
@@ -2148,13 +2380,25 @@ impl State {
             };
 
             // Look up thread — signal only meaningful for running threads
-            let current_phase = match self.threads.get(&ticket_id) {
-                Some(t) if t.status == lisa_core::types::ThreadStatus::Running => t.current_phase,
+            let (current_phase, source_lease) = match self.threads.get(&ticket_id) {
+                Some(t) if t.status == lisa_core::types::ThreadStatus::Running => {
+                    (t.current_phase, t.attempt_lease.clone())
+                }
                 _ => continue,
             };
 
             match current_phase {
                 Phase::Implement => {
+                    if let Err(error) =
+                        self.admit_artifact(&ticket_id, source_lease.as_ref(), "progress.md")
+                    {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Rejected idle progress publication for {}: {}",
+                                ticket_id, error
+                            ),
+                        });
+                    }
                     // Idle signal alone is the completion signal for Implement
                     let file_path = self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
                     let file_path = match file_path {
@@ -2191,12 +2435,10 @@ impl State {
                     // session), advance straight to Done in the same tick.
                     // check_artifact_advances() already ran this cycle so it
                     // won't catch this transition.
-                    let review_path = self.config.work_dir.join(&ticket_id).join("review.md");
-                    if review_path.exists() {
-                        let source_lease = self
-                            .threads
-                            .get(&ticket_id)
-                            .and_then(|thread| thread.attempt_lease.clone());
+                    if matches!(
+                        self.admit_artifact(&ticket_id, source_lease.as_ref(), "review.md"),
+                        Ok(true)
+                    ) {
                         self.request_completion(
                             ticket_id.clone(),
                             CompletionSource::Idle,
@@ -2215,9 +2457,22 @@ impl State {
                         Some(name) => name,
                         None => continue,
                     };
-                    let artifact_path = self.config.work_dir.join(&ticket_id).join(artifact_name);
+                    let artifact_admitted =
+                        match self.admit_artifact(&ticket_id, source_lease.as_ref(), artifact_name)
+                        {
+                            Ok(admitted) => admitted,
+                            Err(error) => {
+                                self.log_activity(ActivityEvent::Error {
+                                    message: format!(
+                                        "Rejected idle artifact publication for {}: {}",
+                                        ticket_id, error
+                                    ),
+                                });
+                                false
+                            }
+                        };
 
-                    if artifact_path.exists() {
+                    if artifact_admitted {
                         let next_phase = match current_phase.next() {
                             Some(p) => p,
                             None => continue,
@@ -2626,10 +2881,24 @@ impl State {
                 self.config.client,
                 self.config.lisa_bin.as_deref(),
             );
+            let Some(artifact_dir) = self.prompt_artifact_dir(&ticket_id, pane_id) else {
+                return;
+            };
+            if let Err(error) = self.publish_prompt_lease_marker(&ticket_id, pane_id) {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Cannot deliver prompt for {} on pane {}: {}",
+                        ticket_id, pane_id, error
+                    ),
+                });
+                return;
+            }
+            let artifact_dir = strip_host_prefix(&artifact_dir);
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                artifact_dir: &artifact_dir,
                 assignment_generation: self.active_assignment_generation(pane_id),
             };
             let prompt = adapter.reuse_prompt(&ctx);
@@ -2736,10 +3005,24 @@ impl State {
                 self.fail_assignment_recovery(pane_id, "ticket route no longer resolves to Codex");
                 continue;
             }
+            let Some(artifact_dir) = self.prompt_artifact_dir(&ticket_id, pane_id) else {
+                continue;
+            };
+            if let Err(error) = self.publish_prompt_lease_marker(&ticket_id, pane_id) {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Cannot launch {} on pane {} after exit: {}",
+                        ticket_id, pane_id, error
+                    ),
+                });
+                continue;
+            }
+            let artifact_dir = strip_host_prefix(&artifact_dir);
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                artifact_dir: &artifact_dir,
                 assignment_generation: self.active_assignment_generation(pane_id),
             };
             let command = adapter.launch_command(&ctx);
@@ -2806,10 +3089,24 @@ impl State {
                     self.config.client,
                     self.config.lisa_bin.as_deref(),
                 );
+                let Some(artifact_dir) = self.prompt_artifact_dir(tid, pane_id) else {
+                    continue;
+                };
+                if let Err(error) = self.publish_prompt_lease_marker(tid, pane_id) {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "Cannot deliver timeout prompt for {} on pane {}: {}",
+                            tid, pane_id, error
+                        ),
+                    });
+                    continue;
+                }
+                let artifact_dir = strip_host_prefix(&artifact_dir);
                 let ctx = SpawnContext {
                     ticket_dir: &host_ticket_dir,
                     ticket_id: tid,
                     pane_id,
+                    artifact_dir: &artifact_dir,
                     assignment_generation: self.active_assignment_generation(pane_id),
                 };
                 let prompt = adapter.reuse_prompt(&ctx);
@@ -2862,7 +3159,19 @@ impl State {
                 continue;
             }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-            let host_work_dir = strip_host_prefix(&self.config.work_dir);
+            let host_work_dir = match self
+                .threads
+                .get(&ticket_id)
+                .and_then(|thread| thread.attempt_lease.clone())
+            {
+                Some(lease) if lease.is_current(self.current_leases.get(&ticket_id)) => {
+                    strip_host_prefix(&self.attempt_work_dir(&lease))
+                }
+                None if !self.current_leases.contains_key(&ticket_id) => {
+                    strip_host_prefix(&self.config.work_dir.join(&ticket_id))
+                }
+                _ => continue,
+            };
             // Adapter owns the follow-up mechanism. Native Claude and Codex type
             // the finish-up prompt into their live TUIs; headless/future bridges
             // may instead return a full spawn command.
@@ -3979,6 +4288,7 @@ impl ZellijPlugin for State {
 
         // Signal directory for idle signal detection
         self.signal_dir = host.join(".lisa/signals");
+        self.attempt_dir = host.join(".lisa/attempts");
 
         // Provenance ledger + per-provider usage-artifact directories.
         self.ledger_path = host.join(".lisa/provenance.jsonl");
@@ -4667,7 +4977,14 @@ mod tests {
     #[test]
     fn test_build_claude_command() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-042-01", 7, None, None);
+        let cmd = build_claude_command(
+            ticket_dir,
+            "T-042-01",
+            7,
+            None,
+            None,
+            Path::new(".lisa/attempts/T-042-01/1/work"),
+        );
 
         assert!(cmd.starts_with(
             "LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "
@@ -4686,7 +5003,14 @@ mod tests {
     #[test]
     fn test_build_claude_command_with_model() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-042-01", 7, Some("opus"), None);
+        let cmd = build_claude_command(
+            ticket_dir,
+            "T-042-01",
+            7,
+            Some("opus"),
+            None,
+            Path::new(".lisa/attempts/T-042-01/1/work"),
+        );
         // The Claude adapter maps a routed model to `--model`, placed after the
         // permission flag and before the quoted prompt.
         assert!(
@@ -4698,7 +5022,14 @@ mod tests {
     #[test]
     fn test_build_claude_command_includes_env_vars() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-042-01", 42, None, None);
+        let cmd = build_claude_command(
+            ticket_dir,
+            "T-042-01",
+            42,
+            None,
+            None,
+            Path::new(".lisa/attempts/T-042-01/1/work"),
+        );
 
         assert!(
             cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID=T-042-01 "),
@@ -4710,7 +5041,14 @@ mod tests {
     #[test]
     fn test_build_claude_command_includes_rdspi_reference() {
         let ticket_dir = Path::new("docs/active/tickets");
-        let cmd = build_claude_command(ticket_dir, "T-001", 1, None, None);
+        let cmd = build_claude_command(
+            ticket_dir,
+            "T-001",
+            1,
+            None,
+            None,
+            Path::new(".lisa/attempts/T-001/1/work"),
+        );
 
         assert!(
             cmd.contains("docs/knowledge/rdspi-workflow.md"),
@@ -4802,11 +5140,18 @@ mod tests {
     #[test]
     fn test_ticket_prompt_content() {
         let dir = Path::new("docs/active/tickets");
-        let prompt = ticket_prompt(dir, "T-024-03", AgentClient::Claude.context_file());
+        let prompt = ticket_prompt(
+            dir,
+            "T-024-03",
+            AgentClient::Claude.context_file(),
+            Path::new(".lisa/attempts/T-024-03/1/work"),
+        );
 
         assert!(prompt.contains("docs/active/tickets/T-024-03.md"));
         assert!(prompt.contains("CLAUDE.md"));
         assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(prompt.contains(".lisa/attempts/T-024-03/1/work"));
+        assert!(prompt.contains("Do not write phase artifacts directly"));
         assert!(prompt.contains("current phase"));
         assert!(prompt.contains("lisa commit-ticket"));
         assert!(prompt.contains("exact repository-relative --include paths"));
@@ -4820,7 +5165,12 @@ mod tests {
     fn test_ticket_prompt_uses_given_context_file() {
         let dir = Path::new("docs/active/tickets");
         // Codex's context file replaces CLAUDE.md in the shared prompt body.
-        let prompt = ticket_prompt(dir, "T-024-03", "AGENTS.md");
+        let prompt = ticket_prompt(
+            dir,
+            "T-024-03",
+            "AGENTS.md",
+            Path::new(".lisa/attempts/T-024-03/1/work"),
+        );
         assert!(prompt.contains("AGENTS.md"));
         assert!(!prompt.contains("CLAUDE.md"));
         assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
@@ -4837,7 +5187,12 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = ticket_prompt(&ticket_dir, "T-024-03", "AGENTS.md");
+        let prompt = ticket_prompt(
+            &ticket_dir,
+            "T-024-03",
+            "AGENTS.md",
+            Path::new(".lisa/attempts/T-024-03/1/work"),
+        );
 
         assert!(prompt.contains("T-024-03-descriptive-title.md"));
         assert!(!prompt.contains("tickets/T-024-03.md"));
@@ -4847,11 +5202,11 @@ mod tests {
     fn test_finish_up_prompt_preserves_atomic_completion_contract() {
         let prompt = finish_up_prompt(
             Path::new("docs/active/tickets"),
-            Path::new("docs/active/work"),
+            Path::new(".lisa/attempts/T-024-03/1/work"),
             "T-024-03",
         );
 
-        assert!(prompt.contains("docs/active/work/T-024-03/review.md"));
+        assert!(prompt.contains(".lisa/attempts/T-024-03/1/work/review.md"));
         assert!(prompt.contains("Do NOT update the ticket's phase or status"));
         assert!(prompt.contains("ordinary-index git add/git commit"));
         assert!(prompt.contains("wait until Lisa confirms the completion commit"));
@@ -4938,10 +5293,7 @@ mod tests {
             "---\nid: T-002\ntitle: impl-test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
-        // Only progress.md — should NOT advance
         let work_dir = dir.path().join("work");
-        fs::create_dir_all(work_dir.join("T-002")).unwrap();
-        fs::write(work_dir.join("T-002/progress.md"), "# Progress").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -4959,12 +5311,20 @@ mod tests {
         let mut thread = Thread::new("T-002", 2);
         thread.current_phase = Phase::Implement;
         state.threads.insert("T-002".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-002");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("progress.md"), "# Progress").unwrap();
 
         state.check_artifact_advances();
 
         let thread = state.threads.get("T-002").unwrap();
         assert_eq!(thread.current_phase, Phase::Implement);
         assert_eq!(thread.status, ThreadStatus::Running);
+        assert_eq!(
+            fs::read_to_string(state.config.work_dir.join("T-002/progress.md")).unwrap(),
+            "# Progress"
+        );
     }
 
     #[test]
@@ -4984,8 +5344,6 @@ mod tests {
         ).unwrap();
 
         let work_dir = dir.path().join("work");
-        fs::create_dir_all(work_dir.join("T-002")).unwrap();
-        fs::write(work_dir.join("T-002/review.md"), "# Review\nAll good.").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -5003,7 +5361,10 @@ mod tests {
         let mut thread = Thread::new("T-002", 2);
         thread.current_phase = Phase::Implement;
         state.threads.insert("T-002".to_string(), thread);
-        install_current_attempt(&mut state, "T-002");
+        let lease = install_current_attempt(&mut state, "T-002");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review\nAll good.").unwrap();
 
         state.check_artifact_advances();
 
@@ -5035,14 +5396,7 @@ mod tests {
             "---\nid: T-005\ntitle: full-run\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
         ).unwrap();
 
-        // All artifacts present
         let work_dir = dir.path().join("work");
-        fs::create_dir_all(work_dir.join("T-005")).unwrap();
-        fs::write(work_dir.join("T-005/research.md"), "# Research").unwrap();
-        fs::write(work_dir.join("T-005/design.md"), "# Design").unwrap();
-        fs::write(work_dir.join("T-005/structure.md"), "# Structure").unwrap();
-        fs::write(work_dir.join("T-005/plan.md"), "# Plan").unwrap();
-        fs::write(work_dir.join("T-005/review.md"), "# Review").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -5060,7 +5414,14 @@ mod tests {
         let mut thread = Thread::new("T-005", 5);
         thread.current_phase = Phase::Research;
         state.threads.insert("T-005".to_string(), thread);
-        install_current_attempt(&mut state, "T-005");
+        let lease = install_current_attempt(&mut state, "T-005");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("research.md"), "# Research").unwrap();
+        fs::write(staged.join("design.md"), "# Design").unwrap();
+        fs::write(staged.join("structure.md"), "# Structure").unwrap();
+        fs::write(staged.join("plan.md"), "# Plan").unwrap();
+        fs::write(staged.join("review.md"), "# Review").unwrap();
 
         state.check_artifact_advances();
 
@@ -5134,10 +5495,7 @@ mod tests {
             "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nBody\n",
         ).unwrap();
 
-        // Create work dir with review.md artifact
         let work_dir = dir.path().join("work");
-        fs::create_dir_all(work_dir.join("T-001")).unwrap();
-        fs::write(work_dir.join("T-001/review.md"), "# Review summary").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -5156,7 +5514,10 @@ mod tests {
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
         state.threads.insert("T-001".to_string(), thread);
-        install_current_attempt(&mut state, "T-001");
+        let lease = install_current_attempt(&mut state, "T-001");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review summary").unwrap();
 
         state.check_artifact_advances();
 
@@ -6893,10 +7254,7 @@ mod tests {
             "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
-        // Create work dir with review.md already present (agent ran all phases)
         let work_dir = dir.path().join("work");
-        fs::create_dir_all(work_dir.join("T-001")).unwrap();
-        fs::write(work_dir.join("T-001/review.md"), "# Review\nAll good.").unwrap();
 
         // Create signal directory with idle signal
         let signal_dir = dir.path().join("signals");
@@ -6933,7 +7291,10 @@ mod tests {
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
-        install_current_attempt(&mut state, "T-001");
+        let lease = install_current_attempt(&mut state, "T-001");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review\nAll good.").unwrap();
 
         // Run idle signal check
         state.check_idle_signals();
@@ -7193,17 +7554,36 @@ mod tests {
 
     #[test]
     fn test_heartbeat_clears_awaiting() {
+        use lisa_core::types::Thread;
         use std::fs;
 
         let dir = tempfile::tempdir().unwrap();
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("pane-7.heartbeat"), "2026-06-20T00:00:00Z").unwrap();
-
         let mut state = State {
             signal_dir: signal_dir.clone(),
             ..State::default()
         };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 7,
+            ticket_id: Some("T-007".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+        state
+            .threads
+            .insert("T-007".to_string(), Thread::new("T-007", 7));
+        let lease = install_current_attempt(&mut state, "T-007");
+        fs::write(
+            signal_dir.join("pane-7.heartbeat"),
+            serde_json::to_string(&lease).unwrap(),
+        )
+        .unwrap();
         state.awaiting_human.insert(7);
 
         state.check_heartbeat_signals();
@@ -7569,10 +7949,7 @@ mod tests {
         fs::create_dir_all(&signal_dir).unwrap();
         fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
 
-        // Create work dir with review.md artifact
         let work_dir = dir.path().join("work");
-        fs::create_dir_all(work_dir.join("T-001")).unwrap();
-        fs::write(work_dir.join("T-001/review.md"), "# Review summary").unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -7604,7 +7981,10 @@ mod tests {
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
         state.threads.insert("T-001".to_string(), thread);
-        install_current_attempt(&mut state, "T-001");
+        let lease = install_current_attempt(&mut state, "T-001");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review summary").unwrap();
 
         state.check_idle_signals();
 
@@ -7976,10 +8356,12 @@ mod tests {
             dag: Dag::from_tickets(tickets).unwrap(),
             config: PluginConfig {
                 ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
                 client: default_agent,
                 wind_down_secs: 0,
                 ..PluginConfig::new()
             },
+            signal_dir: dir.path().join("signals"),
             permissions_granted: true,
             slots_discovered: true,
             ..State::default()
@@ -8018,12 +8400,14 @@ mod tests {
             dag: Dag::from_tickets(tickets).unwrap(),
             config: PluginConfig {
                 ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
                 client: provider,
                 max_threads: pane_ids.len(),
                 wind_down_secs: 0,
                 assignment_ack_timeout_secs: 1,
                 ..PluginConfig::new()
             },
+            signal_dir: dir.path().join("signals"),
             permissions_granted: true,
             slots_discovered: true,
             ..State::default()
@@ -8133,6 +8517,11 @@ mod tests {
             Some(&first),
             "the assigned physical seat carries the same lease"
         );
+        let marker: AttemptLease = serde_json::from_str(
+            &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker, first, "heartbeat marker carries the exact lease");
 
         state.release_slot_for_ticket(&ticket_id);
         state.threads.remove(&ticket_id);
@@ -8170,6 +8559,23 @@ mod tests {
             state.agent_slots[0].attempt_lease.as_ref(),
             Some(&second),
             "the reassigned seat carries the successor lease"
+        );
+        let marker: AttemptLease = serde_json::from_str(
+            &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker, first,
+            "the predecessor marker remains while the resident session clears"
+        );
+        state.handle_cleared_signal(10);
+        let marker: AttemptLease = serde_json::from_str(
+            &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker, second,
+            "the successor marker is published at prompt delivery"
         );
     }
 
@@ -10623,8 +11029,6 @@ timeout\n\
         let dir = tempfile::tempdir().unwrap();
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("pane-1.heartbeat"), "2026-01-01T00:00:00Z").unwrap();
-
         let mut state = State {
             signal_dir: signal_dir.clone(),
             ..State::default()
@@ -10645,6 +11049,12 @@ timeout\n\
         let mut thread = Thread::new("T-001", 1);
         thread.last_activity = stale;
         state.threads.insert("T-001".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-001");
+        fs::write(
+            signal_dir.join("pane-1.heartbeat"),
+            serde_json::to_string(&lease).unwrap(),
+        )
+        .unwrap();
 
         state.check_heartbeat_signals();
 
@@ -10654,6 +11064,115 @@ timeout\n\
         // Thread and slot activity clocks refreshed
         assert!(state.threads.get("T-001").unwrap().last_activity > stale);
         assert!(state.agent_slots[0].last_activity_at.is_some());
+    }
+
+    #[test]
+    fn stale_attempt_cannot_keep_replacement_alive_or_publish_same_artifact() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        let signal_dir = dir.path().join("signals");
+        let attempt_dir = dir.path().join("attempts");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-LEASE.md"),
+            "---\nid: T-LEASE\ntitle: lease boundary\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n",
+        )
+        .unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: work_dir.clone(),
+                ..PluginConfig::new()
+            },
+            signal_dir: signal_dir.clone(),
+            attempt_dir,
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 2,
+            ticket_id: Some("T-LEASE".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Codex),
+        });
+        let stale_clock = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let mut thread = Thread::new("T-LEASE", 2);
+        thread.current_phase = Phase::Research;
+        thread.last_activity = stale_clock;
+        state.threads.insert("T-LEASE".to_string(), thread);
+
+        let predecessor = install_current_attempt(&mut state, "T-LEASE");
+        let current = install_current_attempt(&mut state, "T-LEASE");
+        assert!(!predecessor.is_current(state.current_leases.get("T-LEASE")));
+        assert!(current.is_current(state.current_leases.get("T-LEASE")));
+
+        let stale_stage = state.attempt_work_dir(&predecessor);
+        fs::create_dir_all(&stale_stage).unwrap();
+        fs::write(stale_stage.join("research.md"), "stale predecessor bytes").unwrap();
+        state.awaiting_human.insert(2);
+        state.notified_attention.insert(2);
+        fs::write(
+            signal_dir.join("pane-2.heartbeat"),
+            serde_json::to_string(&predecessor).unwrap(),
+        )
+        .unwrap();
+
+        state.check_heartbeat_signals();
+        state.check_artifact_advances();
+
+        assert_eq!(
+            state.threads.get("T-LEASE").unwrap().last_activity,
+            stale_clock,
+            "a predecessor heartbeat must not refresh the replacement"
+        );
+        assert!(state.agent_slots[0].last_activity_at.is_none());
+        assert!(state.awaiting_human.contains(&2));
+        assert!(state.notified_attention.contains(&2));
+        assert_eq!(
+            state.threads.get("T-LEASE").unwrap().current_phase,
+            Phase::Research
+        );
+        assert!(!work_dir.join("T-LEASE/research.md").exists());
+
+        let current_stage = state.attempt_work_dir(&current);
+        fs::create_dir_all(&current_stage).unwrap();
+        fs::write(current_stage.join("research.md"), "current lease bytes").unwrap();
+        fs::write(
+            signal_dir.join("pane-2.heartbeat"),
+            serde_json::to_string(&current).unwrap(),
+        )
+        .unwrap();
+
+        state.check_heartbeat_signals();
+        state.check_artifact_advances();
+
+        assert!(state.threads.get("T-LEASE").unwrap().last_activity > stale_clock);
+        assert!(state.agent_slots[0].last_activity_at.is_some());
+        assert!(!state.awaiting_human.contains(&2));
+        assert!(!state.notified_attention.contains(&2));
+        assert_eq!(
+            state.threads.get("T-LEASE").unwrap().current_phase,
+            Phase::Design
+        );
+        assert_eq!(
+            fs::read_to_string(work_dir.join("T-LEASE/research.md")).unwrap(),
+            "current lease bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(stale_stage.join("research.md")).unwrap(),
+            "stale predecessor bytes"
+        );
     }
 
     #[test]
@@ -11184,13 +11703,12 @@ timeout\n\
         use std::fs;
 
         let (mut state, _dir) = codex_state_with_dag();
-        let ticket_work = state.config.work_dir.join("T-CDX-01");
-        fs::create_dir_all(&ticket_work).unwrap();
-
         let mut thread = Thread::new("T-CDX-01", 1);
         thread.current_phase = Phase::Research;
         state.threads.insert("T-CDX-01".to_string(), thread);
-        install_current_attempt(&mut state, "T-CDX-01");
+        let lease = install_current_attempt(&mut state, "T-CDX-01");
+        let ticket_work = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&ticket_work).unwrap();
 
         // Each artifact advances exactly one phase boundary. Implement→Review
         // and Review→Done both ride review.md, so writing it cascades to Done in
@@ -11763,12 +12281,6 @@ timeout\n\
             "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: review\npriority: high\nphase: review\nagent: codex\n---\n\nBody\n",
         )
         .unwrap();
-        fs::create_dir_all(state.config.work_dir.join("T-CDX-01")).unwrap();
-        fs::write(
-            state.config.work_dir.join("T-CDX-01/review.md"),
-            "# Review\n",
-        )
-        .unwrap();
         let tickets = lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap();
         state.dag = Dag::from_tickets(tickets).unwrap();
         let mut thread = Thread::new("T-CDX-01", 1);
@@ -11779,7 +12291,10 @@ timeout\n\
         state
             .last_pane_names
             .insert(1, "codex · T-CDX-01 · codex-a".to_string());
-        install_current_attempt(&mut state, "T-CDX-01");
+        let lease = install_current_attempt(&mut state, "T-CDX-01");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review\n").unwrap();
 
         state.check_artifact_advances();
 

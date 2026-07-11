@@ -54,6 +54,8 @@ pub(crate) struct SpawnContext<'a> {
     pub ticket_dir: &'a Path,
     pub ticket_id: &'a str,
     pub pane_id: u32,
+    /// Private workflow artifact directory for this exact attempt lease.
+    pub artifact_dir: &'a Path,
     /// Identity for a recycled Codex delivery awaiting provider acknowledgment.
     /// Claude and immediately-owned fresh assignments leave this unset.
     pub assignment_generation: Option<u64>,
@@ -185,6 +187,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             ctx.pane_id,
             self.model.as_deref(),
             self.lisa_bin.as_deref(),
+            ctx.artifact_dir,
         )
     }
 
@@ -198,6 +201,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             ctx.ticket_dir,
             ctx.ticket_id,
             AgentClient::Claude.context_file(),
+            ctx.artifact_dir,
         )
     }
 
@@ -270,6 +274,7 @@ impl CodexAdapter {
             ctx.ticket_dir,
             ctx.ticket_id,
             AgentClient::Codex.context_file(),
+            ctx.artifact_dir,
         );
         match ctx.assignment_generation {
             Some(generation) => tag_codex_assignment(
@@ -404,6 +409,7 @@ mod tests {
             ticket_dir: dir,
             ticket_id: id,
             pane_id: pane,
+            artifact_dir: Path::new(".lisa/attempts/T-042-01/1/work"),
             assignment_generation: None,
         }
     }
@@ -414,7 +420,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
             ClaudeCodeAdapter::default().launch_command(&ctx),
-            build_claude_command(dir, "T-042-01", 7, None, None)
+            build_claude_command(dir, "T-042-01", 7, None, None, ctx.artifact_dir)
         );
     }
 
@@ -426,7 +432,7 @@ mod tests {
         assert!(cmd.contains("--model opus"), "got: {cmd}");
         assert_eq!(
             cmd,
-            build_claude_command(dir, "T-042-01", 7, Some("opus"), None)
+            build_claude_command(dir, "T-042-01", 7, Some("opus"), None, ctx.artifact_dir,)
         );
     }
 
@@ -452,7 +458,12 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
             ClaudeCodeAdapter::default().reuse_prompt(&ctx),
-            ticket_prompt(dir, "T-042-01", AgentClient::Claude.context_file())
+            ticket_prompt(
+                dir,
+                "T-042-01",
+                AgentClient::Claude.context_file(),
+                ctx.artifact_dir,
+            )
         );
     }
 
@@ -604,7 +615,8 @@ mod tests {
         assert!(cmd.contains(&ticket_prompt(
             dir,
             "T-042-01",
-            AgentClient::Codex.context_file()
+            AgentClient::Codex.context_file(),
+            ctx.artifact_dir,
         )));
         assert!(cmd.contains("AGENTS.md"));
     }
@@ -644,7 +656,12 @@ mod tests {
         let a = CodexAdapter::new(Some("/abs/lisa"), None);
         assert_eq!(
             a.reuse_prompt(&ctx),
-            ticket_prompt(dir, "T-042-01", AgentClient::Codex.context_file())
+            ticket_prompt(
+                dir,
+                "T-042-01",
+                AgentClient::Codex.context_file(),
+                ctx.artifact_dir,
+            )
         );
         assert!(!a.reuse_prompt(&ctx).contains(" codex "));
     }
