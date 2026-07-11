@@ -24,6 +24,15 @@ pub(crate) struct CommitTransactionRequest {
     pub includes: Vec<PathBuf>,
 }
 
+#[derive(Debug)]
+pub(crate) struct CompleteTicketRequest {
+    pub repo_root: PathBuf,
+    pub ticket_id: String,
+    pub message: String,
+    pub ticket_file: PathBuf,
+    pub work_dir: PathBuf,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CommitTransactionResult {
     pub commit_id: String,
@@ -544,6 +553,65 @@ pub(crate) fn commit_ticket(
     }
 }
 
+/// Prepare both completion frontmatter fields and commit the loop-owned ticket
+/// paths through the isolated transaction.
+///
+/// If the transaction does not report success, the exact original ticket bytes
+/// are restored before the error is returned.
+pub(crate) fn complete_ticket(
+    request: CompleteTicketRequest,
+) -> Result<CommitTransactionResult, CommitTransactionError> {
+    let ticket_file = normalize_includes(vec![request.ticket_file])?
+        .pop()
+        .ok_or_else(|| CommitTransactionError::new("completion ticket file path is required"))?;
+    if ticket_file.extension() != Some(OsStr::new("md")) {
+        return Err(CommitTransactionError::new(
+            "completion ticket file must be a Markdown path",
+        ));
+    }
+    let work_dir = normalize_includes(vec![request.work_dir])?
+        .pop()
+        .ok_or_else(|| CommitTransactionError::new("completion work directory is required"))?;
+    if ticket_file == work_dir {
+        return Err(CommitTransactionError::new(
+            "completion ticket file and work directory must be distinct",
+        ));
+    }
+    let includes = vec![ticket_file.clone(), work_dir];
+    let ticket_path = request.repo_root.join(&ticket_file);
+    let original = fs::read(&ticket_path).map_err(|e| {
+        CommitTransactionError::new(format!(
+            "cannot read completion ticket {}: {e}",
+            ticket_path.display()
+        ))
+    })?;
+
+    lisa_core::ticket::update_ticket_done(&ticket_path).map_err(|e| {
+        CommitTransactionError::new(format!(
+            "cannot prepare completion frontmatter for {}: {e}",
+            ticket_path.display()
+        ))
+    })?;
+
+    let result = commit_ticket(CommitTransactionRequest {
+        repo_root: request.repo_root,
+        ticket_id: request.ticket_id,
+        message: request.message,
+        includes,
+    });
+
+    match result {
+        Ok(result) => Ok(result),
+        Err(primary) => match fs::write(&ticket_path, original) {
+            Ok(()) => Err(primary),
+            Err(rollback) => Err(CommitTransactionError::new(format!(
+                "{primary}; restoring non-done ticket {} also failed: {rollback}",
+                ticket_path.display()
+            ))),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,5 +901,97 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("discover repository root"), "{error}");
+    }
+
+    #[test]
+    fn complete_ticket_commits_done_frontmatter_and_all_work_artifacts() {
+        let repo = GitRepo::new();
+        let ticket = "docs/active/tickets/T-031-02-gate-done-on-commit.md";
+        let work = "docs/active/work/T-031-02";
+        repo.write(
+            ticket,
+            "---\nid: T-031-02\nstatus: open\nphase: review\n---\nBody\n",
+        );
+        repo.write("foreign.txt", "foreign base\n");
+        repo.base_commit();
+
+        repo.write("foreign.txt", "foreign staged\n");
+        repo.git(["add", "foreign.txt"]);
+        let foreign_before = repo.git(["ls-files", "--stage", "-z", "--", "foreign.txt"]);
+        for artifact in [
+            "research.md",
+            "design.md",
+            "structure.md",
+            "plan.md",
+            "progress.md",
+            "review.md",
+        ] {
+            repo.write(&format!("{work}/{artifact}"), &format!("# {artifact}\n"));
+        }
+
+        let result = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-031-02".to_string(),
+            message: "Complete T-031-02".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from(work),
+        })
+        .unwrap();
+
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), result.commit_id);
+        let committed_ticket = repo.git_string(["show", &format!("HEAD:{ticket}")]);
+        assert!(committed_ticket.contains("phase: done"));
+        assert!(committed_ticket.contains("status: done"));
+        for artifact in [
+            "research.md",
+            "design.md",
+            "structure.md",
+            "plan.md",
+            "progress.md",
+            "review.md",
+        ] {
+            assert_eq!(
+                repo.git_string(["show", &format!("HEAD:{work}/{artifact}")]),
+                format!("# {artifact}")
+            );
+        }
+        assert_eq!(
+            repo.git_string(["show", "HEAD:foreign.txt"]),
+            "foreign base"
+        );
+        assert_eq!(
+            repo.git(["ls-files", "--stage", "-z", "--", "foreign.txt"])
+                .stdout,
+            foreign_before.stdout
+        );
+    }
+
+    #[test]
+    fn complete_ticket_failure_restores_exact_non_done_ticket() {
+        let repo = GitRepo::new();
+        let ticket = "docs/active/tickets/T-031-02.md";
+        let original = "---\nid: T-031-02\nstatus: open\nphase: review\n---\nBody\n";
+        repo.write(ticket, original);
+        repo.write("docs/active/work/T-031-02/review.md", "# Review\n");
+        repo.base_commit();
+        repo.git(["config", "user.name", ""]);
+        let head = repo.git_string(["rev-parse", "HEAD"]);
+
+        let error = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-031-02".to_string(),
+            message: "Complete T-031-02".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from("docs/active/work/T-031-02"),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("create ticket commit"), "{error}");
+        assert_eq!(
+            fs::read(repo.root().join(ticket)).unwrap(),
+            original.as_bytes()
+        );
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
     }
 }

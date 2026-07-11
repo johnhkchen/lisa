@@ -131,6 +131,28 @@ enum Commands {
         #[arg(long = "include", required = true)]
         includes: Vec<PathBuf>,
     },
+    /// Mark a ticket done and commit its loop-owned files atomically.
+    CompleteTicket {
+        /// Repository root containing the ticket changes.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Ticket identifier used for transaction diagnostics.
+        #[arg(long)]
+        ticket_id: String,
+
+        /// Commit message for the ticket completion commit.
+        #[arg(long)]
+        message: String,
+
+        /// Repository-relative path to the ticket's real Markdown file.
+        #[arg(long)]
+        ticket_file: PathBuf,
+
+        /// Repository-relative path to this ticket's work artifact directory.
+        #[arg(long)]
+        work_dir: PathBuf,
+    },
     /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
     Loop {
         /// Path to the project root (defaults to current directory)
@@ -208,6 +230,28 @@ fn main() {
                 includes,
             };
             match commit_transaction::commit_ticket(request) {
+                Ok(result) => println!("{}", result.commit_id),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::CompleteTicket {
+            path,
+            ticket_id,
+            message,
+            ticket_file,
+            work_dir,
+        } => {
+            let request = commit_transaction::CompleteTicketRequest {
+                repo_root: resolve_path(&path),
+                ticket_id,
+                message,
+                ticket_file,
+                work_dir,
+            };
+            match commit_transaction::complete_ticket(request) {
                 Ok(result) => println!("{}", result.commit_id),
                 Err(e) => {
                     eprintln!("Error: {}", e);
