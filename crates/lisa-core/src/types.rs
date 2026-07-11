@@ -446,6 +446,12 @@ pub struct Thread {
     /// The Zellij pane ID where this session is running
     pub pane_id: u32,
 
+    /// Provider-neutral authority for this ticket execution attempt. The
+    /// scheduler stamps this after dispatch admission; `None` represents a
+    /// legacy or manually constructed thread with no granted attempt lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_lease: Option<AttemptLease>,
+
     /// Current phase the thread is working on
     pub current_phase: Phase,
 
@@ -499,6 +505,7 @@ impl Thread {
         Self {
             ticket_id: ticket_id.into(),
             pane_id,
+            attempt_lease: None,
             current_phase: Phase::Ready,
             started_at: now,
             last_phase_change: now,
@@ -1100,6 +1107,7 @@ mod tests {
     #[test]
     fn test_thread_run_meta_defaults() {
         let thread = Thread::new("T-001", 42);
+        assert_eq!(thread.attempt_lease, None);
         assert_eq!(thread.client, AgentClient::default());
         assert_eq!(thread.concurrency_at_spawn, 0);
     }
@@ -1118,6 +1126,7 @@ mod tests {
             "status": "running"
         }"#;
         let thread: Thread = serde_json::from_str(json).unwrap();
+        assert_eq!(thread.attempt_lease, None);
         assert_eq!(thread.client, AgentClient::default());
         assert_eq!(thread.concurrency_at_spawn, 0);
         assert_eq!(thread.ticket_id, "T-001");

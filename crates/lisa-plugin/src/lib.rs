@@ -21,7 +21,9 @@ use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
 use lisa_core::provenance::{self, ProvenanceRecord, Route, RunOutcome};
 use lisa_core::ticket;
-use lisa_core::types::{ActivityEvent, Phase, PluginConfig, Thread, TicketId, TicketStatus};
+use lisa_core::types::{
+    ActivityEvent, AttemptLease, Phase, PluginConfig, Thread, TicketId, TicketStatus,
+};
 use pane_name::{format_pane_name, PaneName};
 
 /// How often (in seconds) the plugin rescans ticket files to detect phase changes.
@@ -156,6 +158,9 @@ struct AgentSlot {
     pane_id: u32,
     /// Which ticket is running in this slot (None = idle).
     ticket_id: Option<TicketId>,
+    /// The provider-neutral attempt assigned to this physical seat. Cleared
+    /// with `ticket_id` when the seat is released.
+    attempt_lease: Option<AttemptLease>,
     /// Whether this slot currently hosts a resident agent session.
     has_session: bool,
     /// Transition state machine for session reuse handshake.
@@ -292,6 +297,10 @@ pub struct State {
 
     /// Active threads indexed by ticket ID.
     threads: HashMap<TicketId, Thread>,
+
+    /// Latest lease minted for each ticket. Entries survive seat/thread release
+    /// so a redispatch can mint a strictly greater attempt.
+    current_leases: HashMap<TicketId, AttemptLease>,
 
     /// Plugin configuration (ticket directory path, etc.)
     config: PluginConfig,
@@ -900,6 +909,7 @@ impl State {
                     self.agent_slots.push(AgentSlot {
                         pane_id: pane.id,
                         ticket_id: None,
+                        attempt_lease: None,
                         has_session: false,
                         transition_state: TransitionState::Idle,
                         transition_started_at: None,
@@ -1255,6 +1265,7 @@ impl State {
         for slot in &mut self.agent_slots {
             if slot.ticket_id.as_ref() == Some(ticket_id) {
                 slot.ticket_id = None;
+                slot.attempt_lease = None;
                 // has_session stays true — the native agent TUI is still running
                 slot.cooldown_until = Some(
                     std::time::SystemTime::now()
@@ -1392,6 +1403,26 @@ impl State {
                 continue;
             }
 
+            // Mint only after every admission gate, but before pane lifecycle
+            // side effects. Retaining the predecessor in `current_leases`
+            // makes release followed by redispatch strictly monotonic.
+            let attempt_lease =
+                match AttemptLease::mint(ticket_id.clone(), self.current_leases.get(&ticket_id)) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Cannot dispatch {}: failed to mint attempt lease: {}",
+                                ticket_id, error
+                            ),
+                        });
+                        unscheduled += 1;
+                        continue;
+                    }
+                };
+            self.current_leases
+                .insert(ticket_id.clone(), attempt_lease.clone());
+
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
@@ -1481,6 +1512,7 @@ impl State {
             }
 
             self.agent_slots[slot_idx].ticket_id = Some(ticket_id.clone());
+            self.agent_slots[slot_idx].attempt_lease = Some(attempt_lease.clone());
             // Stamp the provider that claimed this pane. A compatible session is
             // reused in-place; a recycled pane is reserved for this provider
             // while WaitingForExit prevents any other scheduler claim.
@@ -1517,6 +1549,7 @@ impl State {
 
             // Create thread record with the ticket's current phase
             let mut thread = Thread::new(ticket_id.clone(), pane_id);
+            thread.attempt_lease = Some(attempt_lease);
             // Snapshot run provenance known only at spawn: the resolved route
             // (T-026-01) and the concurrency at spawn (running_count, computed
             // above, excludes this new thread). `client` mirrors the route's
@@ -4989,6 +5022,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5095,6 +5129,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5139,6 +5174,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: None,
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5160,6 +5196,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: None,
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5444,6 +5481,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 7,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5471,6 +5509,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 7,
             ticket_id: None,
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5543,6 +5582,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5621,6 +5661,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5687,6 +5728,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 5,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5748,6 +5790,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5849,6 +5892,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5963,6 +6007,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6156,6 +6201,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 5,
             ticket_id: Some("T-002".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6166,6 +6212,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 6,
             ticket_id: None,
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6319,6 +6366,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 42,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6329,6 +6377,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 43,
             ticket_id: None,
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6454,6 +6503,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6536,6 +6586,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6618,6 +6669,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -6831,6 +6883,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForStop,
             transition_started_at: Some(std::time::SystemTime::now()),
@@ -6859,6 +6912,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForClear,
             transition_started_at: Some(std::time::SystemTime::now()),
@@ -6887,6 +6941,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForStop,
             transition_started_at: Some(long_ago),
@@ -7017,6 +7072,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -7027,6 +7083,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 2,
             ticket_id: Some("T-002".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -7106,6 +7163,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -7186,6 +7244,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -7259,6 +7318,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -7312,6 +7372,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -7489,6 +7550,7 @@ mod tests {
             state.agent_slots.push(AgentSlot {
                 pane_id: 10 + i,
                 ticket_id: None,
+                attempt_lease: None,
                 has_session: false,
                 transition_state: TransitionState::Idle,
                 transition_started_at: None,
@@ -7534,6 +7596,7 @@ mod tests {
         AgentSlot {
             pane_id,
             ticket_id: None,
+            attempt_lease: None,
             has_session: last_client.is_some(),
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -7699,6 +7762,59 @@ mod tests {
             "a fresh Codex launch retains the existing immediate ownership contract"
         );
         assert!(state.seat_is_owned(10));
+    }
+
+    #[test]
+    fn dispatch_mints_and_stamps_strictly_new_attempt_lease() {
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        let ticket_id = "T-NAME".to_string();
+
+        state.schedule_ready_tickets();
+
+        let first = state.current_leases[&ticket_id].clone();
+        assert_eq!(first.ticket_id, ticket_id);
+        assert_eq!(first.attempt_id, 1);
+        assert_eq!(
+            state.threads[&ticket_id].attempt_lease.as_ref(),
+            Some(&first),
+            "the logical thread carries the ticket's current lease"
+        );
+        assert_eq!(
+            state.agent_slots[0].attempt_lease.as_ref(),
+            Some(&first),
+            "the assigned physical seat carries the same lease"
+        );
+
+        state.release_slot_for_ticket(&ticket_id);
+        state.threads.remove(&ticket_id);
+        // Make eligibility deterministic independently of clock granularity.
+        state.agent_slots[0].cooldown_until =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        assert_eq!(state.agent_slots[0].ticket_id, None);
+        assert_eq!(state.agent_slots[0].attempt_lease, None);
+        assert_eq!(
+            state.current_leases.get(&ticket_id),
+            Some(&first),
+            "release retains the high-water predecessor needed by redispatch"
+        );
+
+        state.schedule_ready_tickets();
+
+        let second = state.current_leases[&ticket_id].clone();
+        assert_eq!(second.attempt_id, 2);
+        assert!(second.attempt_id > first.attempt_id);
+        assert!(!first.is_current(Some(&second)));
+        assert!(second.is_current(Some(&second)));
+        assert_eq!(
+            state.threads[&ticket_id].attempt_lease.as_ref(),
+            Some(&second),
+            "the redispatched thread carries the successor lease"
+        );
+        assert_eq!(
+            state.agent_slots[0].attempt_lease.as_ref(),
+            Some(&second),
+            "the reassigned seat carries the successor lease"
+        );
     }
 
     fn dashboard_thread_row(state: &State, ticket_id: &str) -> String {
@@ -9030,6 +9146,7 @@ timeout\n\
         let slot = AgentSlot {
             pane_id: 1,
             ticket_id: None,
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::default(),
             transition_started_at: None,
@@ -9056,6 +9173,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForStop,
             transition_started_at: Some(std::time::SystemTime::now()),
@@ -9099,6 +9217,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -9136,6 +9255,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForClear,
             transition_started_at: Some(std::time::SystemTime::now()),
@@ -9176,6 +9296,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -9217,6 +9338,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForStop,
             // Set to 61 seconds ago
@@ -9256,6 +9378,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForClear,
             // Past the 90s clear-signal timeout
@@ -9301,6 +9424,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForStop,
             // Set to 5 seconds ago — well within the 60s threshold
@@ -9335,6 +9459,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-RECYCLE".to_string()),
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::WaitingForExit,
             transition_started_at: Some(
@@ -9383,6 +9508,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-RECYCLE".to_string()),
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::WaitingForExit,
             transition_started_at: Some(std::time::SystemTime::now()),
@@ -9406,6 +9532,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: None,
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::WaitingForExit,
             transition_started_at: Some(
@@ -9447,6 +9574,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-RECYCLE".to_string()),
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::WaitingForExit,
             transition_started_at: Some(std::time::SystemTime::now()),
@@ -9525,6 +9653,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -9866,6 +9995,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -10032,6 +10162,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -10063,6 +10194,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: None,
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -10089,6 +10221,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: None,
+            attempt_lease: None,
             has_session: false,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -10106,6 +10239,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::WaitingForClear,
             // Far past the 90s clear-signal timeout...
@@ -10244,6 +10378,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -10374,6 +10509,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -10426,6 +10562,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -10555,6 +10692,7 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id,
             ticket_id: Some(ticket.to_string()),
+            attempt_lease: None,
             has_session: true,
             // A running/ready native TUI sits Idle. When the slot is reassigned,
             // scheduling moves it through WaitingForClear before the next prompt.
