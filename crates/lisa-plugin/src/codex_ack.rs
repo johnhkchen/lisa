@@ -14,7 +14,6 @@ const ASSIGNMENT_PREFIX: &str = "LISA_ASSIGNMENT ";
 ///
 /// A ticket may be delivered more than once, so ticket identity alone is not
 /// sufficient to reject delayed lifecycle events from an older attempt.
-#[allow(dead_code)] // Consumed by scheduler promotion in T-033-01-03.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CodexAssignmentRef<'a> {
     pub ticket_id: &'a str,
@@ -37,7 +36,6 @@ struct LifecycleEvent {
 ///
 /// Serialization, rather than string interpolation, keeps arbitrary ticket IDs
 /// unambiguous. Generation allocation belongs to the scheduler integration.
-#[allow(dead_code)] // Consumed by prompt delivery in T-033-01-03.
 pub(crate) fn tag_codex_assignment(prompt: &str, assignment: CodexAssignmentRef<'_>) -> String {
     let marker = AssignmentMarker {
         ticket_id: assignment.ticket_id.to_string(),
@@ -52,7 +50,6 @@ pub(crate) fn tag_codex_assignment(prompt: &str, assignment: CodexAssignmentRef<
 ///
 /// Invalid JSON, non-submit events, missing prompts, malformed markers, and
 /// ticket/generation mismatches all fail closed as `false`.
-#[allow(dead_code)] // Consumed by scheduler promotion in T-033-01-03.
 pub(crate) fn detect_codex_ack(payload_json: &str, pending: CodexAssignmentRef<'_>) -> bool {
     let Ok(event) = serde_json::from_str::<LifecycleEvent>(payload_json) else {
         return false;

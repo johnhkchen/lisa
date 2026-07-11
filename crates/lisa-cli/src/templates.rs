@@ -128,6 +128,28 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 "#];
 
+/// The native Codex `UserPromptSubmit` hook. It preserves the complete JSON
+/// payload for the plugin's ticket/generation detector and publishes it with an
+/// atomic rename so the polling scheduler never observes a partial document.
+pub const ON_ACK_HOOK: &str = r#"#!/bin/sh
+# Lisa Codex acknowledgment hook — called before Codex submits a user prompt.
+# Writes the raw lifecycle payload for ticket/generation matching in the plugin.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.ack.tmp.$$"
+    if cat > "$tmp"; then
+        mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.ack"
+    else
+        rm -f "$tmp"
+    fi
+fi
+"#;
+
+pub(crate) const LEGACY_ON_ACK_HOOKS: &[&str] = &[];
+
 /// Gitignore content for `.lisa/` runtime state. Signal files and per-provider
 /// usage/session artifacts are machine-owned and must never enter the project DAG.
 pub const LISA_GITIGNORE: &str = "signals/\nclaude/\ncodex/\n";
@@ -283,9 +305,9 @@ pub fn settings_local_json() -> String {
 /// Generate `.codex/hooks.json` for the native interactive Codex adapter.
 ///
 /// Codex has no `idle_prompt` or `AskUserQuestion` hook equivalent, so the TUI
-/// installs only the lifecycle signals it can state truthfully: tool progress,
-/// turn completion, and `/clear` completion. The same versioned shell scripts
-/// serve both clients and attribute events through `LISA_PANE_ID`.
+/// installs only lifecycle signals it can state truthfully: prompt submission,
+/// tool progress, turn completion, and `/clear` completion. Shared scripts
+/// attribute events through `LISA_PANE_ID`; the ack script preserves raw JSON.
 pub fn codex_hooks_json() -> String {
     r#"{
   "hooks": {
@@ -317,6 +339,16 @@ pub fn codex_hooks_json() -> String {
           {
             "type": "command",
             "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
           }
         ]
       }
@@ -506,6 +538,12 @@ pub fn merge_codex_hooks(existing_json: &str) -> Result<String, String> {
         "PostToolUse",
         Some(".*"),
         "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "UserPromptSubmit",
+        None,
+        "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh",
     );
 
     serde_json::to_string_pretty(&root).map_err(|e| format!("failed to serialize JSON: {}", e))
@@ -698,6 +736,15 @@ mod tests {
     }
 
     #[test]
+    fn test_on_ack_hook_preserves_payload_atomically() {
+        assert!(ON_ACK_HOOK.starts_with("#!/bin/sh"));
+        assert!(ON_ACK_HOOK.contains("LISA_PANE_ID"));
+        assert!(ON_ACK_HOOK.contains("cat > \"$tmp\""));
+        assert!(ON_ACK_HOOK.contains("mv \"$tmp\""));
+        assert!(ON_ACK_HOOK.contains("pane-$LISA_PANE_ID.ack"));
+    }
+
+    #[test]
     fn test_on_notify_hook_content() {
         assert!(ON_NOTIFY_HOOK.starts_with("#!/bin/sh"));
         assert!(ON_NOTIFY_HOOK.contains("on-notify"));
@@ -764,11 +811,13 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed["hooks"]["Stop"].is_array());
         assert!(parsed["hooks"]["PostToolUse"].is_array());
+        assert!(parsed["hooks"]["UserPromptSubmit"].is_array());
         assert_eq!(parsed["hooks"]["PostToolUse"][0]["matcher"], ".*");
         assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "clear");
         assert!(json.contains("on-stop.sh"));
         assert!(json.contains("on-clear.sh"));
         assert!(json.contains("on-heartbeat.sh"));
+        assert!(json.contains("on-ack.sh"));
         assert!(!json.contains("idle_prompt"));
         assert!(!json.contains("AskUserQuestion"));
     }
@@ -782,6 +831,7 @@ mod tests {
         assert!(merged.contains("on-stop.sh"));
         assert!(merged.contains("on-clear.sh"));
         assert!(merged.contains("on-heartbeat.sh"));
+        assert!(merged.contains("on-ack.sh"));
 
         let again = merge_codex_hooks(&merged).unwrap();
         assert_eq!(again.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
@@ -790,6 +840,7 @@ mod tests {
             again.matches("test -x .lisa/hooks/on-heartbeat.sh").count(),
             1
         );
+        assert_eq!(again.matches("test -x .lisa/hooks/on-ack.sh").count(), 1);
     }
 
     #[test]

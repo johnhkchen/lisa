@@ -43,6 +43,7 @@ use lisa_core::client::AgentClient;
 use lisa_core::route::{resolve_route, ResolvedRoute};
 use lisa_core::types::Ticket;
 
+use crate::codex_ack::{tag_codex_assignment, CodexAssignmentRef};
 use crate::{build_claude_command, finish_up_prompt, ticket_prompt};
 
 /// Inputs needed to construct a launch command or a reuse prompt for a ticket.
@@ -53,6 +54,9 @@ pub(crate) struct SpawnContext<'a> {
     pub ticket_dir: &'a Path,
     pub ticket_id: &'a str,
     pub pane_id: u32,
+    /// Identity for a recycled Codex delivery awaiting provider acknowledgment.
+    /// Claude and immediately-owned fresh assignments leave this unset.
+    pub assignment_generation: Option<u64>,
 }
 
 /// Inputs needed to construct a follow-up nudge for a parked Review session.
@@ -218,14 +222,16 @@ impl AgentAdapter for ClaudeCodeAdapter {
 /// Native Codex adapter: launches the official interactive CLI so Codex panes
 /// have the same first-class chat experience as Claude panes.
 ///
-/// Lisa-generated Codex hooks mirror the Claude hook contract: `Stop` writes
-/// `.stopped`, `SessionStart[clear]` writes `.cleared`, and `PostToolUse` writes
-/// `.heartbeat`. That lets Codex use [`ResetStrategy::ClearHandshake`] and keeps
-/// the live TUI resident across tickets. `--dangerously-bypass-hook-trust` is
-/// scoped to this invocation because lisa generated the hook definitions. Agent
-/// command execution uses Codex's full-access/no-approval mode, matching the
-/// existing Claude `--dangerously-skip-permissions` contract and allowing the
-/// RDSPI workflow to commit through `.git`.
+/// Lisa-generated Codex hooks mirror the Claude transport contract: `Stop`
+/// writes `.stopped`, `SessionStart[clear]` writes `.cleared`, and `PostToolUse`
+/// writes `.heartbeat`. `UserPromptSubmit` additionally preserves the raw ack
+/// payload used for recycled-seat ownership. That lets Codex use
+/// [`ResetStrategy::ClearHandshake`] and keeps the live TUI resident across
+/// tickets. `--dangerously-bypass-hook-trust` is scoped to this invocation
+/// because lisa generated the hook definitions. Agent command execution uses
+/// Codex's full-access/no-approval mode, matching the existing Claude
+/// `--dangerously-skip-permissions` contract and allowing the RDSPI workflow to
+/// commit through `.git`.
 pub(crate) struct CodexAdapter {
     lisa_bin: String,
     /// The routed model for this pane (T-026-01), mapped to Codex's top-level
@@ -257,10 +263,34 @@ impl CodexAdapter {
         }
     }
 
+    /// Build the provider prompt and attach scheduler identity only when this
+    /// Codex delivery is waiting for positive acknowledgment.
+    fn assignment_prompt(&self, ctx: &SpawnContext) -> String {
+        let prompt = ticket_prompt(
+            ctx.ticket_dir,
+            ctx.ticket_id,
+            AgentClient::Codex.context_file(),
+        );
+        match ctx.assignment_generation {
+            Some(generation) => tag_codex_assignment(
+                &prompt,
+                CodexAssignmentRef {
+                    ticket_id: ctx.ticket_id,
+                    generation,
+                },
+            ),
+            None => prompt,
+        }
+    }
+
     /// The full interactive shell line for a fresh Codex TUI. The env prefix
     /// gives lifecycle hooks pane/ticket attribution and tells `capture-usage`
     /// to parse the Codex transcript into `.lisa/codex/`.
     fn interactive_line(&self, ctx: &SpawnContext) -> String {
+        // The prompt is one double-quoted shell argument. Escape the structured
+        // marker's JSON quotes so Codex receives them rather than the shell
+        // treating them as quote delimiters.
+        let prompt = self.assignment_prompt(ctx).replace('"', "\\\"");
         format!(
             "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} \
              codex --dangerously-bypass-approvals-and-sandbox \
@@ -271,12 +301,7 @@ impl CodexAdapter {
             pane = ctx.pane_id,
             ticket = ctx.ticket_id,
             model = self.model_flag(),
-            // Codex auto-loads AGENTS.md, not CLAUDE.md.
-            prompt = ticket_prompt(
-                ctx.ticket_dir,
-                ctx.ticket_id,
-                AgentClient::Codex.context_file()
-            ),
+            prompt = prompt,
         )
     }
 }
@@ -291,11 +316,7 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
-        ticket_prompt(
-            ctx.ticket_dir,
-            ctx.ticket_id,
-            AgentClient::Codex.context_file(),
-        )
+        self.assignment_prompt(ctx)
     }
 
     fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
@@ -383,6 +404,7 @@ mod tests {
             ticket_dir: dir,
             ticket_id: id,
             pane_id: pane,
+            assignment_generation: None,
         }
     }
 
@@ -625,6 +647,22 @@ mod tests {
             ticket_prompt(dir, "T-042-01", AgentClient::Codex.context_file())
         );
         assert!(!a.reuse_prompt(&ctx).contains(" codex "));
+    }
+
+    #[test]
+    fn codex_pending_delivery_tags_launch_and_reuse_prompt() {
+        let dir = Path::new("docs/active/tickets");
+        let mut ctx = spawn_ctx(dir, "T-042-01", 3);
+        ctx.assignment_generation = Some(17);
+        let adapter = CodexAdapter::new(Some("/abs/lisa"), None);
+
+        let reuse = adapter.reuse_prompt(&ctx);
+        assert!(reuse.contains(r#"LISA_ASSIGNMENT {"ticket_id":"T-042-01","generation":17}"#));
+
+        let launch = adapter.launch_command(&ctx);
+        assert!(
+            launch.contains(r#"LISA_ASSIGNMENT {\"ticket_id\":\"T-042-01\",\"generation\":17}"#)
+        );
     }
 
     #[test]

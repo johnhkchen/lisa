@@ -18,11 +18,11 @@ The flow is one-directional: **shell hooks write signals, the plugin consumes th
 The plugin never writes signal files. Signal files are ephemeral — `.lisa/signals/` is
 gitignored.
 
-## The four lifecycle hooks
+## The five lifecycle hooks
 
-`lisa init` scaffolds these four executable scripts into `.lisa/hooks/`. Claude
-binds them through `.claude/settings.local.json`; Codex binds the supported subset
-through `.codex/hooks.json`:
+`lisa init` scaffolds these five executable scripts into `.lisa/hooks/`. Claude
+and Codex bind their supported subsets through `.claude/settings.local.json` and
+`.codex/hooks.json` respectively:
 
 | Script             | Agent lifecycle event        | Signal file written                 | Tells the plugin        |
 |--------------------|-----------------------------|-------------------------------------|-------------------------|
@@ -30,10 +30,12 @@ through `.codex/hooks.json`:
 | `on-stop.sh`       | `Stop`                      | `.lisa/signals/pane-<id>.stopped`   | session ready for input |
 | `on-clear.sh`      | `SessionStart[clear]`       | `.lisa/signals/pane-<id>.cleared`   | context was cleared     |
 | `on-heartbeat.sh`  | `PostToolUse`               | `.lisa/signals/pane-<id>.heartbeat` | session actively working|
+| `on-ack.sh`        | `UserPromptSubmit`          | `.lisa/signals/pane-<id>.ack`       | assigned prompt accepted|
 | *(launch guard)*   | Codex TUI exits non-zero     | `.lisa/signals/pane-<id>.error`     | session failed          |
 
-Each script is POSIX `sh`, does `mkdir -p .lisa/signals`, and writes a UTC timestamp
-only when `$LISA_PANE_ID` is set (so it is inert outside a Lisa session). The
+Each script is POSIX `sh`, does `mkdir -p .lisa/signals`, and writes only when
+`$LISA_PANE_ID` is set (so it is inert outside a Lisa session). The ack hook atomically
+preserves its raw JSON payload; the other lifecycle scripts write UTC timestamps. The
 **heartbeat** is the liveness primitive: the plugin reuses a pane only after a stretch
 of heartbeat *silence* — not on a stop/idle signal, which can fire before an agent is
 truly finished.
@@ -156,11 +158,12 @@ files and only writes what is missing or stale):
 | `.lisa/hooks/on-stop.sh`          | stop signal hook (executable)                        |
 | `.lisa/hooks/on-clear.sh`         | clear signal hook (executable)                       |
 | `.lisa/hooks/on-heartbeat.sh`     | heartbeat signal hook (executable)                   |
+| `.lisa/hooks/on-ack.sh`           | Codex assignment ack payload hook (executable)       |
 | `.lisa/hooks/on-notify.sample`    | notify hook sample (non-executable; opt in to enable)|
 | `.lisa/signals/`                  | ephemeral signal files (gitignored)                  |
 | `.lisa/.gitignore`                | ignores signals and provider runtime state           |
 | `.claude/settings.local.json`     | binds all six hooks to Claude Code events            |
-| `.codex/hooks.json`               | binds Stop, clear, and heartbeat to Codex events     |
+| `.codex/hooks.json`               | binds Stop, clear, heartbeat, and prompt submission  |
 
 After `lisa init`, optionally enable `on-notify` (see **Enable it** above), then run
 `lisa validate` to confirm.
@@ -227,8 +230,9 @@ If you cannot run `lisa init`, create these by hand.
    "agent is asking a question" detail rather than failing.
 
 4. **Codex bindings.** Create `.codex/hooks.json` with `Stop`, `SessionStart`
-   matched on `clear`, and `PostToolUse` command hooks pointing at `on-stop.sh`,
-   `on-clear.sh`, and `on-heartbeat.sh` respectively. Lisa's Codex launch uses
+   matched on `clear`, `PostToolUse`, and `UserPromptSubmit` command hooks pointing at
+   `on-stop.sh`, `on-clear.sh`, `on-heartbeat.sh`, and `on-ack.sh` respectively.
+   Lisa's Codex launch uses
    `--dangerously-bypass-hook-trust` for these generated definitions; project
    trust is still pre-seeded by `lisa doctor` and `lisa loop`.
 
@@ -241,9 +245,9 @@ lisa validate
 `lisa validate` confirms the hook set is wired correctly. It checks that
 `.claude/settings.local.json` contains all six bindings (`idle_prompt`, the `on-notify`
 catch-all, `Stop`, `SessionStart`, `PostToolUse`, and `PreToolUse[AskUserQuestion]`) and
-that the five hook files exist — with the four `.sh` scripts executable and
+that the six hook files exist — with the five `.sh` scripts executable and
 `on-notify.sample` exempt from the executable check (it is opt-in by design). The
 `PreToolUse[AskUserQuestion]` binding is an inline command with no backing script file, so
 there is nothing extra to scaffold. When Codex is selected, validation also requires
-`.codex/hooks.json` with Stop, clear, and heartbeat bindings. Fix any reported errors,
-then run `lisa loop`.
+`.codex/hooks.json` with Stop, clear, heartbeat, and prompt-submission bindings. Fix any
+reported errors, then run `lisa loop`.

@@ -421,6 +421,11 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
             templates::ON_HEARTBEAT_HOOK,
             templates::LEGACY_ON_HEARTBEAT_HOOKS,
         ),
+        (
+            "on-ack.sh",
+            templates::ON_ACK_HOOK,
+            templates::LEGACY_ON_ACK_HOOKS,
+        ),
         // Scaffolded as a non-executable `.sample`: the user opts in by copying
         // it to `on-notify` and `chmod +x`. Deliberately excluded from the chmod
         // loop below so the catch-all Notification hook's `test -x` guard stays
@@ -632,7 +637,13 @@ fn run_init_with_writer(root: &Path, dry_run: bool, out: &mut impl Write) -> Res
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for script in &["on-idle.sh", "on-stop.sh", "on-clear.sh", "on-heartbeat.sh"] {
+        for script in &[
+            "on-idle.sh",
+            "on-stop.sh",
+            "on-clear.sh",
+            "on-heartbeat.sh",
+            "on-ack.sh",
+        ] {
             let hook_path = root.join(format!(".lisa/hooks/{}", script));
             if mutations.iter().any(|mutation| mutation.path == hook_path) {
                 let perms = fs::Permissions::from_mode(0o755);
@@ -914,7 +925,7 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         }
     }
 
-    // Hook scripts — on-idle.sh, on-stop.sh, on-clear.sh, on-heartbeat.sh, on-notify.sample.
+    // Hook scripts — active lifecycle hooks plus the opt-in notification sample.
     // The `.sample` is scaffolded non-executable (opt-in), so it is checked for
     // existence but exempt from the executable-bit check.
     for script in &[
@@ -922,6 +933,7 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         "on-stop.sh",
         "on-clear.sh",
         "on-heartbeat.sh",
+        "on-ack.sh",
         "on-notify.sample",
     ] {
         let hook_path = root.join(format!(".lisa/hooks/{}", script));
@@ -1190,13 +1202,13 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   12 files (the project/context/config files, five shared hook files,
+        //   13 files (the project/context/config files, six shared hook files,
         //   .lisa/.gitignore, Claude settings, and Codex hooks.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, InitAction::CreateDir(_) | InitAction::CreateFile { .. }))
             .collect();
-        assert_eq!(creates.len(), 20);
+        assert_eq!(creates.len(), 21);
     }
 
     #[test]
@@ -1471,6 +1483,7 @@ mod tests {
             ("on-stop.sh", templates::ON_STOP_HOOK),
             ("on-clear.sh", templates::ON_CLEAR_HOOK),
             ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
+            ("on-ack.sh", templates::ON_ACK_HOOK),
         ];
         for (name, content) in hooks {
             fs::write(root.join(format!(".lisa/hooks/{}", name)), content).unwrap();

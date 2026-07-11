@@ -213,7 +213,7 @@ enum TransitionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeatAssignmentState {
     /// The seat is reserved for a ticket, but Codex has not acknowledged it.
-    AssignedPendingAck,
+    AssignedPendingAck { generation: u64 },
     /// The provider is considered to have accepted the assigned ticket.
     Owned,
     /// The pending assignment timed out and bounded recovery is in progress.
@@ -298,6 +298,11 @@ pub struct State {
     /// that reservation is pending acknowledgment, owned, or recovering.
     /// Missing means the seat has no current assignment.
     seat_assignments: HashMap<u32, SeatAssignmentState>,
+
+    /// Monotonic identity source for recycled Codex delivery attempts. A
+    /// generation is retained in `AssignedPendingAck` until that exact prompt
+    /// submission is acknowledged.
+    next_assignment_generation: u64,
 
     /// Last pane name applied by Lisa, keyed by physical terminal pane ID.
     /// Used to suppress redundant Zellij rename operations across scheduler polls.
@@ -913,6 +918,48 @@ impl State {
         self.seat_assignments.get(&pane_id).copied()
     }
 
+    /// Allocate a process-local, nonzero identity for one pending delivery.
+    fn allocate_assignment_generation(&mut self) -> u64 {
+        self.next_assignment_generation = self.next_assignment_generation.saturating_add(1);
+        self.next_assignment_generation
+    }
+
+    /// Return the expected generation only while this seat is pending.
+    fn pending_assignment_generation(&self, pane_id: u32) -> Option<u64> {
+        match self.seat_assignment(pane_id) {
+            Some(SeatAssignmentState::AssignedPendingAck { generation }) => Some(generation),
+            _ => None,
+        }
+    }
+
+    /// Promote a recycled Codex seat only when the provider payload identifies
+    /// the ticket and delivery generation currently pending in that pane.
+    /// Returning true means this call performed the one pending-to-owned edge.
+    fn acknowledge_codex_assignment(&mut self, pane_id: u32, payload_json: &str) -> bool {
+        let Some(generation) = self.pending_assignment_generation(pane_id) else {
+            return false;
+        };
+        let Some(ticket_id) = self
+            .agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id)
+            .and_then(|slot| slot.ticket_id.as_deref())
+        else {
+            return false;
+        };
+        let pending = codex_ack::CodexAssignmentRef {
+            ticket_id,
+            generation,
+        };
+        if !codex_ack::detect_codex_ack(payload_json, pending) {
+            return false;
+        }
+
+        self.seat_assignments
+            .insert(pane_id, SeatAssignmentState::Owned);
+        true
+    }
+
     /// Whether a physical seat has acknowledged ownership of its assignment.
     ///
     /// Pending and recovering seats are intentionally not owned even though
@@ -1129,6 +1176,12 @@ impl State {
 
             let pane_id = self.agent_slots[slot_idx].pane_id;
 
+            let assignment_generation = if route.agent == AgentClient::Codex && reused_seat {
+                Some(self.allocate_assignment_generation())
+            } else {
+                None
+            };
+
             // Defensive: an idle slot rarely hosts an agent blocked on a question,
             // but if it does, leave the slot unassigned and retry next poll rather
             // than /clear-ing or launching over the question UI.
@@ -1141,6 +1194,7 @@ impl State {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                assignment_generation,
             };
 
             // Replace any previous ticket/idle title before the first lifecycle
@@ -1229,8 +1283,8 @@ impl State {
             // reused in-place; a recycled pane is reserved for this provider
             // while WaitingForExit prevents any other scheduler claim.
             self.agent_slots[slot_idx].last_client = Some(route.agent);
-            let assignment_state = if route.agent == AgentClient::Codex && reused_seat {
-                SeatAssignmentState::AssignedPendingAck
+            let assignment_state = if let Some(generation) = assignment_generation {
+                SeatAssignmentState::AssignedPendingAck { generation }
             } else {
                 // Fresh launches retain the established immediate-ownership
                 // contract, as do all Claude paths.
@@ -1487,6 +1541,42 @@ impl State {
             // A real tool call means an AskUserQuestion (if any) was answered and
             // the agent resumed — stop suppressing injection into this pane.
             self.awaiting_human.remove(&pane_id);
+        }
+    }
+
+    /// Consume raw Codex `UserPromptSubmit` payloads and promote only the
+    /// ticket/generation currently pending in the addressed physical seat.
+    fn check_codex_ack_signals(&mut self) {
+        let entries = match std::fs::read_dir(&self.signal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let pane_id = match path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("pane-"))
+                .and_then(|name| name.strip_suffix(".ack"))
+                .and_then(|id| id.parse::<u32>().ok())
+            {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let payload = std::fs::read_to_string(&path).ok();
+            let _ = std::fs::remove_file(&path);
+            let Some(payload) = payload else {
+                continue;
+            };
+
+            if self.acknowledge_codex_assignment(pane_id, &payload) {
+                self.bump_pane_activity(pane_id);
+                self.log_activity(ActivityEvent::Info {
+                    message: format!("Pane {} acknowledged its Codex assignment", pane_id),
+                });
+            }
         }
     }
 
@@ -2045,6 +2135,7 @@ impl State {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                assignment_generation: self.pending_assignment_generation(pane_id),
             };
             let prompt = adapter.reuse_prompt(&ctx);
             self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
@@ -2140,6 +2231,7 @@ impl State {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                assignment_generation: self.pending_assignment_generation(pane_id),
             };
             let command = adapter.launch_command(&ctx);
             self.send_line_to_pane(&command, PaneId::Terminal(pane_id));
@@ -2201,6 +2293,7 @@ impl State {
                     ticket_dir: &host_ticket_dir,
                     ticket_id: tid,
                     pane_id,
+                    assignment_generation: self.pending_assignment_generation(pane_id),
                 };
                 let prompt = adapter.reuse_prompt(&ctx);
                 self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
@@ -2548,6 +2641,10 @@ impl State {
         // into them this tick (must precede check_idle_signals and the timeout
         // fallbacks). Heartbeats above already cleared resumed panes.
         self.check_awaiting_signals();
+
+        // Promote recycled Codex ownership only from a matching native prompt
+        // submission. This runs before timeout/recovery evaluation.
+        self.check_codex_ack_signals();
 
         // Check for new artifacts and advance phases before rebuilding DAG
         self.check_artifact_advances();
@@ -6283,6 +6380,63 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_ack_signal_promotes_matching_pending_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        std::fs::create_dir_all(&signal_dir).unwrap();
+
+        let mut slot = fresh_slot(7, Some(AgentClient::Codex));
+        slot.ticket_id = Some("T-ACK".to_string());
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(slot);
+        state
+            .seat_assignments
+            .insert(7, SeatAssignmentState::AssignedPendingAck { generation: 9 });
+
+        let payload = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "assigned work",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-ACK",
+                    generation: 9,
+                },
+            ),
+        });
+        std::fs::write(signal_dir.join("pane-7.ack"), payload.to_string()).unwrap();
+
+        state.check_codex_ack_signals();
+
+        assert!(!signal_dir.join("pane-7.ack").exists());
+        assert_eq!(state.seat_assignment(7), Some(SeatAssignmentState::Owned));
+        assert!(state.seat_is_owned(7));
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .filter(|event| matches!(event, ActivityEvent::Info { message } if message.contains("acknowledged its Codex assignment")))
+                .count(),
+            1
+        );
+
+        std::fs::write(signal_dir.join("pane-7.ack"), payload.to_string()).unwrap();
+        state.check_codex_ack_signals();
+        assert!(!signal_dir.join("pane-7.ack").exists());
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .filter(|event| matches!(event, ActivityEvent::Info { message } if message.contains("acknowledged its Codex assignment")))
+                .count(),
+            1,
+            "duplicate ack is consumed without a second promotion"
+        );
+    }
+
+    #[test]
     fn test_build_notify_command_complete() {
         let root = Path::new("/proj");
         let extra = vec![
@@ -7188,7 +7342,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recycled_codex_assignment_is_pending_ack_and_not_owned() {
+    fn test_recycled_codex_ownership_requires_matching_ack_exactly_once() {
         let (mut state, _dir) =
             pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
         state
@@ -7207,12 +7361,60 @@ mod tests {
         );
         assert_eq!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck)
+            Some(SeatAssignmentState::AssignedPendingAck { generation: 1 })
         );
         assert!(
             !state.seat_is_owned(10),
             "ticket reservation must not imply acknowledged Codex ownership"
         );
+
+        let stale_ticket = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "old work",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-OLD",
+                    generation: 1,
+                },
+            ),
+        });
+        assert!(!state.acknowledge_codex_assignment(10, &stale_ticket.to_string()));
+        assert!(!state.seat_is_owned(10));
+
+        let stale_generation = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "new work",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-NAME",
+                    generation: 0,
+                },
+            ),
+        });
+        assert!(!state.acknowledge_codex_assignment(10, &stale_generation.to_string()));
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::AssignedPendingAck { generation: 1 })
+        );
+
+        let matching = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "new work",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-NAME",
+                    generation: 1,
+                },
+            ),
+        });
+        assert!(state.acknowledge_codex_assignment(10, &matching.to_string()));
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
+        assert!(state.seat_is_owned(10));
+        assert!(
+            !state.acknowledge_codex_assignment(10, &matching.to_string()),
+            "duplicate acknowledgment cannot perform a second transition"
+        );
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
     }
 
     #[test]
@@ -7252,7 +7454,7 @@ mod tests {
         assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
         assert_eq!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck)
+            Some(SeatAssignmentState::AssignedPendingAck { generation: 1 })
         );
         assert!(!state.seat_is_owned(10));
     }
@@ -7265,9 +7467,10 @@ mod tests {
         let mut shell = fresh_slot(11, None);
         shell.ticket_id = Some("T-SHELL".to_string());
         state.agent_slots.extend([codex, shell]);
-        state
-            .seat_assignments
-            .insert(10, SeatAssignmentState::AssignedPendingAck);
+        state.seat_assignments.insert(
+            10,
+            SeatAssignmentState::AssignedPendingAck { generation: 1 },
+        );
         state
             .seat_assignments
             .insert(11, SeatAssignmentState::Owned);
@@ -8026,7 +8229,7 @@ mod tests {
         });
         state
             .seat_assignments
-            .insert(1, SeatAssignmentState::AssignedPendingAck);
+            .insert(1, SeatAssignmentState::AssignedPendingAck { generation: 1 });
 
         state.check_transition_timeouts();
 
@@ -8035,7 +8238,7 @@ mod tests {
         assert!(state.agent_slots[0].transition_started_at.is_none());
         assert_eq!(
             state.seat_assignment(1),
-            Some(SeatAssignmentState::AssignedPendingAck),
+            Some(SeatAssignmentState::AssignedPendingAck { generation: 1 }),
             "a clear timeout sends the prompt but is not Codex acknowledgment"
         );
         assert!(!state.seat_is_owned(1));
@@ -8100,7 +8303,7 @@ mod tests {
         });
         state
             .seat_assignments
-            .insert(1, SeatAssignmentState::AssignedPendingAck);
+            .insert(1, SeatAssignmentState::AssignedPendingAck { generation: 1 });
 
         state.check_transition_timeouts();
 
@@ -8111,7 +8314,7 @@ mod tests {
         assert_eq!(slot.last_client, Some(AgentClient::Codex));
         assert_eq!(
             state.seat_assignment(1),
-            Some(SeatAssignmentState::AssignedPendingAck),
+            Some(SeatAssignmentState::AssignedPendingAck { generation: 1 }),
             "exit-grace launch must preserve pending assignment truth"
         );
         assert!(!state.seat_is_owned(1));
