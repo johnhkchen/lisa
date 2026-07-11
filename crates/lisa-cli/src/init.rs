@@ -2175,6 +2175,42 @@ depends_on: [T-999]
     }
 
     #[test]
+    fn test_plan_init_never_replaces_malformed_structured_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        let malformed_toml = "project_setting = [\n# keep this project content\n";
+        fs::write(dir.path().join(".lisa.toml"), malformed_toml).unwrap();
+        fs::write(
+            dir.path().join(".claude/settings.local.json"),
+            "{ not valid json",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".codex/hooks.json"), "[ not valid json").unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        for name in &["settings.local.json", "hooks.json"] {
+            assert!(actions.iter().any(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason.contains("JSON is malformed"))));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(name))));
+        }
+
+        let config_update = actions.iter().find_map(|action| match action {
+            InitAction::UpdateFile { path, content } if path.ends_with(".lisa.toml") => {
+                Some(content)
+            }
+            _ => None,
+        });
+        assert!(
+            config_update.is_some_and(|content| content.contains(malformed_toml)),
+            "the textual TOML merge must retain malformed project content instead of falling back to defaults"
+        );
+    }
+
+    #[test]
     fn test_run_init_upgrades_known_prior_hook() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();

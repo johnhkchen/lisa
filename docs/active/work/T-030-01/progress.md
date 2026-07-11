@@ -2,8 +2,8 @@
 
 ## Status
 
-Implementation is complete and focused init tests pass. Full workspace and
-project verification remain before Review.
+Implementation and verification are complete. Review handoff is the only
+remaining artifact.
 
 ## Completed: RDSPI preparation
 
@@ -67,7 +67,8 @@ project verification remain before Review.
   new helper/test code.
 - Ran `cargo fmt --all` as the planned mechanical correction.
 - `cargo test -p lisa-cli init::tests --no-fail-fast` passed:
-  64 passed, 0 failed, 183 filtered out.
+  65 passed, 0 failed, 183 filtered out after the final malformed-structure
+  regression was added.
 - `git diff --check` passed.
 - Scoped diff inspection confirms production changes are limited to
   `crates/lisa-cli/src/init.rs`, `crates/lisa-cli/src/templates.rs`, and the new
@@ -110,12 +111,44 @@ error branch used for unreadable or non-text existing files.
 - Implementation commits will explicitly name only T-030-01 production/test and
   artifact paths.
 
+## Full verification completed
+
+- `cargo test --workspace` passed before the final test-only addition:
+  - `lisa-cli`: 247 passed;
+  - `lisa-core`: 145 passed;
+  - `lisa-plugin`: 234 passed;
+  - doc tests: 0 failures.
+- `just check` passed, including:
+  - `cargo check -p lisa-plugin --target wasm32-wasip1`;
+  - the complete workspace test suite with the same 626 passing tests.
+- The final malformed-structure regression passed individually and the complete
+  init subset then passed 65/65.
+- `cargo fmt --all` completed and subsequent source is formatted.
+- `git diff --check` passed.
+
+## Lint result
+
+- `cargo clippy --workspace --all-targets -- -D warnings` does not pass on the
+  baseline because twelve old `unnecessary_to_owned` findings remain in
+  `crates/lisa-core/src/dag.rs` tests.
+- A narrower `cargo clippy -p lisa-cli --all-targets -- -D warnings` reaches the
+  CLI and reports one old `needless_borrows_for_generic_args` finding at the
+  pre-existing `&format!` in `init.rs`'s config-upsert test.
+- `git blame` attributes that line to commit `55e85c14`, predating this ticket;
+  the core findings date to `ba92ee43`.
+- No lint finding points to the new ownership helper, historical constants, or
+  regressions. These unrelated baseline cleanup items were not changed.
+
+## Commits completed
+
+- `0e67320 docs: design ownership-aware init planning`
+- `d2d06b3 fix: preserve unowned init templates`
+
+The final malformed-input regression and closing artifacts will be committed as
+the verification/handoff unit.
+
 ## Remaining
 
-- Run template-focused tests.
-- Run all `lisa-cli` tests.
-- Run full workspace tests.
-- Run clippy and `just check` in proportion to available toolchains.
-- Re-run formatting and diff checks.
-- Commit the implementation as an isolated unit.
 - Write `review.md` with final results and open concerns.
+- Commit the final regression and closing artifacts without staging unrelated
+  working-tree changes.
