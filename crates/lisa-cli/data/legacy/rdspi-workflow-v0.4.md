@@ -36,11 +36,9 @@ Artifact: `docs/active/work/{ticket-id}/plan.md`
 
 ### Implement
 
-Execute the plan. Track progress in `progress.md`. Commit meaningful units through Lisa's isolated transaction.
+Execute the plan. Track progress in `progress.md`. Commit incrementally.
 
-Follow the plan step by step. Update `progress.md` with what has been completed, what remains, and any deviations from the plan. If the plan needs adjustment, document the deviation and rationale before proceeding.
-
-For each meaningful implementation unit, run `lisa commit-ticket --ticket-id <ticket-id> --message <message> --include <exact-repository-relative-path>...`. Pass only paths owned by this ticket. Never use the ordinary index for ticket work: do not run ordinary `git add`, broad `git add -A`, or ordinary `git commit`, and do not leave staged changes for another command or process to consume. Before finishing Review, ensure every ticket-owned source change is committed through `lisa commit-ticket` and no ticket-owned source file remains staged, modified, or untracked.
+Follow the plan step by step. After each meaningful unit of work, commit. Update `progress.md` with what has been completed, what remains, and any deviations from the plan. If the plan needs adjustment, document the deviation and rationale before proceeding.
 
 Artifact: `docs/active/work/{ticket-id}/progress.md`
 
@@ -49,8 +47,6 @@ Artifact: `docs/active/work/{ticket-id}/progress.md`
 Self-assess the completed work. Produce `review.md` (~200 lines).
 
 Summarize what changed: files created, modified, or deleted. Evaluate test coverage and flag gaps. Surface open concerns, TODOs, or known limitations. Flag critical issues that need human attention. This is the handoff document — what a human reviewer needs to understand the work without reading every diff.
-
-After writing `review.md`, remain on the current ticket and wait. Do not edit phase/status, publish completion yourself, or start another ticket. Lisa prepares Done, commits the ticket and work artifacts through the isolated transaction, and confirms that completion commit before releasing the seat or scheduling dependents.
 
 Artifact: `docs/active/work/{ticket-id}/review.md`
 
@@ -67,8 +63,6 @@ Artifact: `docs/active/work/{ticket-id}/review.md`
 4. **High-leverage phases.** Research and Design artifacts are the best return on review time. Reviewing ~200 lines of research or design catches problems before they become thousands of lines of wrong code. Structure and Plan may auto-advance depending on project configuration.
 
 5. **Artifacts are insurance.** If a session crashes or hits limits, the latest artifact plus the ticket is enough to seed a new session at the correct phase.
-
-6. **Completion is commit-gated.** The agent makes ticket-owned source changes durable through `lisa commit-ticket`, but Lisa alone writes Done and publishes completion. A failed completion commit leaves the ticket, seat, and dependents in place for a safe retry.
 
 ---
 
@@ -112,6 +106,6 @@ Fields:
 
 ## Concurrency
 
-Lisa computes the DAG from ticket dependencies and spawns threads for all tickets whose dependencies are satisfied. Multiple threads work on the same branch. `lisa commit-ticket` and Lisa's final completion command serialize commits while using an isolated Git index, so unrelated entries already staged in the ordinary index remain untouched and uncommitted.
+Lisa computes the DAG from ticket dependencies and spawns threads for all tickets whose dependencies are satisfied. Multiple threads work on the same branch. Commit serialization is handled via file locking -- agents do not need to coordinate with each other.
 
-If two tickets modify the same files, that is a missing dependency edge in the DAG. The isolated transaction is a safety boundary, not a substitute for correct dependency modeling or exact `--include` ownership.
+If two tickets modify the same files, that is a missing dependency edge in the DAG. The lock is a safety net, not a substitute for correct dependency modeling.

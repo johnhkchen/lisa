@@ -48,7 +48,16 @@ const AGENT_EXIT_GRACE_SECS: u64 = 8;
 /// [`AgentClient::context_file`]). The prompt body is otherwise identical across
 /// clients, so it stays single-sourced here.
 pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, context_file: &str) -> String {
-    let ticket_path = ticket_dir.join(format!("{}.md", ticket_id));
+    let ticket_path = lisa_core::ticket::scan_tickets(ticket_dir)
+        .ok()
+        .and_then(|tickets| {
+            tickets
+                .into_iter()
+                .find(|ticket| ticket.id == ticket_id)
+                .map(|ticket| ticket.file_path)
+        })
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| ticket_dir.join(format!("{}.md", ticket_id)));
     format!(
         "Read the ticket at {path}, {context}, and docs/knowledge/rdspi-workflow.md. \
          Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
@@ -56,8 +65,12 @@ pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, context_file: &s
          For each phase, write the artifact to docs/active/work/{id}/ then immediately continue to the next phase. \
          Do NOT update the ticket's phase or status fields in the frontmatter — \
          Lisa detects your artifacts and handles all phase transitions automatically. \
+         During Implement, commit each meaningful ticket-owned source unit only with \
+         lisa commit-ticket and exact repository-relative --include paths. Do not use ordinary-index git add, \
+         git add -A, or git commit for ticket work, and do not leave ticket-owned files staged, modified, or untracked. \
          After Review is complete (review.md written summarizing changes, test coverage, and open concerns), \
-         simply stop — Lisa handles the rest.",
+         remain on this ticket and stop. Do not start another ticket until Lisa confirms the completion commit; \
+         Lisa handles Done publication and seat release.",
         path = ticket_path.display(),
         context = context_file,
         id = ticket_id,
@@ -109,7 +122,8 @@ pub(crate) fn finish_up_prompt(_ticket_dir: &Path, work_dir: &Path, ticket_id: &
         "You have been in the Review phase for a while. Please finish writing your review artifact at {}. \
          It should cover: what changes were made, files created/modified/deleted, test coverage, \
          any open concerns or TODOs, and critical issues to surface for human review. \
-         Do NOT update the ticket's phase or status fields — Lisa detects review.md and handles the rest.",
+         Do NOT update the ticket's phase or status fields or use ordinary-index git add/git commit to publish completion. \
+         Remain on this ticket and wait until Lisa confirms the completion commit before starting another ticket.",
         review_path.display(),
     )
 }
@@ -3971,6 +3985,12 @@ mod tests {
         assert!(prompt.contains("CLAUDE.md"));
         assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
         assert!(prompt.contains("current phase"));
+        assert!(prompt.contains("lisa commit-ticket"));
+        assert!(prompt.contains("exact repository-relative --include paths"));
+        assert!(prompt.contains("Do not use ordinary-index git add"));
+        assert!(prompt.contains("git add -A"));
+        assert!(prompt.contains("do not leave ticket-owned files staged, modified, or untracked"));
+        assert!(prompt.contains("Do not start another ticket until Lisa confirms"));
     }
 
     #[test]
@@ -3981,6 +4001,38 @@ mod tests {
         assert!(prompt.contains("AGENTS.md"));
         assert!(!prompt.contains("CLAUDE.md"));
         assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
+    }
+
+    #[test]
+    fn test_ticket_prompt_uses_discovered_descriptive_ticket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("tickets");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        std::fs::write(
+            ticket_dir.join("T-024-03-descriptive-title.md"),
+            "---\nid: T-024-03\ntitle: descriptive-title\ntype: task\nstatus: open\npriority: medium\nphase: research\n---\n",
+        )
+        .unwrap();
+
+        let prompt = ticket_prompt(&ticket_dir, "T-024-03", "AGENTS.md");
+
+        assert!(prompt.contains("T-024-03-descriptive-title.md"));
+        assert!(!prompt.contains("tickets/T-024-03.md"));
+    }
+
+    #[test]
+    fn test_finish_up_prompt_preserves_atomic_completion_contract() {
+        let prompt = finish_up_prompt(
+            Path::new("docs/active/tickets"),
+            Path::new("docs/active/work"),
+            "T-024-03",
+        );
+
+        assert!(prompt.contains("docs/active/work/T-024-03/review.md"));
+        assert!(prompt.contains("Do NOT update the ticket's phase or status"));
+        assert!(prompt.contains("ordinary-index git add/git commit"));
+        assert!(prompt.contains("wait until Lisa confirms the completion commit"));
+        assert!(prompt.contains("before starting another ticket"));
     }
 
     #[test]

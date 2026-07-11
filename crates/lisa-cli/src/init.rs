@@ -2170,6 +2170,34 @@ depends_on: [T-999]
     }
 
     #[test]
+    fn test_plan_init_updates_every_known_rdspi_template() {
+        assert!(
+            templates::LEGACY_RDSPI_WORKFLOWS
+                .iter()
+                .all(|legacy| *legacy != templates::RDSPI_WORKFLOW),
+            "legacy workflow fixtures must be byte-distinct from current content"
+        );
+
+        for legacy in templates::LEGACY_RDSPI_WORKFLOWS {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+            fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), legacy).unwrap();
+
+            let project = detect_project(dir.path());
+            let actions = plan_init_actions(dir.path(), &project);
+
+            assert!(
+                actions.iter().any(
+                    |action| matches!(action, InitAction::UpdateFile { path, content }
+                        if path.ends_with("rdspi-workflow.md")
+                            && content == templates::RDSPI_WORKFLOW)
+                ),
+                "every exact prior Lisa workflow must upgrade to the current template"
+            );
+        }
+    }
+
+    #[test]
     fn test_plan_init_skips_all_current_plain_text_templates() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();

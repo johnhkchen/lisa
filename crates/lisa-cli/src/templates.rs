@@ -5,8 +5,10 @@ pub const RDSPI_WORKFLOW: &str = include_str!("../data/rdspi-workflow.md");
 
 /// Exact outgoing Lisa templates accepted as proof of an unmodified install.
 /// Keep only byte-distinct generations; current content is handled separately.
-pub(crate) const LEGACY_RDSPI_WORKFLOWS: &[&str] =
-    &[include_str!("../data/legacy/rdspi-workflow-v0.2.md")];
+pub(crate) const LEGACY_RDSPI_WORKFLOWS: &[&str] = &[
+    include_str!("../data/legacy/rdspi-workflow-v0.2.md"),
+    include_str!("../data/legacy/rdspi-workflow-v0.4.md"),
+];
 
 /// The hooks setup guide, embedded at compile time. Printed by `lisa hooks-guide`.
 pub const HOOKS_GUIDE: &str = include_str!("../data/hooks-guide.md");
