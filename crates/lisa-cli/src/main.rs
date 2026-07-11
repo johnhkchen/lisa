@@ -1,5 +1,6 @@
 mod agent_exec;
 mod capture_usage;
+mod commit_transaction;
 mod config;
 mod detect;
 mod doctor;
@@ -112,6 +113,24 @@ enum Commands {
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
+    /// Commit ticket-owned paths without using the repository's ordinary index.
+    CommitTicket {
+        /// Repository root containing the ticket changes.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Ticket identifier used for transaction diagnostics.
+        #[arg(long)]
+        ticket_id: String,
+
+        /// Commit message for the ticket completion commit.
+        #[arg(long)]
+        message: String,
+
+        /// Repository-relative ticket-owned path to include (repeatable).
+        #[arg(long = "include", required = true)]
+        includes: Vec<PathBuf>,
+    },
     /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
     Loop {
         /// Path to the project root (defaults to current directory)
@@ -175,6 +194,26 @@ fn main() {
             // unwritable `.lisa/claude`) are swallowed; tokens stay null.
             let cwd = resolve_path(&cwd);
             let _ = capture_usage::run_capture_usage(&cwd);
+        }
+        Commands::CommitTicket {
+            path,
+            ticket_id,
+            message,
+            includes,
+        } => {
+            let request = commit_transaction::CommitTransactionRequest {
+                repo_root: resolve_path(&path),
+                ticket_id,
+                message,
+                includes,
+            };
+            match commit_transaction::commit_ticket(request) {
+                Ok(result) => println!("{}", result.commit_id),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Init { dry_run, path } => {
             let path = resolve_path(&path);
