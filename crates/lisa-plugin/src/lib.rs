@@ -203,6 +203,24 @@ enum TransitionState {
     WaitingForExit,
 }
 
+/// Scheduler-owned truth for the ticket assigned to a physical seat.
+///
+/// This is deliberately independent of [`TransitionState`]: a pane can be
+/// waiting for `/clear` or `/exit` while its ticket assignment is still waiting
+/// for positive provider acknowledgment. Absence from `State::seat_assignments`
+/// means the seat is unassigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatAssignmentState {
+    /// The seat is reserved for a ticket, but Codex has not acknowledged it.
+    AssignedPendingAck,
+    /// The provider is considered to have accepted the assigned ticket.
+    Owned,
+    /// The pending assignment timed out and bounded recovery is in progress.
+    /// T-033-01-04 owns the transition into this state.
+    #[allow(dead_code)]
+    Recovering,
+}
+
 /// Diagnostic origin for a request to durably complete a ticket. Every origin
 /// enters the same completion transaction and result publisher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +291,12 @@ pub struct State {
     /// Pre-created terminal pane slots for agent sessions.
     /// Populated on first PaneUpdate after permissions are granted.
     agent_slots: Vec<AgentSlot>,
+
+    /// Assignment truth keyed by physical terminal pane ID. Slot `ticket_id`
+    /// remains the reservation/routing key during handoff; this map says whether
+    /// that reservation is pending acknowledgment, owned, or recovering.
+    /// Missing means the seat has no current assignment.
+    seat_assignments: HashMap<u32, SeatAssignmentState>,
 
     /// Last pane name applied by Lisa, keyed by physical terminal pane ID.
     /// Used to suppress redundant Zellij rename operations across scheduler polls.
@@ -883,6 +907,20 @@ impl State {
         }
     }
 
+    /// Return the explicit assignment state for a physical seat.
+    fn seat_assignment(&self, pane_id: u32) -> Option<SeatAssignmentState> {
+        self.seat_assignments.get(&pane_id).copied()
+    }
+
+    /// Whether a physical seat has acknowledged ownership of its assignment.
+    ///
+    /// Pending and recovering seats are intentionally not owned even though
+    /// their slot retains a ticket reservation.
+    #[allow(dead_code)] // Scheduler tests today; S-033-02 will project this to UI.
+    fn seat_is_owned(&self, pane_id: u32) -> bool {
+        self.seat_assignment(pane_id) == Some(SeatAssignmentState::Owned)
+    }
+
     /// Find an idle agent slot that has finished its cooldown period.
     ///
     /// Busy-pane guard: a slot with a live session is only eligible once the
@@ -984,6 +1022,9 @@ impl State {
                 break;
             }
         }
+        if let Some((pane_id, _)) = &released_pane {
+            self.seat_assignments.remove(pane_id);
+        }
         match released_pane {
             Some((pane_id, idle_name)) => {
                 self.rename_slot(pane_id, idle_name);
@@ -1076,6 +1117,11 @@ impl State {
                     continue;
                 }
             };
+            // Preserve the pre-handoff residency fact. The recycle branch below
+            // clears `has_session` while the old provider exits, but this remains
+            // a reassigned physical seat and needs the pending-ack contract when
+            // the incoming provider is Codex.
+            let reused_seat = self.agent_slots[slot_idx].has_session;
 
             // Build the host-relative ticket dir (strip /host/ prefix)
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
@@ -1182,6 +1228,14 @@ impl State {
             // reused in-place; a recycled pane is reserved for this provider
             // while WaitingForExit prevents any other scheduler claim.
             self.agent_slots[slot_idx].last_client = Some(route.agent);
+            let assignment_state = if route.agent == AgentClient::Codex && reused_seat {
+                SeatAssignmentState::AssignedPendingAck
+            } else {
+                // Fresh launches retain the established immediate-ownership
+                // contract, as do all Claude paths.
+                SeatAssignmentState::Owned
+            };
+            self.seat_assignments.insert(pane_id, assignment_state);
             // Sending input counts as pane activity — restarts the wind-down clock.
             self.agent_slots[slot_idx].last_activity_at = Some(std::time::SystemTime::now());
 
@@ -2058,6 +2112,7 @@ impl State {
                     slot.has_session = false;
                     slot.last_client = None;
                 }
+                self.seat_assignments.remove(&pane_id);
                 self.rename_slot(
                     pane_id,
                     format_pane_name(PaneName::Idle {
@@ -7123,10 +7178,16 @@ mod tests {
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
         assert!(state.agent_slots[0].has_session);
         assert_eq!(state.threads["T-NAME"].client, AgentClient::Codex);
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Owned),
+            "a fresh Codex launch retains the existing immediate ownership contract"
+        );
+        assert!(state.seat_is_owned(10));
     }
 
     #[test]
-    fn test_pane_title_same_provider_reuse_replaces_stale_name() {
+    fn test_recycled_codex_assignment_is_pending_ack_and_not_owned() {
         let (mut state, _dir) =
             pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
         state
@@ -7143,6 +7204,30 @@ mod tests {
             state.agent_slots[0].transition_state,
             TransitionState::WaitingForClear
         );
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::AssignedPendingAck)
+        );
+        assert!(
+            !state.seat_is_owned(10),
+            "ticket reservation must not imply acknowledged Codex ownership"
+        );
+    }
+
+    #[test]
+    fn test_reused_claude_assignment_remains_owned() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("claude", AgentClient::Codex, Some(AgentClient::Claude));
+
+        state.schedule_ready_tickets();
+
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForClear,
+            "Claude keeps its existing clear handshake"
+        );
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
+        assert!(state.seat_is_owned(10));
     }
 
     #[test]
@@ -7164,6 +7249,11 @@ mod tests {
             TransitionState::WaitingForExit
         );
         assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::AssignedPendingAck)
+        );
+        assert!(!state.seat_is_owned(10));
     }
 
     #[test]
@@ -7174,9 +7264,20 @@ mod tests {
         let mut shell = fresh_slot(11, None);
         shell.ticket_id = Some("T-SHELL".to_string());
         state.agent_slots.extend([codex, shell]);
+        state
+            .seat_assignments
+            .insert(10, SeatAssignmentState::AssignedPendingAck);
+        state
+            .seat_assignments
+            .insert(11, SeatAssignmentState::Owned);
 
         state.release_slot_for_ticket(&"T-CODEX".to_string());
         state.release_slot_for_ticket(&"T-SHELL".to_string());
+
+        assert_eq!(state.seat_assignment(10), None);
+        assert_eq!(state.seat_assignment(11), None);
+        assert!(!state.seat_is_owned(10));
+        assert!(!state.seat_is_owned(11));
 
         assert_eq!(
             state.last_pane_names.get(&10).map(String::as_str),
@@ -7922,12 +8023,21 @@ mod tests {
             last_activity_at: None,
             last_client: None,
         });
+        state
+            .seat_assignments
+            .insert(1, SeatAssignmentState::AssignedPendingAck);
 
         state.check_transition_timeouts();
 
         // Should have forced to Idle
         assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(state.agent_slots[0].transition_started_at.is_none());
+        assert_eq!(
+            state.seat_assignment(1),
+            Some(SeatAssignmentState::AssignedPendingAck),
+            "a clear timeout sends the prompt but is not Codex acknowledgment"
+        );
+        assert!(!state.seat_is_owned(1));
 
         // Should have logged a warning
         assert!(state.activity_log.iter().any(|e| matches!(
@@ -7987,6 +8097,9 @@ mod tests {
             // Scheduling stamps the incoming provider while `/exit` is pending.
             last_client: Some(AgentClient::Codex),
         });
+        state
+            .seat_assignments
+            .insert(1, SeatAssignmentState::AssignedPendingAck);
 
         state.check_transition_timeouts();
 
@@ -7995,6 +8108,12 @@ mod tests {
         assert!(slot.transition_started_at.is_none());
         assert!(slot.has_session);
         assert_eq!(slot.last_client, Some(AgentClient::Codex));
+        assert_eq!(
+            state.seat_assignment(1),
+            Some(SeatAssignmentState::AssignedPendingAck),
+            "exit-grace launch must preserve pending assignment truth"
+        );
+        assert!(!state.seat_is_owned(1));
         assert_eq!(state.pending_enters.len(), 1, "fresh launch queued Enter");
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
