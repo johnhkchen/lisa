@@ -314,6 +314,7 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
                 review_timeout_secs "{review_timeout_secs}"
                 session_timeout_secs "{session_timeout_secs}"
                 wind_down_secs "{wind_down_secs}"
+                assignment_ack_timeout_secs "{assignment_ack_timeout_secs}"
                 client "{client}"
 {provider_cap_lines}{lisa_bin_line}            }}
         }}
@@ -332,6 +333,7 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
         review_timeout_secs = config.review_timeout_secs,
         session_timeout_secs = config.session_timeout_secs,
         wind_down_secs = config.wind_down_secs,
+        assignment_ack_timeout_secs = config.assignment_ack_timeout_secs,
         client = config.client.as_str(),
     )
 }
@@ -390,6 +392,7 @@ mod tests {
         assert!(layout.contains("auto_advance \"false\""));
         assert!(layout.contains("review_timeout_secs \"600\""));
         assert!(layout.contains("session_timeout_secs \"3600\""));
+        assert!(layout.contains("assignment_ack_timeout_secs \"30\""));
         assert!(
             layout.contains("compact-bar"),
             "layout should include status bar"

@@ -43,6 +43,7 @@ pub struct SchedulingConfig {
     pub review_timeout_secs: Option<u64>,
     pub session_timeout_secs: Option<u64>,
     pub wind_down_secs: Option<u64>,
+    pub assignment_ack_timeout_secs: Option<u64>,
     pub phase_timeouts: Option<std::collections::HashMap<String, u64>>,
     /// Optional per-provider concurrency sub-caps (T-026-02), keyed by raw
     /// client name (`claude` | `codex`). Kept as raw strings here so an invalid
@@ -63,6 +64,7 @@ pub struct ResolvedConfig {
     pub review_timeout_secs: u64,
     pub session_timeout_secs: u64,
     pub wind_down_secs: u64,
+    pub assignment_ack_timeout_secs: u64,
     pub phase_timeouts: std::collections::HashMap<String, u64>,
     pub client: AgentClient,
     /// Resolved per-provider concurrency sub-caps, keyed by raw client name.
@@ -81,6 +83,7 @@ impl Default for ResolvedConfig {
             review_timeout_secs: PluginConfig::DEFAULT_REVIEW_TIMEOUT_SECS,
             session_timeout_secs: PluginConfig::DEFAULT_SESSION_TIMEOUT_SECS,
             wind_down_secs: PluginConfig::DEFAULT_WIND_DOWN_SECS,
+            assignment_ack_timeout_secs: PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
             provider_caps: std::collections::HashMap::new(),
@@ -155,6 +158,10 @@ pub fn resolve_config(
             .scheduling
             .wind_down_secs
             .unwrap_or(defaults.wind_down_secs),
+        assignment_ack_timeout_secs: config
+            .scheduling
+            .assignment_ack_timeout_secs
+            .unwrap_or(defaults.assignment_ack_timeout_secs),
         phase_timeouts: config.scheduling.phase_timeouts.clone().unwrap_or_default(),
         provider_caps: config.scheduling.provider_caps.clone().unwrap_or_default(),
     }
@@ -181,6 +188,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
         "review_timeout_secs",
         "session_timeout_secs",
         "wind_down_secs",
+        "assignment_ack_timeout_secs",
         "phase_timeouts",
         "provider_caps",
     ];
@@ -264,6 +272,9 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     if config.scheduling.max_threads == Some(0) {
         return Err("max_threads must be at least 1".to_string());
     }
+    if config.scheduling.assignment_ack_timeout_secs == Some(0) {
+        return Err("assignment_ack_timeout_secs must be at least 1".to_string());
+    }
     if let Some(client) = &config.agent.client {
         AgentClient::parse(client)?;
     }
@@ -331,6 +342,7 @@ max_threads = 2
 # review_timeout_secs = 600
 # session_timeout_secs = 3600
 # wind_down_secs = 300
+# assignment_ack_timeout_secs = 30
 
 # [scheduling.phase_timeouts]
 # research = 300
@@ -579,6 +591,29 @@ foo = 1
         let result = validate_config("[scheduling]\nreview_timeout_secs = 300\n").unwrap();
         assert!(result.warnings.is_empty());
         assert_eq!(result.config.scheduling.review_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_assignment_ack_timeout_config_contract() {
+        let config: LisaConfig =
+            toml::from_str("[scheduling]\nassignment_ack_timeout_secs = 7\n").unwrap();
+        assert_eq!(config.scheduling.assignment_ack_timeout_secs, Some(7));
+        assert_eq!(
+            resolve_config(&config, None, None).assignment_ack_timeout_secs,
+            7
+        );
+
+        let defaults = resolve_config(&LisaConfig::default(), None, None);
+        assert_eq!(defaults.assignment_ack_timeout_secs, 30);
+
+        let validated = validate_config("[scheduling]\nassignment_ack_timeout_secs = 7\n").unwrap();
+        assert!(validated.warnings.is_empty());
+        assert!(
+            validate_config("[scheduling]\nassignment_ack_timeout_secs = 0\n")
+                .unwrap_err()
+                .contains("assignment_ack_timeout_secs must be at least 1")
+        );
+        assert!(default_config_toml().contains("# assignment_ack_timeout_secs = 30"));
     }
 
     #[test]

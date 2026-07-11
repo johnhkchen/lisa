@@ -80,6 +80,9 @@ fn section_config() -> GuideSection {
          default bar: 40min, tolerating 30-minute silent test runs)\n\
          - `wind_down_secs` — how long a pane must be signal-silent before it can be \
          reused for a new ticket (default: 300s)\n\
+         - `assignment_ack_timeout_secs` — positive deadline after submitting a tagged \
+         recycled/recovery Codex prompt (default: 30s); timeout triggers one fresh-session \
+         fallback, then an actionable terminal error if that fallback is not acknowledged\n\
          - `[scheduling.phase_timeouts]` — per-phase timeout overrides (e.g. `research = 300`)",
         default_content.trim()
     );

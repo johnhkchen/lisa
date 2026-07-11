@@ -151,6 +151,10 @@ fn upsert_missing_config_keys(existing: &str) -> String {
         ("review_timeout_secs", "# review_timeout_secs = 600"),
         ("session_timeout_secs", "# session_timeout_secs = 3600"),
         ("wind_down_secs", "# wind_down_secs = 300"),
+        (
+            "assignment_ack_timeout_secs",
+            "# assignment_ack_timeout_secs = 30",
+        ),
     ];
 
     for (key, commented_line) in scheduling_keys {
@@ -2065,6 +2069,7 @@ depends_on: [T-999]
             assert!(content.contains("session_timeout_secs"));
             assert!(content.contains("phase_timeouts"));
             assert!(content.contains("review_timeout_secs"));
+            assert!(content.contains("assignment_ack_timeout_secs"));
             // Original content preserved
             assert!(content.contains("max_threads = 4"));
         }
@@ -2083,6 +2088,7 @@ depends_on: [T-999]
         // Should add missing keys
         assert!(result.contains("review_timeout_secs"));
         assert!(result.contains("phase_timeouts"));
+        assert!(result.contains("assignment_ack_timeout_secs"));
     }
 
     #[test]

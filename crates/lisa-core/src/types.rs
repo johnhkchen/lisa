@@ -559,6 +559,11 @@ pub struct PluginConfig {
     /// quiet rather than on any single signal.
     pub wind_down_secs: u64,
 
+    /// Maximum seconds to wait after submitting a generation-tagged recycled
+    /// or recovery Codex prompt for exact provider acknowledgment (default: 30).
+    /// Always positive: pending assignment ownership may never wait forever.
+    pub assignment_ack_timeout_secs: u64,
+
     /// The agent client this loop drives by default (default: Claude). The
     /// spawn-time adapter resolver reads this as the loop-level default; per-ticket
     /// routing (S-026) will later override it per pane.
@@ -611,6 +616,9 @@ impl PluginConfig {
     /// Default wind-down period in seconds (5 minutes).
     pub const DEFAULT_WIND_DOWN_SECS: u64 = 300;
 
+    /// Default recycled-Codex assignment acknowledgment timeout (30 seconds).
+    pub const DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS: u64 = 30;
+
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
         Self {
@@ -624,6 +632,7 @@ impl PluginConfig {
             session_timeout_secs: Self::DEFAULT_SESSION_TIMEOUT_SECS,
             phase_timeouts: HashMap::new(),
             wind_down_secs: Self::DEFAULT_WIND_DOWN_SECS,
+            assignment_ack_timeout_secs: Self::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             client: AgentClient::default(),
             lisa_bin: None,
             provider_caps: HashMap::new(),
@@ -677,6 +686,14 @@ impl PluginConfig {
         if let Some(wind_down) = config.get("wind_down_secs") {
             if let Ok(n) = wind_down.parse() {
                 result.wind_down_secs = n;
+            }
+        }
+
+        if let Some(ack_timeout) = config.get("assignment_ack_timeout_secs") {
+            if let Ok(n) = ack_timeout.parse::<u64>() {
+                if n > 0 {
+                    result.assignment_ack_timeout_secs = n;
+                }
             }
         }
 
@@ -1212,6 +1229,33 @@ mod tests {
         map.insert("wind_down_secs".to_string(), "300".to_string());
         let config = PluginConfig::from_config_map(&map);
         assert_eq!(config.wind_down_secs, 300);
+    }
+
+    #[test]
+    fn test_config_assignment_ack_timeout_default() {
+        let config = PluginConfig::new();
+        assert_eq!(config.assignment_ack_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_config_assignment_ack_timeout_from_map() {
+        let mut map = BTreeMap::new();
+        map.insert("assignment_ack_timeout_secs".to_string(), "7".to_string());
+        let config = PluginConfig::from_config_map(&map);
+        assert_eq!(config.assignment_ack_timeout_secs, 7);
+    }
+
+    #[test]
+    fn test_config_assignment_ack_timeout_stays_finite_for_bad_map_values() {
+        for value in ["0", "not-a-number"] {
+            let mut map = BTreeMap::new();
+            map.insert("assignment_ack_timeout_secs".to_string(), value.to_string());
+            let config = PluginConfig::from_config_map(&map);
+            assert_eq!(
+                config.assignment_ack_timeout_secs,
+                PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS
+            );
+        }
     }
 
     #[test]
