@@ -521,6 +521,20 @@ pub fn update_ticket_phase<P: AsRef<Path>>(path: P, new_phase: Phase) -> Result<
     Ok(())
 }
 
+/// Atomically prepares a ticket's completion frontmatter.
+///
+/// Both `phase` and `status` are transformed in memory before the file is
+/// written, so readers never observe a successful half-update from this call.
+pub fn update_ticket_done<P: AsRef<Path>>(path: P) -> Result<(), TicketError> {
+    let path = path.as_ref();
+    let content = fs::read_to_string(path)?;
+    let with_phase = update_frontmatter_field(&content, "phase", "done")?;
+    let updated = update_frontmatter_field(&with_phase, "status", "done")?;
+
+    fs::write(path, updated)?;
+    Ok(())
+}
+
 /// Updates a single field in the YAML frontmatter.
 fn update_frontmatter_field(
     content: &str,
@@ -761,6 +775,37 @@ error handling. They need to be consolidated into a single climate service modul
         assert!(!updated.contains("phase: research"));
         assert!(updated.contains("id: T-024-03"));
         assert!(updated.contains("## Context"));
+    }
+
+    #[test]
+    fn test_update_ticket_done_updates_both_fields_in_one_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("T-024-03.md");
+        fs::write(&path, SAMPLE_TICKET).unwrap();
+
+        update_ticket_done(&path).unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("phase: done"));
+        assert!(updated.contains("status: done"));
+        assert!(updated.contains("id: T-024-03"));
+        assert!(updated.contains("## Context"));
+        assert!(!updated.contains("phase: research"));
+        assert!(!updated.contains("status: open"));
+    }
+
+    #[test]
+    fn test_update_ticket_done_does_not_write_malformed_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("T-001.md");
+        let original = "id: T-001\nphase: review\nstatus: open\n";
+        fs::write(&path, original).unwrap();
+
+        assert!(matches!(
+            update_ticket_done(&path),
+            Err(TicketError::MissingFrontmatter)
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
