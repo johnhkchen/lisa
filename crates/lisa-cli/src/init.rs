@@ -196,6 +196,37 @@ impl fmt::Display for InitAction {
     }
 }
 
+/// Plan a whole-file template write without guessing that Lisa owns an existing
+/// file. Exact current bytes are a no-op; only exact bytes from a bundled prior
+/// template authorize replacement. Unknown or unreadable content is preserved.
+fn plan_owned_template(path: PathBuf, current: &str, known_prior: &[&str]) -> InitAction {
+    if !path.exists() {
+        return InitAction::CreateFile {
+            path,
+            content: current.to_string(),
+        };
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(existing) if existing == current => InitAction::Skip {
+            path,
+            reason: "already up to date".to_string(),
+        },
+        Ok(existing) if known_prior.contains(&existing.as_str()) => InitAction::UpdateFile {
+            path,
+            content: current.to_string(),
+        },
+        Ok(_) => InitAction::Skip {
+            path,
+            reason: "preserved: content is not a known Lisa template".to_string(),
+        },
+        Err(_) => InitAction::Skip {
+            path,
+            reason: "preserved: existing file is unreadable".to_string(),
+        },
+    }
+}
+
 /// Plan what init should do without executing anything
 pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitAction> {
     let mut actions = Vec::new();
@@ -255,27 +286,11 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
 
     // docs/knowledge/rdspi-workflow.md
     let workflow_path = root.join("docs/knowledge/rdspi-workflow.md");
-    if workflow_path.exists() {
-        match fs::read_to_string(&workflow_path) {
-            Ok(existing) if existing == templates::RDSPI_WORKFLOW => {
-                actions.push(InitAction::Skip {
-                    path: workflow_path,
-                    reason: "already up to date".to_string(),
-                });
-            }
-            _ => {
-                actions.push(InitAction::UpdateFile {
-                    path: workflow_path,
-                    content: templates::RDSPI_WORKFLOW.to_string(),
-                });
-            }
-        }
-    } else {
-        actions.push(InitAction::CreateFile {
-            path: workflow_path,
-            content: templates::RDSPI_WORKFLOW.to_string(),
-        });
-    }
+    actions.push(plan_owned_template(
+        workflow_path,
+        templates::RDSPI_WORKFLOW,
+        templates::LEGACY_RDSPI_WORKFLOWS,
+    ));
 
     // .lisa.toml
     let config_path = root.join(".lisa.toml");
@@ -335,63 +350,49 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     }
 
     // Hook scripts
-    let hook_scripts: &[(&str, &str)] = &[
-        ("on-idle.sh", templates::ON_IDLE_HOOK),
-        ("on-stop.sh", templates::ON_STOP_HOOK),
-        ("on-clear.sh", templates::ON_CLEAR_HOOK),
-        ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
+    let hook_scripts: &[(&str, &str, &[&str])] = &[
+        (
+            "on-idle.sh",
+            templates::ON_IDLE_HOOK,
+            templates::LEGACY_ON_IDLE_HOOKS,
+        ),
+        (
+            "on-stop.sh",
+            templates::ON_STOP_HOOK,
+            templates::LEGACY_ON_STOP_HOOKS,
+        ),
+        (
+            "on-clear.sh",
+            templates::ON_CLEAR_HOOK,
+            templates::LEGACY_ON_CLEAR_HOOKS,
+        ),
+        (
+            "on-heartbeat.sh",
+            templates::ON_HEARTBEAT_HOOK,
+            templates::LEGACY_ON_HEARTBEAT_HOOKS,
+        ),
         // Scaffolded as a non-executable `.sample`: the user opts in by copying
         // it to `on-notify` and `chmod +x`. Deliberately excluded from the chmod
         // loop below so the catch-all Notification hook's `test -x` guard stays
         // inert until then.
-        ("on-notify.sample", templates::ON_NOTIFY_HOOK),
+        (
+            "on-notify.sample",
+            templates::ON_NOTIFY_HOOK,
+            templates::LEGACY_ON_NOTIFY_HOOKS,
+        ),
     ];
-    for (name, content) in hook_scripts {
+    for (name, content, known_prior) in hook_scripts {
         let hook_path = root.join(format!(".lisa/hooks/{}", name));
-        if hook_path.exists() {
-            match fs::read_to_string(&hook_path) {
-                Ok(existing) if existing == *content => {
-                    actions.push(InitAction::Skip {
-                        path: hook_path,
-                        reason: "already up to date".to_string(),
-                    });
-                }
-                _ => {
-                    actions.push(InitAction::UpdateFile {
-                        path: hook_path,
-                        content: content.to_string(),
-                    });
-                }
-            }
-        } else {
-            actions.push(InitAction::CreateFile {
-                path: hook_path,
-                content: content.to_string(),
-            });
-        }
+        actions.push(plan_owned_template(hook_path, content, known_prior));
     }
 
     // .lisa/.gitignore (ignores ephemeral signal/session/usage files)
     let lisa_gitignore_path = root.join(".lisa/.gitignore");
-    if lisa_gitignore_path.exists() {
-        match fs::read_to_string(&lisa_gitignore_path) {
-            Ok(existing) if existing == templates::LISA_GITIGNORE => {
-                actions.push(InitAction::Skip {
-                    path: lisa_gitignore_path,
-                    reason: "already up to date".to_string(),
-                });
-            }
-            _ => actions.push(InitAction::UpdateFile {
-                path: lisa_gitignore_path,
-                content: templates::LISA_GITIGNORE.to_string(),
-            }),
-        }
-    } else {
-        actions.push(InitAction::CreateFile {
-            path: lisa_gitignore_path,
-            content: templates::LISA_GITIGNORE.to_string(),
-        });
-    }
+    actions.push(plan_owned_template(
+        lisa_gitignore_path,
+        templates::LISA_GITIGNORE,
+        templates::LEGACY_LISA_GITIGNORES,
+    ));
 
     // .claude/settings.local.json (Stop, SessionStart, Notification hooks)
     // Always run merge_hooks on existing files to upgrade old bare-path commands.
@@ -1697,7 +1698,7 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_run_init_updates_stale_hooks() {
+    fn test_run_init_preserves_unknown_hook_content() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("Cargo.toml"),
@@ -1705,7 +1706,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        // Pre-create hook files with outdated content
+        // Pre-create a locally modified hook that Lisa cannot prove it owns.
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(
             dir.path().join(".lisa/hooks/on-idle.sh"),
@@ -1718,9 +1719,9 @@ depends_on: [T-999]
         let result = run_init(dir.path(), false);
         assert!(result.is_ok());
 
-        // on-idle.sh should be updated to the current template
+        // The unknown hook must remain byte-for-byte unchanged.
         let hook = fs::read_to_string(dir.path().join(".lisa/hooks/on-idle.sh")).unwrap();
-        assert_eq!(hook, templates::ON_IDLE_HOOK);
+        assert_eq!(hook, "old hook content");
         // New hook scripts should be created
         assert!(dir.path().join(".lisa/hooks/on-stop.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-clear.sh").exists());
@@ -1732,7 +1733,7 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_plan_init_actions_existing_hooks_stale() {
+    fn test_plan_init_actions_preserves_unknown_hook() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "old content").unwrap();
@@ -1743,12 +1744,12 @@ depends_on: [T-999]
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        // on-idle.sh should be updated (stale content)
-        let updated_hook: Vec<_> = actions
+        // An arbitrary difference is not evidence that this is a Lisa template.
+        let preserved_hook: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with("on-idle.sh")))
+            .filter(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with("on-idle.sh") && reason == "preserved: content is not a known Lisa template"))
             .collect();
-        assert_eq!(updated_hook.len(), 1);
+        assert_eq!(preserved_hook.len(), 1);
 
         // settings.local.json should be updated (not skipped) since it lacks idle_prompt
         let updated_settings: Vec<_> = actions
@@ -1975,7 +1976,7 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_plan_init_updates_stale_rdspi() {
+    fn test_plan_init_preserves_unknown_rdspi() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -1987,15 +1988,11 @@ depends_on: [T-999]
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        let updated: Vec<_> = actions
+        let preserved: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with("rdspi-workflow.md")))
+            .filter(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with("rdspi-workflow.md") && reason == "preserved: content is not a known Lisa template"))
             .collect();
-        assert_eq!(updated.len(), 1);
-
-        if let InitAction::UpdateFile { content, .. } = &updated[0] {
-            assert_eq!(content, templates::RDSPI_WORKFLOW);
-        }
+        assert_eq!(preserved.len(), 1);
     }
 
     #[test]
@@ -2019,24 +2016,215 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_plan_init_updates_stale_hooks() {
+    fn test_plan_init_updates_known_prior_plain_text_templates() {
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
-        fs::write(dir.path().join(".lisa/hooks/on-idle.sh"), "old idle").unwrap();
-        fs::write(dir.path().join(".lisa/hooks/on-stop.sh"), "old stop").unwrap();
-        fs::write(dir.path().join(".lisa/hooks/on-clear.sh"), "old clear").unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            templates::LEGACY_RDSPI_WORKFLOWS[0],
+        )
+        .unwrap();
+        for (name, content) in [
+            ("on-stop.sh", templates::LEGACY_ON_STOP_HOOKS[0]),
+            ("on-clear.sh", templates::LEGACY_ON_CLEAR_HOOKS[0]),
+            ("on-heartbeat.sh", templates::LEGACY_ON_HEARTBEAT_HOOKS[0]),
+        ] {
+            fs::write(dir.path().join(format!(".lisa/hooks/{name}")), content).unwrap();
+        }
+        fs::write(
+            dir.path().join(".lisa/.gitignore"),
+            templates::LEGACY_LISA_GITIGNORES[0],
+        )
+        .unwrap();
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
 
-        for name in &["on-idle.sh", "on-stop.sh", "on-clear.sh"] {
-            let updated: Vec<_> = actions
+        for name in &[
+            "rdspi-workflow.md",
+            "on-stop.sh",
+            "on-clear.sh",
+            "on-heartbeat.sh",
+            ".gitignore",
+        ] {
+            assert!(
+                actions.iter().any(
+                    |a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(name))
+                ),
+                "known prior {name} should update"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_init_skips_all_current_plain_text_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            templates::RDSPI_WORKFLOW,
+        )
+        .unwrap();
+        for (name, content) in [
+            ("on-idle.sh", templates::ON_IDLE_HOOK),
+            ("on-stop.sh", templates::ON_STOP_HOOK),
+            ("on-clear.sh", templates::ON_CLEAR_HOOK),
+            ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
+            ("on-notify.sample", templates::ON_NOTIFY_HOOK),
+        ] {
+            fs::write(dir.path().join(format!(".lisa/hooks/{name}")), content).unwrap();
+        }
+        fs::write(
+            dir.path().join(".lisa/.gitignore"),
+            templates::LISA_GITIGNORE,
+        )
+        .unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        for name in &[
+            "rdspi-workflow.md",
+            "on-idle.sh",
+            "on-stop.sh",
+            "on-clear.sh",
+            "on-heartbeat.sh",
+            "on-notify.sample",
+            ".gitignore",
+        ] {
+            assert!(
+                actions.iter().any(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason == "already up to date")),
+                "current {name} should be a no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn test_init_preserves_project_modified_plain_text_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+
+        let workflow = format!(
+            "{}\n## Story Layer\n\nRead the parent story before every ticket.\n",
+            templates::RDSPI_WORKFLOW
+        );
+        let stop_hook = format!(
+            "{}\n# Project addition: notify the local supervisor.\n",
+            templates::LEGACY_ON_STOP_HOOKS[0]
+        );
+        let notify_sample = format!(
+            "{}\n# Project addition: custom notification notes.\n",
+            templates::ON_NOTIFY_HOOK
+        );
+        let gitignore = "signals/\nhooks/ntfy-topic\n";
+        let fixtures = [
+            ("docs/knowledge/rdspi-workflow.md", workflow.as_bytes()),
+            (".lisa/hooks/on-stop.sh", stop_hook.as_bytes()),
+            (".lisa/hooks/on-notify.sample", notify_sample.as_bytes()),
+            (".lisa/.gitignore", gitignore.as_bytes()),
+        ];
+        for (path, content) in fixtures {
+            fs::write(dir.path().join(path), content).unwrap();
+        }
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+        for path in fixtures.map(|(path, _)| path) {
+            assert!(actions.iter().any(|a| matches!(a, InitAction::Skip { path: action_path, reason } if action_path == &dir.path().join(path) && reason == "preserved: content is not a known Lisa template")));
+        }
+        assert_eq!(
+            fs::read(dir.path().join("docs/knowledge/rdspi-workflow.md")).unwrap(),
+            workflow.as_bytes()
+        );
+
+        run_init(dir.path(), false).unwrap();
+
+        for (path, content) in fixtures {
+            assert_eq!(
+                fs::read(dir.path().join(path)).unwrap(),
+                content,
+                "{path} changed during real init"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_init_preserves_non_utf8_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            [0xff, 0xfe],
+        )
+        .unwrap();
+        fs::write(dir.path().join(".lisa/hooks/on-stop.sh"), [0xff, 0xfe]).unwrap();
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        for name in &["rdspi-workflow.md", "on-stop.sh"] {
+            assert!(actions.iter().any(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason == "preserved: existing file is unreadable")));
+            assert!(!actions
                 .iter()
-                .filter(
-                    |a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(name)),
-                )
+                .any(|a| matches!(a, InitAction::UpdateFile { path, .. } if path.ends_with(name))));
+        }
+    }
+
+    #[test]
+    fn test_run_init_upgrades_known_prior_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(
+            dir.path().join(".lisa/hooks/on-stop.sh"),
+            templates::LEGACY_ON_STOP_HOOKS[0],
+        )
+        .unwrap();
+
+        run_init(dir.path(), false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".lisa/hooks/on-stop.sh")).unwrap(),
+            templates::ON_STOP_HOOK
+        );
+    }
+
+    #[test]
+    fn test_plan_init_preserves_unknown_plain_text_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        for name in &[
+            "on-idle.sh",
+            "on-stop.sh",
+            "on-clear.sh",
+            "on-heartbeat.sh",
+            "on-notify.sample",
+        ] {
+            fs::write(
+                dir.path().join(format!(".lisa/hooks/{name}")),
+                format!("project-owned {name}\n"),
+            )
+            .unwrap();
+        }
+
+        let project = detect_project(dir.path());
+        let actions = plan_init_actions(dir.path(), &project);
+
+        for name in &[
+            "on-idle.sh",
+            "on-stop.sh",
+            "on-clear.sh",
+            "on-heartbeat.sh",
+            "on-notify.sample",
+        ] {
+            let preserved: Vec<_> = actions
+                .iter()
+                .filter(|a| matches!(a, InitAction::Skip { path, reason } if path.ends_with(name) && reason == "preserved: content is not a known Lisa template"))
                 .collect();
-            assert_eq!(updated.len(), 1, "{} should be updated", name);
+            assert_eq!(preserved.len(), 1, "{} should be preserved", name);
         }
     }
 

@@ -3,6 +3,11 @@ use crate::detect::DetectedProject;
 /// The RDSPI workflow document, embedded at compile time
 pub const RDSPI_WORKFLOW: &str = include_str!("../data/rdspi-workflow.md");
 
+/// Exact outgoing Lisa templates accepted as proof of an unmodified install.
+/// Keep only byte-distinct generations; current content is handled separately.
+pub(crate) const LEGACY_RDSPI_WORKFLOWS: &[&str] =
+    &[include_str!("../data/legacy/rdspi-workflow-v0.2.md")];
+
 /// The hooks setup guide, embedded at compile time. Printed by `lisa hooks-guide`.
 pub const HOOKS_GUIDE: &str = include_str!("../data/hooks-guide.md");
 
@@ -22,6 +27,8 @@ if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.idle"
 fi
 "#;
+
+pub(crate) const LEGACY_ON_IDLE_HOOKS: &[&str] = &[];
 
 /// The on-stop hook script, called by the native client's Stop event.
 /// Fires when Claude or Codex finishes responding (ready for input).
@@ -52,6 +59,19 @@ in=$(cat)
 printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage 2>/dev/null || true
 "#;
 
+/// Stop hook shipped by Lisa v0.3 before token-usage capture was added.
+pub(crate) const LEGACY_ON_STOP_HOOKS: &[&str] = &[r#"#!/bin/sh
+# Lisa stop signal hook — called by Claude Code when it finishes responding.
+# Writes a signal file so the plugin knows the pane is ready for input.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
+fi
+"#];
+
 /// The on-clear hook script, called by the native client's SessionStart[clear] event.
 /// Fires after /clear is processed (context cleared).
 pub const ON_CLEAR_HOOK: &str = r#"#!/bin/sh
@@ -65,6 +85,18 @@ if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.cleared"
 fi
 "#;
+
+pub(crate) const LEGACY_ON_CLEAR_HOOKS: &[&str] = &[r#"#!/bin/sh
+# Lisa clear signal hook — called by Claude Code after /clear is processed.
+# Writes a signal file so the plugin knows context has been cleared.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.cleared"
+fi
+"#];
 
 /// The heartbeat hook script, called by the native client's PostToolUse event.
 /// Fires after every tool call, proving the session is actively working.
@@ -82,9 +114,23 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 "#;
 
+pub(crate) const LEGACY_ON_HEARTBEAT_HOOKS: &[&str] = &[r#"#!/bin/sh
+# Lisa heartbeat signal hook — called by Claude Code after each tool call.
+# Writes a signal file so the plugin knows this session is actively working.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
+fi
+"#];
+
 /// Gitignore content for `.lisa/` runtime state. Signal files and per-provider
 /// usage/session artifacts are machine-owned and must never enter the project DAG.
 pub const LISA_GITIGNORE: &str = "signals/\nclaude/\ncodex/\n";
+
+pub(crate) const LEGACY_LISA_GITIGNORES: &[&str] = &["signals/\n"];
 
 /// The `AGENTS.md` pointer file scaffolded by `lisa init`.
 ///
@@ -137,6 +183,8 @@ pub const ON_NOTIFY_HOOK: &str = r#"#!/bin/sh
 
 exit 0
 "#;
+
+pub(crate) const LEGACY_ON_NOTIFY_HOOKS: &[&str] = &[];
 
 /// Command for the catch-all (matcher-less) `Notification` hook that fires the
 /// user-owned `on-notify` hook for permission/attention payloads. POSIX `sh`
