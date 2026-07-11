@@ -37,6 +37,7 @@ pub(crate) struct CompleteTicketRequest {
 pub(crate) struct CommitTransactionResult {
     pub commit_id: String,
     pub committed_paths: Vec<PathBuf>,
+    previous_commit_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,28 +478,95 @@ fn run_transaction_body(
         OsStr::new("--"),
     ];
     reset_args.extend(committed_paths.iter().map(|path| path.as_os_str()));
-    repo.git(
+    if let Err(error) = repo.git(
         None,
         "reconcile committed paths in ordinary index",
         reset_args,
-    )
-    .map_err(|error| {
-        CommitTransactionError::new(format!(
-            "ticket commit {commit_id} advanced HEAD but {error}"
-        ))
-    })?;
+    ) {
+        return Err(rollback_after_ref_advance(
+            repo,
+            &old_head,
+            &commit_id,
+            &committed_paths,
+            error,
+        ));
+    }
 
-    let final_staged = staged_snapshot(repo)?;
+    let final_staged = match staged_snapshot(repo) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(rollback_after_ref_advance(
+                repo,
+                &old_head,
+                &commit_id,
+                &committed_paths,
+                error,
+            ));
+        }
+    };
     if final_staged != original_staged {
-        return Err(CommitTransactionError::new(format!(
-            "ticket commit {commit_id} advanced HEAD but ordinary staged entries changed during verification"
-        )));
+        return Err(rollback_after_ref_advance(
+            repo,
+            &old_head,
+            &commit_id,
+            &committed_paths,
+            CommitTransactionError::new("ordinary staged entries changed during verification"),
+        ));
     }
 
     Ok(CommitTransactionResult {
         commit_id,
         committed_paths,
+        previous_commit_id: old_head,
     })
+}
+
+fn rollback_advanced_head(
+    repo: &Repository,
+    old_head: &str,
+    commit_id: &str,
+    committed_paths: &[PathBuf],
+) -> Result<(), CommitTransactionError> {
+    repo.git(
+        None,
+        "roll back failed ticket commit",
+        [
+            OsStr::new("update-ref"),
+            OsStr::new("HEAD"),
+            OsStr::new(old_head),
+            OsStr::new(commit_id),
+        ],
+    )?;
+    let mut reset_args: Vec<&OsStr> = vec![
+        OsStr::new("reset"),
+        OsStr::new("--quiet"),
+        OsStr::new("HEAD"),
+        OsStr::new("--"),
+    ];
+    reset_args.extend(committed_paths.iter().map(|path| path.as_os_str()));
+    repo.git(
+        None,
+        "reconcile ticket paths after commit rollback",
+        reset_args,
+    )?;
+    Ok(())
+}
+
+fn rollback_after_ref_advance(
+    repo: &Repository,
+    old_head: &str,
+    commit_id: &str,
+    committed_paths: &[PathBuf],
+    primary: CommitTransactionError,
+) -> CommitTransactionError {
+    match rollback_advanced_head(repo, old_head, commit_id, committed_paths) {
+        Ok(()) => CommitTransactionError::new(format!(
+            "ticket commit {commit_id} was rolled back after failure: {primary}"
+        )),
+        Err(rollback) => CommitTransactionError::new(format!(
+            "ticket commit {commit_id} advanced HEAD and {primary}; rollback also failed: {rollback}"
+        )),
+    }
 }
 
 pub(crate) fn commit_ticket(
@@ -527,7 +595,7 @@ pub(crate) fn commit_ticket(
         }
     };
 
-    let primary = run_transaction_body(&repo, &request, &includes, &alternate_index.path);
+    let mut primary = run_transaction_body(&repo, &request, &includes, &alternate_index.path);
     let index_cleanup = alternate_index.cleanup();
     let unlock = lock.finish();
 
@@ -537,6 +605,23 @@ pub(crate) fn commit_ticket(
     }
     if let Err(error) = unlock {
         cleanup_errors.push(error.to_string());
+    }
+
+    if !cleanup_errors.is_empty() {
+        if let Ok(result) = &primary {
+            let cleanup = CommitTransactionError::new(format!(
+                "transaction cleanup failed: {}",
+                cleanup_errors.join("; ")
+            ));
+            primary = Err(rollback_after_ref_advance(
+                &repo,
+                &result.previous_commit_id,
+                &result.commit_id,
+                &result.committed_paths,
+                cleanup,
+            ));
+            cleanup_errors.clear();
+        }
     }
 
     match (primary, cleanup_errors.is_empty()) {
@@ -993,5 +1078,42 @@ mod tests {
             original.as_bytes()
         );
         assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn compensating_rollback_restores_head_paths_and_foreign_stage() {
+        let repo = GitRepo::new();
+        repo.write("ticket.txt", "base\n");
+        repo.write("foreign.txt", "foreign base\n");
+        repo.base_commit();
+        repo.write("foreign.txt", "foreign staged\n");
+        repo.git(["add", "foreign.txt"]);
+        let foreign_before = repo.git(["ls-files", "--stage", "-z", "--", "foreign.txt"]);
+        repo.write("ticket.txt", "completed\n");
+
+        let result = commit_ticket(repo.request(&["ticket.txt"])).unwrap();
+        let context = Repository::discover(repo.root()).unwrap();
+        rollback_advanced_head(
+            &context,
+            &result.previous_commit_id,
+            &result.commit_id,
+            &result.committed_paths,
+        )
+        .unwrap();
+
+        assert_eq!(
+            repo.git_string(["rev-parse", "HEAD"]),
+            result.previous_commit_id
+        );
+        assert_eq!(repo.git_string(["show", "HEAD:ticket.txt"]), "base");
+        assert_eq!(
+            repo.git_string(["status", "--short", "--", "ticket.txt"]),
+            "M ticket.txt"
+        );
+        assert_eq!(
+            repo.git(["ls-files", "--stage", "-z", "--", "foreign.txt"])
+                .stdout,
+            foreign_before.stdout
+        );
     }
 }
