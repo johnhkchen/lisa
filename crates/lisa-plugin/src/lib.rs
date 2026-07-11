@@ -153,6 +153,15 @@ fn strip_host_prefix(path: &Path) -> PathBuf {
     PathBuf::from(s.strip_prefix("/host/").unwrap_or(&s).to_string())
 }
 
+/// Terminate a hard-silent attempt at the Zellij pane boundary. Native unit
+/// tests observe the state transition instead of invoking a plugin host call.
+fn close_fenced_pane(pane_id: u32) {
+    #[cfg(not(test))]
+    close_terminal_pane(pane_id);
+    #[cfg(test)]
+    let _ = pane_id;
+}
+
 /// An agent pane slot — a pre-created terminal in the stacked layout.
 struct AgentSlot {
     pane_id: u32,
@@ -207,6 +216,26 @@ enum TransitionState {
     /// `/exit` sent to a released session whose provider does not match the next
     /// ticket. Once the grace period expires, launch the new provider at shell.
     WaitingForExit,
+    /// The attempt hosted by this pane was hard-silent, so Lisa closed the
+    /// terminal pane. This is a terminal, non-reusable state with no retry.
+    Fenced,
+}
+
+/// Bounded result of fencing one ticket attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceOutcome {
+    Fenced { pane_id: u32 },
+    AlreadyFenced { pane_id: u32 },
+    NoAssignedPane,
+}
+
+/// Test-only observation of the safety-critical timeout teardown order.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttemptLifecycleEvent {
+    LeaseRevoked { ticket_id: TicketId },
+    PaneFenced { ticket_id: TicketId, pane_id: u32 },
+    SlotReleased { ticket_id: TicketId },
 }
 
 /// Scheduler-owned truth for the ticket assigned to a physical seat.
@@ -298,9 +327,18 @@ pub struct State {
     /// Active threads indexed by ticket ID.
     threads: HashMap<TicketId, Thread>,
 
-    /// Latest lease minted for each ticket. Entries survive seat/thread release
-    /// so a redispatch can mint a strictly greater attempt.
+    /// Currently authorized lease for each ticket. Absence means that no
+    /// attempt owns the ticket, including the interval after revocation and
+    /// before a successor dispatch.
     current_leases: HashMap<TicketId, AttemptLease>,
+
+    /// Latest lease ever minted for each ticket in this scheduler process.
+    /// Entries survive revocation/release so redispatch remains monotonic.
+    lease_high_water: HashMap<TicketId, AttemptLease>,
+
+    /// Safety-order trace used only by native scheduler tests.
+    #[cfg(test)]
+    attempt_lifecycle: Vec<AttemptLifecycleEvent>,
 
     /// Plugin configuration (ticket directory path, etc.)
     config: PluginConfig,
@@ -1257,40 +1295,131 @@ impl State {
         }
     }
 
+    /// End the currently authorized attempt without discarding its monotonic
+    /// high-water predecessor. Repeated revocation is intentionally harmless.
+    fn revoke_current_lease(&mut self, ticket_id: &TicketId) -> Option<AttemptLease> {
+        let revoked = self.current_leases.remove(ticket_id);
+        #[cfg(test)]
+        if revoked.is_some() {
+            self.attempt_lifecycle
+                .push(AttemptLifecycleEvent::LeaseRevoked {
+                    ticket_id: ticket_id.clone(),
+                });
+        }
+        revoked
+    }
+
+    /// Revoke one attempt and permanently disqualify its physical pane before
+    /// the ticket reservation can be released for a successor dispatch.
+    fn revoke_and_fence_attempt(&mut self, ticket_id: &TicketId) -> FenceOutcome {
+        self.revoke_current_lease(ticket_id);
+
+        let Some(slot_idx) = self
+            .agent_slots
+            .iter()
+            .position(|slot| slot.ticket_id.as_ref() == Some(ticket_id))
+        else {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "Revoked {} after hard silence, but no assigned pane was found to fence",
+                    ticket_id
+                ),
+            });
+            return FenceOutcome::NoAssignedPane;
+        };
+
+        let pane_id = self.agent_slots[slot_idx].pane_id;
+        if self.agent_slots[slot_idx].transition_state == TransitionState::Fenced {
+            return FenceOutcome::AlreadyFenced { pane_id };
+        }
+
+        {
+            let slot = &mut self.agent_slots[slot_idx];
+            slot.transition_state = TransitionState::Fenced;
+            slot.transition_started_at = None;
+            slot.has_session = false;
+            slot.last_client = None;
+            slot.cooldown_until = None;
+        }
+        self.seat_assignments.remove(&pane_id);
+        self.awaiting_human.remove(&pane_id);
+        self.notified_attention.remove(&pane_id);
+        self.pending_enters
+            .retain(|pending| pending.pane_id != PaneId::Terminal(pane_id));
+
+        close_fenced_pane(pane_id);
+        #[cfg(test)]
+        self.attempt_lifecycle
+            .push(AttemptLifecycleEvent::PaneFenced {
+                ticket_id: ticket_id.clone(),
+                pane_id,
+            });
+        self.log_activity(ActivityEvent::Info {
+            message: format!(
+                "Fenced pane {} for hard-silent attempt {} (terminal state, no retry)",
+                pane_id, ticket_id
+            ),
+        });
+        FenceOutcome::Fenced { pane_id }
+    }
+
     /// Mark a slot as idle when its ticket completes. Keeps `has_session = true`
     /// so the same provider can reuse the TUI via `/clear`, while the other
     /// provider can explicitly recycle it via `/exit` after cooldown.
     fn release_slot_for_ticket(&mut self, ticket_id: &TicketId) {
-        let mut released_pane: Option<(u32, String)> = None;
+        // Release is the shared rescheduling boundary. No caller may expose a
+        // ticket to the DAG while its prior attempt remains authoritative.
+        self.revoke_current_lease(ticket_id);
+
+        let mut released_pane: Option<(u32, Option<String>, bool)> = None;
         for slot in &mut self.agent_slots {
             if slot.ticket_id.as_ref() == Some(ticket_id) {
+                let fenced = slot.transition_state == TransitionState::Fenced;
                 slot.ticket_id = None;
                 slot.attempt_lease = None;
-                // has_session stays true — the native agent TUI is still running
-                slot.cooldown_until = Some(
-                    std::time::SystemTime::now()
-                        + std::time::Duration::from_secs(self.config.wind_down_secs),
-                );
-                let resident_agent = if slot.has_session {
-                    slot.last_client
-                } else {
+                let idle_name = if fenced {
+                    // The terminal pane no longer exists and this slot is
+                    // permanently ineligible. Do not rename or cool it down.
+                    slot.has_session = false;
+                    slot.last_client = None;
+                    slot.cooldown_until = None;
                     None
+                } else {
+                    // has_session stays true — the native agent TUI is still running
+                    slot.cooldown_until = Some(
+                        std::time::SystemTime::now()
+                            + std::time::Duration::from_secs(self.config.wind_down_secs),
+                    );
+                    let resident_agent = if slot.has_session {
+                        slot.last_client
+                    } else {
+                        None
+                    };
+                    Some(format_pane_name(PaneName::Idle { resident_agent }))
                 };
-                released_pane = Some((
-                    slot.pane_id,
-                    format_pane_name(PaneName::Idle { resident_agent }),
-                ));
+                released_pane = Some((slot.pane_id, idle_name, fenced));
                 break;
             }
         }
-        if let Some((pane_id, _)) = &released_pane {
+        if let Some((pane_id, _, _)) = &released_pane {
             self.seat_assignments.remove(pane_id);
         }
         match released_pane {
-            Some((pane_id, idle_name)) => {
-                self.rename_slot(pane_id, idle_name);
+            Some((pane_id, idle_name, fenced)) => {
+                if let Some(idle_name) = idle_name {
+                    self.rename_slot(pane_id, idle_name);
+                }
+                #[cfg(test)]
+                self.attempt_lifecycle
+                    .push(AttemptLifecycleEvent::SlotReleased {
+                        ticket_id: ticket_id.clone(),
+                    });
                 self.log_activity(ActivityEvent::Info {
-                    message: format!("Released slot #{} for {}", pane_id, ticket_id),
+                    message: if fenced {
+                        format!("Released fenced slot #{} for {}", pane_id, ticket_id)
+                    } else {
+                        format!("Released slot #{} for {}", pane_id, ticket_id)
+                    },
                 });
             }
             None => self.log_activity(ActivityEvent::Info {
@@ -1404,22 +1533,27 @@ impl State {
             }
 
             // Mint only after every admission gate, but before pane lifecycle
-            // side effects. Retaining the predecessor in `current_leases`
-            // makes release followed by redispatch strictly monotonic.
-            let attempt_lease =
-                match AttemptLease::mint(ticket_id.clone(), self.current_leases.get(&ticket_id)) {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        self.log_activity(ActivityEvent::Error {
-                            message: format!(
-                                "Cannot dispatch {}: failed to mint attempt lease: {}",
-                                ticket_id, error
-                            ),
-                        });
-                        unscheduled += 1;
-                        continue;
-                    }
-                };
+            // side effects. Retaining the predecessor in `lease_high_water`
+            // makes revocation/release followed by redispatch monotonic while
+            // `current_leases` remains a truthful authority registry.
+            let attempt_lease = match AttemptLease::mint(
+                ticket_id.clone(),
+                self.lease_high_water.get(&ticket_id),
+            ) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "Cannot dispatch {}: failed to mint attempt lease: {}",
+                            ticket_id, error
+                        ),
+                    });
+                    unscheduled += 1;
+                    continue;
+                }
+            };
+            self.lease_high_water
+                .insert(ticket_id.clone(), attempt_lease.clone());
             self.current_leases
                 .insert(ticket_id.clone(), attempt_lease.clone());
 
@@ -2713,9 +2847,9 @@ impl State {
     /// Check for sessions that have exceeded the configured session timeout.
     ///
     /// When `session_timeout_secs > 0` and a running thread's total wall-clock
-    /// time (since `started_at`) exceeds the limit, the thread is marked failed,
-    /// the slot is released, and the thread is removed. The Claude Code process
-    /// is NOT killed — it may still be doing useful work.
+    /// time (since `started_at`) exceeds the limit, the thread is marked failed.
+    /// Once it is also hard-silent, its lease is revoked and its terminal pane
+    /// closed/fenced before the slot is released and the thread removed.
     ///
     /// Busy-pane guard: a session that is over budget but not provably dead
     /// is never reclaimed — interrupting a partially-done ticket wastes the
@@ -2805,6 +2939,7 @@ impl State {
                 thread.fail();
             }
             self.emit_provenance(&ticket_id, RunOutcome::TimedOut);
+            self.revoke_and_fence_attempt(&ticket_id);
             self.release_slot_for_ticket(&ticket_id);
             self.threads.remove(&ticket_id);
             self.timeout_alerts
@@ -2852,6 +2987,7 @@ impl State {
                 thread.fail();
             }
             self.emit_provenance(&ticket_id, RunOutcome::Failed);
+            self.revoke_and_fence_attempt(&ticket_id);
             self.release_slot_for_ticket(&ticket_id);
             self.threads.remove(&ticket_id);
             self.log_activity(ActivityEvent::Error {
@@ -5010,8 +5146,18 @@ mod tests {
             ..State::default()
         };
 
+        let ticket_id = "T-001".to_string();
+        let lease = AttemptLease::mint(ticket_id.clone(), None).unwrap();
+        state
+            .lease_high_water
+            .insert(ticket_id.clone(), lease.clone());
+        state
+            .current_leases
+            .insert(ticket_id.clone(), lease.clone());
+
         // Create a thread that's been silent for 31+ minutes (past the bar)
         let mut thread = Thread::new("T-001", 1);
+        thread.attempt_lease = Some(lease.clone());
         thread.current_phase = Phase::Research;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
@@ -5022,7 +5168,7 @@ mod tests {
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
+            attempt_lease: Some(lease.clone()),
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
@@ -5038,6 +5184,12 @@ mod tests {
 
         // Slot should be released
         assert!(state.agent_slots[0].ticket_id.is_none());
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert_eq!(state.current_leases.get(&ticket_id), None);
+        assert_eq!(state.lease_high_water.get(&ticket_id), Some(&lease));
 
         // Error logged
         assert!(state.activity_log.iter().any(|e| matches!(
@@ -7774,6 +7926,7 @@ mod tests {
         let first = state.current_leases[&ticket_id].clone();
         assert_eq!(first.ticket_id, ticket_id);
         assert_eq!(first.attempt_id, 1);
+        assert_eq!(state.lease_high_water.get(&ticket_id), Some(&first));
         assert_eq!(
             state.threads[&ticket_id].attempt_lease.as_ref(),
             Some(&first),
@@ -7794,8 +7947,14 @@ mod tests {
         assert_eq!(state.agent_slots[0].attempt_lease, None);
         assert_eq!(
             state.current_leases.get(&ticket_id),
+            None,
+            "release revokes the prior attempt before redispatch"
+        );
+        assert!(!first.is_current(state.current_leases.get(&ticket_id)));
+        assert_eq!(
+            state.lease_high_water.get(&ticket_id),
             Some(&first),
-            "release retains the high-water predecessor needed by redispatch"
+            "release retains only the predecessor needed by redispatch"
         );
 
         state.schedule_ready_tickets();
@@ -7803,6 +7962,7 @@ mod tests {
         let second = state.current_leases[&ticket_id].clone();
         assert_eq!(second.attempt_id, 2);
         assert!(second.attempt_id > first.attempt_id);
+        assert_eq!(state.lease_high_water.get(&ticket_id), Some(&second));
         assert!(!first.is_current(Some(&second)));
         assert!(second.is_current(Some(&second)));
         assert_eq!(
@@ -9971,21 +10131,36 @@ timeout\n\
             tickets_dir.join("T-001.md"),
             "---\nid: T-001\ntitle: timeout-test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
 
         let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
                 session_timeout_secs: 1800, // 30 minutes
                 stuck_threshold_secs: 600,  // hard-silence bar = 2x = 1200s
+                wind_down_secs: 0,
                 ..PluginConfig::new()
             },
+            permissions_granted: true,
+            slots_discovered: true,
             ..State::default()
         };
+
+        let ticket_id = "T-001".to_string();
+        let first = AttemptLease::mint(ticket_id.clone(), None).unwrap();
+        state
+            .lease_high_water
+            .insert(ticket_id.clone(), first.clone());
+        state
+            .current_leases
+            .insert(ticket_id.clone(), first.clone());
 
         // Create a thread that started 31+ minutes ago (past 1800s timeout)
         // and has been silent the whole time (past the hard-silence bar),
         // so it is reclaimable
         let mut thread = Thread::new("T-001", 1);
+        thread.attempt_lease = Some(first.clone());
         thread.current_phase = Phase::Implement;
         thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
         thread.last_activity = thread.started_at;
@@ -9995,22 +10170,51 @@ timeout\n\
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
+            attempt_lease: Some(first.clone()),
             has_session: true,
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
             last_activity_at: None,
-            last_client: None,
+            last_client: Some(AgentClient::Claude),
         });
+        // The fenced pane is never reusable; a successor can use this separate
+        // eligible pane instead.
+        state.agent_slots.push(fresh_slot(2, None));
 
         state.check_session_timeouts();
+
+        assert_eq!(
+            state.attempt_lifecycle,
+            vec![
+                AttemptLifecycleEvent::LeaseRevoked {
+                    ticket_id: ticket_id.clone(),
+                },
+                AttemptLifecycleEvent::PaneFenced {
+                    ticket_id: ticket_id.clone(),
+                    pane_id: 1,
+                },
+                AttemptLifecycleEvent::SlotReleased {
+                    ticket_id: ticket_id.clone(),
+                },
+            ],
+            "hard-silence teardown must revoke, fence, then release"
+        );
+        assert_eq!(state.current_leases.get(&ticket_id), None);
+        assert!(!first.is_current(state.current_leases.get(&ticket_id)));
+        assert_eq!(state.lease_high_water.get(&ticket_id), Some(&first));
 
         // Thread should be removed
         assert!(state.threads.is_empty());
 
-        // Slot should be released
+        // The old slot is released but permanently disqualified.
         assert!(state.agent_slots[0].ticket_id.is_none());
+        assert_eq!(state.agent_slots[0].attempt_lease, None);
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert!(!state.agent_slots[0].has_session);
 
         // Activity log should have SessionTimedOut event
         assert!(state.activity_log.iter().any(|e| matches!(
@@ -10023,6 +10227,26 @@ timeout\n\
         assert_eq!(state.timeout_alerts.len(), 1);
         assert_eq!(state.timeout_alerts[0].0, "T-001");
         assert_eq!(state.timeout_alerts[0].2, Phase::Implement);
+
+        state.schedule_ready_tickets();
+
+        let second = state.current_leases[&ticket_id].clone();
+        assert!(second.attempt_id > first.attempt_id);
+        assert_eq!(second.attempt_id, 2);
+        assert!(!first.is_current(Some(&second)));
+        assert!(second.is_current(state.current_leases.get(&ticket_id)));
+        assert_eq!(state.lease_high_water.get(&ticket_id), Some(&second));
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert_eq!(state.agent_slots[0].ticket_id, None);
+        assert_eq!(state.agent_slots[1].ticket_id.as_ref(), Some(&ticket_id));
+        assert_eq!(state.agent_slots[1].attempt_lease.as_ref(), Some(&second));
+        assert_eq!(
+            state.threads[&ticket_id].attempt_lease.as_ref(),
+            Some(&second)
+        );
     }
 
     #[test]
