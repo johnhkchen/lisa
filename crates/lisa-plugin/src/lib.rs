@@ -280,11 +280,18 @@ enum CompletionSource {
     ObservedDone,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionAuthority {
+    Attempt(AttemptLease),
+    Operator,
+}
+
+#[derive(Debug, Clone)]
 struct PendingCompletion {
     prior_phase: Phase,
     prior_status: TicketStatus,
     source: CompletionSource,
+    authority: CompletionAuthority,
 }
 
 /// How an idle pane can satisfy an incoming provider request.
@@ -700,10 +707,33 @@ impl State {
     }
 
     /// Enter the single commit-gated completion state machine.
-    fn request_completion(&mut self, ticket_id: TicketId, source: CompletionSource) -> bool {
+    fn request_completion(
+        &mut self,
+        ticket_id: TicketId,
+        source: CompletionSource,
+        authority: Option<CompletionAuthority>,
+    ) -> bool {
         if self.pending_completions.contains_key(&ticket_id) {
             return false;
         }
+        let authority = match authority {
+            Some(CompletionAuthority::Attempt(lease))
+                if lease.is_current(self.current_leases.get(&ticket_id)) =>
+            {
+                CompletionAuthority::Attempt(lease)
+            }
+            Some(CompletionAuthority::Operator) if source == CompletionSource::Manual => {
+                CompletionAuthority::Operator
+            }
+            authority => {
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!(
+                        "Rejected completion for {ticket_id} ({source:?}): source authority {authority:?} does not hold the current lease"
+                    ),
+                });
+                return false;
+            }
+        };
         if !self.dag.all_dependencies_done(&ticket_id) {
             self.log_activity(ActivityEvent::Error {
                 message: format!(
@@ -742,6 +772,7 @@ impl State {
                 prior_phase,
                 prior_status,
                 source,
+                authority,
             },
         );
 
@@ -789,7 +820,7 @@ impl State {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) {
-        let pending = match self.pending_completions.get(ticket_id).copied() {
+        let pending = match self.pending_completions.get(ticket_id).cloned() {
             Some(pending) => pending,
             None => return,
         };
@@ -799,8 +830,9 @@ impl State {
             let detail = String::from_utf8_lossy(&stderr);
             self.log_activity(ActivityEvent::Error {
                 message: format!(
-                    "Completion commit failed for {} ({:?}, exit {:?}): {}. Ticket remains recoverable for retry",
+                    "Completion commit failed for {} authority {:?} ({:?}, exit {:?}): {}. Ticket remains recoverable for retry",
                     ticket_id,
+                    pending.authority,
                     pending.source,
                     exit_code,
                     if detail.trim().is_empty() {
@@ -845,8 +877,9 @@ impl State {
         });
         self.log_activity(ActivityEvent::Info {
             message: format!(
-                "Completion commit verified for {} at {}",
+                "Completion commit verified for {} authority {:?} at {}",
                 ticket_id,
+                pending.authority,
                 String::from_utf8_lossy(&stdout).trim()
             ),
         });
@@ -1838,16 +1871,16 @@ impl State {
     fn check_artifact_advances(&mut self) {
         loop {
             // Snapshot running threads each iteration — phases change as we advance
-            let running: Vec<(TicketId, Phase)> = self
+            let running: Vec<(TicketId, Phase, Option<AttemptLease>)> = self
                 .threads
                 .iter()
                 .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
-                .map(|(tid, t)| (tid.clone(), t.current_phase))
+                .map(|(tid, t)| (tid.clone(), t.current_phase, t.attempt_lease.clone()))
                 .collect();
 
             let mut advanced_any = false;
 
-            for (ticket_id, current_phase) in running {
+            for (ticket_id, current_phase, source_lease) in running {
                 // Determine which artifact signals completion of this phase.
                 // Implement uses review.md instead of progress.md (living doc).
                 let artifact_name = if current_phase == Phase::Implement {
@@ -1871,7 +1904,11 @@ impl State {
                 };
 
                 if next_phase == Phase::Done {
-                    self.request_completion(ticket_id.clone(), CompletionSource::Artifact);
+                    self.request_completion(
+                        ticket_id.clone(),
+                        CompletionSource::Artifact,
+                        source_lease.map(CompletionAuthority::Attempt),
+                    );
                     continue;
                 }
 
@@ -2156,7 +2193,15 @@ impl State {
                     // won't catch this transition.
                     let review_path = self.config.work_dir.join(&ticket_id).join("review.md");
                     if review_path.exists() {
-                        self.request_completion(ticket_id.clone(), CompletionSource::Idle);
+                        let source_lease = self
+                            .threads
+                            .get(&ticket_id)
+                            .and_then(|thread| thread.attempt_lease.clone());
+                        self.request_completion(
+                            ticket_id.clone(),
+                            CompletionSource::Idle,
+                            source_lease.map(CompletionAuthority::Attempt),
+                        );
                     }
                 }
 
@@ -2179,7 +2224,15 @@ impl State {
                         };
 
                         if next_phase == Phase::Done {
-                            self.request_completion(ticket_id.clone(), CompletionSource::Idle);
+                            let source_lease = self
+                                .threads
+                                .get(&ticket_id)
+                                .and_then(|thread| thread.attempt_lease.clone());
+                            self.request_completion(
+                                ticket_id.clone(),
+                                CompletionSource::Idle,
+                                source_lease.map(CompletionAuthority::Attempt),
+                            );
                             continue;
                         }
 
@@ -2441,7 +2494,18 @@ impl State {
 
     /// Route a stopped Review session through commit-gated completion.
     fn auto_complete_review(&mut self, ticket_id: TicketId, pane_id: u32) {
-        self.request_completion(ticket_id, CompletionSource::Stopped(pane_id));
+        let source_lease = self
+            .agent_slots
+            .iter()
+            .find(|slot| {
+                slot.pane_id == pane_id && slot.ticket_id.as_deref() == Some(ticket_id.as_str())
+            })
+            .and_then(|slot| slot.attempt_lease.clone());
+        self.request_completion(
+            ticket_id,
+            CompletionSource::Stopped(pane_id),
+            source_lease.map(CompletionAuthority::Attempt),
+        );
     }
 
     /// Append one provenance record for a finishing ticket-run (T-027-01).
@@ -3140,7 +3204,7 @@ impl State {
         // Externally observed Done still enters the same commit transaction.
         // The pending mask prevents this path from publishing while a command
         // result is outstanding.
-        let done_tickets: Vec<TicketId> = self
+        let done_tickets: Vec<(TicketId, Option<AttemptLease>)> = self
             .threads
             .iter()
             .filter(|(_, t)| t.status == lisa_core::types::ThreadStatus::Running)
@@ -3150,11 +3214,15 @@ impl State {
                     .map(|t| t.phase == Phase::Done)
                     .unwrap_or(false)
             })
-            .map(|(tid, _)| tid.clone())
+            .map(|(tid, thread)| (tid.clone(), thread.attempt_lease.clone()))
             .collect();
 
-        for ticket_id in done_tickets {
-            self.request_completion(ticket_id, CompletionSource::ObservedDone);
+        for (ticket_id, source_lease) in done_tickets {
+            self.request_completion(
+                ticket_id,
+                CompletionSource::ObservedDone,
+                source_lease.map(CompletionAuthority::Attempt),
+            );
         }
 
         // Defensive reconciliation: catch phase changes from external edits or
@@ -3736,7 +3804,14 @@ impl State {
 
     /// Request manual completion through the same isolated transaction.
     fn mark_ticket_done(&mut self, ticket_id: &str) {
-        self.request_completion(ticket_id.to_string(), CompletionSource::Manual);
+        let authority = match self.threads.get(ticket_id) {
+            Some(thread) => thread
+                .attempt_lease
+                .clone()
+                .map(CompletionAuthority::Attempt),
+            None => Some(CompletionAuthority::Operator),
+        };
+        self.request_completion(ticket_id.to_string(), CompletionSource::Manual, authority);
     }
 
     /// Open the reset modal with tickets that are in non-ready, non-done phases.
@@ -4462,6 +4537,31 @@ mod tests {
     use super::*;
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
 
+    /// Mirror production dispatch by installing one newly minted lease as the
+    /// scheduler's high-water/current authority and stamping matching records.
+    fn install_current_attempt(state: &mut State, ticket_id: &str) -> AttemptLease {
+        let lease =
+            AttemptLease::mint(ticket_id.to_string(), state.lease_high_water.get(ticket_id))
+                .unwrap();
+        state
+            .lease_high_water
+            .insert(ticket_id.to_string(), lease.clone());
+        state
+            .current_leases
+            .insert(ticket_id.to_string(), lease.clone());
+        if let Some(thread) = state.threads.get_mut(ticket_id) {
+            thread.attempt_lease = Some(lease.clone());
+        }
+        if let Some(slot) = state
+            .agent_slots
+            .iter_mut()
+            .find(|slot| slot.ticket_id.as_deref() == Some(ticket_id))
+        {
+            slot.attempt_lease = Some(lease.clone());
+        }
+        lease
+    }
+
     #[test]
     fn test_phase_to_ui_phase() {
         assert_eq!(phase_to_ui_phase(Phase::Ready), ui::Phase::Ready);
@@ -4903,6 +5003,7 @@ mod tests {
         let mut thread = Thread::new("T-002", 2);
         thread.current_phase = Phase::Implement;
         state.threads.insert("T-002".to_string(), thread);
+        install_current_attempt(&mut state, "T-002");
 
         state.check_artifact_advances();
 
@@ -4959,6 +5060,7 @@ mod tests {
         let mut thread = Thread::new("T-005", 5);
         thread.current_phase = Phase::Research;
         state.threads.insert("T-005".to_string(), thread);
+        install_current_attempt(&mut state, "T-005");
 
         state.check_artifact_advances();
 
@@ -5054,6 +5156,7 @@ mod tests {
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
         state.threads.insert("T-001".to_string(), thread);
+        install_current_attempt(&mut state, "T-001");
 
         state.check_artifact_advances();
 
@@ -6213,6 +6316,7 @@ mod tests {
             last_activity_at: None,
             last_client: None,
         });
+        install_current_attempt(&mut state, "T-001");
 
         state.mark_ticket_done("T-001");
 
@@ -6221,6 +6325,38 @@ mod tests {
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
         assert!(content.contains("phase: implement"));
+    }
+
+    #[test]
+    fn test_mark_done_without_active_attempt_uses_operator_authority() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: orphaned\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nBody\n",
+        )
+        .unwrap();
+        let dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&tickets_dir).unwrap()).unwrap();
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        state.mark_ticket_done("T-001");
+
+        let pending = state.pending_completions.get("T-001").unwrap();
+        assert_eq!(pending.authority, CompletionAuthority::Operator);
+        assert!(fs::read_to_string(tickets_dir.join("T-001.md"))
+            .unwrap()
+            .contains("phase: review"));
     }
 
     #[test]
@@ -6714,6 +6850,7 @@ mod tests {
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
+        install_current_attempt(&mut state, "T-001");
 
         // Run idle signal check
         state.check_idle_signals();
@@ -6796,6 +6933,7 @@ mod tests {
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
+        install_current_attempt(&mut state, "T-001");
 
         // Run idle signal check
         state.check_idle_signals();
@@ -7466,6 +7604,7 @@ mod tests {
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
         state.threads.insert("T-001".to_string(), thread);
+        install_current_attempt(&mut state, "T-001");
 
         state.check_idle_signals();
 
@@ -9932,6 +10071,7 @@ timeout\n\
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
         state.threads.insert("T-001".to_string(), thread);
+        install_current_attempt(&mut state, "T-001");
 
         // Directly call auto_complete_review
         state.auto_complete_review("T-001".to_string(), 1);
@@ -11050,6 +11190,7 @@ timeout\n\
         let mut thread = Thread::new("T-CDX-01", 1);
         thread.current_phase = Phase::Research;
         state.threads.insert("T-CDX-01".to_string(), thread);
+        install_current_attempt(&mut state, "T-CDX-01");
 
         // Each artifact advances exactly one phase boundary. Implement→Review
         // and Review→Done both ride review.md, so writing it cascades to Done in
@@ -11119,6 +11260,8 @@ timeout\n\
         let mut th2 = Thread::new("T-CDX-02", 2);
         th2.current_phase = Phase::Review;
         state.threads.insert("T-CDX-02".to_string(), th2);
+        install_current_attempt(&mut state, "T-CDX-01");
+        install_current_attempt(&mut state, "T-CDX-02");
 
         // Negative first: T-CDX-02's dep (T-CDX-01) is not Done → guard blocks.
         state.auto_complete_review("T-CDX-02".to_string(), 2);
@@ -11556,6 +11699,59 @@ timeout\n\
     }
 
     #[test]
+    fn request_completion_rejects_stale_attempt_and_accepts_current_lease() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, _dir) = codex_state_with_dag();
+        let ticket_path = state.config.ticket_dir.join("T-CDX-01.md");
+        fs::write(
+            &ticket_path,
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: review\npriority: high\nphase: review\nagent: codex\n---\n\nBody\n",
+        )
+        .unwrap();
+        state.dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap())
+                .unwrap();
+        let mut thread = Thread::new("T-CDX-01", 1);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-CDX-01".to_string(), thread);
+        codex_slot(&mut state, 1, "T-CDX-01");
+
+        let stale = install_current_attempt(&mut state, "T-CDX-01");
+        let current = install_current_attempt(&mut state, "T-CDX-01");
+        assert!(!stale.is_current(state.current_leases.get("T-CDX-01")));
+        assert!(current.is_current(state.current_leases.get("T-CDX-01")));
+
+        assert!(!state.request_completion(
+            "T-CDX-01".to_string(),
+            CompletionSource::Artifact,
+            Some(CompletionAuthority::Attempt(stale.clone())),
+        ));
+        assert!(!state.pending_completions.contains_key("T-CDX-01"));
+        assert!(state.threads.contains_key("T-CDX-01"));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-CDX-01"));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message }
+                if message.contains("Rejected completion")
+                    && message.contains("does not hold the current lease")
+        )));
+
+        assert!(state.request_completion(
+            "T-CDX-01".to_string(),
+            CompletionSource::Artifact,
+            Some(CompletionAuthority::Attempt(current.clone())),
+        ));
+        let pending = state.pending_completions.get("T-CDX-01").unwrap();
+        assert_eq!(pending.authority, CompletionAuthority::Attempt(current));
+        assert_eq!(pending.source, CompletionSource::Artifact);
+        assert!(fs::read_to_string(ticket_path)
+            .unwrap()
+            .contains("phase: review"));
+    }
+
+    #[test]
     fn artifact_completion_publishes_only_after_verified_commit_result() {
         use lisa_core::types::Thread;
         use std::fs;
@@ -11583,6 +11779,7 @@ timeout\n\
         state
             .last_pane_names
             .insert(1, "codex · T-CDX-01 · codex-a".to_string());
+        install_current_attempt(&mut state, "T-CDX-01");
 
         state.check_artifact_advances();
 
@@ -11639,6 +11836,7 @@ timeout\n\
         state
             .last_pane_names
             .insert(1, "codex · T-CDX-01 · codex-a".to_string());
+        install_current_attempt(&mut state, "T-CDX-01");
 
         state.mark_ticket_done("T-CDX-01");
         assert!(matches!(
