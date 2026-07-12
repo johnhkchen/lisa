@@ -97,23 +97,30 @@ wait_until() {
     fail "timed out after ${timeout}s waiting for $description"
 }
 
+event_count() {
+    local kind=$1
+    local events="$CURRENT_ROOT/evidence/events.log"
+    if [[ ! -f "$events" ]]; then
+        printf '0\n'
+        return
+    fi
+
+    awk -F '\t' -v kind="$kind" '$1 == kind { count++ } END { print count + 0 }' "$events"
+}
+
 event_count_is() {
     local kind=$1
     local expected=$2
-    local actual=0
-    if [[ -f "$CURRENT_ROOT/evidence/events.log" ]]; then
-        actual=$(awk -F '\t' -v kind="$kind" '$1 == kind { count++ } END { print count + 0 }' "$CURRENT_ROOT/evidence/events.log")
-    fi
+    local actual
+    actual=$(event_count "$kind")
     [[ "$actual" == "$expected" ]]
 }
 
 event_count_at_least() {
     local kind=$1
     local expected=$2
-    local actual=0
-    if [[ -f "$CURRENT_ROOT/evidence/events.log" ]]; then
-        actual=$(awk -F '\t' -v kind="$kind" '$1 == kind { count++ } END { print count + 0 }' "$CURRENT_ROOT/evidence/events.log")
-    fi
+    local actual
+    actual=$(event_count "$kind")
     (( actual >= expected ))
 }
 
