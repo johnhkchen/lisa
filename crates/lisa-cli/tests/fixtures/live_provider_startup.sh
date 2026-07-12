@@ -14,6 +14,7 @@ PREPARE_ONLY=${PREPARE_ONLY:-0}
 KEEP_LIVE_FIXTURES=${KEEP_LIVE_FIXTURES:-1}
 LIVE_STARTUP_TIMEOUT_SECS=${LIVE_STARTUP_TIMEOUT_SECS:-1200}
 LISA_BIN=${LISA_BIN:-}
+FIXTURE_PARENT=${LISA_LIVE_FIXTURE_PARENT:-${TMPDIR:-/tmp}}
 
 CURRENT_CASE=
 CURRENT_ROOT=
@@ -62,8 +63,10 @@ stop_case() {
 cleanup() {
     local status=$?
     stop_case
-    if [[ "$KEEP_LIVE_FIXTURES" != 1 && -d "$EVIDENCE_DIR/fixtures" ]]; then
-        rm -rf "$EVIDENCE_DIR/fixtures"
+    if [[ "$KEEP_LIVE_FIXTURES" != 1 && -f "$EVIDENCE_DIR/fixture-roots.txt" ]]; then
+        while IFS= read -r root; do
+            [[ -n "$root" ]] && rm -rf "$root"
+        done < "$EVIDENCE_DIR/fixture-roots.txt"
     fi
     if (( status != 0 )); then
         echo "live startup harness failed; retained evidence at $EVIDENCE_DIR" >&2
@@ -85,6 +88,9 @@ fi
 
 mkdir -p "$EVIDENCE_DIR/build" "$EVIDENCE_DIR/fixtures"
 EVIDENCE_DIR=$(cd "$EVIDENCE_DIR" && pwd -P)
+: > "$EVIDENCE_DIR/fixture-roots.txt"
+mkdir -p "$FIXTURE_PARENT"
+FIXTURE_PARENT=$(cd "$FIXTURE_PARENT" && pwd -P)
 
 record_versions() {
     {
@@ -199,9 +205,12 @@ WRAPPER
 create_fixture() {
     local provider=$1
     local ticket_id=$2
-    local root="$EVIDENCE_DIR/fixtures/$provider-first"
-    rm -rf "$root"
-    mkdir -p "$root"
+    # A nested repository can still inherit the parent Codex configuration
+    # layer. Use a canonical external temp root for an honest isolated control.
+    local root
+    root=$(mktemp -d "$FIXTURE_PARENT/lisa-live-$provider.XXXXXX")
+    root=$(cd "$root" && pwd -P)
+    printf '%s\n' "$root" >> "$EVIDENCE_DIR/fixture-roots.txt"
     "$LISA_BIN" init --path "$root" > "$EVIDENCE_DIR/$provider-first/init.log"
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories"
     cat > "$root/.lisa.toml" <<'TOML'
@@ -460,6 +469,16 @@ verify_completion() {
     cp "$work"/*.md "$CURRENT_CASE/published-work/"
 }
 
+snapshot_fixture() {
+    local provider=$1
+    local snapshot="$EVIDENCE_DIR/fixtures/$provider-first"
+    rm -rf "$snapshot"
+    mkdir -p "$snapshot"
+    cp -R "$CURRENT_ROOT/." "$snapshot/"
+    printf 'source_fixture=%s\nsnapshot=%s\n' "$CURRENT_ROOT" "$snapshot" \
+        > "$CURRENT_CASE/fixture-snapshot.txt"
+}
+
 capture_final_screens() {
     discover_panes || return 0
     dump_pane "$CURRENT_PLUGIN_PANE" > "$CURRENT_CASE/dashboard-final.txt" 2>/dev/null || true
@@ -499,6 +518,7 @@ run_case() {
     verify_launch_contract "$provider" "$ticket_id"
     verify_state_order "$provider" "$ticket_id"
     verify_completion "$provider" "$ticket_id"
+    snapshot_fixture "$provider"
     stop_case
     printf '%s-first: PASS\n' "$provider" | tee "$CURRENT_CASE/result.txt"
 }

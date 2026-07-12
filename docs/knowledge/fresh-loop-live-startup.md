@@ -91,8 +91,8 @@ The following environment variables exist for focused diagnosis:
 - `PREPARE_ONLY=1` exits after build and deterministic preflight.
 - `LIVE_STARTUP_TIMEOUT_SECS=<seconds>` changes the per-provider completion bound; default
   is 1200 seconds.
-- `KEEP_LIVE_FIXTURES=0` removes fixture repositories after capture. Default `1` retains
-  them because attempt-private launch and signal files are useful evidence.
+- `KEEP_LIVE_FIXTURES=0` removes the original external temporary repositories after their
+  evidence snapshots are captured. Default `1` retains both originals and snapshots.
 
 Boolean variables accept only `0` or `1`. `SKIP_BUILD=1` without `LISA_BIN` fails before
 creating a fixture.
@@ -112,6 +112,7 @@ claude-first/
 fixtures/
   codex-first/
   claude-first/
+fixture-roots.txt
 ```
 
 Each provider case includes:
@@ -128,6 +129,11 @@ Each provider case includes:
 - `ticket-final.md`, `published-work/`, `git-log.txt`, and `provenance.jsonl`: durable
   completion evidence;
 - `result.txt`: provider case PASS receipt.
+
+The live repositories are canonical `mktemp` directories outside the parent checkout, so
+neither provider can inherit the parent's project configuration layer. After successful
+verification, the harness copies a complete snapshot into `fixtures/<provider>-first/` and
+records each original path in `fixture-roots.txt`.
 
 Full provider transcripts may contain more data than a review needs. Prefer the structural
 receipts, state timeline, final ticket, and published work when sharing results.
