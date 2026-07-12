@@ -184,6 +184,7 @@ pub struct HealthAlert {
 /// Scheduler-owned seat assignment state reduced to dashboard semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeatAssignmentStatus {
+    Starting,
     AssignedPendingAck,
     Owned,
     Recovering,
@@ -193,6 +194,7 @@ pub enum SeatAssignmentStatus {
 impl SeatAssignmentStatus {
     fn label(self) -> &'static str {
         match self {
+            Self::Starting => "starting",
             Self::AssignedPendingAck => "assigned-pending-ack",
             Self::Owned => "owned",
             Self::Recovering => "recovering",
@@ -202,7 +204,7 @@ impl SeatAssignmentStatus {
 
     fn color(self) -> &'static str {
         match self {
-            Self::AssignedPendingAck => YELLOW,
+            Self::Starting | Self::AssignedPendingAck => YELLOW,
             Self::Owned => GREEN,
             Self::Recovering => BRIGHT_YELLOW,
             Self::RecoveryFailed => RED,

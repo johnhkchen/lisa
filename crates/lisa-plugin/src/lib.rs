@@ -276,6 +276,12 @@ enum AttemptLifecycleEvent {
 /// means the seat is unassigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeatAssignmentState {
+    /// A fresh provider process has been launched for the reserved seat, but
+    /// its exact attempt-scoped process-start signal has not been observed.
+    Starting {
+        /// The launched [`AttemptLease::attempt_id`].
+        generation: u64,
+    },
     /// The seat is reserved for a ticket, but Codex has not acknowledged its
     /// current attempt lease.
     AssignedPendingAck {
@@ -1254,6 +1260,37 @@ impl State {
         self.seat_assignments.get(&pane_id).copied()
     }
 
+    /// Promote a fresh seat only when its provider reports the exact current
+    /// attempt lease installed for this pane. Returning true means this call
+    /// performed the sole starting-to-owned edge.
+    fn acknowledge_process_start(&mut self, pane_id: u32, candidate: &AttemptLease) -> bool {
+        let Some(SeatAssignmentState::Starting { generation }) = self.seat_assignment(pane_id)
+        else {
+            return false;
+        };
+        if generation != candidate.attempt_id {
+            return false;
+        }
+        let Some((ticket_id, attempt_lease)) = self
+            .agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id)
+            .and_then(|slot| Some((slot.ticket_id.as_ref()?, slot.attempt_lease.as_ref()?)))
+        else {
+            return false;
+        };
+        if ticket_id != &candidate.ticket_id
+            || attempt_lease != candidate
+            || !candidate.is_current(self.current_leases.get(&candidate.ticket_id))
+        {
+            return false;
+        }
+
+        self.seat_assignments
+            .insert(pane_id, SeatAssignmentState::Owned);
+        true
+    }
+
     /// Return the expected lease attempt ID while an unowned Codex attempt can
     /// still be acknowledged. Original and recovery attempts have distinct
     /// leases.
@@ -2052,14 +2089,20 @@ impl State {
             // reused in-place; a recycled pane is reserved for this provider
             // while WaitingForExit prevents any other scheduler claim.
             self.agent_slots[slot_idx].last_client = Some(route.agent);
-            let assignment_state = if let Some(generation) = assignment_generation {
+            let fresh_launch =
+                recycle || !reused_seat || adapter.reset_strategy() == ResetStrategy::FreshExec;
+            let assignment_state = if fresh_launch {
+                SeatAssignmentState::Starting {
+                    generation: attempt_lease.attempt_id,
+                }
+            } else if let Some(generation) = assignment_generation {
                 SeatAssignmentState::AssignedPendingAck {
                     generation,
                     ack_deadline: None,
                 }
             } else {
-                // Fresh launches retain the established immediate-ownership
-                // contract, as do all Claude paths.
+                // Same-process Claude reuse retains its established ownership;
+                // fresh processes and reused Codex prompts are gated above.
                 SeatAssignmentState::Owned
             };
             self.seat_assignments.insert(pane_id, assignment_state);
@@ -2364,6 +2407,38 @@ impl State {
             // A real tool call means an AskUserQuestion (if any) was answered and
             // the agent resumed — stop suppressing injection into this pane.
             self.awaiting_human.remove(&pane_id);
+        }
+    }
+
+    /// Consume provider-neutral process-start signals and promote only the
+    /// exact current fresh attempt assigned to the addressed physical seat.
+    fn check_process_start_signals(&mut self) {
+        let entries = match std::fs::read_dir(&self.signal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let pane_id = match path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("pane-"))
+                .and_then(|name| name.strip_suffix(".started"))
+                .and_then(|id| id.parse::<u32>().ok())
+            {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let candidate = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|body| serde_json::from_str::<AttemptLease>(&body).ok());
+            let _ = std::fs::remove_file(&path);
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            self.acknowledge_process_start(pane_id, &candidate);
         }
     }
 
@@ -3654,6 +3729,10 @@ impl State {
         // before any health or timeout decisions this tick.
         self.check_heartbeat_signals();
 
+        // A fresh seat is owned only after the provider-neutral startup hook
+        // publishes the exact current pane/ticket/attempt lease.
+        self.check_process_start_signals();
+
         // Flag panes blocked on AskUserQuestion before any consumer can inject
         // into them this tick (must precede check_idle_signals and the timeout
         // fallbacks). Heartbeats above already cleared resumed panes.
@@ -4822,6 +4901,7 @@ impl State {
             .filter_map(|(i, slot)| {
                 self.seat_assignment(slot.pane_id).map(|assignment| {
                     let status = match assignment {
+                        SeatAssignmentState::Starting { .. } => ui::SeatAssignmentStatus::Starting,
                         SeatAssignmentState::AssignedPendingAck { .. } => {
                             ui::SeatAssignmentStatus::AssignedPendingAck
                         }
@@ -8743,10 +8823,10 @@ mod tests {
         assert_eq!(state.threads["T-NAME"].client, AgentClient::Codex);
         assert_eq!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::Owned),
-            "a fresh Codex launch retains the existing immediate ownership contract"
+            Some(SeatAssignmentState::Starting { generation: 1 }),
+            "a fresh Codex launch awaits its exact process-start signal"
         );
-        assert!(state.seat_is_owned(10));
+        assert!(!state.seat_is_owned(10));
     }
 
     #[test]
@@ -8859,6 +8939,55 @@ mod tests {
             .rsplit_once(' ')
             .expect("active dashboard row should end with elapsed time");
         format!("{row} <elapsed>")
+    }
+
+    #[test]
+    fn test_fresh_dispatch_becomes_owned_only_after_exact_process_start() {
+        let (mut state, dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        std::fs::create_dir_all(&state.signal_dir).unwrap();
+
+        state.schedule_ready_tickets();
+
+        let lease = state.current_leases["T-NAME"].clone();
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Starting {
+                generation: lease.attempt_id,
+            }),
+            "dispatch reserves the fresh seat without claiming provider ownership"
+        );
+        assert!(!state.seat_is_owned(10));
+        assert!(dashboard_thread_row(&state, "T-NAME").contains("starting"));
+
+        let started = dir.path().join("signals/pane-10.started");
+        std::fs::write(&started, "not an attempt lease").unwrap();
+        state.check_process_start_signals();
+        assert!(!started.exists(), "malformed start signals are one-shot");
+        assert!(!state.seat_is_owned(10));
+
+        let stale = AttemptLease {
+            ticket_id: lease.ticket_id.clone(),
+            attempt_id: lease.attempt_id + 1,
+        };
+        std::fs::write(&started, serde_json::to_string(&stale).unwrap()).unwrap();
+        state.check_process_start_signals();
+        assert!(!state.seat_is_owned(10), "a stale generation fails closed");
+
+        std::fs::write(&started, serde_json::to_string(&lease).unwrap()).unwrap();
+        state.check_process_start_signals();
+
+        assert!(!started.exists());
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
+        assert!(state.seat_is_owned(10));
+        assert!(dashboard_thread_row(&state, "T-NAME").contains("owned"));
+
+        std::fs::write(&started, serde_json::to_string(&lease).unwrap()).unwrap();
+        state.check_process_start_signals();
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Owned),
+            "duplicate process-start signals cannot repeat the transition"
+        );
     }
 
     #[test]
@@ -9667,10 +9796,8 @@ timeout\n\
         assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
         assert_eq!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: 1,
-                ack_deadline: None,
-            })
+            Some(SeatAssignmentState::Starting { generation: 1 }),
+            "cross-provider recycling launches a fresh process after exit"
         );
         assert!(!state.seat_is_owned(10));
     }
