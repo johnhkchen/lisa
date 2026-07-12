@@ -6,6 +6,7 @@
 
 mod adapter;
 mod codex_ack;
+mod deadline;
 mod pane_name;
 mod signal;
 mod ui;
@@ -18,6 +19,10 @@ use zellij_tile::prelude::*;
 use adapter::{
     resolve_adapter_or_native, FollowUp, FollowUpContext, ReadinessMode, ResetStrategy,
     SpawnContext,
+};
+use deadline::{
+    AcknowledgementInput, DeadlineEvaluator, HealthInput, ReviewInput, SessionAction, SessionInput,
+    StaleInput, SystemClock, TransitionAction, TransitionInput, TransitionPolicy,
 };
 
 use lisa_core::client::AgentClient;
@@ -2246,40 +2251,41 @@ impl State {
         now: std::time::SystemTime,
     ) -> Vec<FailureTransitionOutcome> {
         let mut outcomes = Vec::new();
-        let expired: Vec<(u32, SeatAssignmentState)> = self
-            .seat_assignments
-            .iter()
-            .filter_map(|(pane_id, state)| {
-                let deadline = match state {
-                    SeatAssignmentState::Starting {
-                        start_deadline: Some(deadline),
-                        ..
-                    }
-                    | SeatAssignmentState::Delivering {
-                        ack_deadline: deadline,
-                        ..
-                    }
-                    | SeatAssignmentState::AssignedPendingAck {
-                        ack_deadline: Some(deadline),
-                        ..
-                    }
-                    | SeatAssignmentState::Recovering {
-                        ack_deadline: Some(deadline),
-                        ..
-                    }
-                    | SeatAssignmentState::ResettingStartup {
-                        reset_deadline: deadline,
-                        ..
-                    } => *deadline,
-                    _ => return None,
-                };
-                now.duration_since(deadline)
-                    .is_ok()
-                    .then_some((*pane_id, *state))
+        let candidates = self.seat_assignments.iter().filter_map(|(pane_id, state)| {
+            let deadline = match state {
+                SeatAssignmentState::Starting {
+                    start_deadline: Some(deadline),
+                    ..
+                }
+                | SeatAssignmentState::Delivering {
+                    ack_deadline: deadline,
+                    ..
+                }
+                | SeatAssignmentState::AssignedPendingAck {
+                    ack_deadline: Some(deadline),
+                    ..
+                }
+                | SeatAssignmentState::Recovering {
+                    ack_deadline: Some(deadline),
+                    ..
+                }
+                | SeatAssignmentState::ResettingStartup {
+                    reset_deadline: deadline,
+                    ..
+                } => *deadline,
+                _ => return None,
+            };
+            Some(AcknowledgementInput {
+                pane_id: *pane_id,
+                state: *state,
+                deadline,
             })
-            .collect();
+        });
+        let expired = DeadlineEvaluator::new(now).acknowledgements(candidates);
 
-        for (pane_id, state) in expired {
+        for action in expired {
+            let pane_id = action.pane_id;
+            let state = action.state;
             if self.seat_assignment(pane_id) != Some(state) {
                 continue;
             }
@@ -3888,36 +3894,36 @@ impl State {
     /// arrives because the session is still working (heartbeats flowing), the
     /// transition waits rather than injecting input into a busy session.
     fn check_transition_timeouts(&mut self) {
-        let now = std::time::SystemTime::now();
-        let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
+        let evaluator = DeadlineEvaluator::new(SystemClock);
+        let now = evaluator.now();
+        let actions = evaluator.transitions(
+            self.agent_slots.iter().map(|slot| TransitionInput {
+                pane_id: slot.pane_id,
+                ticket_id: slot.ticket_id.clone(),
+                state: slot.transition_state,
+                started: slot.transition_started_at,
+                last_activity: slot.last_activity_at,
+                awaiting_human: self.awaiting_human.contains(&slot.pane_id),
+            }),
+            TransitionPolicy {
+                wind_down: std::time::Duration::from_secs(self.config.wind_down_secs),
+                exit_grace_secs: AGENT_EXIT_GRACE_SECS,
+                stop_timeout_secs: STOP_SIGNAL_TIMEOUT_SECS,
+                clear_timeout_secs: CLEAR_SIGNAL_TIMEOUT_SECS,
+            },
+        );
 
-        // Collect actions to avoid borrow conflicts
         let mut exit_ready: Vec<(u32, Option<TicketId>)> = Vec::new();
         let mut stop_timeouts: Vec<u32> = Vec::new();
         let mut clear_timeouts: Vec<(u32, Option<TicketId>)> = Vec::new();
-
-        for slot in &self.agent_slots {
-            if let Some(started) = slot.transition_started_at {
-                let elapsed = now.duration_since(started).unwrap_or_default().as_secs();
-                let quiet = slot
-                    .last_activity_at
-                    .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down);
-
-                match slot.transition_state {
-                    TransitionState::WaitingForExit if elapsed > AGENT_EXIT_GRACE_SECS => {
-                        exit_ready.push((slot.pane_id, slot.ticket_id.clone()));
-                    }
-                    TransitionState::WaitingForStop
-                        if elapsed > STOP_SIGNAL_TIMEOUT_SECS && quiet =>
-                    {
-                        stop_timeouts.push(slot.pane_id);
-                    }
-                    TransitionState::WaitingForClear
-                        if elapsed > CLEAR_SIGNAL_TIMEOUT_SECS && quiet =>
-                    {
-                        clear_timeouts.push((slot.pane_id, slot.ticket_id.clone()));
-                    }
-                    _ => {}
+        for action in actions {
+            match action {
+                TransitionAction::ExitReady { pane_id, ticket_id } => {
+                    exit_ready.push((pane_id, ticket_id));
+                }
+                TransitionAction::StopTimedOut { pane_id } => stop_timeouts.push(pane_id),
+                TransitionAction::ClearTimedOut { pane_id, ticket_id } => {
+                    clear_timeouts.push((pane_id, ticket_id));
                 }
             }
         }
@@ -4067,11 +4073,6 @@ impl State {
         }
 
         for pane_id in stop_timeouts {
-            // Don't force a /clear over a question — skip this pane in the fallback;
-            // the transition resumes on a later tick once the agent is unblocked.
-            if self.is_pane_awaiting(pane_id) {
-                continue;
-            }
             self.log_activity(ActivityEvent::Warning {
                 message: format!(
                     "Stop signal timeout for pane {}, sending /clear anyway",
@@ -4086,10 +4087,6 @@ impl State {
         }
 
         for (pane_id, ticket_id) in clear_timeouts {
-            // Don't force the prompt over a question — skip; retry once unblocked.
-            if self.is_pane_awaiting(pane_id) {
-                continue;
-            }
             self.log_activity(ActivityEvent::Warning {
                 message: format!(
                     "Clear signal timeout for pane {}, sending prompt anyway",
@@ -4145,37 +4142,28 @@ impl State {
     ///
     /// Set `review_timeout_secs = 0` to disable this feature.
     fn check_review_timeouts(&mut self) {
-        if self.config.review_timeout_secs == 0 {
-            return;
-        }
-
-        let now = std::time::SystemTime::now();
+        let evaluator = DeadlineEvaluator::new(SystemClock);
+        let now = evaluator.now();
         let timeout = std::time::Duration::from_secs(self.config.review_timeout_secs);
         let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
+        let actions = evaluator.reviews(
+            self.threads.iter().map(|(ticket_id, thread)| ReviewInput {
+                ticket_id: ticket_id.clone(),
+                pane_id: thread.pane_id,
+                status: thread.status,
+                phase: thread.current_phase,
+                already_prompted: self.finish_up_sent.contains(ticket_id),
+                awaiting_human: self.awaiting_human.contains(&thread.pane_id),
+                last_phase_change: thread.last_phase_change,
+                last_activity: thread.last_activity,
+            }),
+            timeout,
+            wind_down,
+        );
 
-        // Collect candidates: running threads in Review phase past timeout,
-        // not yet prompted, and quiet — never prod a session that is still
-        // actively working (heartbeats flowing).
-        let candidates: Vec<(TicketId, u32)> = self
-            .threads
-            .iter()
-            .filter(|(_, t)| {
-                t.status == lisa_core::types::ThreadStatus::Running
-                    && t.current_phase == Phase::Review
-            })
-            .filter(|(tid, _)| !self.finish_up_sent.contains(*tid))
-            .filter(|(_, t)| now.duration_since(t.last_phase_change).unwrap_or_default() >= timeout)
-            .filter(|(_, t)| now.duration_since(t.last_activity).unwrap_or_default() >= wind_down)
-            .map(|(tid, t)| (tid.clone(), t.pane_id))
-            .collect();
-
-        for (ticket_id, pane_id) in candidates {
-            // Most acute clobber risk: a Review agent legitimately asking a question
-            // must not be prodded with a finish-up prompt over its question UI. Skip
-            // without marking finish_up_sent so it's re-evaluated once unblocked.
-            if self.is_pane_awaiting(pane_id) {
-                continue;
-            }
+        for action in actions {
+            let ticket_id = action.ticket_id;
+            let pane_id = action.pane_id;
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let host_work_dir = match self
                 .threads
@@ -4220,7 +4208,7 @@ impl State {
             self.bump_pane_activity(pane_id);
 
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
-                thread.mark_phase_change(std::time::SystemTime::now());
+                thread.mark_phase_change(now);
             }
 
             self.finish_up_sent.insert(ticket_id.clone());
@@ -4234,45 +4222,38 @@ impl State {
     /// Logs `HealthStateChanged` activity events when a thread transitions
     /// between health states (e.g., Healthy → Stuck).
     fn evaluate_health(&mut self) {
-        use lisa_core::types::{HealthStatus, ThreadStatus};
+        use lisa_core::types::ThreadStatus;
 
-        let now = std::time::SystemTime::now();
         let threshold = std::time::Duration::from_secs(self.config.stuck_threshold_secs);
+        let observations = DeadlineEvaluator::new(SystemClock).health(
+            self.threads
+                .iter()
+                .filter(|(ticket_id, thread)| {
+                    thread.status == ThreadStatus::Running
+                        || thread.status == ThreadStatus::Failed
+                        || !self.last_health.contains_key(*ticket_id)
+                })
+                .map(|(ticket_id, thread)| HealthInput {
+                    ticket_id: ticket_id.clone(),
+                    status: thread.status,
+                    last_activity: thread.last_activity,
+                    previous: self.last_health.get(ticket_id).copied(),
+                }),
+            threshold,
+        );
 
-        // Collect health transitions
-        let transitions: Vec<(TicketId, HealthStatus, HealthStatus)> = self
-            .threads
-            .iter()
-            .filter(|(_, t)| t.status == ThreadStatus::Running || t.status == ThreadStatus::Failed)
-            .filter_map(|(tid, t)| {
-                let current = t.health(now, threshold);
-                let previous = self
-                    .last_health
-                    .get(tid)
-                    .copied()
-                    .unwrap_or(HealthStatus::Healthy);
-                if current != previous {
-                    Some((tid.clone(), previous, current))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (ticket_id, old_health, new_health) in transitions {
-            self.last_health.insert(ticket_id.clone(), new_health);
-            self.log_activity(ActivityEvent::HealthStateChanged {
-                ticket_id,
-                old_health,
-                new_health,
-            });
-        }
-
-        // Track health for threads we haven't seen before
-        for (tid, t) in &self.threads {
-            if !self.last_health.contains_key(tid) {
-                let health = t.health(now, threshold);
-                self.last_health.insert(tid.clone(), health);
+        for observation in observations {
+            let previous = observation
+                .previous
+                .unwrap_or(lisa_core::types::HealthStatus::Healthy);
+            self.last_health
+                .insert(observation.ticket_id.clone(), observation.current);
+            if observation.current != previous {
+                self.log_activity(ActivityEvent::HealthStateChanged {
+                    ticket_id: observation.ticket_id,
+                    old_health: previous,
+                    new_health: observation.current,
+                });
             }
         }
 
@@ -4296,7 +4277,6 @@ impl State {
     /// (multi-minute silent stretches) never get a progressing session
     /// reclaimed. Budgets warn; only silence kills.
     fn check_session_timeouts(&mut self) -> Vec<FailureTransitionOutcome> {
-        let now = std::time::SystemTime::now();
         let global_timeout = self.config.session_timeout_secs;
         let has_phase_timeouts = !self.config.phase_timeouts.is_empty();
         let hard_silence = std::time::Duration::from_secs(self.config.stuck_threshold_secs * 2);
@@ -4306,77 +4286,49 @@ impl State {
             return Vec::new();
         }
 
-        let mut timed_out: Vec<(TicketId, u64, Phase)> = Vec::new();
-        let mut over_budget_active: Vec<(TicketId, u64, Phase)> = Vec::new();
-
-        for (tid, t) in &self.threads {
-            if t.status != lisa_core::types::ThreadStatus::Running {
-                continue;
-            }
-            if self.pending_completions.contains_key(tid) {
-                continue;
-            }
-
-            // Check global session timeout (total wall-clock since start)
-            let mut exceeded: Option<(u64, Phase)> = None;
-            if global_timeout > 0 {
-                let elapsed = now.duration_since(t.started_at).unwrap_or_default();
-                if elapsed >= std::time::Duration::from_secs(global_timeout) {
-                    exceeded = Some((elapsed.as_secs(), t.current_phase));
-                }
-            }
-
-            // Check per-phase timeout (time-in-phase since last phase change)
-            if exceeded.is_none() && has_phase_timeouts {
-                let phase_limit = self.config.timeout_for_phase(t.current_phase);
-                if phase_limit > 0 {
-                    let elapsed_in_phase =
-                        now.duration_since(t.last_phase_change).unwrap_or_default();
-                    if elapsed_in_phase >= std::time::Duration::from_secs(phase_limit) {
-                        exceeded = Some((elapsed_in_phase.as_secs(), t.current_phase));
-                    }
-                }
-            }
-
-            if let Some((elapsed_secs, phase)) = exceeded {
-                // Reclaim only at death-level silence (same bar as stale
-                // detection), not a mere wind-down gap: slow test or
-                // integration commands routinely produce multi-minute silent
-                // stretches in a session that is progressing fine, and a
-                // wind-down gap after the budget line would reclaim it
-                // mid-ticket. The budget itself is advisory — silence kills,
-                // budgets warn.
-                let silent_for = now.duration_since(t.last_activity).unwrap_or_default();
-                // Awaiting-human exemption (T-020-04): a pane blocked on an
-                // AskUserQuestion may be silent far longer than hard-silence while a
-                // human composes an answer. Never kill it — reclaiming mid-question
-                // is the exact failure S-020 exists to prevent. It falls into the
-                // warn branch instead, so it is still surfaced (warnings may log;
-                // only the kill is suppressed). The exemption clears with the flag
-                // on the pane's next heartbeat, restoring normal reclamation.
-                if silent_for >= hard_silence && !self.awaiting_human.contains(&t.pane_id) {
-                    timed_out.push((tid.clone(), elapsed_secs, phase));
-                } else {
-                    over_budget_active.push((tid.clone(), elapsed_secs, phase));
-                }
+        let actions = DeadlineEvaluator::new(SystemClock).sessions(
+            self.threads.iter().map(|(ticket_id, thread)| SessionInput {
+                ticket_id: ticket_id.clone(),
+                pane_id: thread.pane_id,
+                status: thread.status,
+                phase: thread.current_phase,
+                pending_completion: self.pending_completions.contains_key(ticket_id),
+                awaiting_human: self.awaiting_human.contains(&thread.pane_id),
+                started_at: thread.started_at,
+                last_phase_change: thread.last_phase_change,
+                last_activity: thread.last_activity,
+                phase_timeout: std::time::Duration::from_secs(
+                    self.config.timeout_for_phase(thread.current_phase),
+                ),
+            }),
+            std::time::Duration::from_secs(global_timeout),
+            hard_silence,
+        );
+        let mut timed_out = Vec::new();
+        let mut over_budget_active = Vec::new();
+        for action in actions {
+            match action {
+                SessionAction::Warn(deadline) => over_budget_active.push(deadline),
+                SessionAction::Reclaim(deadline) => timed_out.push(deadline),
             }
         }
 
-        for (ticket_id, elapsed_secs, phase) in over_budget_active {
-            if self.over_budget_warned.insert(ticket_id.clone()) {
+        for deadline in over_budget_active {
+            if self.over_budget_warned.insert(deadline.ticket_id.clone()) {
                 self.log_activity(ActivityEvent::Warning {
                     message: format!(
                         "{} exceeded its timeout ({}s in {}) but is still active — \
                          waiting for it to wind down instead of interrupting",
-                        ticket_id, elapsed_secs, phase
+                        deadline.ticket_id, deadline.elapsed_secs, deadline.phase
                     ),
                 });
             }
         }
 
         let mut outcomes = Vec::new();
-        for (ticket_id, elapsed_secs, phase) in timed_out {
-            let pane_id = self.threads[&ticket_id].pane_id;
+        for deadline in timed_out {
+            let ticket_id = deadline.ticket_id;
+            let pane_id = deadline.pane_id;
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
             }
@@ -4388,11 +4340,11 @@ impl State {
             self.release_slot_for_ticket(&ticket_id);
             self.threads.remove(&ticket_id);
             self.timeout_alerts
-                .push((ticket_id.clone(), elapsed_secs, phase));
+                .push((ticket_id.clone(), deadline.elapsed_secs, deadline.phase));
             self.log_activity(ActivityEvent::SessionTimedOut {
                 ticket_id: ticket_id.clone(),
-                elapsed_secs,
-                phase,
+                elapsed_secs: deadline.elapsed_secs,
+                phase: deadline.phase,
             });
             outcomes.push(FailureTransitionOutcome::SessionTimedOut {
                 pane_id,
@@ -4411,31 +4363,25 @@ impl State {
     /// phase runs. Silent threads are marked as failed, their slots released,
     /// and they are removed from the threads map for retry.
     fn detect_stale_threads(&mut self) -> Vec<FailureTransitionOutcome> {
-        use lisa_core::types::{HealthStatus, ThreadStatus};
-
-        let now = std::time::SystemTime::now();
         // Hard timeout: 2x the configured stuck threshold
         let hard_timeout = std::time::Duration::from_secs(self.config.stuck_threshold_secs * 2);
 
-        // Awaiting-human exemption (T-020-04): a pane blocked on an AskUserQuestion
-        // is intentionally silent while a human answers. Exclude it from stale
-        // reclamation so it is never killed mid-question. The marker on the
-        // dashboard (driven off this same set) keeps it visible; the exemption
-        // clears with the flag on the pane's next heartbeat.
-        let awaiting = &self.awaiting_human;
-        let stale: Vec<TicketId> = self
-            .threads
-            .iter()
-            .filter(|(_, t)| t.status == ThreadStatus::Running)
-            .filter(|(tid, _)| !self.pending_completions.contains_key(*tid))
-            .filter(|(_, t)| t.health(now, hard_timeout) == HealthStatus::Stuck)
-            .filter(|(_, t)| !awaiting.contains(&t.pane_id))
-            .map(|(tid, _)| tid.clone())
-            .collect();
+        let stale = DeadlineEvaluator::new(SystemClock).stale(
+            self.threads.iter().map(|(ticket_id, thread)| StaleInput {
+                ticket_id: ticket_id.clone(),
+                pane_id: thread.pane_id,
+                status: thread.status,
+                pending_completion: self.pending_completions.contains_key(ticket_id),
+                awaiting_human: self.awaiting_human.contains(&thread.pane_id),
+                last_activity: thread.last_activity,
+            }),
+            hard_timeout,
+        );
 
         let mut outcomes = Vec::new();
-        for ticket_id in stale {
-            let pane_id = self.threads[&ticket_id].pane_id;
+        for action in stale {
+            let ticket_id = action.ticket_id;
+            let pane_id = action.pane_id;
             let mins = self.config.stuck_threshold_secs * 2 / 60;
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
