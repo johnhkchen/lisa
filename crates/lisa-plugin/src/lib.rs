@@ -10496,10 +10496,12 @@ timeout\n\
 
     #[test]
     fn test_recycle_exit_grace_launches_fresh_incoming_client() {
+        let dir = tempfile::tempdir().unwrap();
         let mut state = State {
             config: PluginConfig {
                 client: AgentClient::Codex,
                 ticket_dir: std::path::PathBuf::from("/tmp/tickets"),
+                work_dir: dir.path().join("work"),
                 ..PluginConfig::new()
             },
             ..State::default()
@@ -11026,6 +11028,7 @@ timeout\n\
             dag: Dag::from_tickets(tickets).unwrap(),
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
                 session_timeout_secs: 1800, // 30 minutes
                 stuck_threshold_secs: 600,  // hard-silence bar = 2x = 1200s
                 wind_down_secs: 0,
