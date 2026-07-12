@@ -195,6 +195,10 @@ Each provider must also produce six admitted artifacts, a Lisa completion commit
 `status: done`/`phase: done`, a clean disposable fixture repository, and authoritative
 Done provenance attributed to the selected provider.
 
+The clean-tree assertion permits only Lisa's expected runtime-owned untracked files:
+`.lisa-layout.kdl`, `.lisa-commit.lock`, and `.lisa/provenance.jsonl`. Any other residual
+tracked or untracked path fails the case.
+
 The harness never edits the synthetic ticket to manufacture these receipts.
 
 ## Failure handling

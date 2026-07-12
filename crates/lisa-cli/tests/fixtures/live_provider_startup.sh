@@ -492,7 +492,13 @@ verify_completion() {
         "$CURRENT_ROOT/.lisa/provenance.jsonl" >/dev/null \
         || fail "authoritative $provider Done provenance is missing for $ticket_id"
     git -C "$CURRENT_ROOT" status --short > "$CURRENT_CASE/fixture-status.txt"
-    [[ ! -s "$CURRENT_CASE/fixture-status.txt" ]] || fail "completed fixture repository is not clean"
+    awk '
+        $2 != ".lisa-commit.lock" &&
+        $2 != ".lisa-layout.kdl" &&
+        $2 != ".lisa/provenance.jsonl" { print }
+    ' "$CURRENT_CASE/fixture-status.txt" > "$CURRENT_CASE/unexpected-fixture-status.txt"
+    [[ ! -s "$CURRENT_CASE/unexpected-fixture-status.txt" ]] \
+        || fail "completed fixture repository has unexpected changes"
     git -C "$CURRENT_ROOT" log --oneline --decorate -10 > "$CURRENT_CASE/git-log.txt"
     cp "$CURRENT_ROOT/docs/active/tickets/$ticket_id.md" "$CURRENT_CASE/ticket-final.md"
     cp "$CURRENT_ROOT/.lisa/provenance.jsonl" "$CURRENT_CASE/provenance.jsonl"
