@@ -12,10 +12,18 @@ only its first ticket crosses the fresh plugin/pane boundary.
 The harness proves that each provider:
 
 1. launches from a bounded command with no inline ticket prompt;
-2. reports exact process start and becomes `ready-for-assignment`, not `owned`;
+2. reaches assignment readiness by its own truthful bootstrap path — Claude reports exact
+   process start and becomes `ready-for-assignment`; grace-mode Codex, which has no truthful
+   pre-prompt readiness hook, instead waits out a bounded named startup grace and moves
+   `starting → delivering` directly, never claiming `ready-for-assignment` from elapsed time.
+   Neither becomes `owned` on process start or elapsed time alone;
 3. receives the bounded attempt-tagged chat reference to a separate assignment file;
 4. becomes `owned` only after a matching `UserPromptSubmit` acknowledgement;
 5. acts on the accepted assignment through Lisa's normal artifact and completion path.
+
+This provider split is the E-037 contract landed in S-037-01 (grace-mode Codex vs
+SessionStart-mode Claude): the two controls are deliberately not symmetric, and each is asserted
+against its own path.
 
 The deterministic real-Zellij regression remains the stronger fault-injection proof for
 missing start, missing acknowledgement, and `dquote>` recovery. This live harness adds the
@@ -153,7 +161,9 @@ receipts, state timeline, final ticket, and published work when sharing results.
 
 ## Expected state order
 
-For both provider cases, `state-events.tsv` must show first occurrences in this order:
+The order is provider-aware, matching the E-037 bootstrap-readiness contract.
+
+For the **Claude-first** case, `state-events.tsv` must show first occurrences in this order:
 
 ```text
 starting
@@ -165,8 +175,23 @@ owned
 The plugin polls every five seconds. It consumes process start after collecting the ready
 set, deliberately leaving `ready-for-assignment` observable for one complete boundary.
 
-The signal sampler retains `.started` and `.ack` before the plugin removes them. The saved
-acknowledgement must contain the exact ticket-specific `LISA_ASSIGNMENT` marker.
+For the **Codex-first** case, the order is:
+
+```text
+starting
+delivering
+owned
+```
+
+`ready-for-assignment` must **never** appear. Codex 0.144.1 emits no truthful pre-prompt
+readiness signal, so the bounded named startup grace — which lives inside `starting` — paces the
+first prompt straight into `delivering`. Elapsed grace time is a pacing envelope only and is
+never treated as readiness or ownership.
+
+The signal sampler retains `.started` and `.ack` before the plugin removes them. For Claude the
+saved `.started` is the pre-prompt `SessionStart` readiness evidence and is required; Codex has
+no pre-prompt `.started`, so its ownership evidence is the matching `.ack` alone. In both cases
+the saved acknowledgement must contain the exact ticket-specific `LISA_ASSIGNMENT` marker.
 
 The harness also rejects any retained display containing `dquote>`, startup/delivery
 failure, recovery failure, or common project-trust choice wording.

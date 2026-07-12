@@ -461,23 +461,55 @@ verify_launch_contract() {
 }
 
 verify_state_order() {
+    local provider=$1
+    local ticket_id=$2
+    # Provider-aware order (E-037, landed in S-037-01). Claude proves readiness
+    # with a pre-prompt SessionStart signal and passes through
+    # ready-for-assignment; grace-mode Codex has no truthful pre-prompt hook, so
+    # a bounded named startup grace (which lives inside `starting`) paces the
+    # first prompt straight into delivering and must never claim
+    # ready-for-assignment. Both converge on the same acknowledgement-gated
+    # delivering -> owned boundary.
+    local ordered_states ordered_receipt
+    if [[ "$provider" == codex ]]; then
+        ordered_states=(starting delivering owned)
+        ordered_receipt='starting -> delivering -> owned'
+    else
+        ordered_states=(starting ready-for-assignment delivering owned)
+        ordered_receipt='starting -> ready-for-assignment -> delivering -> owned'
+    fi
     local previous=0 state line
-    for state in starting ready-for-assignment delivering owned; do
+    for state in "${ordered_states[@]}"; do
         line=$(awk -F '\t' -v value="$state" '$2 == value { print NR; exit }' "$CURRENT_CASE/state-events.tsv")
         [[ -n "$line" ]] || fail "dashboard never exposed $state"
         (( line > previous )) || fail "state $state was observed out of order"
         previous=$line
     done
-    [[ -f "$CURRENT_CASE/started.json" ]] || fail "sampler did not retain process-start evidence"
+    if [[ "$provider" == codex ]]; then
+        # The grace path must reach delivering directly; a synthetic ready claim
+        # from elapsed time would be exactly the E-037 correctness violation.
+        if state_was_seen ready-for-assignment; then
+            fail "grace-mode $provider must not claim ready-for-assignment"
+        fi
+    else
+        # Claude's readiness is a positive pre-prompt SessionStart signal.
+        [[ -f "$CURRENT_CASE/started.json" ]] || fail "sampler did not retain process-start evidence"
+    fi
     [[ -f "$CURRENT_CASE/ack.json" ]] || fail "sampler did not retain prompt acknowledgement evidence"
-    jq -e --arg ticket "$2" '.prompt | contains("LISA_ASSIGNMENT") and contains($ticket)' "$CURRENT_CASE/ack.json" >/dev/null \
+    jq -e --arg ticket "$ticket_id" '.prompt | contains("LISA_ASSIGNMENT") and contains($ticket)' "$CURRENT_CASE/ack.json" >/dev/null \
         || fail "acknowledgement did not carry the matching ticket marker"
     if grep -Eiq 'dquote>|startup-failed|delivery-failed|recovery-failed|do you trust the contents|trust this folder' \
         "$CURRENT_CASE/dashboard-snapshots.txt" "$CURRENT_CASE/terminal-snapshots.txt"; then
         fail "forbidden repair, trust, or failure state appeared"
     fi
-    printf 'ordered_states=starting -> ready-for-assignment -> delivering -> owned\nmatching_ack=PASS\n' \
-        > "$CURRENT_CASE/state-contract.txt"
+    {
+        printf 'provider=%s\n' "$provider"
+        printf 'ordered_states=%s\n' "$ordered_receipt"
+        if [[ "$provider" == codex ]]; then
+            printf 'ready_for_assignment_absent=PASS\n'
+        fi
+        printf 'matching_ack=PASS\n'
+    } > "$CURRENT_CASE/state-contract.txt"
 }
 
 verify_completion() {
