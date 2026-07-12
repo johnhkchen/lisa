@@ -5808,6 +5808,7 @@ mod tests {
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
 
     mod signal_consumer_characterization;
+    mod signal_ingestion_regression;
 
     /// Mirror production dispatch by installing one newly minted lease as the
     /// scheduler's high-water/current authority and stamping matching records.
