@@ -1,0 +1,4 @@
+*
+!.gitignore
+!decisions.jsonl
+!forward-e1.jsonl

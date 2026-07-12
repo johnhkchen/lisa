@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
