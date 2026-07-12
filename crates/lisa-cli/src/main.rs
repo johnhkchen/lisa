@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a project for lisa-loop completion
+    /// Set up a project to run with Lisa.
     #[command(display_order = 0)]
     Init {
         /// Show what would be done without making changes
@@ -39,7 +39,7 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
-    /// Validate ticket DAG and project setup
+    /// Check your tickets and project setup for problems before a run.
     #[command(display_order = 1)]
     Validate {
         /// Path to the project root (defaults to current directory)
@@ -50,34 +50,34 @@ enum Commands {
         #[arg(long)]
         check_tools: bool,
     },
-    /// Show DAG status: tickets, dependencies, execution waves, scheduling readiness
+    /// Show which tickets are ready to run and which are waiting, and why.
     #[command(display_order = 2)]
     Status {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
-    /// Output LLM-friendly setup instructions for this project
+    /// Print setup instructions for an agent to follow.
     #[command(hide = true)]
     SetupGuide {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
-    /// Output the hooks setup guide for agents configuring Claude Code hooks
+    /// Print the guide for wiring up Claude Code hooks.
     #[command(hide = true)]
     HooksGuide,
-    /// Check that all runtime dependencies are installed
+    /// Check that the tools Lisa needs are installed.
     #[command(display_order = 3)]
     Doctor {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
-    /// Print version information
+    /// Print Lisa's version.
     #[command(hide = true)]
     Version,
-    /// Run Codex under Lisa's legacy JSON signal/rendering wrapper.
+    /// Run Codex and turn its output into Lisa's pane signals.
     ///
     /// Reads LISA_PANE_ID / LISA_TICKET_ID from the environment (inherited from
     /// the pane launch) for signal attribution. Runs `codex exec --json …`,
@@ -114,7 +114,7 @@ enum Commands {
         #[arg(long, default_value = ".lisa/signals")]
         signal_dir: PathBuf,
     },
-    /// Capture Claude session token usage from a Stop-hook payload on stdin,
+    /// Record a Claude session's token usage from its Stop-hook payload on stdin,
     /// writing `.lisa/claude/<ticket>.usage.json` for the provenance ledger.
     #[command(display_order = 21)]
     CaptureUsage {
@@ -122,7 +122,7 @@ enum Commands {
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
-    /// Commit ticket-owned paths without using the repository's ordinary index.
+    /// Commit this ticket's own files without touching the repo's ordinary git index.
     #[command(display_order = 22)]
     CommitTicket {
         /// Repository root containing the ticket changes.
@@ -141,7 +141,7 @@ enum Commands {
         #[arg(long = "include", required = true)]
         includes: Vec<PathBuf>,
     },
-    /// Mark a ticket done and commit its loop-owned files atomically.
+    /// Mark a ticket done and commit its files in one step.
     #[command(display_order = 23)]
     CompleteTicket {
         /// Repository root containing the ticket changes.
@@ -164,7 +164,7 @@ enum Commands {
         #[arg(long)]
         work_dir: PathBuf,
     },
-    /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
+    /// Start a run: work through the ready tickets, in parallel where they don't collide.
     #[command(display_order = 4)]
     Loop {
         /// Path to the project root (defaults to current directory)
