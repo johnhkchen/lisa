@@ -86,7 +86,9 @@ fn recognized_records_are_one_shot_before_payload_or_state_admission() {
             "awaiting" => state.check_awaiting_signals(),
             "idle" => state.check_idle_signals(),
             "transition" => state.check_transition_signals(),
-            "error" => state.check_error_signals(),
+            "error" => {
+                state.check_error_signals();
+            }
             _ => unreachable!(),
         }
 
@@ -123,7 +125,9 @@ fn idle_alone_admits_the_legacy_ticket_filename_family() {
             "awaiting" => state.check_awaiting_signals(),
             "idle" => state.check_idle_signals(),
             "transition" => state.check_transition_signals(),
-            "error" => state.check_error_signals(),
+            "error" => {
+                state.check_error_signals();
+            }
             _ => unreachable!(),
         }
 

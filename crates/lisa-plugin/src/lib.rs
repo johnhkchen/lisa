@@ -273,6 +273,44 @@ enum FenceOutcome {
     NoAssignedPane,
 }
 
+/// Typed result of a completed scheduler failure or reclaim transition.
+///
+/// These values describe mutations that have already happened. They do not
+/// replace lease, seat, thread, or pane state as scheduling authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailureTransitionOutcome {
+    AssignmentDeliveryFailed {
+        pane_id: u32,
+        ticket_id: Option<TicketId>,
+    },
+    AssignmentRecoveryFailed {
+        pane_id: u32,
+        ticket_id: Option<TicketId>,
+    },
+    StartupFailed {
+        pane_id: u32,
+        ticket_id: Option<TicketId>,
+    },
+    StartupRecoveryFailed {
+        pane_id: u32,
+        ticket_id: TicketId,
+    },
+    ErrorReclaimed {
+        pane_id: u32,
+        ticket_id: TicketId,
+    },
+    SessionTimedOut {
+        pane_id: u32,
+        ticket_id: TicketId,
+        fenced: bool,
+    },
+    StaleThreadReclaimed {
+        pane_id: u32,
+        ticket_id: TicketId,
+        fenced: bool,
+    },
+}
+
 /// Test-only observation of the safety-critical timeout teardown order.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1662,7 +1700,11 @@ impl State {
 
     /// Retain a started-but-unassigned provider as an explicit terminal failure
     /// after bounded chat delivery is exhausted.
-    fn fail_assignment_delivery(&mut self, pane_id: u32, reason: &str) {
+    fn fail_assignment_delivery(
+        &mut self,
+        pane_id: u32,
+        reason: &str,
+    ) -> Option<FailureTransitionOutcome> {
         if !matches!(
             self.seat_assignment(pane_id),
             Some(
@@ -1674,7 +1716,7 @@ impl State {
                     | SeatAssignmentState::Delivering { .. }
             )
         ) {
-            return;
+            return None;
         }
         self.seat_assignments
             .insert(pane_id, SeatAssignmentState::DeliveryFailed);
@@ -1690,7 +1732,10 @@ impl State {
                     pane_id, reason
                 ),
             });
-            return;
+            return Some(FailureTransitionOutcome::AssignmentDeliveryFailed {
+                pane_id,
+                ticket_id: None,
+            });
         };
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
             thread.fail();
@@ -1708,17 +1753,25 @@ impl State {
                 ticket_id, pane_id, reason
             ),
         });
+        Some(FailureTransitionOutcome::AssignmentDeliveryFailed {
+            pane_id,
+            ticket_id: Some(ticket_id),
+        })
     }
 
     /// End the one permitted recovery attempt without releasing the reservation
     /// back into automatic scheduling. The operator can inspect the named state
     /// and use the existing ticket reset action to authorize another attempt.
-    fn fail_assignment_recovery(&mut self, pane_id: u32, reason: &str) {
+    fn fail_assignment_recovery(
+        &mut self,
+        pane_id: u32,
+        reason: &str,
+    ) -> Option<FailureTransitionOutcome> {
         if !matches!(
             self.seat_assignment(pane_id),
             Some(SeatAssignmentState::Recovering { .. })
         ) {
-            return;
+            return None;
         }
         self.seat_assignments
             .insert(pane_id, SeatAssignmentState::RecoveryFailed);
@@ -1735,7 +1788,10 @@ impl State {
                     pane_id, reason
                 ),
             });
-            return;
+            return Some(FailureTransitionOutcome::AssignmentRecoveryFailed {
+                pane_id,
+                ticket_id: None,
+            });
         };
 
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
@@ -1754,6 +1810,10 @@ impl State {
                 ticket_id, pane_id, reason
             ),
         });
+        Some(FailureTransitionOutcome::AssignmentRecoveryFailed {
+            pane_id,
+            ticket_id: Some(ticket_id),
+        })
     }
 
     /// Revoke an unproven original launch and begin the one permitted reset in
@@ -1960,7 +2020,11 @@ impl State {
     /// Exhausted shell reset or replacement startup is terminal for the pane.
     /// Retain the failed reservation for operator inspection, but revoke its
     /// authority and permanently fence the physical seat.
-    fn fail_startup_recovery(&mut self, pane_id: u32, reason: &str) {
+    fn fail_startup_recovery(
+        &mut self,
+        pane_id: u32,
+        reason: &str,
+    ) -> Option<FailureTransitionOutcome> {
         let recoverable = match self.seat_assignment(pane_id) {
             Some(SeatAssignmentState::ResettingStartup { .. }) => true,
             Some(SeatAssignmentState::Starting { relaunches, .. }) => {
@@ -1969,17 +2033,17 @@ impl State {
             _ => false,
         };
         if !recoverable {
-            return;
+            return None;
         }
         let Some(slot_idx) = self
             .agent_slots
             .iter()
             .position(|slot| slot.pane_id == pane_id)
         else {
-            return;
+            return None;
         };
         let Some(ticket_id) = self.agent_slots[slot_idx].ticket_id.clone() else {
-            return;
+            return None;
         };
 
         self.seat_assignments
@@ -2021,18 +2085,19 @@ impl State {
                 ticket_id, pane_id, reason
             ),
         });
+        Some(FailureTransitionOutcome::StartupRecoveryFailed { pane_id, ticket_id })
     }
 
     /// End a fresh provider start wait without releasing the reservation back
     /// into automatic scheduling. Missing positive start evidence must remain a
     /// named operator-actionable failure, never implicit ownership or a retry
     /// loop.
-    fn fail_startup(&mut self, pane_id: u32, reason: &str) {
+    fn fail_startup(&mut self, pane_id: u32, reason: &str) -> Option<FailureTransitionOutcome> {
         if !matches!(
             self.seat_assignment(pane_id),
             Some(SeatAssignmentState::Starting { .. })
         ) {
-            return;
+            return None;
         }
         self.seat_assignments
             .insert(pane_id, SeatAssignmentState::StartupFailed);
@@ -2049,7 +2114,10 @@ impl State {
                     pane_id, reason
                 ),
             });
-            return;
+            return Some(FailureTransitionOutcome::StartupFailed {
+                pane_id,
+                ticket_id: None,
+            });
         };
 
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
@@ -2068,6 +2136,10 @@ impl State {
                 ticket_id, pane_id, reason
             ),
         });
+        Some(FailureTransitionOutcome::StartupFailed {
+            pane_id,
+            ticket_id: Some(ticket_id),
+        })
     }
 
     /// Fence an expired reused-session delivery and begin the one allowed fresh
@@ -3477,7 +3549,8 @@ impl State {
     /// Runs before `check_transition_timeouts` so an errored pane is failed, not
     /// force-advanced by the transition-timeout fallback. Presence is the signal;
     /// any body is ignored.
-    fn check_error_signals(&mut self) {
+    fn check_error_signals(&mut self) -> Vec<FailureTransitionOutcome> {
+        let mut outcomes = Vec::new();
         for record in signal::ingest(&self.signal_dir, SignalRequest::Errors) {
             let SignalRecord::Error { pane_id } = record else {
                 continue;
@@ -3487,7 +3560,11 @@ impl State {
                 self.seat_assignment(pane_id),
                 Some(SeatAssignmentState::Recovering { .. })
             ) {
-                self.fail_assignment_recovery(pane_id, "fresh Codex process reported an error");
+                if let Some(outcome) =
+                    self.fail_assignment_recovery(pane_id, "fresh Codex process reported an error")
+                {
+                    outcomes.push(outcome);
+                }
                 continue;
             }
 
@@ -3517,6 +3594,10 @@ impl State {
                             tid, pane_id
                         ),
                     });
+                    outcomes.push(FailureTransitionOutcome::ErrorReclaimed {
+                        pane_id,
+                        ticket_id: tid,
+                    });
                 }
                 None => {
                     self.log_activity(ActivityEvent::Info {
@@ -3528,6 +3609,7 @@ impl State {
                 }
             }
         }
+        outcomes
     }
 
     /// Handle a `.stopped` signal for the given pane.
@@ -4199,7 +4281,7 @@ impl State {
     /// (2x stuck_threshold_secs), so slow tests or long integration calls
     /// (multi-minute silent stretches) never get a progressing session
     /// reclaimed. Budgets warn; only silence kills.
-    fn check_session_timeouts(&mut self) {
+    fn check_session_timeouts(&mut self) -> Vec<FailureTransitionOutcome> {
         let now = std::time::SystemTime::now();
         let global_timeout = self.config.session_timeout_secs;
         let has_phase_timeouts = !self.config.phase_timeouts.is_empty();
@@ -4207,7 +4289,7 @@ impl State {
 
         // If both global and per-phase timeouts are disabled, skip entirely
         if global_timeout == 0 && !has_phase_timeouts {
-            return;
+            return Vec::new();
         }
 
         let mut timed_out: Vec<(TicketId, u64, Phase)> = Vec::new();
@@ -4278,7 +4360,9 @@ impl State {
             }
         }
 
+        let mut outcomes = Vec::new();
         for (ticket_id, elapsed_secs, phase) in timed_out {
+            let pane_id = self.threads[&ticket_id].pane_id;
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
             }
@@ -4292,11 +4376,17 @@ impl State {
             self.timeout_alerts
                 .push((ticket_id.clone(), elapsed_secs, phase));
             self.log_activity(ActivityEvent::SessionTimedOut {
-                ticket_id,
+                ticket_id: ticket_id.clone(),
                 elapsed_secs,
                 phase,
             });
+            outcomes.push(FailureTransitionOutcome::SessionTimedOut {
+                pane_id,
+                ticket_id,
+                fenced,
+            });
         }
+        outcomes
     }
 
     /// Detect threads that have been silent beyond the hard timeout.
@@ -4306,7 +4396,7 @@ impl State {
     /// is actively making tool calls never trips this, no matter how long its
     /// phase runs. Silent threads are marked as failed, their slots released,
     /// and they are removed from the threads map for retry.
-    fn detect_stale_threads(&mut self) {
+    fn detect_stale_threads(&mut self) -> Vec<FailureTransitionOutcome> {
         use lisa_core::types::{HealthStatus, ThreadStatus};
 
         let now = std::time::SystemTime::now();
@@ -4329,7 +4419,9 @@ impl State {
             .map(|(tid, _)| tid.clone())
             .collect();
 
+        let mut outcomes = Vec::new();
         for ticket_id in stale {
+            let pane_id = self.threads[&ticket_id].pane_id;
             let mins = self.config.stuck_threshold_secs * 2 / 60;
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
@@ -4347,7 +4439,13 @@ impl State {
                     ticket_id, mins
                 ),
             });
+            outcomes.push(FailureTransitionOutcome::StaleThreadReclaimed {
+                pane_id,
+                ticket_id,
+                fenced,
+            });
         }
+        outcomes
     }
 
     /// Periodic audit: remove any thread whose ticket is done or missing from the DAG.
@@ -6719,7 +6817,16 @@ mod tests {
             last_client: None,
         });
 
-        state.detect_stale_threads();
+        let outcomes = state.detect_stale_threads();
+
+        assert_eq!(
+            outcomes,
+            vec![FailureTransitionOutcome::StaleThreadReclaimed {
+                pane_id: 1,
+                ticket_id: ticket_id.clone(),
+                fenced: true,
+            }]
+        );
 
         // Thread should be removed (failed + cleaned up for retry)
         assert!(state.threads.is_empty());
@@ -8757,7 +8864,9 @@ mod tests {
         state.threads.insert("T-001".to_string(), thread);
         state.awaiting_human.insert(1);
 
-        state.check_session_timeouts();
+        let outcomes = state.check_session_timeouts();
+
+        assert!(outcomes.is_empty());
 
         // Exempt: still present, not reclaimed.
         assert!(state.threads.contains_key("T-001"));
@@ -10539,6 +10648,82 @@ mod tests {
                 .count(),
             launch_count,
             "chat recovery never relaunches the started provider"
+        );
+    }
+
+    #[test]
+    fn retained_failure_helpers_return_path_specific_outcomes() {
+        use lisa_core::types::Thread;
+
+        fn reserved_state(seat: SeatAssignmentState) -> State {
+            let mut state = State::default();
+            state.agent_slots.push(AgentSlot {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+                attempt_lease: None,
+                has_session: true,
+                transition_state: TransitionState::Idle,
+                transition_started_at: None,
+                cooldown_until: None,
+                last_activity_at: None,
+                last_client: Some(AgentClient::Claude),
+            });
+            state
+                .threads
+                .insert("T-NAME".to_string(), Thread::new("T-NAME", 10));
+            state.seat_assignments.insert(10, seat);
+            state
+        }
+
+        let deadline = std::time::SystemTime::now();
+        let mut delivery = reserved_state(SeatAssignmentState::Delivering {
+            generation: 1,
+            ack_deadline: deadline,
+            retries: MAX_ASSIGNMENT_DELIVERY_RETRIES,
+        });
+        assert_eq!(
+            delivery.fail_assignment_delivery(10, "test"),
+            Some(FailureTransitionOutcome::AssignmentDeliveryFailed {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            })
+        );
+
+        let mut recovery = reserved_state(SeatAssignmentState::Recovering {
+            generation: 2,
+            ack_deadline: Some(deadline),
+        });
+        assert_eq!(
+            recovery.fail_assignment_recovery(10, "test"),
+            Some(FailureTransitionOutcome::AssignmentRecoveryFailed {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            })
+        );
+
+        let mut startup = reserved_state(SeatAssignmentState::Starting {
+            generation: 1,
+            start_deadline: Some(deadline),
+            relaunches: 0,
+        });
+        assert_eq!(
+            startup.fail_startup(10, "test"),
+            Some(FailureTransitionOutcome::StartupFailed {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            })
+        );
+
+        let mut startup_recovery = reserved_state(SeatAssignmentState::ResettingStartup {
+            generation: 2,
+            reset_deadline: deadline,
+        });
+        assert_eq!(
+            startup_recovery.fail_startup_recovery(10, "test"),
+            Some(FailureTransitionOutcome::StartupRecoveryFailed {
+                pane_id: 10,
+                ticket_id: "T-NAME".to_string(),
+            })
         );
     }
 
@@ -12620,7 +12805,16 @@ owned\n\
         // eligible pane instead.
         state.agent_slots.push(fresh_slot(2, None));
 
-        state.check_session_timeouts();
+        let outcomes = state.check_session_timeouts();
+
+        assert_eq!(
+            outcomes,
+            vec![FailureTransitionOutcome::SessionTimedOut {
+                pane_id: 1,
+                ticket_id: ticket_id.clone(),
+                fenced: true,
+            }]
+        );
 
         assert_eq!(
             state.attempt_lifecycle,
@@ -13349,7 +13543,15 @@ owned\n\
         assert_eq!(thread.status, ThreadStatus::Running);
         state.threads.insert("T-001".to_string(), thread);
 
-        state.check_error_signals();
+        let outcomes = state.check_error_signals();
+
+        assert_eq!(
+            outcomes,
+            vec![FailureTransitionOutcome::ErrorReclaimed {
+                pane_id: 1,
+                ticket_id: "T-001".to_string(),
+            }]
+        );
 
         // Signal consumed
         assert!(!signal_dir.join("pane-1.error").exists());
