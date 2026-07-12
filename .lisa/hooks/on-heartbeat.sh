@@ -1,10 +1,16 @@
 #!/bin/sh
 # Lisa heartbeat signal hook — called after each tool call.
-# Writes a signal file so the plugin knows this session is actively working.
+# Copies the scheduler-owned attempt lease into an atomic liveness signal.
 
 SIGNAL_DIR=".lisa/signals"
 mkdir -p "$SIGNAL_DIR"
 
 if [ -n "$LISA_PANE_ID" ]; then
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
+    marker="$SIGNAL_DIR/pane-$LISA_PANE_ID.lease"
+    tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat.tmp.$$"
+    if [ -r "$marker" ] && cp "$marker" "$tmp"; then
+        mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
+    else
+        rm -f "$tmp"
+    fi
 fi

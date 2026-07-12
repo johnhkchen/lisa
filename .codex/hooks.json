@@ -2,32 +2,42 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": ".*",
         "hooks": [
           {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh"
+            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
+            "type": "command"
           }
-        ]
+        ],
+        "matcher": ".*"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "clear"
       }
     ],
     "Stop": [
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"
+            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh",
+            "type": "command"
           }
         ]
       }
     ],
-    "SessionStart": [
+    "UserPromptSubmit": [
       {
-        "matcher": "clear",
         "hooks": [
           {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
+            "command": "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh",
+            "type": "command"
           }
         ]
       }

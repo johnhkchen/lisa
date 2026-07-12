@@ -1,6 +1,6 @@
 # Lisa project configuration
 
-version = "0.4.0-rc.1"
+version = "0.4.0-rc.6"
 [dirs]
 tickets = "docs/active/tickets"
 stories = "docs/active/stories"
@@ -12,6 +12,7 @@ max_threads = 2
 # review_timeout_secs = 240
 # session_timeout_secs = 3600
 # wind_down_secs = 300
+# assignment_ack_timeout_secs = 30
 
 # [scheduling.phase_timeouts]
 # research = 300
