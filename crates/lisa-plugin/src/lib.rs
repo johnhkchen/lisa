@@ -8,6 +8,7 @@ mod adapter;
 mod codex_ack;
 mod deadline;
 mod pane_name;
+mod publication;
 mod signal;
 mod ui;
 
@@ -34,16 +35,12 @@ use lisa_core::types::{
     ActivityEvent, AttemptLease, Phase, PluginConfig, Thread, TicketId, TicketStatus,
 };
 use pane_name::{format_pane_name, PaneName};
+use publication::{
+    PublicationErrors, PublicationPath, RustPublication, ShellPublication, TemporaryName,
+};
 use signal::{IdleTarget, SignalRecord, SignalRequest};
 
-/// Encode one arbitrary UTF-8 value as one POSIX shell argument.
-///
-/// Always single-quote, and leave/re-enter single quotes around literal `'`
-/// bytes. This prevents command, parameter, glob, and whitespace expansion in
-/// provider launch payloads and in the bounded launch-file address.
-pub(crate) fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
+pub(crate) use publication::shell_quote;
 
 /// How often (in seconds) the plugin rescans ticket files to detect phase changes.
 const POLL_INTERVAL_SECS: f64 = 5.0;
@@ -721,26 +718,21 @@ impl State {
         })?;
 
         let destination = artifact_dir.join(format!(".lisa-launch-{pane_id}.sh"));
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = artifact_dir.join(format!(".lisa-launch-{pane_id}.sh.tmp.{nonce}"));
         let script = format!("#!/bin/sh\n{payload}\n");
-
-        std::fs::write(&temporary, script).map_err(|error| {
-            format!(
-                "cannot write launch payload {}: {error}",
-                temporary.display()
-            )
-        })?;
-        if let Err(error) = std::fs::rename(&temporary, &destination) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(format!(
-                "cannot publish launch payload {}: {error}",
-                destination.display()
-            ));
+        let destination = RustPublication {
+            path: PublicationPath {
+                destination,
+                temporary_name: TemporaryName::Nonce {
+                    prefix: format!(".lisa-launch-{pane_id}.sh.tmp."),
+                },
+            },
+            body: script.as_bytes(),
+            errors: PublicationErrors {
+                write: "cannot write launch payload",
+                publish: "cannot publish launch payload",
+            },
         }
+        .publish()?;
 
         let shell_path = strip_host_prefix(&destination);
         Ok(format!("sh {}", shell_quote(&shell_path.to_string_lossy())))
@@ -758,25 +750,20 @@ impl State {
         })?;
 
         let destination = artifact_dir.join(ASSIGNMENT_FILE_NAME);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = artifact_dir.join(format!(".{ASSIGNMENT_FILE_NAME}.tmp.{nonce}"));
-        std::fs::write(&temporary, assignment).map_err(|error| {
-            format!(
-                "cannot write assignment payload {}: {error}",
-                temporary.display()
-            )
-        })?;
-        if let Err(error) = std::fs::rename(&temporary, &destination) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(format!(
-                "cannot publish assignment payload {}: {error}",
-                destination.display()
-            ));
+        RustPublication {
+            path: PublicationPath {
+                destination,
+                temporary_name: TemporaryName::Nonce {
+                    prefix: format!(".{ASSIGNMENT_FILE_NAME}.tmp."),
+                },
+            },
+            body: assignment.as_bytes(),
+            errors: PublicationErrors {
+                write: "cannot write assignment payload",
+                publish: "cannot publish assignment payload",
+            },
         }
-        Ok(destination)
+        .publish()
     }
 
     /// Construct a bounded shell command whose successful execution positively
@@ -791,21 +778,17 @@ impl State {
             .map_err(|error| format!("cannot serialize shell readiness lease: {error}"))?;
         let host_signal_dir = strip_host_prefix(signal_dir);
         let destination = host_signal_dir.join(format!("pane-{pane_id}.shell-ready"));
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = host_signal_dir.join(format!(
-            "pane-{pane_id}.shell-ready.tmp.{}-{nonce}",
-            lease.attempt_id
-        ));
-        Ok(format!(
-            "command printf '%s' {} > {} && command mv {} {}",
-            shell_quote(&body),
-            shell_quote(&temporary.to_string_lossy()),
-            shell_quote(&temporary.to_string_lossy()),
-            shell_quote(&destination.to_string_lossy()),
-        ))
+        Ok(ShellPublication {
+            path: PublicationPath {
+                destination,
+                temporary_name: TemporaryName::AttemptNonce {
+                    prefix: format!("pane-{pane_id}.shell-ready.tmp."),
+                    attempt_id: lease.attempt_id,
+                },
+            },
+            body: &body,
+        }
+        .command())
     }
 
     /// Best-effort removal of pane-scoped predecessor lifecycle state. Exact
@@ -1012,29 +995,23 @@ impl State {
             )
         })?;
         let destination = signal_dir.join(format!("pane-{pane_id}.lease"));
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = signal_dir.join(format!(
-            "pane-{pane_id}.lease.tmp.{}-{nonce}",
-            lease.attempt_id
-        ));
         let body = serde_json::to_vec(lease)
             .map_err(|error| format!("cannot serialize attempt lease: {error}"))?;
-        std::fs::write(&temporary, body).map_err(|error| {
-            format!(
-                "cannot write pane lease marker {}: {error}",
-                temporary.display()
-            )
-        })?;
-        if let Err(error) = std::fs::rename(&temporary, &destination) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(format!(
-                "cannot publish pane lease marker {}: {error}",
-                destination.display()
-            ));
+        RustPublication {
+            path: PublicationPath {
+                destination,
+                temporary_name: TemporaryName::AttemptNonce {
+                    prefix: format!("pane-{pane_id}.lease.tmp."),
+                    attempt_id: lease.attempt_id,
+                },
+            },
+            body: &body,
+            errors: PublicationErrors {
+                write: "cannot write pane lease marker",
+                publish: "cannot publish pane lease marker",
+            },
         }
+        .publish()?;
         Ok(())
     }
 
@@ -1073,21 +1050,20 @@ impl State {
                 canonical_dir.display()
             )
         })?;
-        let temporary =
-            canonical_dir.join(format!(".{artifact_name}.attempt-{}.tmp", lease.attempt_id));
-        std::fs::write(&temporary, body).map_err(|error| {
-            format!(
-                "cannot write canonical artifact temporary {}: {error}",
-                temporary.display()
-            )
-        })?;
-        if let Err(error) = std::fs::rename(&temporary, &canonical) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(format!(
-                "cannot publish canonical artifact {}: {error}",
-                canonical.display()
-            ));
+        RustPublication {
+            path: PublicationPath {
+                destination: canonical,
+                temporary_name: TemporaryName::Exact {
+                    file_name: format!(".{artifact_name}.attempt-{}.tmp", lease.attempt_id),
+                },
+            },
+            body: &body,
+            errors: PublicationErrors {
+                write: "cannot write canonical artifact temporary",
+                publish: "cannot publish canonical artifact",
+            },
         }
+        .publish()?;
         Ok(true)
     }
 
