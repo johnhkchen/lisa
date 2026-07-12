@@ -174,6 +174,14 @@ const ASSIGNMENT_FILE_NAME: &str = "assignment.md";
 /// One same-attempt chat redelivery is allowed before operator-visible failure.
 const MAX_ASSIGNMENT_DELIVERY_RETRIES: u8 = 1;
 
+/// Bounded startup grace for grace-mode providers (Codex). After a fresh launch
+/// Lisa waits this long for the TUI to become input-ready, then paces the first
+/// prompt directly from `Starting` into `Delivering`. The elapsed grace PACES
+/// the send; it is never evidence of readiness or ownership (E-037, P2).
+/// SessionStart-mode providers (Claude) ignore this and gate on their positive
+/// process-start signal instead.
+const STARTUP_GRACE_SECS: u64 = 8;
+
 /// One startup whose shell boundary cannot be proven may be relaunched in the
 /// same physical pane. The replacement cannot recursively recover again.
 const MAX_SAME_PANE_STARTUP_RELAUNCHES: u8 = 1;
@@ -1442,6 +1450,13 @@ impl State {
         })
     }
 
+    /// The absolute deadline at which a grace-mode seat's bounded startup grace
+    /// elapses and its paced first prompt is attempted. Saturating on overflow.
+    fn startup_grace_deadline(&self, now: std::time::SystemTime) -> std::time::SystemTime {
+        now.checked_add(std::time::Duration::from_secs(STARTUP_GRACE_SECS))
+            .unwrap_or(now)
+    }
+
     /// Submit the bounded assignment-file reference for one exact ready or
     /// retrying attempt and enter the common Delivering state.
     fn deliver_assignment_to_pane(
@@ -1569,11 +1584,23 @@ impl State {
                 generation,
                 start_deadline: None,
                 relaunches,
-            } => SeatAssignmentState::Starting {
-                generation,
-                start_deadline: Some(deadline),
-                relaunches,
-            },
+            } => {
+                // Grace-mode (Codex) paces its first prompt after a bounded
+                // startup grace; SessionStart-mode (Claude) bounds the wait for
+                // its exact process-start signal with the acceptance clock.
+                let start_deadline = Some(
+                    if self.seat_readiness_mode(pane_id) == Some(ReadinessMode::Grace) {
+                        self.startup_grace_deadline(now)
+                    } else {
+                        deadline
+                    },
+                );
+                SeatAssignmentState::Starting {
+                    generation,
+                    start_deadline,
+                    relaunches,
+                }
+            }
             SeatAssignmentState::AssignedPendingAck {
                 generation,
                 ack_deadline: None,
@@ -1637,7 +1664,11 @@ impl State {
         if !matches!(
             self.seat_assignment(pane_id),
             Some(
-                SeatAssignmentState::ReadyForAssignment { .. }
+                // Starting is accepted so a grace-mode paced send that cannot be
+                // submitted resolves in a named terminal state (E-037) rather
+                // than silently remaining Starting.
+                SeatAssignmentState::Starting { .. }
+                    | SeatAssignmentState::ReadyForAssignment { .. }
                     | SeatAssignmentState::Delivering { .. }
             )
         ) {
@@ -2180,8 +2211,28 @@ impl State {
                 continue;
             }
             match state {
-                SeatAssignmentState::Starting { relaunches: 0, .. } => {
-                    self.begin_startup_recovery(pane_id, now);
+                SeatAssignmentState::Starting {
+                    relaunches: 0,
+                    generation,
+                    ..
+                } => {
+                    if self.seat_readiness_mode(pane_id) == Some(ReadinessMode::Grace) {
+                        // The named startup grace elapsed. Pace the first prompt
+                        // now: attempt the bounded attempt-tagged assignment and
+                        // enter Delivering directly. Elapsed time paced the send
+                        // — it is not readiness or ownership (E-037). A missed
+                        // acknowledgement is resolved by the existing bounded
+                        // Delivering retry → DeliveryFailed path, and ownership
+                        // stays gated on the exact UserPromptSubmit. A send that
+                        // cannot be submitted resolves in a named DeliveryFailed.
+                        if let Err(error) =
+                            self.deliver_assignment_to_pane(pane_id, generation, 0, now)
+                        {
+                            self.fail_assignment_delivery(pane_id, &error);
+                        }
+                    } else {
+                        self.begin_startup_recovery(pane_id, now);
+                    }
                 }
                 SeatAssignmentState::Starting { .. } => {
                     self.fail_startup_recovery(
