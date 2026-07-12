@@ -281,6 +281,9 @@ enum SeatAssignmentState {
     Starting {
         /// The launched [`AttemptLease::attempt_id`].
         generation: u64,
+        /// None until the fresh launcher is actually submitted. Some bounds
+        /// the wait for its exact process-start signal.
+        start_deadline: Option<std::time::SystemTime>,
     },
     /// The seat is reserved for a ticket, but Codex has not acknowledged its
     /// current attempt lease.
@@ -303,6 +306,9 @@ enum SeatAssignmentState {
     /// The single fresh fallback failed. Retain the reservation for an explicit
     /// operator reset rather than automatically retrying forever.
     RecoveryFailed,
+    /// A fresh provider launch did not publish its exact process-start signal.
+    /// Retain the reservation for an explicit operator reset.
+    StartupFailed,
 }
 
 /// Diagnostic origin for a request to durably complete a ticket. Every origin
@@ -1264,7 +1270,7 @@ impl State {
     /// attempt lease installed for this pane. Returning true means this call
     /// performed the sole starting-to-owned edge.
     fn acknowledge_process_start(&mut self, pane_id: u32, candidate: &AttemptLease) -> bool {
-        let Some(SeatAssignmentState::Starting { generation }) = self.seat_assignment(pane_id)
+        let Some(SeatAssignmentState::Starting { generation, .. }) = self.seat_assignment(pane_id)
         else {
             return false;
         };
@@ -1304,9 +1310,10 @@ impl State {
         }
     }
 
-    /// Start the finite provider-acceptance clock after an actual tagged prompt
-    /// delivery. Transport-only `/clear` and `/exit` steps deliberately leave it
-    /// unarmed so an assignment cannot expire before Codex receives the prompt.
+    /// Start the finite provider-acceptance clock after an actual fresh launch
+    /// or tagged prompt delivery. Transport-only `/clear` and `/exit` steps
+    /// deliberately leave it unarmed so a reservation cannot expire before the
+    /// provider receives its input.
     fn start_assignment_ack_wait(&mut self, pane_id: u32, now: std::time::SystemTime) -> bool {
         // `send_line_to_pane` has typed the prompt, but its Enter is deliberately
         // deferred. Add that transport delay so even the minimum configured wait
@@ -1321,6 +1328,13 @@ impl State {
             return false;
         };
         let next = match current {
+            SeatAssignmentState::Starting {
+                generation,
+                start_deadline: None,
+            } => SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+            },
             SeatAssignmentState::AssignedPendingAck {
                 generation,
                 ack_deadline: None,
@@ -1419,6 +1433,53 @@ impl State {
         self.log_activity(ActivityEvent::Error {
             message: format!(
                 "{} Codex assignment recovery failed on pane {}: {}; reset the ticket to retry",
+                ticket_id, pane_id, reason
+            ),
+        });
+    }
+
+    /// End a fresh provider start wait without releasing the reservation back
+    /// into automatic scheduling. Missing positive start evidence must remain a
+    /// named operator-actionable failure, never implicit ownership or a retry
+    /// loop.
+    fn fail_startup(&mut self, pane_id: u32, reason: &str) {
+        if !matches!(
+            self.seat_assignment(pane_id),
+            Some(SeatAssignmentState::Starting { .. })
+        ) {
+            return;
+        }
+        self.seat_assignments
+            .insert(pane_id, SeatAssignmentState::StartupFailed);
+
+        let ticket_id = self
+            .agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id)
+            .and_then(|slot| slot.ticket_id.clone());
+        let Some(ticket_id) = ticket_id else {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Provider startup failed on pane {}: {}; reset the ticket after repairing the seat reservation",
+                    pane_id, reason
+                ),
+            });
+            return;
+        };
+
+        if let Some(thread) = self.threads.get_mut(&ticket_id) {
+            thread.fail();
+        }
+        if !self
+            .error_alerts
+            .iter()
+            .any(|(existing, existing_pane)| existing == &ticket_id && *existing_pane == pane_id)
+        {
+            self.error_alerts.push((ticket_id.clone(), pane_id));
+        }
+        self.log_activity(ActivityEvent::Error {
+            message: format!(
+                "{} provider startup failed on pane {}: {}; reset the ticket to retry",
                 ticket_id, pane_id, reason
             ),
         });
@@ -1534,7 +1595,11 @@ impl State {
             .iter()
             .filter_map(|(pane_id, state)| {
                 let deadline = match state {
-                    SeatAssignmentState::AssignedPendingAck {
+                    SeatAssignmentState::Starting {
+                        start_deadline: Some(deadline),
+                        ..
+                    }
+                    | SeatAssignmentState::AssignedPendingAck {
                         ack_deadline: Some(deadline),
                         ..
                     }
@@ -1555,6 +1620,12 @@ impl State {
                 continue;
             }
             match state {
+                SeatAssignmentState::Starting { .. } => {
+                    self.fail_startup(
+                        pane_id,
+                        "provider process start was not observed before the deadline",
+                    );
+                }
                 SeatAssignmentState::AssignedPendingAck { .. } => {
                     self.begin_assignment_recovery(pane_id, now);
                 }
@@ -2094,6 +2165,7 @@ impl State {
             let assignment_state = if fresh_launch {
                 SeatAssignmentState::Starting {
                     generation: attempt_lease.attempt_id,
+                    start_deadline: None,
                 }
             } else if let Some(generation) = assignment_generation {
                 SeatAssignmentState::AssignedPendingAck {
@@ -2106,9 +2178,7 @@ impl State {
                 SeatAssignmentState::Owned
             };
             self.seat_assignments.insert(pane_id, assignment_state);
-            if assignment_generation.is_some()
-                && self.agent_slots[slot_idx].transition_state == TransitionState::Idle
-            {
+            if self.agent_slots[slot_idx].transition_state == TransitionState::Idle {
                 self.start_assignment_ack_wait(pane_id, std::time::SystemTime::now());
             }
             // Sending input counts as pane activity — restarts the wind-down clock.
@@ -4911,6 +4981,9 @@ impl State {
                         }
                         SeatAssignmentState::RecoveryFailed => {
                             ui::SeatAssignmentStatus::RecoveryFailed
+                        }
+                        SeatAssignmentState::StartupFailed => {
+                            ui::SeatAssignmentStatus::StartupFailed
                         }
                     };
                     (i + 1, status)
@@ -8821,9 +8894,14 @@ mod tests {
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
         assert!(state.agent_slots[0].has_session);
         assert_eq!(state.threads["T-NAME"].client, AgentClient::Codex);
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::Starting { generation: 1 }),
+        assert!(
+            matches!(
+                state.seat_assignment(10),
+                Some(SeatAssignmentState::Starting {
+                    generation: 1,
+                    start_deadline: Some(_),
+                })
+            ),
             "a fresh Codex launch awaits its exact process-start signal"
         );
         assert!(!state.seat_is_owned(10));
@@ -8949,12 +9027,15 @@ mod tests {
         state.schedule_ready_tickets();
 
         let lease = state.current_leases["T-NAME"].clone();
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::Starting {
-                generation: lease.attempt_id,
-            }),
-            "dispatch reserves the fresh seat without claiming provider ownership"
+        assert!(
+            matches!(
+                state.seat_assignment(10),
+                Some(SeatAssignmentState::Starting {
+                    generation,
+                    start_deadline: Some(_),
+                }) if generation == lease.attempt_id
+            ),
+            "dispatch reserves and bounds the fresh seat without claiming provider ownership"
         );
         assert!(!state.seat_is_owned(10));
         assert!(dashboard_thread_row(&state, "T-NAME").contains("starting"));
@@ -8987,6 +9068,95 @@ mod tests {
             state.seat_assignment(10),
             Some(SeatAssignmentState::Owned),
             "duplicate process-start signals cannot repeat the transition"
+        );
+    }
+
+    #[test]
+    fn test_missing_fresh_start_signal_fails_within_bound_without_relaunch() {
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        state.config.assignment_ack_timeout_secs = 1;
+
+        state.schedule_ready_tickets();
+
+        let lease = state.current_leases["T-NAME"].clone();
+        let deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+            }) => {
+                assert_eq!(generation, lease.attempt_id);
+                deadline
+            }
+            other => panic!("expected an armed fresh start wait, got {other:?}"),
+        };
+        assert!(!state.seat_is_owned(10));
+        assert!(dashboard_thread_row(&state, "T-NAME").contains("starting"));
+
+        let launch_count = state
+            .activity_log
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"
+                )
+            })
+            .count();
+        assert_eq!(launch_count, 1);
+
+        state.check_assignment_ack_timeouts_at(deadline);
+
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::StartupFailed)
+        );
+        assert!(
+            !state.seat_is_owned(10),
+            "timeout must never imply ownership"
+        );
+        assert_eq!(
+            state.threads["T-NAME"].status,
+            lisa_core::types::ThreadStatus::Failed
+        );
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert_eq!(state.agent_slots[0].attempt_lease.as_ref(), Some(&lease));
+        assert_eq!(state.current_leases.get("T-NAME"), Some(&lease));
+        assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
+        assert_eq!(
+            state.to_ui_state().seat_assignment_statuses.get(&1),
+            Some(&ui::SeatAssignmentStatus::StartupFailed)
+        );
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message }
+                if message.contains("provider startup failed")
+                    && message.contains("reset the ticket to retry")
+        )));
+
+        for extra_secs in [1, 30, 300] {
+            state.check_assignment_ack_timeouts_at(
+                deadline + std::time::Duration::from_secs(extra_secs),
+            );
+        }
+
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::StartupFailed)
+        );
+        assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"
+                    )
+                })
+                .count(),
+            launch_count,
+            "terminal startup failure cannot relaunch the provider"
         );
     }
 
@@ -9796,7 +9966,10 @@ timeout\n\
         assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
         assert_eq!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::Starting { generation: 1 }),
+            Some(SeatAssignmentState::Starting {
+                generation: 1,
+                start_deadline: None,
+            }),
             "cross-provider recycling launches a fresh process after exit"
         );
         assert!(!state.seat_is_owned(10));

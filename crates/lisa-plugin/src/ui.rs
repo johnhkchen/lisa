@@ -189,6 +189,7 @@ pub enum SeatAssignmentStatus {
     Owned,
     Recovering,
     RecoveryFailed,
+    StartupFailed,
 }
 
 impl SeatAssignmentStatus {
@@ -199,6 +200,7 @@ impl SeatAssignmentStatus {
             Self::Owned => "owned",
             Self::Recovering => "recovering",
             Self::RecoveryFailed => "recovery-failed",
+            Self::StartupFailed => "startup-failed",
         }
     }
 
@@ -207,7 +209,7 @@ impl SeatAssignmentStatus {
             Self::Starting | Self::AssignedPendingAck => YELLOW,
             Self::Owned => GREEN,
             Self::Recovering => BRIGHT_YELLOW,
-            Self::RecoveryFailed => RED,
+            Self::RecoveryFailed | Self::StartupFailed => RED,
         }
     }
 }
