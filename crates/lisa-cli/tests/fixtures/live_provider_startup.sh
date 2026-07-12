@@ -21,6 +21,7 @@ CURRENT_ROOT=
 CURRENT_SESSION=
 CURRENT_PLUGIN_PANE=
 CURRENT_AGENT_PANE=
+CURRENT_CODEX_HOME=
 LOOP_PID=
 SAMPLER_PID=
 
@@ -68,6 +69,11 @@ cleanup() {
             [[ -n "$root" ]] && rm -rf "$root"
         done < "$EVIDENCE_DIR/fixture-roots.txt"
     fi
+    if [[ -f "$EVIDENCE_DIR/codex-homes.txt" ]]; then
+        while IFS= read -r home; do
+            [[ -n "$home" ]] && rm -rf "$home"
+        done < "$EVIDENCE_DIR/codex-homes.txt"
+    fi
     if (( status != 0 )); then
         echo "live startup harness failed; retained evidence at $EVIDENCE_DIR" >&2
     fi
@@ -89,6 +95,7 @@ fi
 mkdir -p "$EVIDENCE_DIR/build" "$EVIDENCE_DIR/fixtures"
 EVIDENCE_DIR=$(cd "$EVIDENCE_DIR" && pwd -P)
 : > "$EVIDENCE_DIR/fixture-roots.txt"
+: > "$EVIDENCE_DIR/codex-homes.txt"
 mkdir -p "$FIXTURE_PARENT"
 FIXTURE_PARENT=$(cd "$FIXTURE_PARENT" && pwd -P)
 
@@ -213,28 +220,6 @@ create_fixture() {
     printf '%s\n' "$root" >> "$EVIDENCE_DIR/fixture-roots.txt"
     "$LISA_BIN" init --path "$root" > "$EVIDENCE_DIR/$provider-first/init.log"
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories"
-    if [[ "$provider" == codex ]]; then
-        # hooks.json is loaded from an active trusted project config layer.
-        # Make the live control explicit instead of depending on a developer's
-        # user-level feature setting or another repository's config layer.
-        cat > "$root/.codex/config.toml" <<'CODEX_CONFIG'
-[features]
-hooks = true
-
-[[hooks.SessionStart]]
-matcher = "startup"
-
-[[hooks.SessionStart.hooks]]
-type = "command"
-command = "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh"
-
-[[hooks.UserPromptSubmit]]
-
-[[hooks.UserPromptSubmit.hooks]]
-type = "command"
-command = "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
-CODEX_CONFIG
-    fi
     cat > "$root/.lisa.toml" <<'TOML'
 version = "0.4.0"
 
@@ -300,15 +285,35 @@ TICKET
     printf '%s\n' "$root"
 }
 
+prepare_codex_home() {
+    local root=$1
+    local source_home=${CODEX_HOME:-$HOME/.codex}
+    [[ -f "$source_home/auth.json" ]] || fail "Codex authentication file is missing from $source_home"
+    CURRENT_CODEX_HOME=$(mktemp -d "$FIXTURE_PARENT/lisa-live-codex-home.XXXXXX")
+    CURRENT_CODEX_HOME=$(cd "$CURRENT_CODEX_HOME" && pwd -P)
+    printf '%s\n' "$CURRENT_CODEX_HOME" >> "$EVIDENCE_DIR/codex-homes.txt"
+    ln -s "$source_home/auth.json" "$CURRENT_CODEX_HOME/auth.json"
+    cp "$root/.codex/hooks.json" "$CURRENT_CODEX_HOME/hooks.json"
+    cat > "$CURRENT_CODEX_HOME/config.toml" <<'CODEX_CONFIG'
+[features]
+hooks = true
+CODEX_CONFIG
+    printf 'codex_home=%s\nauth_source=%s\nhooks_source=%s\n' \
+        "$CURRENT_CODEX_HOME" "$source_home/auth.json" "$root/.codex/hooks.json" \
+        > "$CURRENT_CASE/codex-runtime.txt"
+}
+
 start_loop() {
     local provider=$1
     local root=$2
     local runner="$CURRENT_CASE/run-loop.sh"
+    local codex_home=${CURRENT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}
     cat > "$runner" <<RUNNER
 #!/usr/bin/env bash
 stty rows 50 cols 140 2>/dev/null || true
 exec env -u ZELLIJ -u ZELLIJ_PANE_ID -u ZELLIJ_SESSION_NAME \\
   PATH=$(printf '%q' "$root/bin:$PATH") \\
+  CODEX_HOME=$(printf '%q' "$codex_home") \\
   LISA_LIVE_REAL_ZELLIJ=$(printf '%q' "$REAL_ZELLIJ") \\
   LISA_LIVE_SESSION=$(printf '%q' "$CURRENT_SESSION") \\
   $(printf '%q' "$LISA_BIN") loop --path $(printf '%q' "$root") --client $(printf '%q' "$provider")
@@ -409,11 +414,7 @@ verify_build_identity() {
 verify_codex_trust() {
     local canonical_root config header
     canonical_root=$(cd "$CURRENT_ROOT" && pwd -P)
-    if [[ -n "${CODEX_HOME:-}" ]]; then
-        config="$CODEX_HOME/config.toml"
-    else
-        config="$HOME/.codex/config.toml"
-    fi
+    config="$CURRENT_CODEX_HOME/config.toml"
     header="[projects.\"$canonical_root\"]"
     [[ -f "$config" ]] || fail "Codex config was not found at $config"
     awk -v header="$header" '
@@ -520,6 +521,10 @@ run_case() {
     mkdir -p "$CURRENT_CASE"
     CURRENT_ROOT=$(create_fixture "$provider" "$ticket_id")
     CURRENT_ROOT=$(cd "$CURRENT_ROOT" && pwd -P)
+    CURRENT_CODEX_HOME=
+    if [[ "$provider" == codex ]]; then
+        prepare_codex_home "$CURRENT_ROOT"
+    fi
     CURRENT_SESSION="lisa-live-$provider-$$"
     printf 'provider=%s\nticket_id=%s\ncanonical_root=%s\nsession=%s\n' \
         "$provider" "$ticket_id" "$CURRENT_ROOT" "$CURRENT_SESSION" > "$CURRENT_CASE/case.txt"

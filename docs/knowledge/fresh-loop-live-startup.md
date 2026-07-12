@@ -44,12 +44,11 @@ Run from a checkout with:
 On macOS, Lisa canonicalizes the disposable fixture before pregranting Codex project trust,
 so `/var/...` and `/private/var/...` do not create an interactive trust mismatch.
 
-The Codex fixture explicitly enables `features.hooks` in its trusted project
-`.codex/config.toml` and repeats the two boundary-critical handlers (`SessionStart` and
-`UserPromptSubmit`) inline. The freshly initialized `.codex/hooks.json` remains present for
-Lisa's preflight and parity inspection. Inline handlers avoid depending on an installed
-Codex version's JSON-layer discovery or a developer's user-level feature defaults while
-using the same generated Lisa hook scripts and payloads.
+The Codex case uses an ephemeral `CODEX_HOME` because user-level hooks are independent of
+project hook-layer discovery. It symlinks the existing `auth.json` (never copies credential
+bytes), installs the freshly initialized Lisa `hooks.json` at that user layer, and enables
+`features.hooks`. Lisa then performs its normal canonical project-trust pregrant into this
+ephemeral config. Cleanup always deletes the temporary Codex home and credential symlink.
 
 The harness preserves the real HOME and provider configuration so existing authentication
 remains available. It copies only the matched Codex project trust header/line into evidence,
@@ -120,6 +119,7 @@ fixtures/
   codex-first/
   claude-first/
 fixture-roots.txt
+codex-homes.txt
 ```
 
 Each provider case includes:
@@ -141,6 +141,10 @@ The live repositories are canonical `mktemp` directories outside the parent chec
 neither provider can inherit the parent's project configuration layer. After successful
 verification, the harness copies a complete snapshot into `fixtures/<provider>-first/` and
 records each original path in `fixture-roots.txt`.
+
+`codex-homes.txt` records the ephemeral runtime home for diagnostics. That directory is
+always deleted at exit because it contains a symlink to the operator's authentication file;
+credential content is never copied into the evidence tree.
 
 Full provider transcripts may contain more data than a review needs. Prefer the structural
 receipts, state timeline, final ticket, and published work when sharing results.
