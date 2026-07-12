@@ -267,6 +267,45 @@ mod tests {
     }
 
     #[test]
+    fn append_preserves_cross_ticket_lease_attribution_without_publication_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_dir = dir.path().join("ledger path ' ; $() `x`");
+        let path = ledger_dir.join("provenance.jsonl");
+        let ticket_a = sample();
+        let mut ticket_b = sample();
+        ticket_b.ticket_id = "T-027-02".to_string();
+        ticket_b.attempt_lease = AttemptLease {
+            ticket_id: "T-027-02".to_string(),
+            attempt_id: 42,
+        };
+        ticket_b.outcome = RunOutcome::TimedOut;
+        ticket_b.authoritative = false;
+        ticket_b.fenced = true;
+        ticket_b.pane_id = 9;
+
+        append_record(&path, &ticket_a).unwrap();
+        append_record(&path, &ticket_b).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        let records: Vec<ProvenanceRecord> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(records, vec![ticket_a, ticket_b]);
+        for record in &records {
+            assert_eq!(record.ticket_id, record.attempt_lease.ticket_id);
+        }
+        assert_eq!(records[0].attempt_lease.attempt_id, 1);
+        assert_eq!(records[1].attempt_lease.attempt_id, 42);
+        assert_eq!(records[0].outcome, RunOutcome::Done);
+        assert_eq!(records[1].outcome, RunOutcome::TimedOut);
+        assert_eq!(fs::read_dir(&ledger_dir).unwrap().count(), 1);
+    }
+
+    #[test]
     fn append_failure_preserves_existing_target_contents() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger path ' ; $()");
