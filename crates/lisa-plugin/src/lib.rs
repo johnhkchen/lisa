@@ -9838,6 +9838,207 @@ mod tests {
         );
     }
 
+    /// Count the operator-visible "delivering assignment" info logs for a ticket
+    /// — one per actual chat send, so it distinguishes the initial paced send
+    /// from its bounded retry.
+    fn delivery_log_count(state: &State, ticket_id: &str) -> usize {
+        let needle = format!("delivering assignment for {ticket_id}");
+        state
+            .activity_log
+            .iter()
+            .filter(|event| matches!(event, ActivityEvent::Info { message } if message.contains(&needle)))
+            .count()
+    }
+
+    #[test]
+    fn codex_delayed_send_reaches_owned_only_on_current_attempt_ack() {
+        // T-037-01-03 (delayed-send regression): a grace-mode (Codex) seat holds
+        // its first prompt through the bounded startup grace — a poll strictly
+        // before the deadline delivers nothing and never fabricates a
+        // ReadyForAssignment — then paces the send directly from Starting into
+        // Delivering when the grace elapses. Ownership is published only by the
+        // exact current-attempt UserPromptSubmit; elapsed time, a stale
+        // generation, and a foreign ticket all fail to own.
+        let (mut codex, _codex_dir) = pane_name_schedule_state("codex", AgentClient::Codex, None);
+        codex.schedule_ready_tickets();
+        assert_eq!(codex.seat_readiness_mode(10), Some(ReadinessMode::Grace));
+        let lease = codex.current_leases["T-NAME"].clone();
+        let grace_deadline = match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+                relaunches: 0,
+            }) => {
+                assert_eq!(generation, lease.attempt_id);
+                deadline
+            }
+            other => panic!("expected a fresh Codex Starting with a named grace, got {other:?}"),
+        };
+
+        // Delayed send: a poll strictly before the grace deadline paces nothing.
+        // The seat stays Starting, surfaces Starting (never a synthetic
+        // ReadyForAssignment), and no assignment has been delivered.
+        codex.check_assignment_ack_timeouts_at(grace_deadline - std::time::Duration::from_secs(1));
+        assert!(
+            matches!(
+                codex.seat_assignment(10),
+                Some(SeatAssignmentState::Starting {
+                    start_deadline: Some(_),
+                    relaunches: 0,
+                    ..
+                })
+            ),
+            "the paced send is delayed until the grace deadline"
+        );
+        assert_eq!(
+            codex.to_ui_state().seat_assignment_statuses.get(&1),
+            Some(&ui::SeatAssignmentStatus::Starting),
+            "before the grace elapses the seat never shows ReadyForAssignment"
+        );
+        assert_eq!(
+            delivery_log_count(&codex, "T-NAME"),
+            0,
+            "nothing is delivered before the grace deadline"
+        );
+        assert!(!codex.seat_is_owned(10));
+
+        // The grace elapses: pace the first prompt directly into Delivering,
+        // with no ReadyForAssignment node in between.
+        codex.check_assignment_ack_timeouts_at(grace_deadline);
+        match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                retries: 0,
+                ..
+            }) => assert_eq!(generation, lease.attempt_id),
+            other => panic!("grace elapse must enter Delivering directly, got {other:?}"),
+        }
+        assert_eq!(
+            codex.to_ui_state().seat_assignment_statuses.get(&1),
+            Some(&ui::SeatAssignmentStatus::Delivering),
+            "the grace pace surfaces Delivering, never ReadyForAssignment"
+        );
+        assert_eq!(
+            delivery_log_count(&codex, "T-NAME"),
+            1,
+            "the grace elapse issues exactly the first paced send"
+        );
+        assert!(!codex.seat_is_owned(10), "elapsed grace never publishes Owned");
+
+        // Owned is gated solely on the exact current-attempt acknowledgement.
+        assert!(
+            !acknowledge_assignment(&mut codex, 10, "T-NAME", lease.attempt_id + 1),
+            "a stale-generation payload cannot own the paced assignment"
+        );
+        assert!(
+            !acknowledge_assignment(&mut codex, 10, "T-OTHER", lease.attempt_id),
+            "a foreign-ticket payload cannot own the paced assignment"
+        );
+        assert!(!codex.seat_is_owned(10));
+        assert!(acknowledge_assignment(
+            &mut codex,
+            10,
+            "T-NAME",
+            lease.attempt_id,
+        ));
+        assert_eq!(codex.seat_assignment(10), Some(SeatAssignmentState::Owned));
+    }
+
+    #[test]
+    fn codex_prompt_miss_retries_then_recycles_to_delivery_failed_never_owned() {
+        // T-037-01-03 (prompt-miss regression): when the grace-paced send is
+        // never acknowledged, the seat resolves inside a finite, named state —
+        // one bounded retry, then DeliveryFailed — and never reaches Owned.
+        // Stale-attempt signals are rejected throughout, and even an exact-
+        // generation ack arriving after the failure cannot resurrect ownership.
+        let (mut codex, _codex_dir) = pane_name_schedule_state("codex", AgentClient::Codex, None);
+        codex.config.assignment_ack_timeout_secs = 1;
+        codex.schedule_ready_tickets();
+        assert_eq!(codex.seat_readiness_mode(10), Some(ReadinessMode::Grace));
+        let lease = codex.current_leases["T-NAME"].clone();
+        let grace_deadline = match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                start_deadline: Some(deadline),
+                relaunches: 0,
+                ..
+            }) => deadline,
+            other => panic!("expected a fresh Codex Starting with a named grace, got {other:?}"),
+        };
+
+        // Grace elapses into the first paced send; no matching ack is ever sent.
+        codex.check_assignment_ack_timeouts_at(grace_deadline);
+        let first_deadline = match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                ack_deadline,
+                retries: 0,
+            }) => {
+                assert_eq!(generation, lease.attempt_id);
+                ack_deadline
+            }
+            other => panic!("grace elapse must enter Delivering directly, got {other:?}"),
+        };
+        assert!(!codex.seat_is_owned(10));
+
+        // The bounded retry: the acceptance clock elapses once with no ack.
+        codex.check_assignment_ack_timeouts_at(first_deadline);
+        let retry_deadline = match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                ack_deadline,
+                retries: 1,
+            }) => {
+                assert_eq!(generation, lease.attempt_id);
+                ack_deadline
+            }
+            other => panic!("expected exactly one bounded chat retry, got {other:?}"),
+        };
+        assert_eq!(
+            delivery_log_count(&codex, "T-NAME"),
+            2,
+            "the paced send plus exactly one bounded retry"
+        );
+        assert!(!codex.seat_is_owned(10));
+
+        // A stale-attempt signal mid-miss is rejected and never owns.
+        assert!(
+            !acknowledge_assignment(&mut codex, 10, "T-NAME", lease.attempt_id + 1),
+            "a stale-generation payload cannot own a missing-ack seat"
+        );
+        assert!(!codex.seat_is_owned(10));
+
+        // The miss resolves in the named, operator-visible DeliveryFailed state,
+        // retaining the reservation and current lease for an explicit reset.
+        codex.check_assignment_ack_timeouts_at(retry_deadline);
+        assert_eq!(
+            codex.seat_assignment(10),
+            Some(SeatAssignmentState::DeliveryFailed)
+        );
+        assert_eq!(
+            codex.to_ui_state().seat_assignment_statuses.get(&1),
+            Some(&ui::SeatAssignmentStatus::DeliveryFailed),
+            "the resolved miss is a named, operator-visible failure"
+        );
+        assert_eq!(
+            codex.threads["T-NAME"].status,
+            lisa_core::types::ThreadStatus::Failed
+        );
+        assert_eq!(codex.agent_slots[0].attempt_lease.as_ref(), Some(&lease));
+        assert_eq!(codex.current_leases.get("T-NAME"), Some(&lease));
+        assert!(!codex.seat_is_owned(10));
+
+        // Terminal: an exact-generation ack arriving after the failure cannot own.
+        assert!(
+            !acknowledge_assignment(&mut codex, 10, "T-NAME", lease.attempt_id),
+            "DeliveryFailed is terminal; a late exact ack cannot publish Owned"
+        );
+        assert_eq!(
+            codex.seat_assignment(10),
+            Some(SeatAssignmentState::DeliveryFailed)
+        );
+        assert!(!codex.seat_is_owned(10));
+    }
+
     #[test]
     fn dispatch_mints_and_stamps_strictly_new_attempt_lease() {
         let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
