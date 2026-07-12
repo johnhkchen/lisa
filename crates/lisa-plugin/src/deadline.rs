@@ -521,4 +521,431 @@ mod tests {
             )
             .is_empty());
     }
+
+    #[test]
+    fn cross_policy_deadline_actions_remain_distinct() {
+        let evaluator = evaluator(100);
+
+        let acknowledgements = evaluator.acknowledgements([AcknowledgementInput {
+            pane_id: 11,
+            state: "expired",
+            deadline: SystemTime::UNIX_EPOCH + Duration::from_secs(99),
+        }]);
+        assert!(matches!(
+            acknowledgements.as_slice(),
+            [AcknowledgementAction {
+                pane_id: 11,
+                state: "expired"
+            }]
+        ));
+
+        let transitions = evaluator.transitions(
+            [
+                TransitionInput {
+                    pane_id: 21,
+                    ticket_id: Some("T-EXIT".into()),
+                    state: TransitionState::WaitingForExit,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(SystemTime::UNIX_EPOCH),
+                    awaiting_human: false,
+                },
+                TransitionInput {
+                    pane_id: 22,
+                    ticket_id: Some("T-STOP".into()),
+                    state: TransitionState::WaitingForStop,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(SystemTime::UNIX_EPOCH),
+                    awaiting_human: false,
+                },
+                TransitionInput {
+                    pane_id: 23,
+                    ticket_id: Some("T-CLEAR".into()),
+                    state: TransitionState::WaitingForClear,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(SystemTime::UNIX_EPOCH),
+                    awaiting_human: false,
+                },
+            ],
+            TransitionPolicy {
+                wind_down: Duration::from_secs(10),
+                exit_grace_secs: 8,
+                stop_timeout_secs: 60,
+                clear_timeout_secs: 90,
+            },
+        );
+        assert_eq!(
+            transitions,
+            vec![
+                TransitionAction::ExitReady {
+                    pane_id: 21,
+                    ticket_id: Some("T-EXIT".into()),
+                },
+                TransitionAction::StopTimedOut { pane_id: 22 },
+                TransitionAction::ClearTimedOut {
+                    pane_id: 23,
+                    ticket_id: Some("T-CLEAR".into()),
+                },
+            ]
+        );
+
+        let reviews = evaluator.reviews(
+            [ReviewInput {
+                ticket_id: "T-REVIEW".into(),
+                pane_id: 31,
+                status: ThreadStatus::Running,
+                phase: Phase::Review,
+                already_prompted: false,
+                awaiting_human: false,
+                last_phase_change: SystemTime::UNIX_EPOCH,
+                last_activity: SystemTime::UNIX_EPOCH,
+            }],
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        assert!(matches!(
+            reviews.as_slice(),
+            [ReviewAction {
+                ticket_id,
+                pane_id: 31
+            }] if ticket_id == "T-REVIEW"
+        ));
+
+        let health = evaluator.health(
+            [HealthInput {
+                ticket_id: "T-HEALTH".into(),
+                status: ThreadStatus::Running,
+                last_activity: SystemTime::UNIX_EPOCH,
+                previous: Some(HealthStatus::Healthy),
+            }],
+            Duration::from_secs(10),
+        );
+        assert!(matches!(
+            health.as_slice(),
+            [HealthObservation {
+                ticket_id,
+                previous: Some(HealthStatus::Healthy),
+                current: HealthStatus::Stuck,
+            }] if ticket_id == "T-HEALTH"
+        ));
+
+        let sessions = evaluator.sessions(
+            [SessionInput {
+                ticket_id: "T-SESSION".into(),
+                pane_id: 41,
+                status: ThreadStatus::Running,
+                phase: Phase::Implement,
+                pending_completion: false,
+                awaiting_human: false,
+                started_at: SystemTime::UNIX_EPOCH,
+                last_phase_change: SystemTime::UNIX_EPOCH + Duration::from_secs(90),
+                last_activity: SystemTime::UNIX_EPOCH,
+                phase_timeout: Duration::from_secs(20),
+            }],
+            Duration::from_secs(50),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            sessions,
+            vec![SessionAction::Reclaim(SessionDeadline {
+                ticket_id: "T-SESSION".into(),
+                pane_id: 41,
+                elapsed_secs: 100,
+                phase: Phase::Implement,
+            })]
+        );
+
+        let stale = evaluator.stale(
+            [StaleInput {
+                ticket_id: "T-STALE".into(),
+                pane_id: 51,
+                status: ThreadStatus::Running,
+                pending_completion: false,
+                awaiting_human: false,
+                last_activity: SystemTime::UNIX_EPOCH,
+            }],
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            stale,
+            vec![StaleAction {
+                ticket_id: "T-STALE".into(),
+                pane_id: 51,
+            }]
+        );
+    }
+
+    #[test]
+    fn cross_policy_activity_and_human_exemptions_remain_distinct() {
+        let evaluator = evaluator(100);
+        let recent = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        // Acknowledgement evaluation intentionally has no activity or
+        // awaiting-human exemption input.
+        let acknowledgements = evaluator.acknowledgements([AcknowledgementInput {
+            pane_id: 10,
+            state: "expired-without-exemptions",
+            deadline: recent,
+        }]);
+        assert!(matches!(
+            acknowledgements.as_slice(),
+            [AcknowledgementAction {
+                pane_id: 10,
+                state: "expired-without-exemptions"
+            }]
+        ));
+
+        let transitions = evaluator.transitions(
+            [
+                TransitionInput {
+                    pane_id: 21,
+                    ticket_id: Some("T-EXIT-ACTIVE".into()),
+                    state: TransitionState::WaitingForExit,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(recent),
+                    awaiting_human: false,
+                },
+                TransitionInput {
+                    pane_id: 22,
+                    ticket_id: Some("T-EXIT-HUMAN".into()),
+                    state: TransitionState::WaitingForExit,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(SystemTime::UNIX_EPOCH),
+                    awaiting_human: true,
+                },
+                TransitionInput {
+                    pane_id: 23,
+                    ticket_id: Some("T-STOP-ACTIVE".into()),
+                    state: TransitionState::WaitingForStop,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(recent),
+                    awaiting_human: false,
+                },
+                TransitionInput {
+                    pane_id: 24,
+                    ticket_id: Some("T-STOP-HUMAN".into()),
+                    state: TransitionState::WaitingForStop,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(SystemTime::UNIX_EPOCH),
+                    awaiting_human: true,
+                },
+                TransitionInput {
+                    pane_id: 25,
+                    ticket_id: Some("T-CLEAR-ACTIVE".into()),
+                    state: TransitionState::WaitingForClear,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(recent),
+                    awaiting_human: false,
+                },
+                TransitionInput {
+                    pane_id: 26,
+                    ticket_id: Some("T-CLEAR-HUMAN".into()),
+                    state: TransitionState::WaitingForClear,
+                    started: Some(SystemTime::UNIX_EPOCH),
+                    last_activity: Some(SystemTime::UNIX_EPOCH),
+                    awaiting_human: true,
+                },
+            ],
+            TransitionPolicy {
+                wind_down: Duration::from_secs(10),
+                exit_grace_secs: 8,
+                stop_timeout_secs: 60,
+                clear_timeout_secs: 90,
+            },
+        );
+        assert_eq!(
+            transitions,
+            vec![
+                TransitionAction::ExitReady {
+                    pane_id: 21,
+                    ticket_id: Some("T-EXIT-ACTIVE".into()),
+                },
+                TransitionAction::ExitReady {
+                    pane_id: 22,
+                    ticket_id: Some("T-EXIT-HUMAN".into()),
+                },
+            ]
+        );
+
+        let reviews = evaluator.reviews(
+            [
+                ReviewInput {
+                    ticket_id: "T-REVIEW-ACTIVE".into(),
+                    pane_id: 31,
+                    status: ThreadStatus::Running,
+                    phase: Phase::Review,
+                    already_prompted: false,
+                    awaiting_human: false,
+                    last_phase_change: SystemTime::UNIX_EPOCH,
+                    last_activity: recent,
+                },
+                ReviewInput {
+                    ticket_id: "T-REVIEW-HUMAN".into(),
+                    pane_id: 32,
+                    status: ThreadStatus::Running,
+                    phase: Phase::Review,
+                    already_prompted: false,
+                    awaiting_human: true,
+                    last_phase_change: SystemTime::UNIX_EPOCH,
+                    last_activity: SystemTime::UNIX_EPOCH,
+                },
+                ReviewInput {
+                    ticket_id: "T-REVIEW-FIRE".into(),
+                    pane_id: 33,
+                    status: ThreadStatus::Running,
+                    phase: Phase::Review,
+                    already_prompted: false,
+                    awaiting_human: false,
+                    last_phase_change: SystemTime::UNIX_EPOCH,
+                    last_activity: SystemTime::UNIX_EPOCH,
+                },
+            ],
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        assert!(matches!(
+            reviews.as_slice(),
+            [ReviewAction {
+                ticket_id,
+                pane_id: 33
+            }] if ticket_id == "T-REVIEW-FIRE"
+        ));
+
+        // Health is observational: recent activity is Healthy, while a quiet
+        // awaiting-human pane remains Stuck because that marker is not an input.
+        let health = evaluator.health(
+            [
+                HealthInput {
+                    ticket_id: "T-HEALTH-ACTIVE".into(),
+                    status: ThreadStatus::Running,
+                    last_activity: recent,
+                    previous: None,
+                },
+                HealthInput {
+                    ticket_id: "T-HEALTH-HUMAN".into(),
+                    status: ThreadStatus::Running,
+                    last_activity: SystemTime::UNIX_EPOCH,
+                    previous: None,
+                },
+            ],
+            Duration::from_secs(10),
+        );
+        assert!(matches!(
+            health.as_slice(),
+            [
+                HealthObservation {
+                    ticket_id: active,
+                    current: HealthStatus::Healthy,
+                    ..
+                },
+                HealthObservation {
+                    ticket_id: human,
+                    current: HealthStatus::Stuck,
+                    ..
+                }
+            ] if active == "T-HEALTH-ACTIVE" && human == "T-HEALTH-HUMAN"
+        ));
+
+        let sessions = evaluator.sessions(
+            [
+                SessionInput {
+                    ticket_id: "T-SESSION-ACTIVE".into(),
+                    pane_id: 41,
+                    status: ThreadStatus::Running,
+                    phase: Phase::Implement,
+                    pending_completion: false,
+                    awaiting_human: false,
+                    started_at: SystemTime::UNIX_EPOCH,
+                    last_phase_change: SystemTime::UNIX_EPOCH,
+                    last_activity: recent,
+                    phase_timeout: Duration::ZERO,
+                },
+                SessionInput {
+                    ticket_id: "T-SESSION-HUMAN".into(),
+                    pane_id: 42,
+                    status: ThreadStatus::Running,
+                    phase: Phase::Implement,
+                    pending_completion: false,
+                    awaiting_human: true,
+                    started_at: SystemTime::UNIX_EPOCH,
+                    last_phase_change: SystemTime::UNIX_EPOCH,
+                    last_activity: SystemTime::UNIX_EPOCH,
+                    phase_timeout: Duration::ZERO,
+                },
+                SessionInput {
+                    ticket_id: "T-SESSION-FIRE".into(),
+                    pane_id: 43,
+                    status: ThreadStatus::Running,
+                    phase: Phase::Implement,
+                    pending_completion: false,
+                    awaiting_human: false,
+                    started_at: SystemTime::UNIX_EPOCH,
+                    last_phase_change: SystemTime::UNIX_EPOCH,
+                    last_activity: SystemTime::UNIX_EPOCH,
+                    phase_timeout: Duration::ZERO,
+                },
+            ],
+            Duration::from_secs(50),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            sessions,
+            vec![
+                SessionAction::Warn(SessionDeadline {
+                    ticket_id: "T-SESSION-ACTIVE".into(),
+                    pane_id: 41,
+                    elapsed_secs: 100,
+                    phase: Phase::Implement,
+                }),
+                SessionAction::Warn(SessionDeadline {
+                    ticket_id: "T-SESSION-HUMAN".into(),
+                    pane_id: 42,
+                    elapsed_secs: 100,
+                    phase: Phase::Implement,
+                }),
+                SessionAction::Reclaim(SessionDeadline {
+                    ticket_id: "T-SESSION-FIRE".into(),
+                    pane_id: 43,
+                    elapsed_secs: 100,
+                    phase: Phase::Implement,
+                }),
+            ]
+        );
+
+        let stale = evaluator.stale(
+            [
+                StaleInput {
+                    ticket_id: "T-STALE-ACTIVE".into(),
+                    pane_id: 51,
+                    status: ThreadStatus::Running,
+                    pending_completion: false,
+                    awaiting_human: false,
+                    last_activity: recent,
+                },
+                StaleInput {
+                    ticket_id: "T-STALE-HUMAN".into(),
+                    pane_id: 52,
+                    status: ThreadStatus::Running,
+                    pending_completion: false,
+                    awaiting_human: true,
+                    last_activity: SystemTime::UNIX_EPOCH,
+                },
+                StaleInput {
+                    ticket_id: "T-STALE-FIRE".into(),
+                    pane_id: 53,
+                    status: ThreadStatus::Running,
+                    pending_completion: false,
+                    awaiting_human: false,
+                    last_activity: SystemTime::UNIX_EPOCH,
+                },
+            ],
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            stale,
+            vec![StaleAction {
+                ticket_id: "T-STALE-FIRE".into(),
+                pane_id: 53,
+            }]
+        );
+    }
 }
