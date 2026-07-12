@@ -18,7 +18,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "lisa",
-    about = "Lisa - DAG-driven concurrent task scheduling",
+    about = "Runs your coding agents through a project's tickets.",
     version
 )]
 struct Cli {
@@ -29,6 +29,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a project for lisa-loop completion
+    #[command(display_order = 0)]
     Init {
         /// Show what would be done without making changes
         #[arg(long)]
@@ -39,6 +40,7 @@ enum Commands {
         path: PathBuf,
     },
     /// Validate ticket DAG and project setup
+    #[command(display_order = 1)]
     Validate {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
@@ -49,26 +51,31 @@ enum Commands {
         check_tools: bool,
     },
     /// Show DAG status: tickets, dependencies, execution waves, scheduling readiness
+    #[command(display_order = 2)]
     Status {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
     /// Output LLM-friendly setup instructions for this project
+    #[command(hide = true)]
     SetupGuide {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
     /// Output the hooks setup guide for agents configuring Claude Code hooks
+    #[command(hide = true)]
     HooksGuide,
     /// Check that all runtime dependencies are installed
+    #[command(display_order = 3)]
     Doctor {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
     /// Print version information
+    #[command(hide = true)]
     Version,
     /// Run Codex under Lisa's legacy JSON signal/rendering wrapper.
     ///
@@ -77,6 +84,7 @@ enum Commands {
     /// translates its event stream into `.lisa/signals/pane-<id>.*` files, and
     /// renders the conversation to stdout. `lisa loop` uses the native Codex TUI;
     /// this remains available for diagnostics and headless automation.
+    #[command(display_order = 20)]
     AgentExec {
         /// The prompt to send to codex.
         prompt: String,
@@ -108,12 +116,14 @@ enum Commands {
     },
     /// Capture Claude session token usage from a Stop-hook payload on stdin,
     /// writing `.lisa/claude/<ticket>.usage.json` for the provenance ledger.
+    #[command(display_order = 21)]
     CaptureUsage {
         /// Project root the `.lisa/claude` artifact is written under.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
     /// Commit ticket-owned paths without using the repository's ordinary index.
+    #[command(display_order = 22)]
     CommitTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
@@ -132,6 +142,7 @@ enum Commands {
         includes: Vec<PathBuf>,
     },
     /// Mark a ticket done and commit its loop-owned files atomically.
+    #[command(display_order = 23)]
     CompleteTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
@@ -154,6 +165,7 @@ enum Commands {
         work_dir: PathBuf,
     },
     /// Launch zellij with the Lisa plugin for DAG-driven task scheduling
+    #[command(display_order = 4)]
     Loop {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
