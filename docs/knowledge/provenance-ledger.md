@@ -1,7 +1,8 @@
 # Provenance Ledger
 
 The **execution-provenance ledger** is an append-only JSONL file at
-`.lisa/provenance.jsonl`. lisa's plugin appends **one record per ticket-run** the
+`.lisa/provenance.jsonl`. lisa's plugin appends **one record per terminal
+execution attempt** the
 moment a run reaches a terminal state (completed or failed), *after* the ticket's
 frontmatter is already updated — it never races the agent and never touches
 agent-owned fields. `.lisa/` gitignores only `signals/`, so the ledger is
@@ -10,14 +11,14 @@ routing policies (which `(method, provider, model)` yields the best results, is
 most cost-effective, and survives high concurrency).
 
 Schema owner: `crates/lisa-core/src/provenance.rs`. Current
-`schema_version`: **1**.
+`schema_version`: **2**.
 
 ## Record shape
 
 One JSON object per line. Example:
 
 ```json
-{"schema_version":1,"ticket_id":"T-027-01","outcome":"done","requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}
+{"schema_version":2,"ticket_id":"T-027-01","attempt_lease":{"ticket_id":"T-027-01","attempt_id":2},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}
 ```
 
 ## Field table
@@ -26,7 +27,10 @@ One JSON object per line. Example:
 |-------|------|----------|---------|
 | `schema_version` | int | no | Record schema version (bump on shape change). |
 | `ticket_id` | string | no | The ticket this run worked on. Retries reuse the id → multiple records. |
+| `attempt_lease` | object | no | Exact `{ticket_id, attempt_id}` lease stamped on this execution attempt. |
 | `outcome` | enum | no | `done` \| `failed` \| `timed-out`. |
+| `authoritative` | bool | no | True only for the current lease's accepted ticket-level `done` publication. |
+| `fenced` | bool | no | True when scheduler teardown confirmed this attempt's pane was fenced. |
 | `requested` | Route | no | The `(method, provider, model)` requested for the run. |
 | `actual` | Route | no | The route that actually ran. Equals `requested` until per-pane routing (T-026-01) can diverge them via fallback. |
 | `started_at` | int | no | Run start, UTC epoch seconds. |
@@ -41,6 +45,22 @@ One JSON object per line. Example:
 A **Route** is `{ "method": string, "provider": string, "model": string|null }`.
 `method` is the client name (`"claude"` | `"codex"`); `provider` is the vendor
 (`"anthropic"` | `"openai"`); `model` is `null` until model selection lands.
+
+### Attempt and authority semantics
+
+Schema-v2 records use the same complete `AttemptLease` value as scheduler
+admission. A timed-out predecessor and its replacement therefore have the same
+top-level `ticket_id` but different `attempt_lease.attempt_id` values.
+
+`failed` and `timed-out` records are retained attempt history. They have
+`authoritative: false`; this does not make their history untrustworthy, only
+states that they are not the ticket's successful terminal publication. A
+confirmed timeout/hard-silence pane closure also carries `fenced: true`.
+
+Only the current lease can publish a `done` record, and that record carries
+`authoritative: true`. Completion request admission, asynchronous result
+publication, and the ledger writer all check that boundary. Duplicate results
+and stale predecessor results do not append another authoritative row.
 
 ### Nullability & fidelity
 
@@ -61,7 +81,7 @@ provider's numbers mean subtly different things — record raw, segment by
     `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`
     summed over every assistant message. Cache reads/writes are billed at
     different rates than fresh input, so `tokens_in` is a *count*, not a
-    price — the per-class split is not preserved in schema v1.
+    price — the per-class split is not preserved in the provenance schema.
   - `tokens_out` is the summed `output_tokens`.
   - `cost_usd` is **always `null`** for Claude: current transcripts carry no
     dependable dollar field, and a derived cost would go stale in an append-only
@@ -84,7 +104,7 @@ tokens — not a fabricated `0`.
 
 ```sh
 jq -s '
-  map(select(.outcome=="done" and .actual.method=="codex"))
+  map(select(.outcome=="done" and .authoritative==true and .actual.method=="codex"))
   | (map(.wall_clock_secs) | add / length)
 ' .lisa/provenance.jsonl
 ```
@@ -113,6 +133,9 @@ ORDER BY 1, 2;
 
 - **Append-only.** A retry/reset of a ticket appends a *new* record; existing
   lines are never rewritten. History is complete.
+- **Attempt-attributed.** Schema-v2 rows carry the exact execution lease and
+  confirmed fence state. Multiple history rows may exist, but only the accepted
+  current-lease Done row is marked authoritative.
 - **Non-fatal.** A failed ledger write is logged and swallowed — it never
   interrupts the scheduling loop.
 - **Write-after.** The record is appended at run teardown, after the ticket's
@@ -121,7 +144,12 @@ ORDER BY 1, 2;
 
 ## Versioning
 
-`schema_version` lets readers branch as the schema grows. Populating Claude
+`schema_version` lets readers branch as the schema grows. Version 2 added the
+required `attempt_lease`, `authoritative`, and `fenced` fields. Version-1 rows
+remain valid append-only history but predate attempt attribution; readers of a
+mixed ledger must branch on `schema_version` rather than inventing leases.
+
+Populating Claude
 tokens (T-027-02) did **not** bump the version — the record *shape* is unchanged;
 previously-`null` Claude token fields simply become populated where a usage
 artifact exists, and readers already branch on nullability. Per-pane routing

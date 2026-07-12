@@ -1,7 +1,7 @@
 //! Execution-provenance ledger: append-only JSONL learning data.
 //!
 //! One [`ProvenanceRecord`] is appended to `.lisa/provenance.jsonl` per
-//! completed ticket-run, written by the plugin *after* the run ends
+//! terminal execution attempt, written by the plugin *after* the attempt ends
 //! (write-after; it never races the agent and never touches the agent-owned
 //! ticket frontmatter — epic E-001 Decision 2). `.lisa/` gitignores only
 //! `signals/`, so the ledger is committable, queryable-across-runs data.
@@ -26,11 +26,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::AgentClient;
+use crate::types::AttemptLease;
 
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -81,7 +82,14 @@ pub enum RunOutcome {
 pub struct ProvenanceRecord {
     pub schema_version: u32,
     pub ticket_id: String,
+    /// Exact execution attempt that produced this terminal record.
+    pub attempt_lease: AttemptLease,
     pub outcome: RunOutcome,
+    /// Whether this is the ticket-level successful outcome. Schema-v2 writers
+    /// set this only for a current-lease [`RunOutcome::Done`] publication.
+    pub authoritative: bool,
+    /// Whether scheduler teardown confirmed this attempt's pane was fenced.
+    pub fenced: bool,
     /// The route requested for this run (== `actual` until routing lands).
     pub requested: Route,
     /// The route that actually ran.
@@ -162,7 +170,10 @@ mod tests {
         ProvenanceRecord {
             schema_version: SCHEMA_VERSION,
             ticket_id: "T-027-01".to_string(),
+            attempt_lease: AttemptLease::mint("T-027-01", None).unwrap(),
             outcome: RunOutcome::Done,
+            authoritative: true,
+            fenced: false,
             requested: Route::from_client(AgentClient::Codex),
             actual: Route::from_client(AgentClient::Codex),
             started_at: 1_719_800_000,
@@ -207,8 +218,11 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":1"));
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
+        assert!(json.contains("\"authoritative\":true"));
+        assert!(json.contains("\"fenced\":false"));
         assert!(json.contains("\"cost_usd\":null"));
         // Round-trips back to an equal record.
         let back: ProvenanceRecord = serde_json::from_str(&json).unwrap();

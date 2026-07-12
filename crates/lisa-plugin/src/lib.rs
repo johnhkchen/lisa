@@ -999,6 +999,23 @@ impl State {
             Some(pending) => pending,
             None => return,
         };
+        let authority_is_current = match &pending.authority {
+            CompletionAuthority::Attempt(lease) => {
+                lease.is_current(self.current_leases.get(ticket_id))
+            }
+            CompletionAuthority::Operator => pending.source == CompletionSource::Manual,
+        };
+        if !authority_is_current {
+            self.pending_completions.remove(ticket_id);
+            self.rebuild_dag();
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "Rejected completion result for {}: pending authority {:?} is no longer current",
+                    ticket_id, pending.authority
+                ),
+            });
+            return;
+        }
         if exit_code != Some(0) || !Self::is_commit_id(&stdout) {
             self.pending_completions.remove(ticket_id);
             self.rebuild_dag();
@@ -1061,7 +1078,7 @@ impl State {
         if let Some(thread) = self.threads.get_mut(ticket_id) {
             thread.complete();
         }
-        self.emit_provenance(ticket_id, RunOutcome::Done);
+        self.emit_provenance(ticket_id, RunOutcome::Done, false);
         self.release_slot_for_ticket(&ticket_id_owned);
         self.threads.remove(ticket_id);
         self.schedule_ready_tickets();
@@ -2667,7 +2684,7 @@ impl State {
                     if let Some(thread) = self.threads.get_mut(&tid) {
                         thread.fail();
                     }
-                    self.emit_provenance(&tid, RunOutcome::Failed);
+                    self.emit_provenance(&tid, RunOutcome::Failed, false);
                     self.release_slot_for_ticket(&tid);
                     self.threads.remove(&tid);
                     self.error_alerts.push((tid.clone(), pane_id));
@@ -2772,13 +2789,32 @@ impl State {
     /// ledger and never touches thread/slot state. A write error logs and is
     /// swallowed (never fatal to the loop). A no-op when `ledger_path` is unset
     /// (native tests that don't exercise the ledger).
-    fn emit_provenance(&mut self, ticket_id: &str, outcome: RunOutcome) {
+    fn emit_provenance(&mut self, ticket_id: &str, outcome: RunOutcome, fenced: bool) -> bool {
         if self.ledger_path.as_os_str().is_empty() {
-            return;
+            return false;
         }
         let Some(thread) = self.threads.get(ticket_id) else {
-            return;
+            return false;
         };
+        let Some(attempt_lease) = thread.attempt_lease.clone() else {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "provenance rejected for {}: active thread has no attempt lease",
+                    ticket_id
+                ),
+            });
+            return false;
+        };
+        let authoritative = outcome == RunOutcome::Done;
+        if authoritative && !attempt_lease.is_current(self.current_leases.get(ticket_id)) {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "provenance rejected for {}: Done attempt {:?} is no longer current",
+                    ticket_id, attempt_lease
+                ),
+            });
+            return false;
+        }
         let client = thread.client;
         let started = provenance::system_time_to_epoch(thread.started_at);
         let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
@@ -2786,7 +2822,10 @@ impl State {
         let record = ProvenanceRecord {
             schema_version: provenance::SCHEMA_VERSION,
             ticket_id: ticket_id.to_string(),
+            attempt_lease,
             outcome,
+            authoritative,
+            fenced,
             // requested == actual until per-pane routing (T-026-01) can differ them.
             requested: route.clone(),
             actual: route,
@@ -2810,7 +2849,9 @@ impl State {
             self.log_activity(ActivityEvent::Error {
                 message: format!("provenance write failed for {}: {}", ticket_id, e),
             });
+            return false;
         }
+        true
     }
 
     /// Read tokens/cost from a run's usage artifact, selecting the per-provider
@@ -3295,6 +3336,9 @@ impl State {
             if t.status != lisa_core::types::ThreadStatus::Running {
                 continue;
             }
+            if self.pending_completions.contains_key(tid) {
+                continue;
+            }
 
             // Check global session timeout (total wall-clock since start)
             let mut exceeded: Option<(u64, Phase)> = None;
@@ -3357,8 +3401,11 @@ impl State {
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
             }
-            self.emit_provenance(&ticket_id, RunOutcome::TimedOut);
-            self.revoke_and_fence_attempt(&ticket_id);
+            let fenced = matches!(
+                self.revoke_and_fence_attempt(&ticket_id),
+                FenceOutcome::Fenced { .. } | FenceOutcome::AlreadyFenced { .. }
+            );
+            self.emit_provenance(&ticket_id, RunOutcome::TimedOut, fenced);
             self.release_slot_for_ticket(&ticket_id);
             self.threads.remove(&ticket_id);
             self.timeout_alerts
@@ -3395,6 +3442,7 @@ impl State {
             .threads
             .iter()
             .filter(|(_, t)| t.status == ThreadStatus::Running)
+            .filter(|(tid, _)| !self.pending_completions.contains_key(*tid))
             .filter(|(_, t)| t.health(now, hard_timeout) == HealthStatus::Stuck)
             .filter(|(_, t)| !awaiting.contains(&t.pane_id))
             .map(|(tid, _)| tid.clone())
@@ -3405,8 +3453,11 @@ impl State {
             if let Some(thread) = self.threads.get_mut(&ticket_id) {
                 thread.fail();
             }
-            self.emit_provenance(&ticket_id, RunOutcome::Failed);
-            self.revoke_and_fence_attempt(&ticket_id);
+            let fenced = matches!(
+                self.revoke_and_fence_attempt(&ticket_id),
+                FenceOutcome::Fenced { .. } | FenceOutcome::AlreadyFenced { .. }
+            );
+            self.emit_provenance(&ticket_id, RunOutcome::Failed, fenced);
             self.release_slot_for_ticket(&ticket_id);
             self.threads.remove(&ticket_id);
             self.log_activity(ActivityEvent::Error {
@@ -12054,13 +12105,17 @@ timeout\n\
         let mut thread = Thread::new("T-CDX-02", 2);
         thread.client = AgentClient::Codex;
         state.threads.insert("T-CDX-02".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-CDX-02");
 
         state.check_error_signals();
 
         let records = read_ledger(&ledger);
         assert_eq!(records.len(), 1, "one record on failure");
         assert_eq!(records[0].ticket_id, "T-CDX-02");
+        assert_eq!(records[0].attempt_lease, lease);
         assert_eq!(records[0].outcome, RunOutcome::Failed);
+        assert!(!records[0].authoritative);
+        assert!(!records[0].fenced);
         assert_eq!(records[0].actual.method, "codex");
         assert_eq!(records[0].actual.provider, "openai");
         assert_eq!(
@@ -12081,17 +12136,21 @@ timeout\n\
         state
             .threads
             .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
-        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+        let first = install_current_attempt(&mut state, "T-CDX-01");
+        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
         state.threads.remove("T-CDX-01");
 
         // Retry of the same ticket: fails.
         state
             .threads
             .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
-        state.emit_provenance("T-CDX-01", RunOutcome::Failed);
+        let second = install_current_attempt(&mut state, "T-CDX-01");
+        state.emit_provenance("T-CDX-01", RunOutcome::Failed, false);
 
         let records = read_ledger(&ledger);
         assert_eq!(records.len(), 2, "retry appends a second record");
+        assert_eq!(records[0].attempt_lease, first);
+        assert_eq!(records[1].attempt_lease, second);
         assert_eq!(records[0].outcome, RunOutcome::Done, "first record intact");
         assert_eq!(records[1].outcome, RunOutcome::Failed);
     }
@@ -12115,7 +12174,8 @@ timeout\n\
         let mut thread = Thread::new("T-CDX-01", 1);
         thread.client = AgentClient::Codex;
         state.threads.insert("T-CDX-01".to_string(), thread);
-        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+        install_current_attempt(&mut state, "T-CDX-01");
+        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
 
         let records = read_ledger(&ledger);
         assert_eq!(records[0].tokens_in, Some(120));
@@ -12138,7 +12198,8 @@ timeout\n\
         thread.concurrency_at_spawn = 3;
         state.threads.insert("T-CDX-01".to_string(), thread);
 
-        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+        install_current_attempt(&mut state, "T-CDX-01");
+        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
 
         let records = read_ledger(&ledger);
         assert_eq!(records[0].tokens_in, None);
@@ -12172,7 +12233,8 @@ timeout\n\
         let mut thread = Thread::new("T-CDX-01", 1);
         thread.client = AgentClient::Claude;
         state.threads.insert("T-CDX-01".to_string(), thread);
-        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+        install_current_attempt(&mut state, "T-CDX-01");
+        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
 
         let records = read_ledger(&ledger);
         assert_eq!(records[0].tokens_in, Some(167));
@@ -12194,7 +12256,8 @@ timeout\n\
         state
             .threads
             .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
-        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+        install_current_attempt(&mut state, "T-CDX-01");
+        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
 
         let after = std::fs::read(&ticket_file).unwrap();
         assert_eq!(before, after, "ticket frontmatter must be byte-identical");
@@ -12213,7 +12276,7 @@ timeout\n\
             .threads
             .insert("T-CDX-01".to_string(), Thread::new("T-CDX-01", 1));
         // Must not panic or write anywhere.
-        state.emit_provenance("T-CDX-01", RunOutcome::Done);
+        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
     }
 
     #[test]
@@ -12267,6 +12330,127 @@ timeout\n\
         assert!(fs::read_to_string(ticket_path)
             .unwrap()
             .contains("phase: review"));
+    }
+
+    #[test]
+    fn fenced_attempt_and_replacement_publish_one_authoritative_done_record() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        let ticket_path = state.config.ticket_dir.join("T-CDX-01.md");
+        fs::write(
+            &ticket_path,
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: review\npriority: high\nphase: review\nagent: codex\n---\n\nBody\n",
+        )
+        .unwrap();
+        state.dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap())
+                .unwrap();
+
+        codex_slot(&mut state, 1, "T-CDX-01");
+        let mut predecessor_thread = Thread::new("T-CDX-01", 1);
+        predecessor_thread.client = AgentClient::Codex;
+        predecessor_thread.current_phase = Phase::Review;
+        state
+            .threads
+            .insert("T-CDX-01".to_string(), predecessor_thread);
+        let predecessor = install_current_attempt(&mut state, "T-CDX-01");
+
+        state.threads.get_mut("T-CDX-01").unwrap().fail();
+        let fenced = matches!(
+            state.revoke_and_fence_attempt(&"T-CDX-01".to_string()),
+            FenceOutcome::Fenced { pane_id: 1 }
+        );
+        assert!(fenced);
+        assert!(state.emit_provenance("T-CDX-01", RunOutcome::TimedOut, fenced));
+        state.release_slot_for_ticket(&"T-CDX-01".to_string());
+        state.threads.remove("T-CDX-01");
+
+        codex_slot(&mut state, 2, "T-CDX-01");
+        let mut replacement_thread = Thread::new("T-CDX-01", 2);
+        replacement_thread.client = AgentClient::Codex;
+        replacement_thread.current_phase = Phase::Review;
+        state
+            .threads
+            .insert("T-CDX-01".to_string(), replacement_thread);
+        let replacement = install_current_attempt(&mut state, "T-CDX-01");
+        assert_eq!(replacement.attempt_id, predecessor.attempt_id + 1);
+
+        // The ledger writer is independently fail-closed for Done. Even if a
+        // caller presents the predecessor's thread stamp, current authority is
+        // still the replacement and no row is appended.
+        state.threads.get_mut("T-CDX-01").unwrap().attempt_lease = Some(predecessor.clone());
+        assert!(!state.emit_provenance("T-CDX-01", RunOutcome::Done, false));
+        state.threads.get_mut("T-CDX-01").unwrap().attempt_lease = Some(replacement.clone());
+
+        // A predecessor callback that arrives after redispatch is rejected at
+        // the result publication boundary and cannot append Done provenance.
+        state.pending_completions.insert(
+            "T-CDX-01".to_string(),
+            PendingCompletion {
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Review,
+                source: CompletionSource::Artifact,
+                authority: CompletionAuthority::Attempt(predecessor.clone()),
+            },
+        );
+        state.handle_completion_result("T-CDX-01", Some(0), vec![b'a'; 40], Vec::new());
+        assert!(state.threads.contains_key("T-CDX-01"));
+        assert!(!state.pending_completions.contains_key("T-CDX-01"));
+
+        // An admitted completion is a lease-critical section: even a thread
+        // over both budget and hard-silence thresholds cannot be reclaimed
+        // while its isolated transaction is outstanding.
+        state.config.session_timeout_secs = 1;
+        state.config.stuck_threshold_secs = 1;
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        {
+            let thread = state.threads.get_mut("T-CDX-01").unwrap();
+            thread.started_at = old;
+            thread.last_activity = old;
+        }
+        state.pending_completions.insert(
+            "T-CDX-01".to_string(),
+            PendingCompletion {
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Review,
+                source: CompletionSource::Artifact,
+                authority: CompletionAuthority::Attempt(replacement.clone()),
+            },
+        );
+        state.check_session_timeouts();
+        assert!(state.threads.contains_key("T-CDX-01"));
+        assert!(replacement.is_current(state.current_leases.get("T-CDX-01")));
+        state.pending_completions.remove("T-CDX-01");
+
+        assert!(state.request_completion(
+            "T-CDX-01".to_string(),
+            CompletionSource::Artifact,
+            Some(CompletionAuthority::Attempt(replacement.clone())),
+        ));
+        lisa_core::ticket::update_ticket_done(&ticket_path).unwrap();
+        state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
+        state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records.len(), 2, "history plus one winning completion");
+        assert_eq!(records[0].attempt_lease, predecessor);
+        assert_eq!(records[0].outcome, RunOutcome::TimedOut);
+        assert!(records[0].fenced);
+        assert!(!records[0].authoritative);
+        assert_eq!(records[1].attempt_lease, replacement);
+        assert_eq!(records[1].outcome, RunOutcome::Done);
+        assert!(!records[1].fenced);
+        assert!(records[1].authoritative);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.outcome == RunOutcome::Done && record.authoritative)
+                .count(),
+            1
+        );
     }
 
     #[test]
