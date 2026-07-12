@@ -26,6 +26,15 @@ use lisa_core::types::{
 };
 use pane_name::{format_pane_name, PaneName};
 
+/// Encode one arbitrary UTF-8 value as one POSIX shell argument.
+///
+/// Always single-quote, and leave/re-enter single quotes around literal `'`
+/// bytes. This prevents command, parameter, glob, and whitespace expansion in
+/// provider launch payloads and in the bounded launch-file address.
+pub(crate) fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 /// How often (in seconds) the plugin rescans ticket files to detect phase changes.
 const POLL_INTERVAL_SECS: f64 = 5.0;
 
@@ -98,8 +107,8 @@ pub(crate) fn ticket_prompt(
 /// so the `Stop` hook's `lisa capture-usage` (T-027-02) is reachable even when
 /// the pane shell lacks `lisa` on PATH — mirroring the Codex adapter's
 /// `lisa_bin` threading. `None`/empty omits the var entirely, keeping the launch
-/// line byte-for-byte the pre-capture command (the hook then falls back to a
-/// PATH `lisa`).
+/// command without that environment assignment (the hook then falls back to a
+/// PATH `lisa`). Dynamic values are shell-quoted before the payload is written.
 pub(crate) fn build_claude_command(
     ticket_dir: &Path,
     ticket_id: &str,
@@ -109,28 +118,29 @@ pub(crate) fn build_claude_command(
     artifact_dir: &Path,
 ) -> String {
     // The Claude adapter owns the model→flag mapping (`--model`). When no model
-    // is routed the flag is omitted, so the launch line is byte-for-byte the
-    // pre-routing command — the zero-regression path.
+    // is routed the flag is omitted, preserving the provider invocation while
+    // the dynamic values remain uniformly shell-quoted.
     let model_flag = match model {
-        Some(m) => format!(" --model {}", m),
+        Some(m) => format!(" --model {}", shell_quote(m)),
         None => String::new(),
     };
     let lisa_bin_env = match lisa_bin.filter(|s| !s.is_empty()) {
-        Some(bin) => format!("LISA_BIN={} ", bin),
+        Some(bin) => format!("LISA_BIN={} ", shell_quote(bin)),
         None => String::new(),
     };
+    let prompt = ticket_prompt(
+        ticket_dir,
+        ticket_id,
+        AgentClient::Claude.context_file(),
+        artifact_dir,
+    );
     format!(
-        "{}LISA_PANE_ID={} LISA_TICKET_ID={} claude --dangerously-skip-permissions{} \"{}\"",
+        "{}LISA_PANE_ID={} LISA_TICKET_ID={} claude --dangerously-skip-permissions{} {}",
         lisa_bin_env,
         pane_id,
-        ticket_id,
+        shell_quote(ticket_id),
         model_flag,
-        ticket_prompt(
-            ticket_dir,
-            ticket_id,
-            AgentClient::Claude.context_file(),
-            artifact_dir,
-        )
+        shell_quote(&prompt),
     )
 }
 
@@ -581,6 +591,49 @@ impl State {
         });
         set_timeout(ENTER_DELAY_SECS);
         self.pending_timer_count += 1;
+    }
+
+    /// Atomically prepare a complete fresh provider launch outside the PTY.
+    ///
+    /// The pane receives only the returned `sh <path>` indirection. Publication
+    /// uses a same-directory rename, so a successful return proves the shell can
+    /// address a complete script. Callers must not queue pane input on `Err`.
+    fn prepare_fresh_launch(
+        artifact_dir: &Path,
+        pane_id: u32,
+        payload: &str,
+    ) -> Result<String, String> {
+        std::fs::create_dir_all(artifact_dir).map_err(|error| {
+            format!(
+                "cannot create launch directory {}: {error}",
+                artifact_dir.display()
+            )
+        })?;
+
+        let destination = artifact_dir.join(format!(".lisa-launch-{pane_id}.sh"));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = artifact_dir.join(format!(".lisa-launch-{pane_id}.sh.tmp.{nonce}"));
+        let script = format!("#!/bin/sh\n{payload}\n");
+
+        std::fs::write(&temporary, script).map_err(|error| {
+            format!(
+                "cannot write launch payload {}: {error}",
+                temporary.display()
+            )
+        })?;
+        if let Err(error) = std::fs::rename(&temporary, &destination) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!(
+                "cannot publish launch payload {}: {error}",
+                destination.display()
+            ));
+        }
+
+        let shell_path = strip_host_prefix(&destination);
+        Ok(format!("sh {}", shell_quote(&shell_path.to_string_lossy())))
     }
 
     /// True if `pane_id` is currently blocked on an `AskUserQuestion` (its
@@ -1841,7 +1894,8 @@ impl State {
                 None
             };
 
-            let artifact_dir = strip_host_prefix(&self.attempt_work_dir(&attempt_lease));
+            let attempt_artifact_dir = self.attempt_work_dir(&attempt_lease);
+            let artifact_dir = strip_host_prefix(&attempt_artifact_dir);
 
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
@@ -1879,8 +1933,28 @@ impl State {
                     self.config.lisa_bin.as_deref(),
                 );
                 let exit_command = resident_adapter.exit_command();
-                let cmd = adapter.launch_command(&ctx);
-                launch_cmd = cmd;
+                let payload = adapter.launch_command(&ctx);
+                launch_cmd =
+                    match Self::prepare_fresh_launch(&attempt_artifact_dir, pane_id, &payload) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            self.revoke_current_lease(&ticket_id);
+                            self.rename_slot(
+                                pane_id,
+                                format_pane_name(PaneName::Idle {
+                                    resident_agent: Some(resident_client),
+                                }),
+                            );
+                            self.log_activity(ActivityEvent::Error {
+                                message: format!(
+                                    "Cannot dispatch {} on pane {}: {}",
+                                    ticket_id, pane_id, error
+                                ),
+                            });
+                            unscheduled += 1;
+                            continue;
+                        }
+                    };
                 self.send_line_to_pane(exit_command, PaneId::Terminal(pane_id));
                 self.agent_slots[slot_idx].has_session = false;
                 self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForExit;
@@ -1919,16 +1993,53 @@ impl State {
                     // transition_state untouched (Idle) keeps the .cleared/
                     // clear-timeout machinery inert for this pane.
                     ResetStrategy::FreshExec => {
-                        let cmd = adapter.launch_command(&ctx);
-                        self.send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
-                        launch_cmd = cmd;
+                        let payload = adapter.launch_command(&ctx);
+                        launch_cmd = match Self::prepare_fresh_launch(
+                            &attempt_artifact_dir,
+                            pane_id,
+                            &payload,
+                        ) {
+                            Ok(command) => command,
+                            Err(error) => {
+                                self.revoke_current_lease(&ticket_id);
+                                self.log_activity(ActivityEvent::Error {
+                                    message: format!(
+                                        "Cannot dispatch {} on pane {}: {}",
+                                        ticket_id, pane_id, error
+                                    ),
+                                });
+                                unscheduled += 1;
+                                continue;
+                            }
+                        };
+                        self.send_line_to_pane(&launch_cmd, PaneId::Terminal(pane_id));
                     }
                 }
             } else {
                 // Fresh pane — launch the agent from the shell.
-                let cmd = adapter.launch_command(&ctx);
-                launch_cmd = cmd.clone();
-                self.send_line_to_pane(&cmd, PaneId::Terminal(pane_id));
+                let payload = adapter.launch_command(&ctx);
+                launch_cmd =
+                    match Self::prepare_fresh_launch(&attempt_artifact_dir, pane_id, &payload) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            self.revoke_current_lease(&ticket_id);
+                            self.rename_slot(
+                                pane_id,
+                                format_pane_name(PaneName::Idle {
+                                    resident_agent: None,
+                                }),
+                            );
+                            self.log_activity(ActivityEvent::Error {
+                                message: format!(
+                                    "Cannot dispatch {} on pane {}: {}",
+                                    ticket_id, pane_id, error
+                                ),
+                            });
+                            unscheduled += 1;
+                            continue;
+                        }
+                    };
+                self.send_line_to_pane(&launch_cmd, PaneId::Terminal(pane_id));
                 self.agent_slots[slot_idx].has_session = true;
             }
 
@@ -3058,7 +3169,8 @@ impl State {
                 });
                 continue;
             }
-            let artifact_dir = strip_host_prefix(&artifact_dir);
+            let launch_artifact_dir = artifact_dir;
+            let artifact_dir = strip_host_prefix(&launch_artifact_dir);
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
@@ -3066,7 +3178,20 @@ impl State {
                 artifact_dir: &artifact_dir,
                 assignment_generation: self.active_assignment_generation(pane_id),
             };
-            let command = adapter.launch_command(&ctx);
+            let payload = adapter.launch_command(&ctx);
+            let command = match Self::prepare_fresh_launch(&launch_artifact_dir, pane_id, &payload)
+            {
+                Ok(command) => command,
+                Err(error) => {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "Cannot launch {} on pane {} after exit: {}",
+                            ticket_id, pane_id, error
+                        ),
+                    });
+                    continue;
+                }
+            };
             self.send_line_to_pane(&command, PaneId::Terminal(pane_id));
 
             if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
@@ -5038,12 +5163,11 @@ mod tests {
         );
 
         assert!(cmd.starts_with(
-            "LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 claude --dangerously-skip-permissions "
+            "LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' claude --dangerously-skip-permissions "
         ));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
-        // No routed model → no --model flag (zero-regression: byte-for-byte the
-        // pre-routing launch line).
+        // No routed model → no --model flag.
         assert!(!cmd.contains("--model"));
         assert!(
             !cmd.ends_with('\r'),
@@ -5065,7 +5189,7 @@ mod tests {
         // The Claude adapter maps a routed model to `--model`, placed after the
         // permission flag and before the quoted prompt.
         assert!(
-            cmd.contains("--dangerously-skip-permissions --model opus \""),
+            cmd.contains("--dangerously-skip-permissions --model 'opus' '"),
             "got: {cmd}"
         );
     }
@@ -5083,7 +5207,7 @@ mod tests {
         );
 
         assert!(
-            cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID=T-042-01 "),
+            cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID='T-042-01' "),
             "command should set LISA_PANE_ID and LISA_TICKET_ID env vars, got: {}",
             cmd
         );
@@ -5106,6 +5230,68 @@ mod tests {
             "command should reference RDSPI workflow, got: {}",
             cmd
         );
+    }
+
+    #[test]
+    fn test_shell_quote_round_trips_long_control_and_quote_heavy_values() {
+        let values = [
+            "",
+            "plain",
+            "space and\nnewline\ttab\rreturn",
+            "single ' double \" dollar $(touch nope) ${HOME} `id` * ; \\",
+            "escape:\u{1b} unicode: λ雪",
+            &"long-'-$()-\n".repeat(4_096),
+        ];
+
+        for value in values {
+            let quoted = shell_quote(value);
+            assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
+            let decoded = quoted[1..quoted.len() - 1].replace("'\"'\"'", "'");
+            assert_eq!(decoded, value, "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_prepare_fresh_launch_is_bounded_and_preserves_complete_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_dir = temp.path().join("attempt path with ' quote");
+        let small = "printf '%s' small";
+        let small_launcher = State::prepare_fresh_launch(&artifact_dir, 7, small).unwrap();
+        assert!(!small_launcher.contains(small));
+
+        let hostile = "quote:' double:\" dollar:$() backtick:`x` slash:\\\n\t\r\u{1b}";
+        let large = format!("printf '%s' {}", shell_quote(&hostile.repeat(32_768)));
+        let large_launcher = State::prepare_fresh_launch(&artifact_dir, 7, &large).unwrap();
+
+        assert_eq!(small_launcher, large_launcher);
+        assert!(!large_launcher.contains(&large));
+        assert!(large.len() > 500_000);
+        assert_eq!(
+            std::fs::read_to_string(artifact_dir.join(".lisa-launch-7.sh")).unwrap(),
+            format!("#!/bin/sh\n{large}\n")
+        );
+        assert!(std::fs::read_dir(&artifact_dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp.")));
+    }
+
+    #[test]
+    fn test_prepare_fresh_launch_failure_cannot_queue_enter() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocking_file = temp.path().join("not-a-directory");
+        std::fs::write(&blocking_file, "occupied").unwrap();
+        let mut state = State::default();
+
+        let result = State::prepare_fresh_launch(&blocking_file.join("work"), 3, "payload");
+
+        assert!(result.is_err());
+        assert!(state.pending_enters.is_empty());
+        assert_eq!(state.pending_timer_count, 0);
+        // The only API that queues Enter is deliberately not called on Err.
+        state.flush_pending_enters(std::time::SystemTime::now());
+        assert!(state.pending_enters.is_empty());
     }
 
     #[test]
@@ -8940,7 +9126,7 @@ timeout\n\
                 matches!(
                     event,
                     ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                        if ticket_id == "T-NAME" && command.starts_with("sh '")
                 )
             })
             .count();
@@ -8958,7 +9144,7 @@ timeout\n\
                 matches!(
                     event,
                     ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                        if ticket_id == "T-NAME" && command.starts_with("sh '")
                 )
             })
             .count();
@@ -8997,7 +9183,7 @@ timeout\n\
                 matches!(
                     event,
                     ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                        if ticket_id == "T-NAME" && command.starts_with("sh '")
                 )
             })
             .count();
@@ -9094,7 +9280,7 @@ timeout\n\
                 matches!(
                     event,
                     ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                        if ticket_id == "T-NAME" && command.starts_with("sh '")
                 )
             })
             .count();
@@ -9108,7 +9294,7 @@ timeout\n\
                 matches!(
                     event,
                     ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                        if ticket_id == "T-NAME" && command.starts_with("sh '")
                 )
             })
             .count();
@@ -9142,7 +9328,7 @@ timeout\n\
                 matches!(
                     event,
                     ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.contains("generation\\\":2")
+                        if ticket_id == "T-NAME" && command.starts_with("sh '")
                 )
             })
             .count();

@@ -44,7 +44,7 @@ use lisa_core::route::{resolve_route, ResolvedRoute};
 use lisa_core::types::Ticket;
 
 use crate::codex_ack::{tag_codex_assignment, CodexAssignmentRef};
-use crate::{build_claude_command, finish_up_prompt, ticket_prompt};
+use crate::{build_claude_command, finish_up_prompt, shell_quote, ticket_prompt};
 
 /// Inputs needed to construct a launch command or a reuse prompt for a ticket.
 ///
@@ -155,8 +155,7 @@ pub(crate) trait AgentAdapter {
 /// scheduler (the no-op proof).
 ///
 /// `model` is the routed model for this pane (T-026-01), mapped to Claude's
-/// `--model` flag; `None` runs Claude's default model — the pre-routing launch
-/// line, byte-for-byte.
+/// `--model` flag; `None` runs Claude's default model.
 #[derive(Default)]
 pub(crate) struct ClaudeCodeAdapter {
     model: Option<String>,
@@ -262,7 +261,7 @@ impl CodexAdapter {
     /// no model is routed.
     fn model_flag(&self) -> String {
         match &self.model {
-            Some(m) => format!(" --model {}", m),
+            Some(m) => format!(" --model {}", shell_quote(m)),
             None => String::new(),
         }
     }
@@ -292,21 +291,18 @@ impl CodexAdapter {
     /// gives lifecycle hooks pane/ticket attribution and tells `capture-usage`
     /// to parse the Codex transcript into `.lisa/codex/`.
     fn interactive_line(&self, ctx: &SpawnContext) -> String {
-        // The prompt is one double-quoted shell argument. Escape the structured
-        // marker's JSON quotes so Codex receives them rather than the shell
-        // treating them as quote delimiters.
-        let prompt = self.assignment_prompt(ctx).replace('"', "\\\"");
+        let prompt = self.assignment_prompt(ctx);
         format!(
             "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} \
              codex --dangerously-bypass-approvals-and-sandbox \
-             --dangerously-bypass-hook-trust{model} \"{prompt}\" || \
+             --dangerously-bypass-hook-trust{model} {prompt} || \
              {{ mkdir -p .lisa/signals; date -u +%Y-%m-%dT%H:%M:%SZ > \
              .lisa/signals/pane-{pane}.error; }}",
-            bin = self.lisa_bin,
+            bin = shell_quote(&self.lisa_bin),
             pane = ctx.pane_id,
-            ticket = ctx.ticket_id,
+            ticket = shell_quote(ctx.ticket_id),
             model = self.model_flag(),
-            prompt = prompt,
+            prompt = shell_quote(&prompt),
         )
     }
 }
@@ -429,7 +425,7 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = ClaudeCodeAdapter::new(Some("opus"), None).launch_command(&ctx);
-        assert!(cmd.contains("--model opus"), "got: {cmd}");
+        assert!(cmd.contains("--model 'opus'"), "got: {cmd}");
         assert_eq!(
             cmd,
             build_claude_command(dir, "T-042-01", 7, Some("opus"), None, ctx.artifact_dir,)
@@ -444,7 +440,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let with_bin = ClaudeCodeAdapter::new(None, Some("/abs/lisa")).launch_command(&ctx);
         assert!(
-            with_bin.starts_with("LISA_BIN=/abs/lisa LISA_PANE_ID=7"),
+            with_bin.starts_with("LISA_BIN='/abs/lisa' LISA_PANE_ID=7"),
             "got: {with_bin}"
         );
         let without = ClaudeCodeAdapter::new(None, None).launch_command(&ctx);
@@ -594,7 +590,7 @@ mod tests {
         // The model flows into the launched command for the Codex pane.
         let dir = Path::new("docs/active/tickets");
         let cmd_a = adapter_a.launch_command(&spawn_ctx(dir, "T-005", 1));
-        assert!(cmd_a.contains("--model gpt-5"), "got: {cmd_a}");
+        assert!(cmd_a.contains("--model 'gpt-5'"), "got: {cmd_a}");
     }
 
     // --- CodexAdapter (T-023-02) --------------------------------------------
@@ -605,19 +601,19 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
         assert!(cmd.starts_with(
-            "LISA_BIN=/abs/lisa LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID=T-042-01 codex "
+            "LISA_BIN='/abs/lisa' LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' codex "
         ));
         assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(cmd.contains("--dangerously-bypass-hook-trust"));
         assert!(cmd.contains(".lisa/signals/pane-7.error"));
         // The wrapped prompt is the shared RDSPI ticket prompt, verbatim — with
         // Codex's context file (AGENTS.md).
-        assert!(cmd.contains(&ticket_prompt(
+        assert!(cmd.contains(&shell_quote(&ticket_prompt(
             dir,
             "T-042-01",
             AgentClient::Codex.context_file(),
             ctx.artifact_dir,
-        )));
+        ))));
         assert!(cmd.contains("AGENTS.md"));
     }
 
@@ -643,7 +639,7 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = CodexAdapter::new(Some("/abs/lisa"), Some("gpt-5")).launch_command(&ctx);
-        assert!(cmd.contains("--model gpt-5 \""), "got: {cmd}");
+        assert!(cmd.contains("--model 'gpt-5' '"), "got: {cmd}");
         // No model → no flag (pre-routing wrapper line).
         let bare = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
         assert!(!bare.contains("--model"), "got: {bare}");
@@ -677,9 +673,7 @@ mod tests {
         assert!(reuse.contains(r#"LISA_ASSIGNMENT {"ticket_id":"T-042-01","generation":17}"#));
 
         let launch = adapter.launch_command(&ctx);
-        assert!(
-            launch.contains(r#"LISA_ASSIGNMENT {\"ticket_id\":\"T-042-01\",\"generation\":17}"#)
-        );
+        assert!(launch.contains(r#"LISA_ASSIGNMENT {"ticket_id":"T-042-01","generation":17}"#));
     }
 
     #[test]
@@ -725,7 +719,7 @@ mod tests {
         // None and empty both degrade to a PATH-resolved `lisa` for hooks.
         for bin in [None, Some("")] {
             let cmd = CodexAdapter::new(bin, None).launch_command(&ctx);
-            assert!(cmd.starts_with("LISA_BIN=lisa "), "cmd: {cmd}");
+            assert!(cmd.starts_with("LISA_BIN='lisa' "), "cmd: {cmd}");
         }
     }
 }
