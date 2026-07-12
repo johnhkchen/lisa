@@ -12454,6 +12454,320 @@ timeout\n\
     }
 
     #[test]
+    fn split_brain_timeline_fences_old_attempt_and_admits_one_winner() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        let signal_dir = dir.path().join("signals");
+        let attempt_dir = dir.path().join("attempts");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-SPLIT.md"),
+            "---\nid: T-SPLIT\ntitle: deterministic split brain\ntype: task\nstatus: review\npriority: high\nphase: review\nagent: codex\n---\n",
+        )
+        .unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: work_dir.clone(),
+                client: AgentClient::Codex,
+                max_threads: 1,
+                wind_down_secs: 0,
+                session_timeout_secs: 1,
+                stuck_threshold_secs: 1,
+                ..PluginConfig::new()
+            },
+            signal_dir: signal_dir.clone(),
+            attempt_dir,
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        let ledger = with_ledger(&mut state, &dir);
+
+        // Attempt 1 owns pane 1 but is both over-budget and hard-silent. Pane 2
+        // is the sole eligible replacement and already hosts a resident Codex
+        // process, so redispatch must wait for an attempt-scoped acknowledgment.
+        codex_slot(&mut state, 1, "T-SPLIT");
+        state.agent_slots[0].last_client = Some(AgentClient::Codex);
+        state
+            .agent_slots
+            .push(fresh_slot(2, Some(AgentClient::Codex)));
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        let mut predecessor_thread = Thread::new("T-SPLIT", 1);
+        predecessor_thread.client = AgentClient::Codex;
+        predecessor_thread.current_phase = Phase::Review;
+        predecessor_thread.started_at = old;
+        predecessor_thread.last_activity = old;
+        state
+            .threads
+            .insert("T-SPLIT".to_string(), predecessor_thread);
+        let predecessor = install_current_attempt(&mut state, "T-SPLIT");
+        state.seat_assignments.insert(1, SeatAssignmentState::Owned);
+        let predecessor_stage = state.attempt_work_dir(&predecessor);
+        fs::create_dir_all(&predecessor_stage).unwrap();
+        fs::write(
+            predecessor_stage.join("review.md"),
+            "predecessor review must remain private\n",
+        )
+        .unwrap();
+
+        state.check_session_timeouts();
+
+        assert_eq!(
+            state.attempt_lifecycle,
+            vec![
+                AttemptLifecycleEvent::LeaseRevoked {
+                    ticket_id: "T-SPLIT".to_string(),
+                },
+                AttemptLifecycleEvent::PaneFenced {
+                    ticket_id: "T-SPLIT".to_string(),
+                    pane_id: 1,
+                },
+                AttemptLifecycleEvent::SlotReleased {
+                    ticket_id: "T-SPLIT".to_string(),
+                },
+            ],
+            "the predecessor lease must be revoked and its pane fenced before release"
+        );
+        assert!(!state.threads.contains_key("T-SPLIT"));
+        assert!(!state.current_leases.contains_key("T-SPLIT"));
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert_eq!(state.agent_slots[0].ticket_id, None);
+        assert_eq!(state.agent_slots[0].attempt_lease, None);
+        assert_eq!(state.seat_assignment(1), None);
+        assert_eq!(state.timeout_alerts.len(), 1);
+        let timeout_records = read_ledger(&ledger);
+        assert_eq!(timeout_records.len(), 1);
+        assert_eq!(timeout_records[0].attempt_lease, predecessor);
+        assert_eq!(timeout_records[0].outcome, RunOutcome::TimedOut);
+        assert!(timeout_records[0].fenced);
+        assert!(!timeout_records[0].authoritative);
+
+        state.schedule_ready_tickets();
+
+        let replacement = state.current_leases["T-SPLIT"].clone();
+        assert_eq!(replacement.attempt_id, predecessor.attempt_id + 1);
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert_eq!(state.agent_slots[0].ticket_id, None);
+        assert_eq!(state.agent_slots[1].ticket_id.as_deref(), Some("T-SPLIT"));
+        assert_eq!(
+            state.agent_slots[1].attempt_lease.as_ref(),
+            Some(&replacement)
+        );
+        assert_eq!(state.threads["T-SPLIT"].pane_id, 2);
+        assert_eq!(
+            state.threads["T-SPLIT"].attempt_lease.as_ref(),
+            Some(&replacement)
+        );
+        assert_eq!(
+            state.agent_slots[1].transition_state,
+            TransitionState::WaitingForClear
+        );
+        state.handle_cleared_signal(2);
+        assert_eq!(state.agent_slots[1].transition_state, TransitionState::Idle);
+        assert!(matches!(
+            state.seat_assignment(2),
+            Some(SeatAssignmentState::AssignedPendingAck {
+                generation,
+                ack_deadline: Some(_),
+            }) if generation == replacement.attempt_id
+        ));
+        assert!(
+            !state.seat_is_owned(2),
+            "a delivered prompt without an acknowledgment is not ownership"
+        );
+        assert_eq!(
+            state
+                .agent_slots
+                .iter()
+                .filter(|slot| slot.ticket_id.as_deref() == Some("T-SPLIT"))
+                .count(),
+            1,
+            "only the replacement pane may reserve the ticket"
+        );
+
+        let replacement_thread_clock = state.threads["T-SPLIT"].last_activity;
+        let replacement_pane_clock = state.agent_slots[1].last_activity_at;
+        let stale_ack = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "late predecessor resume",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-SPLIT",
+                    generation: predecessor.attempt_id,
+                },
+            ),
+        });
+        fs::write(
+            signal_dir.join("pane-1.heartbeat"),
+            serde_json::to_string(&predecessor).unwrap(),
+        )
+        .unwrap();
+        fs::write(signal_dir.join("pane-1.ack"), stale_ack.to_string()).unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "late idle").unwrap();
+        fs::write(signal_dir.join("pane-1.stopped"), "late stop").unwrap();
+        fs::write(signal_dir.join("pane-1.cleared"), "late clear").unwrap();
+        fs::write(signal_dir.join("pane-1.error"), "late error").unwrap();
+
+        state.check_heartbeat_signals();
+        state.check_codex_ack_signals();
+        state.check_idle_signals();
+        state.check_transition_signals();
+        state.check_error_signals();
+        state.check_artifact_advances();
+
+        for suffix in ["heartbeat", "ack", "idle", "stopped", "cleared", "error"] {
+            assert!(
+                !signal_dir.join(format!("pane-1.{suffix}")).exists(),
+                "late {suffix} signal must be consumed without replay"
+            );
+        }
+        assert_eq!(
+            state.threads["T-SPLIT"].last_activity,
+            replacement_thread_clock
+        );
+        assert_eq!(
+            state.agent_slots[1].last_activity_at,
+            replacement_pane_clock
+        );
+        assert_eq!(state.current_leases.get("T-SPLIT"), Some(&replacement));
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert_eq!(state.agent_slots[0].ticket_id, None);
+        assert_eq!(state.agent_slots[1].ticket_id.as_deref(), Some("T-SPLIT"));
+        assert!(matches!(
+            state.seat_assignment(2),
+            Some(SeatAssignmentState::AssignedPendingAck { generation, .. })
+                if generation == replacement.attempt_id
+        ));
+        assert!(!state.seat_is_owned(2));
+        assert!(state.error_alerts.is_empty());
+        assert!(!state.pending_completions.contains_key("T-SPLIT"));
+        assert!(!work_dir.join("T-SPLIT/review.md").exists());
+        assert_eq!(
+            fs::read_to_string(predecessor_stage.join("review.md")).unwrap(),
+            "predecessor review must remain private\n"
+        );
+
+        assert!(
+            state
+                .admit_artifact("T-SPLIT", Some(&predecessor), "review.md")
+                .is_err(),
+            "a predecessor lease cannot publish its private artifact"
+        );
+        assert!(!state.request_completion(
+            "T-SPLIT".to_string(),
+            CompletionSource::Artifact,
+            Some(CompletionAuthority::Attempt(predecessor.clone())),
+        ));
+        assert!(!state.pending_completions.contains_key("T-SPLIT"));
+        state.threads.get_mut("T-SPLIT").unwrap().attempt_lease = Some(predecessor.clone());
+        assert!(
+            !state.emit_provenance("T-SPLIT", RunOutcome::Done, false),
+            "a resumed predecessor cannot append authoritative provenance"
+        );
+        state.threads.get_mut("T-SPLIT").unwrap().attempt_lease = Some(replacement.clone());
+        assert_eq!(read_ledger(&ledger).len(), 1);
+
+        assert!(
+            !state.acknowledge_codex_assignment(2, &stale_ack.to_string()),
+            "the old generation cannot promote the replacement pane"
+        );
+        assert!(acknowledge_assignment(
+            &mut state,
+            2,
+            "T-SPLIT",
+            replacement.attempt_id,
+        ));
+        assert_eq!(state.seat_assignment(2), Some(SeatAssignmentState::Owned));
+        assert_eq!(
+            state
+                .seat_assignments
+                .values()
+                .filter(|assignment| **assignment == SeatAssignmentState::Owned)
+                .count(),
+            1,
+            "exactly one physical seat may own the ticket"
+        );
+
+        let replacement_stage = state.attempt_work_dir(&replacement);
+        fs::create_dir_all(&replacement_stage).unwrap();
+        fs::write(
+            replacement_stage.join("review.md"),
+            "replacement review is authoritative\n",
+        )
+        .unwrap();
+        state.check_artifact_advances();
+
+        assert_eq!(
+            fs::read_to_string(work_dir.join("T-SPLIT/review.md")).unwrap(),
+            "replacement review is authoritative\n"
+        );
+        let pending = state.pending_completions.get("T-SPLIT").unwrap();
+        assert_eq!(
+            pending.authority,
+            CompletionAuthority::Attempt(replacement.clone())
+        );
+        assert_eq!(pending.source, CompletionSource::Artifact);
+
+        lisa_core::ticket::update_ticket_done(tickets_dir.join("T-SPLIT.md")).unwrap();
+        let commit_id = vec![b'c'; 40];
+        state.handle_completion_result("T-SPLIT", Some(0), commit_id.clone(), Vec::new());
+        state.handle_completion_result("T-SPLIT", Some(0), commit_id, Vec::new());
+
+        assert!(!state.pending_completions.contains_key("T-SPLIT"));
+        assert!(!state.threads.contains_key("T-SPLIT"));
+        assert!(state
+            .agent_slots
+            .iter()
+            .all(|slot| slot.ticket_id.as_deref() != Some("T-SPLIT")));
+        assert!(state
+            .seat_assignments
+            .values()
+            .all(|assignment| { *assignment != SeatAssignmentState::Owned }));
+
+        let records = read_ledger(&ledger);
+        assert_eq!(
+            records.len(),
+            2,
+            "timeout history plus one winning completion"
+        );
+        assert_eq!(records[0].attempt_lease, predecessor);
+        assert_eq!(records[0].outcome, RunOutcome::TimedOut);
+        assert!(records[0].fenced);
+        assert!(!records[0].authoritative);
+        assert_eq!(records[1].attempt_lease, replacement);
+        assert_eq!(records[1].outcome, RunOutcome::Done);
+        assert!(!records[1].fenced);
+        assert!(records[1].authoritative);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.outcome == RunOutcome::Done && record.authoritative)
+                .count(),
+            1,
+            "only the replacement lease may publish authoritative Done"
+        );
+    }
+
+    #[test]
     fn artifact_completion_publishes_only_after_verified_commit_result() {
         use lisa_core::types::Thread;
         use std::fs;
