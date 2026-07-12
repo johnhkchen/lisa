@@ -7,6 +7,7 @@
 mod adapter;
 mod codex_ack;
 mod pane_name;
+mod signal;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -28,16 +29,7 @@ use lisa_core::types::{
     ActivityEvent, AttemptLease, Phase, PluginConfig, Thread, TicketId, TicketStatus,
 };
 use pane_name::{format_pane_name, PaneName};
-
-/// Parse the pane id from one `pane-<u32>.<suffix>` signal filename.
-fn pane_id_from_signal_filename(filename: &std::ffi::OsStr, suffix: &str) -> Option<u32> {
-    filename
-        .to_str()?
-        .strip_prefix("pane-")?
-        .strip_suffix(suffix)?
-        .parse()
-        .ok()
-}
+use signal::{IdleTarget, SignalRecord, SignalRequest};
 
 /// Encode one arbitrary UTF-8 value as one POSIX shell argument.
 ///
@@ -3113,26 +3105,12 @@ impl State {
     /// pane's wind-down clock, so an active session is never flagged stuck,
     /// never reclaimed by a timeout, and never has its pane reused.
     fn check_heartbeat_signals(&mut self) {
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let pane_id = match path
-                .file_name()
-                .and_then(|name| pane_id_from_signal_filename(name, ".heartbeat"))
-            {
-                Some(id) => id,
-                None => continue,
-            };
-
-            let candidate = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|body| serde_json::from_str::<AttemptLease>(&body).ok());
-            let _ = std::fs::remove_file(&path);
-            let Some(candidate) = candidate else {
+        for record in signal::ingest(&self.signal_dir, SignalRequest::Heartbeats) {
+            let SignalRecord::Heartbeat {
+                pane_id,
+                lease: candidate,
+            } = record
+            else {
                 continue;
             };
             let admitted = self
@@ -3160,26 +3138,12 @@ impl State {
     /// Consume provider-neutral process-start signals and promote only the
     /// exact current fresh attempt assigned to the addressed physical seat.
     fn check_process_start_signals(&mut self) {
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let pane_id = match path
-                .file_name()
-                .and_then(|name| pane_id_from_signal_filename(name, ".started"))
-            {
-                Some(id) => id,
-                None => continue,
-            };
-
-            let candidate = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|body| serde_json::from_str::<AttemptLease>(&body).ok());
-            let _ = std::fs::remove_file(&path);
-            let Some(candidate) = candidate else {
+        for record in signal::ingest(&self.signal_dir, SignalRequest::ProcessStarts) {
+            let SignalRecord::ProcessStarted {
+                pane_id,
+                lease: candidate,
+            } = record
+            else {
                 continue;
             };
             self.acknowledge_process_start(pane_id, &candidate);
@@ -3189,26 +3153,12 @@ impl State {
     /// Consume attempt-scoped proof that an interrupted pane executed a command
     /// at its shell boundary. Only the exact reset successor may relaunch.
     fn check_shell_ready_signals(&mut self) {
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let pane_id = match path
-                .file_name()
-                .and_then(|name| pane_id_from_signal_filename(name, ".shell-ready"))
-            {
-                Some(id) => id,
-                None => continue,
-            };
-
-            let candidate = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|body| serde_json::from_str::<AttemptLease>(&body).ok());
-            let _ = std::fs::remove_file(&path);
-            let Some(candidate) = candidate else {
+        for record in signal::ingest(&self.signal_dir, SignalRequest::ShellReady) {
+            let SignalRecord::ShellReady {
+                pane_id,
+                lease: candidate,
+            } = record
+            else {
                 continue;
             };
             self.acknowledge_shell_ready(pane_id, &candidate, std::time::SystemTime::now());
@@ -3218,24 +3168,8 @@ impl State {
     /// Consume raw provider `UserPromptSubmit` payloads and promote only the
     /// ticket/generation currently pending in the addressed physical seat.
     fn check_codex_ack_signals(&mut self) {
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let pane_id = match path
-                .file_name()
-                .and_then(|name| pane_id_from_signal_filename(name, ".ack"))
-            {
-                Some(id) => id,
-                None => continue,
-            };
-
-            let payload = std::fs::read_to_string(&path).ok();
-            let _ = std::fs::remove_file(&path);
-            let Some(payload) = payload else {
+        for record in signal::ingest(&self.signal_dir, SignalRequest::CodexAcknowledgements) {
+            let SignalRecord::CodexAcknowledgement { pane_id, payload } = record else {
                 continue;
             };
 
@@ -3262,22 +3196,10 @@ impl State {
     /// only; a blocked-then-abandoned pane must still trip stale detection on the
     /// normal silence clock (reclaim exemption is T-020-04).
     fn check_awaiting_signals(&mut self) {
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let pane_id = match path
-                .file_name()
-                .and_then(|name| pane_id_from_signal_filename(name, ".awaiting"))
-            {
-                Some(id) => id,
-                None => continue,
+        for record in signal::ingest(&self.signal_dir, SignalRequest::Awaiting) {
+            let SignalRecord::Awaiting { pane_id } = record else {
+                continue;
             };
-
-            let _ = std::fs::remove_file(&path);
             if self.awaiting_human.insert(pane_id) {
                 self.log_activity(ActivityEvent::Info {
                     message: format!(
@@ -3303,53 +3225,36 @@ impl State {
     fn check_idle_signals(&mut self) {
         self.idle_alerts.clear();
 
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return, // Directory doesn't exist yet — normal on first run
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let filename = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) if name.ends_with(".idle") => name.to_string(),
-                _ => continue,
+        for record in signal::ingest(&self.signal_dir, SignalRequest::Idle) {
+            let SignalRecord::Idle { target } = record else {
+                continue;
             };
-
-            // Clean up the signal file immediately (prevents re-trigger on next poll)
-            let _ = std::fs::remove_file(&path);
-
             // Signal files are named pane-{pane_id}.idle — resolve ticket
             // from the agent slot that owns this pane. `idle_pane_id` is lifted
             // out of the parse branch so the IdleWithoutArtifact arm below can
             // debounce on it and export LISA_PANE_ID.
             let mut idle_pane_id: Option<u32> = None;
-            let ticket_id: TicketId = if let Some(rest) = filename
-                .strip_prefix("pane-")
-                .and_then(|s| s.strip_suffix(".idle"))
-            {
-                let pane_id: u32 = match rest.parse() {
-                    Ok(id) => id,
-                    Err(_) => continue,
-                };
-                idle_pane_id = Some(pane_id);
-                // A transition reserves the slot for its next ticket before the
-                // next prompt/CLI is actually sent. Any idle signal arriving in
-                // that window belongs to the previous session and must not
-                // advance the newly assigned ticket.
-                let slot = match self.agent_slots.iter().find(|s| s.pane_id == pane_id) {
-                    Some(slot) if slot.transition_state == TransitionState::Idle => slot,
-                    _ => continue,
-                };
-                let assigned_ticket = slot.ticket_id.clone();
-                // An idle signal is recent life — restart the wind-down clock.
-                self.bump_pane_activity(pane_id);
-                match assigned_ticket {
-                    Some(tid) => tid,
-                    None => continue,
+            let ticket_id: TicketId = match target {
+                IdleTarget::Pane(pane_id) => {
+                    idle_pane_id = Some(pane_id);
+                    // A transition reserves the slot for its next ticket before the
+                    // next prompt/CLI is actually sent. Any idle signal arriving in
+                    // that window belongs to the previous session and must not
+                    // advance the newly assigned ticket.
+                    let slot = match self.agent_slots.iter().find(|s| s.pane_id == pane_id) {
+                        Some(slot) if slot.transition_state == TransitionState::Idle => slot,
+                        _ => continue,
+                    };
+                    let assigned_ticket = slot.ticket_id.clone();
+                    // An idle signal is recent life — restart the wind-down clock.
+                    self.bump_pane_activity(pane_id);
+                    match assigned_ticket {
+                        Some(tid) => tid,
+                        None => continue,
+                    }
                 }
-            } else {
                 // Legacy: {ticket_id}.idle (from older hook versions)
-                filename.trim_end_matches(".idle").to_string()
+                IdleTarget::LegacyTicket(ticket_id) => ticket_id,
             };
 
             // Look up thread — signal only meaningful for running threads
@@ -3542,46 +3447,19 @@ impl State {
     ///
     /// Signal files are deleted immediately after reading (same as `.idle` signals).
     fn check_transition_signals(&mut self) {
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let filename = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-
-            // Only process .stopped and .cleared signals
-            if filename.strip_prefix("pane-").is_some() {
-                if filename.ends_with(".stopped") {
-                    let _ = std::fs::remove_file(&path);
-                    let pane_id = match pane_id_from_signal_filename(
-                        std::ffi::OsStr::new(&filename),
-                        ".stopped",
-                    ) {
-                        Some(id) => id,
-                        None => continue,
-                    };
+        for record in signal::ingest(&self.signal_dir, SignalRequest::Transitions) {
+            match record {
+                SignalRecord::Stopped { pane_id } => {
                     // A stop signal is recent life — restart the wind-down
                     // clock. Agents often keep working past their stop signal.
                     self.bump_pane_activity(pane_id);
                     self.handle_stopped_signal(pane_id);
-                } else if filename.ends_with(".cleared") {
-                    let _ = std::fs::remove_file(&path);
-                    let pane_id = match pane_id_from_signal_filename(
-                        std::ffi::OsStr::new(&filename),
-                        ".cleared",
-                    ) {
-                        Some(id) => id,
-                        None => continue,
-                    };
+                }
+                SignalRecord::Cleared { pane_id } => {
                     self.bump_pane_activity(pane_id);
                     self.handle_cleared_signal(pane_id);
                 }
-                // .idle files are handled by check_idle_signals()
+                _ => {}
             }
         }
     }
@@ -3600,24 +3478,10 @@ impl State {
     /// force-advanced by the transition-timeout fallback. Presence is the signal;
     /// any body is ignored.
     fn check_error_signals(&mut self) {
-        let entries = match std::fs::read_dir(&self.signal_dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let pane_id = match path
-                .file_name()
-                .and_then(|name| pane_id_from_signal_filename(name, ".error"))
-            {
-                Some(id) => id,
-                None => continue,
+        for record in signal::ingest(&self.signal_dir, SignalRequest::Errors) {
+            let SignalRecord::Error { pane_id } = record else {
+                continue;
             };
-
-            // Read-and-delete: consume the signal regardless of outcome so it
-            // never re-triggers or accumulates.
-            let _ = std::fs::remove_file(&path);
 
             if matches!(
                 self.seat_assignment(pane_id),
@@ -5944,42 +5808,6 @@ mod tests {
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
 
     mod signal_consumer_characterization;
-
-    #[test]
-    fn pane_signal_filename_parser_enforces_exact_grammar() {
-        let cases = [
-            ("pane-0.heartbeat", ".heartbeat", Some(0)),
-            ("pane-42.started", ".started", Some(42)),
-            ("pane-4294967295.error", ".error", Some(u32::MAX)),
-            ("pane-0007.ack", ".ack", Some(7)),
-            ("seat-7.ack", ".ack", None),
-            ("pane-7.awaiting", ".ack", None),
-            ("pane-7.ack.backup", ".ack", None),
-            ("pane-.cleared", ".cleared", None),
-            ("pane-seven.stopped", ".stopped", None),
-            ("pane--1.error", ".error", None),
-            ("pane- 1.error", ".error", None),
-            ("pane-4294967296.error", ".error", None),
-            ("pane-7.error", "", None),
-        ];
-
-        for (filename, suffix, expected) in cases {
-            assert_eq!(
-                pane_id_from_signal_filename(std::ffi::OsStr::new(filename), suffix),
-                expected,
-                "filename={filename:?}, suffix={suffix:?}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pane_signal_filename_parser_rejects_non_utf8() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let filename = std::ffi::OsString::from_vec(b"pane-7.\xfferror".to_vec());
-        assert_eq!(pane_id_from_signal_filename(&filename, ".error"), None);
-    }
 
     /// Mirror production dispatch by installing one newly minted lease as the
     /// scheduler's high-water/current authority and stamping matching records.
