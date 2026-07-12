@@ -124,8 +124,12 @@ run_deterministic_preflight() {
     fi
     (cd "$REPO_ROOT" && cargo test -p lisa-cli --test real_zellij_delivery_boundary -- --ignored --nocapture) \
         2>&1 | tee "$EVIDENCE_DIR/build/deterministic-preflight.txt"
-    grep -Fq 'real-zellij-delivery-boundary: PASS' "$EVIDENCE_DIR/build/deterministic-preflight.txt" \
-        || fail "deterministic real-Zellij preflight lacked its PASS receipt"
+    # The Rust integration wrapper independently asserts the inner shell
+    # harness's `real-zellij-delivery-boundary: PASS` receipt. Cargo captures
+    # that stdout on success, so the outer live harness observes the Rust test's
+    # stable `... ok` line instead.
+    grep -Fq 'test real_zellij_delivery_boundary ... ok' "$EVIDENCE_DIR/build/deterministic-preflight.txt" \
+        || fail "deterministic real-Zellij preflight lacked its passing test receipt"
 }
 
 wait_until() {
