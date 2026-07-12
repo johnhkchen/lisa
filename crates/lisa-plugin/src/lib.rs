@@ -6085,6 +6085,284 @@ mod tests {
     }
 
     #[test]
+    fn publication_sites_preserve_serialization_and_collision_contracts() {
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let hostile_root = temp.path().join("publication path ' ; $(touch INJECTED)");
+
+        let launch_dir = hostile_root.join("launch");
+        fs::create_dir_all(&launch_dir).unwrap();
+        let launch_destination = launch_dir.join(".lisa-launch-7.sh");
+        fs::write(&launch_destination, "old launch").unwrap();
+        let launch_payload = "printf '%s' \"quote:' dollar:$() backtick:`x`\"";
+        let launch_command = State::prepare_fresh_launch(&launch_dir, 7, launch_payload).unwrap();
+        assert_eq!(
+            fs::read_to_string(&launch_destination).unwrap(),
+            format!("#!/bin/sh\n{launch_payload}\n")
+        );
+        assert_eq!(
+            launch_command,
+            format!("sh {}", shell_quote(&launch_destination.to_string_lossy()))
+        );
+        assert!(!launch_command.contains(launch_payload));
+
+        let assignment_dir = hostile_root.join("assignment");
+        fs::create_dir_all(&assignment_dir).unwrap();
+        let assignment_destination = assignment_dir.join(ASSIGNMENT_FILE_NAME);
+        fs::write(&assignment_destination, "old assignment").unwrap();
+        let assignment = "raw assignment\nquote:' dollar:$() backtick:`x`\n";
+        assert_eq!(
+            State::prepare_assignment(&assignment_dir, assignment).unwrap(),
+            assignment_destination
+        );
+        assert_eq!(
+            fs::read_to_string(&assignment_destination).unwrap(),
+            assignment
+        );
+
+        let signal_dir = hostile_root.join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let lease = AttemptLease::mint("T-PUB-'-$()", None).unwrap();
+        let lease_destination = signal_dir.join("pane-19.lease");
+        fs::write(&lease_destination, "old lease").unwrap();
+        let lease_state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        lease_state.write_pane_lease_marker(19, &lease).unwrap();
+        let expected_lease = serde_json::to_string(&lease).unwrap();
+        assert_eq!(
+            fs::read_to_string(&lease_destination).unwrap(),
+            expected_lease
+        );
+        assert_eq!(
+            serde_json::from_str::<AttemptLease>(&fs::read_to_string(&lease_destination).unwrap())
+                .unwrap(),
+            lease
+        );
+
+        let mut artifact_state = State {
+            config: PluginConfig {
+                work_dir: hostile_root.join("canonical work"),
+                ..PluginConfig::new()
+            },
+            attempt_dir: hostile_root.join("attempt staging"),
+            ..State::default()
+        };
+        artifact_state
+            .current_leases
+            .insert(lease.ticket_id.clone(), lease.clone());
+        let staged_dir = artifact_state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged_dir).unwrap();
+        let staged = staged_dir.join("research.md");
+        fs::write(&staged, "current attempt bytes\n' $() `x`").unwrap();
+        let canonical_dir = artifact_state.config.work_dir.join(&lease.ticket_id);
+        fs::create_dir_all(&canonical_dir).unwrap();
+        let canonical = canonical_dir.join("research.md");
+        fs::write(&canonical, "old canonical bytes").unwrap();
+        let artifact_temporary = canonical_dir.join(".research.md.attempt-1.tmp");
+        fs::write(&artifact_temporary, "old temporary collision").unwrap();
+
+        assert!(artifact_state
+            .admit_artifact(&lease.ticket_id, Some(&lease), "research.md")
+            .unwrap());
+        assert_eq!(
+            fs::read_to_string(&canonical).unwrap(),
+            "current attempt bytes\n' $() `x`"
+        );
+        assert_eq!(
+            fs::read_to_string(&staged).unwrap(),
+            "current attempt bytes\n' $() `x`",
+            "admission copies rather than consumes the attributed source"
+        );
+        assert!(!artifact_temporary.exists());
+
+        let shell_destination = signal_dir.join("pane-23.shell-ready");
+        fs::write(&shell_destination, "old readiness").unwrap();
+        let probe = State::shell_readiness_probe(&signal_dir, 23, &lease).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe)
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(&shell_destination).unwrap(),
+            expected_lease
+        );
+        assert!(!temp.path().join("INJECTED").exists());
+
+        for directory in [&launch_dir, &assignment_dir, &signal_dir, &canonical_dir] {
+            assert!(fs::read_dir(directory).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")));
+        }
+    }
+
+    #[test]
+    fn publication_sites_preserve_temp_names_cleanup_and_operator_errors() {
+        use std::fs;
+
+        fn assert_nonce_temp_in_error(error: &str, marker: &str) {
+            let suffix = error
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("missing temp marker {marker:?} in {error:?}"))
+                .1
+                .split(':')
+                .next()
+                .unwrap();
+            assert!(
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()),
+                "expected numeric nonce after {marker:?}, got {suffix:?} in {error:?}"
+            );
+        }
+
+        fn assert_only_destination_directory(directory: &Path, destination: &Path) {
+            let entries: Vec<_> = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(entries, vec![destination.to_path_buf()]);
+            assert!(destination.is_dir());
+        }
+
+        fn deepest_addressable_directory(root: &Path) -> PathBuf {
+            fs::create_dir_all(root).unwrap();
+            let mut current = root.to_path_buf();
+            for depth in 0..2_000 {
+                let candidate = current.join(format!("d{depth:06}"));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => current = candidate,
+                    Err(_) => return current,
+                }
+            }
+            panic!("filesystem accepted an unexpectedly deep test path");
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let hostile_root = temp.path().join("hostile path ' ; $() `x`");
+        fs::create_dir_all(&hostile_root).unwrap();
+
+        let long_dir = deepest_addressable_directory(&hostile_root.join("long-path"));
+        let error = State::prepare_fresh_launch(&long_dir, 7, "payload").unwrap_err();
+        assert!(error.starts_with("cannot write launch payload "));
+        assert!(error.contains(&long_dir.to_string_lossy().into_owned()));
+        assert_nonce_temp_in_error(&error, "/.lisa-launch-7.sh.tmp.");
+
+        let error = State::prepare_assignment(&long_dir, "assignment").unwrap_err();
+        assert!(error.starts_with("cannot write assignment payload "));
+        assert!(error.contains(&long_dir.to_string_lossy().into_owned()));
+        assert_nonce_temp_in_error(&error, "/.assignment.md.tmp.");
+
+        let lease = AttemptLease::mint("T-PUB", None).unwrap();
+        let state = State {
+            signal_dir: long_dir.clone(),
+            ..State::default()
+        };
+        let error = state.write_pane_lease_marker(19, &lease).unwrap_err();
+        assert!(error.starts_with("cannot write pane lease marker "));
+        assert!(error.contains(&long_dir.to_string_lossy().into_owned()));
+        assert_nonce_temp_in_error(&error, "/pane-19.lease.tmp.1-");
+
+        let launch_dir = hostile_root.join("failed-launch");
+        fs::create_dir_all(&launch_dir).unwrap();
+        let launch_destination = launch_dir.join(".lisa-launch-7.sh");
+        fs::create_dir(&launch_destination).unwrap();
+        let error = State::prepare_fresh_launch(&launch_dir, 7, "payload").unwrap_err();
+        assert!(error.starts_with("cannot publish launch payload "));
+        assert!(error.contains(&launch_destination.to_string_lossy().into_owned()));
+        assert_only_destination_directory(&launch_dir, &launch_destination);
+
+        let assignment_dir = hostile_root.join("failed-assignment");
+        fs::create_dir_all(&assignment_dir).unwrap();
+        let assignment_destination = assignment_dir.join(ASSIGNMENT_FILE_NAME);
+        fs::create_dir(&assignment_destination).unwrap();
+        let error = State::prepare_assignment(&assignment_dir, "assignment").unwrap_err();
+        assert!(error.starts_with("cannot publish assignment payload "));
+        assert!(error.contains(&assignment_destination.to_string_lossy().into_owned()));
+        assert_only_destination_directory(&assignment_dir, &assignment_destination);
+
+        let signal_dir = hostile_root.join("failed-signal");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let lease_destination = signal_dir.join("pane-19.lease");
+        fs::create_dir(&lease_destination).unwrap();
+        let state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        let error = state.write_pane_lease_marker(19, &lease).unwrap_err();
+        assert!(error.starts_with("cannot publish pane lease marker "));
+        assert!(error.contains(&lease_destination.to_string_lossy().into_owned()));
+        assert_only_destination_directory(&signal_dir, &lease_destination);
+
+        let mut artifact_state = State {
+            config: PluginConfig {
+                work_dir: hostile_root.join("failed-canonical"),
+                ..PluginConfig::new()
+            },
+            attempt_dir: hostile_root.join("failed-attempt"),
+            ..State::default()
+        };
+        artifact_state
+            .current_leases
+            .insert(lease.ticket_id.clone(), lease.clone());
+        let staged_dir = artifact_state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged_dir).unwrap();
+        fs::write(staged_dir.join("research.md"), "new bytes").unwrap();
+        let canonical_dir = artifact_state.config.work_dir.join(&lease.ticket_id);
+        fs::create_dir_all(&canonical_dir).unwrap();
+        let canonical = canonical_dir.join("research.md");
+        fs::write(&canonical, "old canonical bytes").unwrap();
+        let artifact_temporary = canonical_dir.join(".research.md.attempt-1.tmp");
+        fs::create_dir(&artifact_temporary).unwrap();
+        let error = artifact_state
+            .admit_artifact(&lease.ticket_id, Some(&lease), "research.md")
+            .unwrap_err();
+        assert!(error.starts_with("cannot write canonical artifact temporary "));
+        assert!(error.contains(&artifact_temporary.to_string_lossy().into_owned()));
+        assert_eq!(
+            fs::read_to_string(&canonical).unwrap(),
+            "old canonical bytes"
+        );
+        assert!(artifact_temporary.is_dir());
+
+        let shell_dir = hostile_root.join("failed-shell-readiness");
+        fs::create_dir_all(&shell_dir).unwrap();
+        let shell_destination = shell_dir.join("pane-23.shell-ready");
+        fs::create_dir(&shell_destination).unwrap();
+        let probe = State::shell_readiness_probe(&shell_dir, 23, &lease).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mv treats an existing destination directory as its target directory"
+        );
+        assert!(shell_destination.is_dir());
+        assert_eq!(fs::read_dir(&shell_dir).unwrap().count(), 1);
+        let moved: Vec<_> = fs::read_dir(&shell_destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(moved.len(), 1);
+        let residual_name = moved[0].file_name().unwrap().to_string_lossy();
+        let nonce = residual_name
+            .strip_prefix("pane-23.shell-ready.tmp.1-")
+            .unwrap();
+        assert!(!nonce.is_empty() && nonce.bytes().all(|byte| byte.is_ascii_digit()));
+        assert_eq!(
+            fs::read_to_string(&moved[0]).unwrap(),
+            serde_json::to_string(&lease).unwrap()
+        );
+    }
+
+    #[test]
     fn test_prepare_fresh_launch_is_bounded_and_preserves_complete_payload() {
         let temp = tempfile::tempdir().unwrap();
         let artifact_dir = temp.path().join("attempt path with ' quote");
@@ -14523,6 +14801,47 @@ owned\n\
         assert_eq!(records[1].attempt_lease, second);
         assert_eq!(records[0].outcome, RunOutcome::Done, "first record intact");
         assert_eq!(records[1].outcome, RunOutcome::Failed);
+    }
+
+    #[test]
+    fn provenance_append_failure_is_logged_without_mutating_target() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("provenance path ' ; $()");
+        fs::create_dir(&ledger).unwrap();
+        let sentinel = ledger.join("existing-ledger-bytes");
+        fs::write(&sentinel, "prior provenance remains intact\n").unwrap();
+
+        let mut state = State {
+            ledger_path: ledger.clone(),
+            ..State::default()
+        };
+        let ticket_id = "T-PROV-FAIL";
+        let mut thread = Thread::new(ticket_id, 47);
+        thread.client = AgentClient::Codex;
+        state.threads.insert(ticket_id.to_string(), thread);
+        let lease = install_current_attempt(&mut state, ticket_id);
+
+        assert!(!state.emit_provenance(ticket_id, RunOutcome::Done, false));
+
+        assert!(ledger.is_dir());
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "prior provenance remains intact\n"
+        );
+        assert_eq!(fs::read_dir(&ledger).unwrap().count(), 1);
+        assert_eq!(state.current_leases.get(ticket_id), Some(&lease));
+        assert_eq!(
+            state.threads.get(ticket_id).unwrap().attempt_lease.as_ref(),
+            Some(&lease)
+        );
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message }
+                if message.starts_with("provenance write failed for T-PROV-FAIL: ")
+        )));
     }
 
     /// AC: Codex tokens flow from its usage artifact into the record.

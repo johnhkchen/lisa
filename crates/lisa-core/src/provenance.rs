@@ -267,6 +267,34 @@ mod tests {
     }
 
     #[test]
+    fn append_failure_preserves_existing_target_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger path ' ; $()");
+        fs::create_dir(&path).unwrap();
+        let sentinel = path.join("existing-ledger-bytes");
+        fs::write(&sentinel, b"prior provenance remains intact\n").unwrap();
+
+        let error = append_record(&path, &sample()).unwrap_err();
+
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Other
+            ),
+            "unexpected append error: {error}"
+        );
+        assert!(path.is_dir(), "the colliding target remains a directory");
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"prior provenance remains intact\n",
+            "a failed append must not disturb existing target contents"
+        );
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 1);
+    }
+
+    #[test]
     fn system_time_to_epoch_is_seconds() {
         let t = UNIX_EPOCH + std::time::Duration::from_secs(1_719_800_000);
         assert_eq!(system_time_to_epoch(t), 1_719_800_000);
