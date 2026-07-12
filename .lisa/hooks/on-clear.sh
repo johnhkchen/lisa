@@ -1,5 +1,5 @@
 #!/bin/sh
-# Lisa clear signal hook — called by Claude Code after /clear is processed.
+# Lisa clear signal hook — called after /clear is processed.
 # Writes a signal file so the plugin knows context has been cleared.
 
 SIGNAL_DIR=".lisa/signals"

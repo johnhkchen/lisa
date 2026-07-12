@@ -483,18 +483,29 @@ fn build_codex_argv(args: &AgentExecArgs, resolved_thread: Option<&str>) -> Vec<
             Some(id) => argv.push(id.to_string()),
             None => argv.push("--last".to_string()),
         }
-    }
 
-    argv.push("--json".to_string());
-    argv.push("--skip-git-repo-check".to_string());
-    argv.push("-C".to_string());
-    argv.push(args.cwd.display().to_string());
-
-    if args.bypass_sandbox {
-        argv.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        // `codex exec resume` carries a *reduced* flag set (verified live on
+        // codex 0.144.1, 2026-07-11): it rejects `-C`/`--cd` and `-s`/`--sandbox`
+        // — cwd, sandbox policy, approval policy, and git-repo context are all
+        // inherited from the persisted session — so passing them exits 2 with
+        // `unexpected argument`. `--skip-git-repo-check` happens to still be
+        // accepted on this version, but is equally redundant on resume, so we
+        // drop it too (T-029-03 AC + drift-resilience). Only `--json`, the
+        // event-stream contract the Translator depends on, rides the resume arm.
+        // Re-smoke after `codex update` — this surface drifts (ticket Notes).
+        argv.push("--json".to_string());
     } else {
-        argv.push("-s".to_string());
-        argv.push("workspace-write".to_string());
+        argv.push("--json".to_string());
+        argv.push("--skip-git-repo-check".to_string());
+        argv.push("-C".to_string());
+        argv.push(args.cwd.display().to_string());
+
+        if args.bypass_sandbox {
+            argv.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        } else {
+            argv.push("-s".to_string());
+            argv.push("workspace-write".to_string());
+        }
     }
 
     argv.extend(args.codex_args.iter().cloned());
@@ -537,6 +548,11 @@ pub fn run_agent_exec(args: AgentExecArgs) -> Result<(), String> {
 
     let mut child = Command::new(&args.codex_bin)
         .args(&argv)
+        // Headless: null stdin so `codex exec` cannot block on
+        // "Reading additional input from stdin…" behind a non-TTY pipe. lisa
+        // always passes an explicit prompt positional, never `-`, so codex
+        // never needs to read a prompt from stdin (T-029-03).
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -885,5 +901,91 @@ mod tests {
         a.codex_args = vec!["--model".to_string(), "o4".to_string()];
         let argv = build_codex_argv(&a, None);
         assert!(argv.windows(2).any(|w| w == ["--model", "o4"]));
+    }
+
+    // --- resume argv shape (version-pinned: codex 0.144.1) -------------------
+    // `codex exec resume` rejects `-C`/`--cd` and `-s`/`--sandbox` (cwd + sandbox
+    // inherited from the session). These assert the reduced shape; re-smoke after
+    // `codex update` since this surface drifts (T-029-03).
+
+    /// Flags that must never appear on the `resume` arm, in any mode.
+    fn resume_forbidden_flags() -> [&'static str; 5] {
+        [
+            "-C",
+            "--skip-git-repo-check",
+            "-s",
+            "workspace-write",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    }
+
+    #[test]
+    fn argv_resume_omits_cwd_and_sandbox_flags() {
+        let mut a = base_args();
+        a.resume = true;
+        let argv = build_codex_argv(&a, Some("th_prev"));
+
+        // Reduced resume shape is present…
+        assert_eq!(argv[..5], ["-a", "never", "exec", "resume", "th_prev"]);
+        assert!(argv.contains(&"--json".to_string()));
+        assert_eq!(argv.last().unwrap(), "do the thing");
+
+        // …and the resume-rejected flags are gone.
+        for flag in resume_forbidden_flags() {
+            assert!(
+                !argv.contains(&flag.to_string()),
+                "resume argv must not contain {flag}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_resume_bypass_omits_all_sandbox_and_cwd_flags() {
+        let mut a = base_args();
+        a.resume = true;
+        a.bypass_sandbox = true;
+        let argv = build_codex_argv(&a, Some("th_prev"));
+
+        // bypass suppresses the top-level `-a never`, so resume leads with `exec`.
+        assert_eq!(argv[..4], ["exec", "resume", "th_prev", "--json"]);
+        assert!(!argv.contains(&"-a".to_string()));
+        assert!(!argv.contains(&"never".to_string()));
+        assert_eq!(argv.last().unwrap(), "do the thing");
+
+        for flag in resume_forbidden_flags() {
+            assert!(
+                !argv.contains(&flag.to_string()),
+                "resume bypass argv must not contain {flag}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_resume_last_omits_cwd_and_sandbox_flags() {
+        let mut a = base_args();
+        a.resume = true;
+        let argv = build_codex_argv(&a, None);
+
+        assert!(argv.windows(2).any(|w| w == ["resume", "--last"]));
+        assert!(argv.contains(&"--json".to_string()));
+        for flag in resume_forbidden_flags() {
+            assert!(
+                !argv.contains(&flag.to_string()),
+                "resume --last argv must not contain {flag}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_resume_passes_extra_codex_args() {
+        let mut a = base_args();
+        a.resume = true;
+        a.codex_args = vec!["--model".to_string(), "o4".to_string()];
+        let argv = build_codex_argv(&a, Some("th_prev"));
+        assert!(argv.windows(2).any(|w| w == ["--model", "o4"]));
+        // passthrough sits between `--json` and the prompt, not among rejected flags.
+        for flag in resume_forbidden_flags() {
+            assert!(!argv.contains(&flag.to_string()));
+        }
     }
 }

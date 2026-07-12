@@ -107,3 +107,23 @@ Concrete failure modes are reported bugs, not speculation: #2006 "Pasted newline
 
 ---
 
+## Write-back: #14345 & env-inheritance re-verified live (2026-07-11, codex 0.144.1, T-029-01)
+
+- **Directory-trust in `exec` (#14345) — re-verified, NARROWER than the risk
+  above.** On 0.144.1, `codex exec -s workspace-write` against an **untrusted**
+  repo (real logged-in `~/.codex`) ran a forced shell tool call and returned
+  exit 0 — **no trust prompt, no block on the `exec` path.** The #14345 trust
+  gate that "still blocks under `--yolo`" is a **native-TUI** behaviour (see doc
+  09), not an `exec` behaviour on this version. Practical guidance stands but
+  sharpens: prefer `codex exec` for deterministic no-input runs; keep
+  `lisa doctor`'s `projects.<path>.trust_level="trusted"` pre-seed for the
+  **native TUI** path the loop actually uses (doctor verified writing it on
+  0.144.1). Continue to re-verify per version — this has regressed before.
+- **Env inheritance (the `❓` claim above) — CONFIRMED on 0.144.1.** A
+  `codex exec` launched with `LISA_PANE_ID` set passed it through to the shell
+  codex spawned for a tool call (probe q1, and `lisa agent-exec` used it live to
+  attribute `pane-9.*` signals). Default `shell_environment_policy` inherits the
+  var; the `❓` is now a `✅` for this version/config.
+
+---
+

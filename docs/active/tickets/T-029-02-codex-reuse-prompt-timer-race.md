@@ -5,7 +5,7 @@ title: codex-reuse-prompt-timer-race
 type: bug
 status: open
 priority: critical
-phase: ready
+phase: done
 depends_on: []
 ---
 

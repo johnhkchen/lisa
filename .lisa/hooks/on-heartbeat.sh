@@ -1,5 +1,5 @@
 #!/bin/sh
-# Lisa heartbeat signal hook — called by Claude Code after each tool call.
+# Lisa heartbeat signal hook — called after each tool call.
 # Writes a signal file so the plugin knows this session is actively working.
 
 SIGNAL_DIR=".lisa/signals"

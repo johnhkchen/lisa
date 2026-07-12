@@ -5,7 +5,7 @@ title: codex-runbook-live-run
 type: spike
 status: open
 priority: high
-phase: ready
+phase: done
 depends_on: []
 ---
 

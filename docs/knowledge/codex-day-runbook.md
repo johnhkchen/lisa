@@ -124,3 +124,30 @@ carry real `tokens`/usage from `turn.completed.usage` (schema:
   runbook-execution ticket. Work artifacts stayed in `docs/active/work/` —
   the T-021-01 harness and T-024-01 checklist are this runbook's live
   instruments; sweep them to the archive only after S-029 completes.
+- **2026-07-11** — T-029-01 live run (headless half). Host: codex-cli
+  **0.144.1** (drift from 0.144.0 and the pinned `rust-v0.142.5`), lisa
+  **0.4.0-rc.5** (brew keg now carries the Codex client — preflight *intent* met;
+  the "unlink brew / prefer cargo" mechanism is stale). Executed:
+  - **Step 1 doctor** — green with `client=codex`; detects `codex-cli 0.144.1`;
+    trust pre-seed wrote `trust_level="trusted"` for the dry-run path (#14345
+    re-verified; evidence `docs/active/work/T-029-01/out-doctor.txt`).
+  - **Step 3 harness** — the pinned `harness/*.sh` could not reach codex on
+    0.144.1 (all probes exit 2 on the removed `-a` flag). A corrected re-run
+    settled every unknown: **Q1 PASS, Q2 PASS (hard gate green — #15451 does not
+    reproduce), Q3 render-from-JSON, Q4 no `exec` trust block, Q5 PASS.** All
+    five `[PROVISIONAL]` tags in `T-021-01/design.md` are now `[VERIFIED 0.144.1]`.
+    **GO stands; no app-server escalation.** Three CLI drifts written back to
+    codex-client 02/04/05.
+  - **Step 4 live loop** — scaffold built at `/tmp/lisa-codex-dryrun`
+    (`client=codex`, T-CDX-01→02 DAG). The interactive `lisa loop` itself is
+    **DEFERRED**: it needs a real Zellij session and human forcing (rows 4/5/6),
+    and cannot be launched from inside the lisa-spawned agent that ran this
+    ticket. Row-by-row disposition in `docs/active/work/T-029-01/rows-1-8-status.md`.
+  - **Step 5 provenance** — the Codex usage-capture path is proven live:
+    `lisa agent-exec` wrote a real `.lisa/codex/<t>.usage.json` from
+    `turn.completed.usage` (input 15867 / output 6). Appending a
+    `.lisa/provenance.jsonl` *record* still needs the loop teardown → deferred
+    with step 4. No line fabricated.
+  - **Write-back** — one bug filed (`agent-exec --resume` argv broken on codex
+    ≥0.144.1); `LISA_GITIGNORE` template gap noted for follow-up. Harness NOT
+    deleted (S-029 not yet done).

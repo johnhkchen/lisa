@@ -701,3 +701,34 @@ Model: `model`, `model_provider`, `model_reasoning_effort` (minimal|low|medium|h
 
 ---
 
+## Write-back: observed `codex exec` CLI surface on 0.144.1 (2026-07-11, T-029-01)
+
+Version anchor moves **`rust-v0.142.5` (pinned) → `0.144.1` (installed)**. Live
+`codex exec --help` / `codex exec resume --help` on the host, cross-checked by
+running each argv. Applies to the `exec` command specifically:
+
+- **`-a`/`--ask-for-approval` is a TOP-LEVEL option only.** `codex -a never exec …`
+  works; `codex exec -a never …` is **rejected** (`unexpected argument '-a'`,
+  exit 2). Put approval flags before the `exec` subcommand, or use
+  `-c approval_policy="never"` (a `-c` config override, which the `exec`
+  subcommand *does* accept).
+- **`codex exec` reads stdin.** With a prompt passed as an arg but stdin left
+  open on a non-TTY pipe, exec prints `Reading additional input from stdin…` and
+  **blocks until EOF**. Headless callers must pass `</dev/null` (or close stdin);
+  an interactive TTY is fine.
+- **`codex exec resume` has a REDUCED flag set.** It accepts `[SESSION_ID]
+  [PROMPT]`, `-c`, `--last`, `--all`, `--enable/--disable`, `-m`, `--json`,
+  `--dangerously-bypass-*`, `--ephemeral`, `--ignore-*`, `--output-schema`,
+  `-o` — but **NOT `-C/--cd`, `-s/--sandbox`, or `--skip-git-repo-check`**
+  (cwd/sandbox are inherited from the resumed session). Passing any of those →
+  exit 2.
+- **`--json` event / usage shapes are UNCHANGED vs. this doc.** Observed event
+  `type`s: `thread.started`, `turn.started`, `turn.completed`, `turn.failed`,
+  `item.started`, `item.completed`; item `type`s `agent_message`,
+  `command_execution`, `file_change`; `thread.started` carries `thread_id`;
+  `turn.completed.usage = {input_tokens, cached_input_tokens, output_tokens,
+  reasoning_output_tokens}`. **No `item.updated`** observed in `exec`. No drift
+  to the JSON section above.
+
+---
+

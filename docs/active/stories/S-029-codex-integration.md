@@ -1,7 +1,10 @@
 ---
 id: S-029
 title: codex-integration
+type: story
 status: open
+priority: high
+tickets: [T-029-01, T-029-02, T-029-03]
 ---
 
 ## Codex integration — first live run

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Lisa stop signal hook — called by Claude Code when it finishes responding.
+# Lisa stop signal hook — called when the native agent finishes responding.
 # Writes a signal file so the plugin knows the pane is ready for input, and
 # captures session token usage for the provenance ledger (T-027-02).
 

@@ -1,0 +1,7 @@
+thread.started: 0
+turn.started:   0
+turn.completed: 0
+turn.failed:    0
+item.completed: 0
+command_execution items: 0
+exit-code:      2

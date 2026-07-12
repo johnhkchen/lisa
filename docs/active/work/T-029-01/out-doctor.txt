@@ -1,0 +1,31 @@
+# Step 1 — lisa doctor with Codex client (T-029-01), 2026-07-11
+# Host: codex-cli 0.144.1, lisa 0.4.0-rc.5, project /tmp/lisa-codex-dryrun ([agent] client=codex)
+
+Checking dependencies...
+
+  zellij       zellij 0.44.3  OK
+  codex        codex-cli 0.144.1 OK
+  wasm target  installed      OK
+
+All dependencies satisfied.
+
+Checking project...
+
+  project version 0.4.0-rc.5     OK
+
+
+Checking Zellij plugin cache...
+
+  Cleaned 2 cached lisa-plugin entries
+
+
+Checking Codex trust...
+
+  Seeded trust_level="trusted" for /tmp/lisa-codex-dryrun
+    in /Users/johnchen/.codex/config.toml
+    Note: Codex trust behaviour is version-specific (#14345); re-run `lisa doctor` after `codex update`.
+
+
+# Confirmation: seeded block present in ~/.codex/config.toml:
+[projects."/tmp/lisa-codex-dryrun"]
+trust_level = "trusted"

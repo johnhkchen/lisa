@@ -1,0 +1,3 @@
+delta-style item events (partial text):
+completed assistant/agent message items:
+0

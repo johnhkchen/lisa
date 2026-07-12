@@ -157,3 +157,36 @@ Cheap to confirm with stub scripts on the pinned `rust-v0.142.5`; do **not** des
 ## Sources
 
 Headless `exec`/`--json`: developers.openai.com/codex/noninteractive, /cli/reference; SDK `events.ts`; issues #10141, #14691, #15451, #5773. app-server: developers.openai.com/codex/app-server, repo `codex-rs/app-server/README.md`; MCP: /guides/agents-sdk. `notify`/injection/prior-art: /codex/config-advanced, /config-reference; issues #11808, #12524, #4005; PR #18914; codex-yolo, danielvaughan orchestration writeups. Full URLs inline above and in the per-topic research.
+
+---
+
+## Write-back: live-run verdicts (2026-07-11, codex-cli 0.144.1) — T-029-01
+
+The S-021 empirical unknowns (the numbered list above) were run live for the
+first time. Evidence: `docs/active/work/T-021-01/design.md` (verdicts) +
+`docs/active/work/T-029-01/progress.md`.
+
+- **#5 `--json` fidelity — RESOLVED PASS.** A real RDSPI ticket produced a
+  terminal `turn.completed` agreeing with exit 0, with `command_execution` and
+  `file_change` items present; **#15451 did not reproduce** with builtin tools.
+  Anchor rule confirmed: `turn.completed`/`turn.failed` + exit are authoritative.
+- **#6 rendering — RESOLVED render-from-JSON.** Under `--json`, stderr is a
+  spinner-only status line (~39 bytes); stdout emits **completed-only** items,
+  **no `*delta*` events**. Deltas remain app-server-only. tee-stderr rejected.
+- **#1 env inheritance — PASS** (`LISA_PANE_ID` reaches the tool-shell).
+- **#3 directory trust in `exec` — no block on 0.144.1** with the logged-in home
+  (`-s workspace-write`, forced tool call ran, exit 0). #14345 affects the
+  **native TUI** path, not `exec`; `lisa doctor`'s pre-seed is retained for the
+  TUI (verified writing `trust_level="trusted"`).
+- **Option-1 event map / usage shape — no drift.** Dot-form event names
+  (`thread.started`, `turn.started`, `turn.completed`, `item.completed`), item
+  types `agent_message`/`command_execution`/`file_change`, and
+  `turn.completed.usage:{input_tokens, cached_input_tokens, output_tokens,
+  reasoning_output_tokens}` all match. No `item.updated` observed.
+
+**CLI-surface drift (0.144.1):** (a) `-a/--ask-for-approval` is **top-level
+only** — rejected after `exec`; (b) `codex exec` **blocks reading stdin** unless
+`</dev/null` (native TUI unaffected); (c) `codex exec resume` **rejects `-C`,
+`-s`, `--skip-git-repo-check`** (inherits session cwd/sandbox). (c) breaks the
+shipped `lisa agent-exec --resume` argv (diagnostics/headless path only — the
+loop uses the native TUI). See docs 02 and 04 for the per-claim updates.
