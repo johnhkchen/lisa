@@ -44,6 +44,10 @@ Run from a checkout with:
 On macOS, Lisa canonicalizes the disposable fixture before pregranting Codex project trust,
 so `/var/...` and `/private/var/...` do not create an interactive trust mismatch.
 
+The Codex fixture explicitly enables `features.hooks` in its trusted project
+`.codex/config.toml`. This activates the adjacent `.codex/hooks.json` layer without
+depending on a developer's user-level feature defaults.
+
 The harness preserves the real HOME and provider configuration so existing authentication
 remains available. It copies only the matched Codex project trust header/line into evidence,
 never the complete user configuration.

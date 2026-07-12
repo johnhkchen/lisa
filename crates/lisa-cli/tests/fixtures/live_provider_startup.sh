@@ -213,6 +213,15 @@ create_fixture() {
     printf '%s\n' "$root" >> "$EVIDENCE_DIR/fixture-roots.txt"
     "$LISA_BIN" init --path "$root" > "$EVIDENCE_DIR/$provider-first/init.log"
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories"
+    if [[ "$provider" == codex ]]; then
+        # hooks.json is loaded from an active trusted project config layer.
+        # Make the live control explicit instead of depending on a developer's
+        # user-level feature setting or another repository's config layer.
+        cat > "$root/.codex/config.toml" <<'CODEX_CONFIG'
+[features]
+hooks = true
+CODEX_CONFIG
+    fi
     cat > "$root/.lisa.toml" <<'TOML'
 version = "0.4.0"
 
