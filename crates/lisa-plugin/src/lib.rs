@@ -13336,6 +13336,383 @@ owned\n\
         assert!(state.activity_log.is_empty());
     }
 
+    // =========================================================================
+    // Deadline policy characterization (T-039-04-01)
+    //
+    // These tests deliberately exercise the existing policy entry points. They
+    // pin each policy's clock, exemptions, and action before the traversal and
+    // clock plumbing are centralized by the next ticket.
+    // =========================================================================
+
+    #[test]
+    fn characterizes_acknowledgement_deadline_clock_and_recovery_action() {
+        use lisa_core::types::Thread;
+
+        let deadline = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-ACK".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Codex),
+        });
+        state
+            .threads
+            .insert("T-ACK".to_string(), Thread::new("T-ACK", 1));
+        let predecessor = install_current_attempt(&mut state, "T-ACK");
+        state.seat_assignments.insert(
+            1,
+            SeatAssignmentState::AssignedPendingAck {
+                generation: predecessor.attempt_id,
+                ack_deadline: Some(deadline),
+            },
+        );
+        // Awaiting-human is intentionally not an acknowledgement exemption: the
+        // timed-out TUI is abandoned and this marker is cleared during recovery.
+        state.awaiting_human.insert(1);
+
+        assert!(state
+            .check_assignment_ack_timeouts_at(deadline - std::time::Duration::from_nanos(1))
+            .is_empty());
+        assert_eq!(
+            state.seat_assignment(1),
+            Some(SeatAssignmentState::AssignedPendingAck {
+                generation: predecessor.attempt_id,
+                ack_deadline: Some(deadline),
+            })
+        );
+        assert!(predecessor.is_current(state.current_leases.get("T-ACK")));
+
+        assert!(state.check_assignment_ack_timeouts_at(deadline).is_empty());
+        let successor = state.current_leases["T-ACK"].clone();
+        assert_eq!(successor.attempt_id, predecessor.attempt_id + 1);
+        assert!(!predecessor.is_current(state.current_leases.get("T-ACK")));
+        assert_eq!(
+            state.seat_assignment(1),
+            Some(SeatAssignmentState::Recovering {
+                generation: successor.attempt_id,
+                ack_deadline: None,
+            })
+        );
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert!(!state.awaiting_human.contains(&1));
+    }
+
+    #[test]
+    fn characterizes_transition_deadline_and_active_session_exemption() {
+        let now = std::time::SystemTime::now();
+        let mut state = State::default();
+        state.agent_slots.extend([
+            AgentSlot {
+                pane_id: 1,
+                ticket_id: None,
+                attempt_lease: None,
+                has_session: true,
+                transition_state: TransitionState::WaitingForExit,
+                transition_started_at: Some(
+                    now - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 10),
+                ),
+                cooldown_until: None,
+                last_activity_at: Some(now),
+                last_client: Some(AgentClient::Codex),
+            },
+            AgentSlot {
+                pane_id: 2,
+                ticket_id: None,
+                attempt_lease: None,
+                has_session: true,
+                transition_state: TransitionState::WaitingForExit,
+                transition_started_at: Some(
+                    now - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS - 1),
+                ),
+                cooldown_until: None,
+                last_activity_at: None,
+                last_client: Some(AgentClient::Codex),
+            },
+            AgentSlot {
+                pane_id: 3,
+                ticket_id: Some("T-ACTIVE".to_string()),
+                attempt_lease: None,
+                has_session: true,
+                transition_state: TransitionState::WaitingForClear,
+                transition_started_at: Some(
+                    now - std::time::Duration::from_secs(CLEAR_SIGNAL_TIMEOUT_SECS + 10),
+                ),
+                cooldown_until: None,
+                last_activity_at: Some(now),
+                last_client: Some(AgentClient::Codex),
+            },
+            AgentSlot {
+                pane_id: 4,
+                ticket_id: Some("T-HUMAN".to_string()),
+                attempt_lease: None,
+                has_session: true,
+                transition_state: TransitionState::WaitingForClear,
+                transition_started_at: Some(
+                    now - std::time::Duration::from_secs(CLEAR_SIGNAL_TIMEOUT_SECS + 10),
+                ),
+                cooldown_until: None,
+                last_activity_at: Some(
+                    now - std::time::Duration::from_secs(state.config.wind_down_secs + 10),
+                ),
+                last_client: Some(AgentClient::Codex),
+            },
+        ]);
+        state.awaiting_human.insert(4);
+
+        state.check_transition_timeouts();
+
+        // Exit uses only transition_started_at: recent pane activity is not an
+        // exemption once the grace deadline has elapsed.
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(!state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, None);
+        assert_eq!(
+            state.agent_slots[1].transition_state,
+            TransitionState::WaitingForExit
+        );
+        // Stop/clear use last_activity_at as an independent busy-pane guard.
+        assert_eq!(
+            state.agent_slots[2].transition_state,
+            TransitionState::WaitingForClear
+        );
+        // A quiet pane is independently exempt while its question is awaiting
+        // a human answer.
+        assert_eq!(
+            state.agent_slots[3].transition_state,
+            TransitionState::WaitingForClear
+        );
+        assert!(state.awaiting_human.contains(&4));
+    }
+
+    #[test]
+    fn characterizes_review_deadline_exemptions_and_finish_up_action() {
+        use lisa_core::types::{Thread, ThreadStatus};
+
+        let now = std::time::SystemTime::now();
+        let mut state = State {
+            config: PluginConfig {
+                review_timeout_secs: 10,
+                wind_down_secs: 20,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        for (ticket_id, pane_id, last_activity) in [
+            ("T-REVIEW-ACTIVE", 1, now),
+            (
+                "T-REVIEW-HUMAN",
+                2,
+                now - std::time::Duration::from_secs(30),
+            ),
+            ("T-REVIEW-FIRE", 3, now - std::time::Duration::from_secs(30)),
+        ] {
+            let mut thread = Thread::new(ticket_id, pane_id);
+            thread.current_phase = Phase::Review;
+            // Review expiry is measured from the phase-change clock.
+            thread.last_phase_change = now - std::time::Duration::from_secs(30);
+            thread.last_activity = last_activity;
+            state.threads.insert(ticket_id.to_string(), thread);
+        }
+        state.awaiting_human.insert(2);
+
+        state.check_review_timeouts();
+
+        assert!(!state.finish_up_sent.contains("T-REVIEW-ACTIVE"));
+        assert!(!state.finish_up_sent.contains("T-REVIEW-HUMAN"));
+        assert!(state.finish_up_sent.contains("T-REVIEW-FIRE"));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::FinishUpPromptSent { ticket_id, pane_id }
+                if ticket_id == "T-REVIEW-FIRE" && *pane_id == 3
+        )));
+        assert_eq!(
+            state.threads["T-REVIEW-ACTIVE"].status,
+            ThreadStatus::Running
+        );
+        assert_eq!(
+            state.threads["T-REVIEW-HUMAN"].status,
+            ThreadStatus::Running
+        );
+        assert!(state.awaiting_human.contains(&2));
+    }
+
+    #[test]
+    fn characterizes_health_deadline_as_observational_for_awaiting_human() {
+        use lisa_core::types::{HealthStatus, Thread};
+
+        let now = std::time::SystemTime::now();
+        let mut state = State {
+            config: PluginConfig {
+                stuck_threshold_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        let mut thread = Thread::new("T-HEALTH", 1);
+        // Health is measured from last_activity, not the phase clock.
+        thread.last_activity = now - std::time::Duration::from_secs(20);
+        state.threads.insert("T-HEALTH".to_string(), thread);
+        state.awaiting_human.insert(1);
+
+        state.evaluate_health();
+
+        assert_eq!(
+            state.last_health.get("T-HEALTH"),
+            Some(&HealthStatus::Stuck)
+        );
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::HealthStateChanged {
+                ticket_id,
+                old_health: HealthStatus::Healthy,
+                new_health: HealthStatus::Stuck,
+            } if ticket_id == "T-HEALTH"
+        )));
+        assert!(state.threads.contains_key("T-HEALTH"));
+        assert!(state.awaiting_human.contains(&1));
+    }
+
+    #[test]
+    fn characterizes_session_deadline_exemptions_and_timeout_action() {
+        use lisa_core::types::Thread;
+
+        let now = std::time::SystemTime::now();
+        let mut state = State {
+            config: PluginConfig {
+                session_timeout_secs: 100,
+                stuck_threshold_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        for (ticket_id, pane_id, last_activity) in [
+            ("T-SESSION-ACTIVE", 1, now),
+            (
+                "T-SESSION-HUMAN",
+                2,
+                now - std::time::Duration::from_secs(30),
+            ),
+            (
+                "T-SESSION-FIRE",
+                3,
+                now - std::time::Duration::from_secs(30),
+            ),
+        ] {
+            let mut thread = Thread::new(ticket_id, pane_id);
+            // Global budget uses started_at; destructive action additionally
+            // requires hard silence measured from last_activity.
+            thread.started_at = now - std::time::Duration::from_secs(200);
+            thread.last_activity = last_activity;
+            state.threads.insert(ticket_id.to_string(), thread);
+        }
+        state.awaiting_human.insert(2);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 3,
+            ticket_id: Some("T-SESSION-FIRE".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Codex),
+        });
+        install_current_attempt(&mut state, "T-SESSION-FIRE");
+
+        let outcomes = state.check_session_timeouts();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            &outcomes[0],
+            FailureTransitionOutcome::SessionTimedOut {
+                pane_id: 3,
+                ticket_id,
+                fenced: true,
+            } if ticket_id == "T-SESSION-FIRE"
+        ));
+        assert!(state.threads.contains_key("T-SESSION-ACTIVE"));
+        assert!(state.threads.contains_key("T-SESSION-HUMAN"));
+        assert!(!state.threads.contains_key("T-SESSION-FIRE"));
+        assert!(state.over_budget_warned.contains("T-SESSION-ACTIVE"));
+        assert!(state.over_budget_warned.contains("T-SESSION-HUMAN"));
+        assert!(state.awaiting_human.contains(&2));
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert!(!state.current_leases.contains_key("T-SESSION-FIRE"));
+    }
+
+    #[test]
+    fn characterizes_stale_deadline_exemptions_and_reclaim_action() {
+        use lisa_core::types::Thread;
+
+        let now = std::time::SystemTime::now();
+        let mut state = State {
+            config: PluginConfig {
+                stuck_threshold_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        let mut active = Thread::new("T-STALE-ACTIVE", 1);
+        active.last_phase_change = now - std::time::Duration::from_secs(1_000);
+        active.last_activity = now;
+        state.threads.insert("T-STALE-ACTIVE".to_string(), active);
+
+        let mut awaiting = Thread::new("T-STALE-HUMAN", 2);
+        awaiting.last_activity = now - std::time::Duration::from_secs(30);
+        state.threads.insert("T-STALE-HUMAN".to_string(), awaiting);
+        state.awaiting_human.insert(2);
+
+        let mut reclaimable = Thread::new("T-STALE-FIRE", 3);
+        reclaimable.last_activity = now - std::time::Duration::from_secs(30);
+        state
+            .threads
+            .insert("T-STALE-FIRE".to_string(), reclaimable);
+        state.agent_slots.push(AgentSlot {
+            pane_id: 3,
+            ticket_id: Some("T-STALE-FIRE".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Codex),
+        });
+        install_current_attempt(&mut state, "T-STALE-FIRE");
+
+        let outcomes = state.detect_stale_threads();
+
+        assert_eq!(
+            outcomes,
+            vec![FailureTransitionOutcome::StaleThreadReclaimed {
+                pane_id: 3,
+                ticket_id: "T-STALE-FIRE".to_string(),
+                fenced: true,
+            }]
+        );
+        assert!(state.threads.contains_key("T-STALE-ACTIVE"));
+        assert!(state.threads.contains_key("T-STALE-HUMAN"));
+        assert!(!state.threads.contains_key("T-STALE-FIRE"));
+        assert!(state.awaiting_human.contains(&2));
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert!(!state.current_leases.contains_key("T-STALE-FIRE"));
+    }
+
     #[test]
     fn test_check_session_timeouts_not_expired() {
         use lisa_core::types::{Thread, ThreadStatus};
