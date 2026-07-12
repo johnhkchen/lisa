@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 
 use zellij_tile::prelude::*;
 
-use adapter::{resolve_adapter_or_native, FollowUp, FollowUpContext, ResetStrategy, SpawnContext};
+use adapter::{
+    resolve_adapter_or_native, FollowUp, FollowUpContext, ReadinessMode, ResetStrategy,
+    SpawnContext,
+};
 
 use lisa_core::client::AgentClient;
 use lisa_core::dag::Dag;
@@ -431,6 +434,13 @@ pub struct State {
     /// that reservation is pending acknowledgment, owned, or recovering.
     /// Missing means the seat has no current assignment.
     seat_assignments: HashMap<u32, SeatAssignmentState>,
+
+    /// Provider bootstrap-readiness classification per pane, recorded at launch
+    /// dispatch (T-037-01-01). Observational only in this ticket; T-037-01-02
+    /// keys the Codex startup-grace transition on it. Deliberately disjoint from
+    /// `seat_assignments` so the readiness-mode shape settles without touching
+    /// the `SeatAssignmentState` machine.
+    seat_readiness: HashMap<u32, ReadinessMode>,
 
     /// Last pane name applied by Lisa, keyed by physical terminal pane ID.
     /// Used to suppress redundant Zellij rename operations across scheduler polls.
@@ -1379,6 +1389,14 @@ impl State {
     /// Return the explicit assignment state for a physical seat.
     fn seat_assignment(&self, pane_id: u32) -> Option<SeatAssignmentState> {
         self.seat_assignments.get(&pane_id).copied()
+    }
+
+    /// The provider bootstrap-readiness mode recorded for this pane at its last
+    /// launch dispatch, if any (T-037-01-01). The behavioural consumer — the
+    /// Codex startup-grace transition — arrives in T-037-01-02.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn seat_readiness_mode(&self, pane_id: u32) -> Option<ReadinessMode> {
+        self.seat_readiness.get(&pane_id).copied()
     }
 
     /// Mark a fresh provider ready only when it reports the exact current
@@ -2763,6 +2781,13 @@ impl State {
                 SeatAssignmentState::Owned
             };
             self.seat_assignments.insert(pane_id, assignment_state);
+            // Read the provider's bootstrap-readiness mode at launch dispatch and
+            // record it for the Starting seat (T-037-01-01). Classification only;
+            // the grace transition that consumes it lands in T-037-01-02.
+            if fresh_launch {
+                self.seat_readiness
+                    .insert(pane_id, adapter.readiness_mode());
+            }
             if self.agent_slots[slot_idx].transition_state == TransitionState::Idle {
                 self.start_assignment_ack_wait(pane_id, std::time::SystemTime::now());
             }
@@ -4001,6 +4026,11 @@ impl State {
                         relaunches: 0,
                     },
                 );
+                // Same launch-dispatch readiness read as the primary path, so a
+                // recovery-relaunched Starting seat is also classified
+                // (T-037-01-01).
+                self.seat_readiness
+                    .insert(pane_id, adapter.readiness_mode());
             }
             self.start_assignment_ack_wait(pane_id, now);
             if recovering {
@@ -9605,6 +9635,36 @@ mod tests {
             "a fresh Codex launch awaits its exact process-start signal"
         );
         assert!(!state.seat_is_owned(10));
+    }
+
+    #[test]
+    fn scheduler_records_provider_readiness_mode_at_dispatch() {
+        // T-037-01-01: the scheduler reads the adapter's readiness mode at launch
+        // dispatch and records it per pane, with no seat-state behavior change.
+        let (mut codex, _codex_dir) =
+            pane_name_schedule_state("codex", AgentClient::Codex, None);
+        codex.schedule_ready_tickets();
+        assert_eq!(
+            codex.seat_readiness_mode(10),
+            Some(ReadinessMode::Grace),
+            "a fresh Codex launch is classified as grace-paced readiness"
+        );
+        assert!(
+            matches!(
+                codex.seat_assignment(10),
+                Some(SeatAssignmentState::Starting { generation: 1, .. })
+            ),
+            "recording the mode does not change the Starting seat state"
+        );
+
+        let (mut claude, _claude_dir) =
+            pane_name_schedule_state("claude", AgentClient::Claude, None);
+        claude.schedule_ready_tickets();
+        assert_eq!(
+            claude.seat_readiness_mode(10),
+            Some(ReadinessMode::SessionStart),
+            "a fresh Claude launch is classified as SessionStart-proven readiness"
+        );
     }
 
     #[test]
