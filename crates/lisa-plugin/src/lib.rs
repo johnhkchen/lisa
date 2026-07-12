@@ -10543,6 +10543,92 @@ mod tests {
     }
 
     #[test]
+    fn assignment_recovery_failure_retains_authority_for_operator_reset() {
+        let (mut state, dir) =
+            pane_name_schedule_state("codex", AgentClient::Codex, Some(AgentClient::Codex));
+        state.schedule_ready_tickets();
+
+        let predecessor = state.current_leases["T-NAME"].clone();
+        state.seat_assignments.insert(
+            10,
+            SeatAssignmentState::AssignedPendingAck {
+                generation: predecessor.attempt_id,
+                ack_deadline: Some(std::time::SystemTime::now()),
+            },
+        );
+
+        let recovery_started = std::time::SystemTime::now();
+        state.begin_assignment_recovery(10, recovery_started);
+        let successor = state.current_leases["T-NAME"].clone();
+        assert_eq!(successor.attempt_id, predecessor.attempt_id + 1);
+        assert_eq!(state.lease_high_water.get("T-NAME"), Some(&successor));
+        assert_eq!(
+            state.agent_slots[0].attempt_lease.as_ref(),
+            Some(&successor)
+        );
+        assert_eq!(
+            state.threads["T-NAME"].attempt_lease.as_ref(),
+            Some(&successor)
+        );
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Recovering {
+                generation,
+                ack_deadline: None,
+            }) if generation == successor.attempt_id
+        ));
+
+        let recovery_deadline = recovery_started + std::time::Duration::from_secs(1);
+        state.seat_assignments.insert(
+            10,
+            SeatAssignmentState::Recovering {
+                generation: successor.attempt_id,
+                ack_deadline: Some(recovery_deadline),
+            },
+        );
+        state.ledger_path = dir.path().join("provenance.jsonl");
+        state.check_assignment_ack_timeouts_at(recovery_deadline);
+
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::RecoveryFailed)
+        );
+        assert_eq!(
+            state.threads["T-NAME"].status,
+            lisa_core::types::ThreadStatus::Failed
+        );
+        assert_eq!(state.current_leases.get("T-NAME"), Some(&successor));
+        assert_eq!(state.lease_high_water.get("T-NAME"), Some(&successor));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert_eq!(
+            state.agent_slots[0].attempt_lease.as_ref(),
+            Some(&successor)
+        );
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert!(!state.agent_slots[0].has_session);
+        assert!(state.threads.contains_key("T-NAME"));
+        assert!(
+            !state.ledger_path.exists(),
+            "retained failures emit no provenance"
+        );
+        assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
+
+        state.check_assignment_ack_timeouts_at(
+            recovery_deadline + std::time::Duration::from_secs(300),
+        );
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::RecoveryFailed),
+            "terminal recovery failure cannot start another automatic attempt"
+        );
+        assert_eq!(state.current_leases.get("T-NAME"), Some(&successor));
+        assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
+    }
+
+    #[test]
     fn test_dashboard_snapshot_shows_fresh_codex_handoff_states() {
         let (mut acknowledged, _dir) =
             pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
