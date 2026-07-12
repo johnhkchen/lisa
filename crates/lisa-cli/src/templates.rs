@@ -178,11 +178,11 @@ fi
 "#,
 ];
 
-/// The native Codex `UserPromptSubmit` hook. It preserves the complete JSON
+/// The native provider `UserPromptSubmit` hook. It preserves the complete JSON
 /// payload for the plugin's ticket/generation detector and publishes it with an
 /// atomic rename so the polling scheduler never observes a partial document.
 pub const ON_ACK_HOOK: &str = r#"#!/bin/sh
-# Lisa Codex acknowledgment hook — called before Codex submits a user prompt.
+# Lisa assignment acknowledgment hook — called before a provider submits a user prompt.
 # Writes the raw lifecycle payload for ticket/generation matching in the plugin.
 
 SIGNAL_DIR=".lisa/signals"
@@ -277,7 +277,7 @@ const NOTIFY_ATTENTION_COMMAND: &str = "test -x .lisa/hooks/on-notify || exit 0;
 /// degrades to the generic detail, never a hard failure (design Q3).
 const NOTIFY_QUESTION_COMMAND: &str = "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); test -x .lisa/hooks/on-notify && printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$PWD\" LISA_QUESTION_HEADER=\"$hdr\" .lisa/hooks/on-notify attention \"$q\"";
 
-/// Generate .claude/settings.local.json with Stop, SessionStart, Notification
+/// Generate .claude/settings.local.json with Stop, SessionStart, UserPromptSubmit, Notification
 /// (idle_prompt + catch-all attention), PostToolUse heartbeat, and
 /// PreToolUse[AskUserQuestion] hooks.
 /// Hook commands use `test -x` guards so they succeed silently if the scripts
@@ -332,6 +332,16 @@ pub fn settings_local_json() -> String {
           {
             "type": "command",
             "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
           }
         ]
       }
@@ -562,6 +572,12 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
         "PostToolUse",
         None,
         "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "UserPromptSubmit",
+        None,
+        "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh",
     );
     // Catch-all (matcher-less) Notification entry for permission/attention payloads.
     // Distinct from the idle_prompt entry above: ensure_hook dedups a matcher-less
@@ -916,17 +932,19 @@ mod tests {
     #[test]
     fn test_settings_local_json() {
         let json = settings_local_json();
-        // All four hook types present
+        // Lifecycle and interaction hook types present.
         assert!(json.contains("\"Stop\""));
         assert!(json.contains("\"SessionStart\""));
         assert!(json.contains("\"Notification\""));
         assert!(json.contains("\"PostToolUse\""));
+        assert!(json.contains("\"UserPromptSubmit\""));
         // Hook commands
         assert!(json.contains("on-stop.sh"));
         assert!(json.contains("on-clear.sh"));
         assert!(json.contains("on-start.sh"));
         assert!(json.contains("on-idle.sh"));
         assert!(json.contains("on-heartbeat.sh"));
+        assert!(json.contains("on-ack.sh"));
         // Matchers
         assert!(json.contains("\"clear\""));
         assert!(json.contains("idle_prompt"));
@@ -935,6 +953,10 @@ mod tests {
         assert!(json.contains("on-notify"));
         // The generated JSON must embed the exact catch-all command and parse cleanly.
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
+        );
         assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "startup");
         assert_eq!(parsed["hooks"]["SessionStart"][1]["matcher"], "clear");
         let notifications = parsed["hooks"]["Notification"].as_array().unwrap();
@@ -1030,12 +1052,16 @@ mod tests {
         assert!(result.contains("on-idle.sh"));
         assert!(result.contains("\"PostToolUse\""));
         assert!(result.contains("on-heartbeat.sh"));
+        assert!(result.contains("\"UserPromptSubmit\""));
+        assert!(result.contains("on-ack.sh"));
         // Catch-all attention binding added too.
         assert!(result.contains("on-notify"));
         // PreToolUse[AskUserQuestion] question binding added.
         assert!(result.contains("\"PreToolUse\""));
         assert!(result.contains("AskUserQuestion"));
         assert_eq!(count_question_commands(&result), 1);
+        let again = merge_hooks(&result).unwrap();
+        assert_eq!(again.matches("test -x .lisa/hooks/on-ack.sh").count(), 1);
     }
 
     #[test]

@@ -185,31 +185,40 @@ pub struct HealthAlert {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeatAssignmentStatus {
     Starting,
+    ReadyForAssignment,
+    Delivering,
     AssignedPendingAck,
     Owned,
     Recovering,
     RecoveryFailed,
     StartupFailed,
+    DeliveryFailed,
 }
 
 impl SeatAssignmentStatus {
     fn label(self) -> &'static str {
         match self {
             Self::Starting => "starting",
+            Self::ReadyForAssignment => "ready-for-assignment",
+            Self::Delivering => "delivering",
             Self::AssignedPendingAck => "assigned-pending-ack",
             Self::Owned => "owned",
             Self::Recovering => "recovering",
             Self::RecoveryFailed => "recovery-failed",
             Self::StartupFailed => "startup-failed",
+            Self::DeliveryFailed => "delivery-failed",
         }
     }
 
     fn color(self) -> &'static str {
         match self {
-            Self::Starting | Self::AssignedPendingAck => YELLOW,
+            Self::Starting
+            | Self::ReadyForAssignment
+            | Self::Delivering
+            | Self::AssignedPendingAck => YELLOW,
             Self::Owned => GREEN,
             Self::Recovering => BRIGHT_YELLOW,
-            Self::RecoveryFailed | Self::StartupFailed => RED,
+            Self::RecoveryFailed | Self::StartupFailed | Self::DeliveryFailed => RED,
         }
     }
 }

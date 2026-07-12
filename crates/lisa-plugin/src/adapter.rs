@@ -29,8 +29,8 @@
 //! The trait is shaped so the two other planned integration methods drop in
 //! without changing this interface (epic E-001, Decision 4; design thesis §5):
 //!
-//! - **Native Codex**: launches the official interactive TUI with an initial
-//!   prompt, reuses it through the same `/clear` handshake as Claude, and types
+//! - **Native Codex**: launches the official interactive TUI bare, reuses it
+//!   through the same `/clear` handshake as Claude, and types
 //!   follow-ups into the live composer. Codex lifecycle hooks emit the normalized
 //!   `.heartbeat`/`.stopped`/`.cleared` files the scheduler already consumes.
 //! - **ACP** (Agent Client Protocol, future): a host-side bridge process writes
@@ -58,8 +58,7 @@ pub(crate) struct SpawnContext<'a> {
     pub attempt_id: u64,
     /// Private workflow artifact directory for this exact attempt lease.
     pub artifact_dir: &'a Path,
-    /// Identity for a recycled Codex delivery awaiting provider acknowledgment.
-    /// Claude and immediately-owned fresh assignments leave this unset.
+    /// Identity for a delivery awaiting provider acknowledgment.
     pub assignment_generation: Option<u64>,
 }
 
@@ -124,8 +123,32 @@ pub(crate) struct SignalCapabilities {
 /// and ACP fit this shape without redesign, and for the WASM constraint that
 /// makes every method return a description rather than perform I/O.
 pub(crate) trait AgentAdapter {
-    /// Command to launch a fresh session in an empty pane.
+    /// Bare command to launch a fresh session in an empty pane.
     fn launch_command(&self, ctx: &SpawnContext) -> String;
+
+    /// Complete attempt-specific instructions, persisted before a fresh launch
+    /// and typed directly only when reusing an established session.
+    fn assignment_text(&self, ctx: &SpawnContext) -> String;
+
+    /// Bounded chat message that refers a ready provider to its complete
+    /// assignment file and carries the exact attempt marker acknowledged by
+    /// `UserPromptSubmit`.
+    fn assignment_reference(&self, ctx: &SpawnContext, assignment_path: &Path) -> String {
+        let generation = ctx
+            .assignment_generation
+            .expect("assignment reference requires an acknowledgment generation");
+        let message = format!(
+            "Read and follow the complete assignment at {}.",
+            assignment_path.display()
+        );
+        tag_codex_assignment(
+            &message,
+            CodexAssignmentRef {
+                ticket_id: ctx.ticket_id,
+                generation,
+            },
+        )
+    }
 
     /// Slash command that gracefully exits the resident interactive client so
     /// the pane's shell can launch a different provider. Both native clients
@@ -183,12 +206,19 @@ impl ClaudeCodeAdapter {
 impl AgentAdapter for ClaudeCodeAdapter {
     fn launch_command(&self, ctx: &SpawnContext) -> String {
         build_claude_command(
-            ctx.ticket_dir,
             ctx.ticket_id,
             ctx.pane_id,
             ctx.attempt_id,
             self.model.as_deref(),
             self.lisa_bin.as_deref(),
+        )
+    }
+
+    fn assignment_text(&self, ctx: &SpawnContext) -> String {
+        ticket_prompt(
+            ctx.ticket_dir,
+            ctx.ticket_id,
+            AgentClient::Claude.context_file(),
             ctx.artifact_dir,
         )
     }
@@ -198,13 +228,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
-        // Native Claude reads CLAUDE.md.
-        ticket_prompt(
-            ctx.ticket_dir,
-            ctx.ticket_id,
-            AgentClient::Claude.context_file(),
-            ctx.artifact_dir,
-        )
+        self.assignment_text(ctx)
     }
 
     fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
@@ -269,15 +293,10 @@ impl CodexAdapter {
         }
     }
 
-    /// Build the provider prompt and attach scheduler identity only when this
-    /// Codex delivery is waiting for positive acknowledgment.
+    /// Attach scheduler identity only when this reused Codex delivery is
+    /// waiting for positive acknowledgment.
     fn assignment_prompt(&self, ctx: &SpawnContext) -> String {
-        let prompt = ticket_prompt(
-            ctx.ticket_dir,
-            ctx.ticket_id,
-            AgentClient::Codex.context_file(),
-            ctx.artifact_dir,
-        );
+        let prompt = self.assignment_text(ctx);
         match ctx.assignment_generation {
             Some(generation) => tag_codex_assignment(
                 &prompt,
@@ -292,13 +311,13 @@ impl CodexAdapter {
 
     /// The full interactive shell line for a fresh Codex TUI. The env prefix
     /// gives lifecycle hooks pane/ticket attribution and tells `capture-usage`
-    /// to parse the Codex transcript into `.lisa/codex/`.
+    /// to parse the Codex transcript into `.lisa/codex/`. Assignment text is
+    /// deliberately absent and arrives through chat only after SessionStart.
     fn interactive_line(&self, ctx: &SpawnContext) -> String {
-        let prompt = self.assignment_prompt(ctx);
         format!(
             "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} LISA_ATTEMPT_ID={attempt} \
              codex --dangerously-bypass-approvals-and-sandbox \
-             --dangerously-bypass-hook-trust{model} {prompt} || \
+             --dangerously-bypass-hook-trust{model} || \
              {{ mkdir -p .lisa/signals; date -u +%Y-%m-%dT%H:%M:%SZ > \
              .lisa/signals/pane-{pane}.error; }}",
             bin = shell_quote(&self.lisa_bin),
@@ -306,7 +325,6 @@ impl CodexAdapter {
             ticket = shell_quote(ctx.ticket_id),
             attempt = ctx.attempt_id,
             model = self.model_flag(),
-            prompt = shell_quote(&prompt),
         )
     }
 }
@@ -314,6 +332,15 @@ impl CodexAdapter {
 impl AgentAdapter for CodexAdapter {
     fn launch_command(&self, ctx: &SpawnContext) -> String {
         self.interactive_line(ctx)
+    }
+
+    fn assignment_text(&self, ctx: &SpawnContext) -> String {
+        ticket_prompt(
+            ctx.ticket_dir,
+            ctx.ticket_id,
+            AgentClient::Codex.context_file(),
+            ctx.artifact_dir,
+        )
     }
 
     fn reset_strategy(&self) -> ResetStrategy {
@@ -421,7 +448,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
             ClaudeCodeAdapter::default().launch_command(&ctx),
-            build_claude_command(dir, "T-042-01", 7, 1, None, None, ctx.artifact_dir)
+            build_claude_command("T-042-01", 7, 1, None, None)
         );
     }
 
@@ -433,7 +460,7 @@ mod tests {
         assert!(cmd.contains("--model 'opus'"), "got: {cmd}");
         assert_eq!(
             cmd,
-            build_claude_command(dir, "T-042-01", 7, 1, Some("opus"), None, ctx.artifact_dir,)
+            build_claude_command("T-042-01", 7, 1, Some("opus"), None)
         );
     }
 
@@ -611,31 +638,25 @@ mod tests {
         assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(cmd.contains("--dangerously-bypass-hook-trust"));
         assert!(cmd.contains(".lisa/signals/pane-7.error"));
-        // The wrapped prompt is the shared RDSPI ticket prompt, verbatim — with
-        // Codex's context file (AGENTS.md).
-        assert!(cmd.contains(&shell_quote(&ticket_prompt(
-            dir,
-            "T-042-01",
-            AgentClient::Codex.context_file(),
-            ctx.artifact_dir,
-        ))));
-        assert!(cmd.contains("AGENTS.md"));
+        assert!(!cmd.contains("Read the ticket"));
+        assert!(!cmd.contains("AGENTS.md"));
+        assert!(!cmd.contains("LISA_ASSIGNMENT"));
     }
 
     #[test]
-    fn codex_prompt_references_agents_not_claude() {
-        // Parity: the Codex launch line points the agent at AGENTS.md, the Claude
-        // launch line at CLAUDE.md — never crossed.
+    fn provider_assignment_text_uses_its_context_file_while_launch_is_bare() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 1);
 
-        let codex_cmd = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
-        assert!(codex_cmd.contains("AGENTS.md"));
-        assert!(!codex_cmd.contains("CLAUDE.md"));
+        let codex = CodexAdapter::new(Some("/abs/lisa"), None);
+        assert!(codex.assignment_text(&ctx).contains("AGENTS.md"));
+        assert!(!codex.assignment_text(&ctx).contains("CLAUDE.md"));
+        assert!(!codex.launch_command(&ctx).contains("AGENTS.md"));
 
-        let claude_cmd = ClaudeCodeAdapter::default().launch_command(&ctx);
-        assert!(claude_cmd.contains("CLAUDE.md"));
-        assert!(!claude_cmd.contains("AGENTS.md"));
+        let claude = ClaudeCodeAdapter::default();
+        assert!(claude.assignment_text(&ctx).contains("CLAUDE.md"));
+        assert!(!claude.assignment_text(&ctx).contains("AGENTS.md"));
+        assert!(!claude.launch_command(&ctx).contains("CLAUDE.md"));
     }
 
     #[test]
@@ -644,7 +665,7 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = CodexAdapter::new(Some("/abs/lisa"), Some("gpt-5")).launch_command(&ctx);
-        assert!(cmd.contains("--model 'gpt-5' '"), "got: {cmd}");
+        assert!(cmd.contains("--model 'gpt-5' ||"), "got: {cmd}");
         // No model → no flag (pre-routing wrapper line).
         let bare = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
         assert!(!bare.contains("--model"), "got: {bare}");
@@ -668,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_pending_delivery_tags_launch_and_reuse_prompt() {
+    fn pending_delivery_tags_reuse_and_bounded_reference_but_not_launch() {
         let dir = Path::new("docs/active/tickets");
         let mut ctx = spawn_ctx(dir, "T-042-01", 3);
         ctx.assignment_generation = Some(17);
@@ -678,7 +699,13 @@ mod tests {
         assert!(reuse.contains(r#"LISA_ASSIGNMENT {"ticket_id":"T-042-01","generation":17}"#));
 
         let launch = adapter.launch_command(&ctx);
-        assert!(launch.contains(r#"LISA_ASSIGNMENT {"ticket_id":"T-042-01","generation":17}"#));
+        assert!(!launch.contains("LISA_ASSIGNMENT"));
+        let reference = adapter.assignment_reference(
+            &ctx,
+            Path::new(".lisa/attempts/T-042-01/1/work/assignment.md"),
+        );
+        assert!(reference.contains("assignment.md"));
+        assert!(reference.contains(r#"LISA_ASSIGNMENT {"ticket_id":"T-042-01","generation":17}"#));
     }
 
     #[test]
