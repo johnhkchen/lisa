@@ -9719,6 +9719,126 @@ mod tests {
     }
 
     #[test]
+    fn codex_startup_grace_paces_first_prompt_into_delivering() {
+        // T-037-01-02: a grace-mode (Codex) seat, with no process-start signal
+        // ever emitted, remains Starting until its bounded named startup grace
+        // elapses, then attempts the tagged chat assignment and enters Delivering
+        // directly — never ReadyForAssignment, StartupFailed, ResettingStartup,
+        // or Owned merely because time passed. Ownership is published only by the
+        // exact current-attempt UserPromptSubmit.
+        let (mut codex, _codex_dir) = pane_name_schedule_state("codex", AgentClient::Codex, None);
+        codex.schedule_ready_tickets();
+        assert_eq!(codex.seat_readiness_mode(10), Some(ReadinessMode::Grace));
+        let lease = codex.current_leases["T-NAME"].clone();
+        let grace_deadline = match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+                relaunches: 0,
+            }) => {
+                assert_eq!(generation, lease.attempt_id);
+                deadline
+            }
+            other => panic!("expected a fresh Codex Starting with a named grace, got {other:?}"),
+        };
+        assert!(!codex.seat_is_owned(10));
+
+        // A stray process-start signal must not exist for grace mode; before the
+        // grace elapses the seat is still Starting, nothing has been delivered.
+        assert!(matches!(
+            codex.seat_assignment(10),
+            Some(SeatAssignmentState::Starting { .. })
+        ));
+
+        // The named grace elapses: pace the first prompt directly into Delivering.
+        codex.check_assignment_ack_timeouts_at(grace_deadline);
+        match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                retries: 0,
+                ..
+            }) => assert_eq!(generation, lease.attempt_id),
+            other => panic!("grace elapse must enter Delivering directly, got {other:?}"),
+        }
+        assert!(!codex.seat_is_owned(10), "elapsed grace never publishes Owned");
+        assert_eq!(
+            codex.to_ui_state().seat_assignment_statuses.get(&1),
+            Some(&ui::SeatAssignmentStatus::Delivering),
+            "grace never surfaces ReadyForAssignment or StartupFailed"
+        );
+
+        // Ownership is gated solely on the exact current-attempt acknowledgement.
+        assert!(
+            !acknowledge_assignment(&mut codex, 10, "T-NAME", lease.attempt_id + 1),
+            "a stale-generation payload cannot own the paced assignment"
+        );
+        assert!(!codex.seat_is_owned(10));
+        assert!(acknowledge_assignment(
+            &mut codex,
+            10,
+            "T-NAME",
+            lease.attempt_id,
+        ));
+        assert_eq!(codex.seat_assignment(10), Some(SeatAssignmentState::Owned));
+    }
+
+    #[test]
+    fn session_start_seat_never_paces_on_grace_and_still_requires_the_signal() {
+        // T-037-01-02: the SessionStart-mode (Claude) path is unchanged. Its
+        // Starting deadline does NOT auto-deliver; it enters same-pane startup
+        // recovery, and only a matching process-start signal reaches
+        // ReadyForAssignment.
+        let (mut claude, _claude_dir) =
+            pane_name_schedule_state("claude", AgentClient::Claude, None);
+        claude.config.assignment_ack_timeout_secs = 1;
+        claude.schedule_ready_tickets();
+        assert_eq!(
+            claude.seat_readiness_mode(10),
+            Some(ReadinessMode::SessionStart)
+        );
+        let lease = claude.current_leases["T-NAME"].clone();
+        assert!(matches!(
+            claude.seat_assignment(10),
+            Some(SeatAssignmentState::Starting {
+                start_deadline: Some(_),
+                relaunches: 0,
+                ..
+            })
+        ));
+
+        // A matching process-start signal is the only route to ReadyForAssignment.
+        assert!(claude.acknowledge_process_start(10, &lease));
+        assert_eq!(
+            claude.seat_assignment(10),
+            Some(SeatAssignmentState::ReadyForAssignment {
+                generation: lease.attempt_id,
+            })
+        );
+
+        // On a fresh Claude launch, the elapsed deadline enters startup recovery,
+        // never a paced Delivering.
+        let (mut claude2, _claude_dir2) =
+            pane_name_schedule_state("claude", AgentClient::Claude, None);
+        claude2.config.assignment_ack_timeout_secs = 1;
+        claude2.schedule_ready_tickets();
+        let deadline2 = match claude2.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                start_deadline: Some(deadline),
+                ..
+            }) => deadline,
+            other => panic!("expected a fresh Claude Starting, got {other:?}"),
+        };
+        claude2.check_assignment_ack_timeouts_at(deadline2);
+        assert!(
+            matches!(
+                claude2.seat_assignment(10),
+                Some(SeatAssignmentState::ResettingStartup { .. })
+            ),
+            "a SessionStart seat recovers on deadline; it never paces into Delivering"
+        );
+    }
+
+    #[test]
     fn dispatch_mints_and_stamps_strictly_new_attempt_lease() {
         let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
         let ticket_id = "T-NAME".to_string();
@@ -10049,110 +10169,113 @@ mod tests {
     }
 
     #[test]
-    fn same_pane_replacement_requires_start_and_chat_ack_for_both_providers() {
-        for (requested_agent, default_agent) in [
-            ("claude", AgentClient::Claude),
-            ("codex", AgentClient::Codex),
-        ] {
-            let (mut state, _dir) = pane_name_schedule_state(requested_agent, default_agent, None);
-            state.config.assignment_ack_timeout_secs = 1;
-            state.schedule_ready_tickets();
-            let predecessor = state.current_leases["T-NAME"].clone();
-            let first_deadline = match state.seat_assignment(10) {
-                Some(SeatAssignmentState::Starting {
-                    start_deadline: Some(deadline),
-                    relaunches: 0,
-                    ..
-                }) => deadline,
-                other => panic!("expected initial Starting, got {other:?}"),
-            };
+    fn same_pane_replacement_requires_start_and_chat_ack_for_claude() {
+        // SessionStart-mode (Claude) same-pane startup replacement contract: a
+        // fresh Starting whose process-start signal is not observed before the
+        // deadline resets in the same pane, requires a fresh shell proof to
+        // relaunch, then requires the exact process-start signal to reach
+        // ReadyForAssignment and the exact chat ack to reach Owned. Grace-mode
+        // (Codex) diverges here — its Starting deadline paces the first prompt
+        // directly into Delivering instead of recovering; that path is covered by
+        // `codex_startup_grace_paces_first_prompt_into_delivering`.
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        state.config.assignment_ack_timeout_secs = 1;
+        state.schedule_ready_tickets();
+        let predecessor = state.current_leases["T-NAME"].clone();
+        let first_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                start_deadline: Some(deadline),
+                relaunches: 0,
+                ..
+            }) => deadline,
+            other => panic!("expected initial Starting, got {other:?}"),
+        };
 
-            state.check_assignment_ack_timeouts_at(first_deadline);
-            let successor = state.current_leases["T-NAME"].clone();
-            assert_eq!(successor.attempt_id, predecessor.attempt_id + 1);
-            let replacement_activity = state.agent_slots[0].last_activity_at;
-            std::fs::write(
-                state.signal_dir.join("pane-10.heartbeat"),
-                serde_json::to_string(&predecessor).unwrap(),
-            )
-            .unwrap();
-            state.check_heartbeat_signals();
-            assert_eq!(state.agent_slots[0].last_activity_at, replacement_activity);
-            assert!(state
-                .admit_artifact("T-NAME", Some(&predecessor), "research.md")
-                .is_err());
-            assert!(!state.acknowledge_shell_ready(10, &predecessor, first_deadline));
-            assert!(matches!(
-                state.seat_assignment(10),
-                Some(SeatAssignmentState::ResettingStartup { generation, .. })
-                    if generation == successor.attempt_id
-            ));
+        state.check_assignment_ack_timeouts_at(first_deadline);
+        let successor = state.current_leases["T-NAME"].clone();
+        assert_eq!(successor.attempt_id, predecessor.attempt_id + 1);
+        let replacement_activity = state.agent_slots[0].last_activity_at;
+        std::fs::write(
+            state.signal_dir.join("pane-10.heartbeat"),
+            serde_json::to_string(&predecessor).unwrap(),
+        )
+        .unwrap();
+        state.check_heartbeat_signals();
+        assert_eq!(state.agent_slots[0].last_activity_at, replacement_activity);
+        assert!(state
+            .admit_artifact("T-NAME", Some(&predecessor), "research.md")
+            .is_err());
+        assert!(!state.acknowledge_shell_ready(10, &predecessor, first_deadline));
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::ResettingStartup { generation, .. })
+                if generation == successor.attempt_id
+        ));
 
-            std::fs::write(
-                state.signal_dir.join("pane-10.shell-ready"),
-                serde_json::to_string(&successor).unwrap(),
-            )
-            .unwrap();
-            state.check_shell_ready_signals();
-            let replacement_deadline = match state.seat_assignment(10) {
-                Some(SeatAssignmentState::Starting {
-                    generation,
-                    start_deadline: Some(deadline),
-                    relaunches: 1,
-                }) => {
-                    assert_eq!(generation, successor.attempt_id);
-                    deadline
-                }
-                other => panic!("expected replacement Starting, got {other:?}"),
-            };
-            assert!(replacement_deadline > first_deadline);
-            assert_eq!(state.agent_slots[0].pane_id, 10);
-            assert_eq!(state.agent_slots.len(), 1);
-            assert!(state
+        std::fs::write(
+            state.signal_dir.join("pane-10.shell-ready"),
+            serde_json::to_string(&successor).unwrap(),
+        )
+        .unwrap();
+        state.check_shell_ready_signals();
+        let replacement_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+                relaunches: 1,
+            }) => {
+                assert_eq!(generation, successor.attempt_id);
+                deadline
+            }
+            other => panic!("expected replacement Starting, got {other:?}"),
+        };
+        assert!(replacement_deadline > first_deadline);
+        assert_eq!(state.agent_slots[0].pane_id, 10);
+        assert_eq!(state.agent_slots.len(), 1);
+        assert!(state
+            .attempt_work_dir(&successor)
+            .join(ASSIGNMENT_FILE_NAME)
+            .is_file());
+        let launch = std::fs::read_to_string(
+            state
                 .attempt_work_dir(&successor)
-                .join(ASSIGNMENT_FILE_NAME)
-                .is_file());
-            let launch = std::fs::read_to_string(
-                state
-                    .attempt_work_dir(&successor)
-                    .join(".lisa-launch-10.sh"),
-            )
-            .unwrap();
-            assert!(!launch.contains("Read the ticket"));
-            assert!(!launch.contains("LISA_ASSIGNMENT"));
-            let marker: AttemptLease = serde_json::from_str(
-                &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(marker, successor);
+                .join(".lisa-launch-10.sh"),
+        )
+        .unwrap();
+        assert!(!launch.contains("Read the ticket"));
+        assert!(!launch.contains("LISA_ASSIGNMENT"));
+        let marker: AttemptLease = serde_json::from_str(
+            &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker, successor);
 
-            assert!(!state.acknowledge_process_start(10, &predecessor));
-            assert!(state.acknowledge_process_start(10, &successor));
-            assert!(matches!(
-                state.seat_assignment(10),
-                Some(SeatAssignmentState::ReadyForAssignment { generation })
-                    if generation == successor.attempt_id
-            ));
-            state.deliver_ready_assignments();
-            assert!(matches!(
-                state.seat_assignment(10),
-                Some(SeatAssignmentState::Delivering { generation, .. })
-                    if generation == successor.attempt_id
-            ));
-            assert!(!acknowledge_assignment(
-                &mut state,
-                10,
-                "T-NAME",
-                predecessor.attempt_id,
-            ));
-            assert!(acknowledge_assignment(
-                &mut state,
-                10,
-                "T-NAME",
-                successor.attempt_id,
-            ));
-            assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
-        }
+        assert!(!state.acknowledge_process_start(10, &predecessor));
+        assert!(state.acknowledge_process_start(10, &successor));
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::ReadyForAssignment { generation })
+                if generation == successor.attempt_id
+        ));
+        state.deliver_ready_assignments();
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Delivering { generation, .. })
+                if generation == successor.attempt_id
+        ));
+        assert!(!acknowledge_assignment(
+            &mut state,
+            10,
+            "T-NAME",
+            predecessor.attempt_id,
+        ));
+        assert!(acknowledge_assignment(
+            &mut state,
+            10,
+            "T-NAME",
+            successor.attempt_id,
+        ));
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
     }
 
     #[test]
