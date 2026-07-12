@@ -45,8 +45,11 @@ On macOS, Lisa canonicalizes the disposable fixture before pregranting Codex pro
 so `/var/...` and `/private/var/...` do not create an interactive trust mismatch.
 
 The Codex fixture explicitly enables `features.hooks` in its trusted project
-`.codex/config.toml`. This activates the adjacent `.codex/hooks.json` layer without
-depending on a developer's user-level feature defaults.
+`.codex/config.toml` and repeats the two boundary-critical handlers (`SessionStart` and
+`UserPromptSubmit`) inline. The freshly initialized `.codex/hooks.json` remains present for
+Lisa's preflight and parity inspection. Inline handlers avoid depending on an installed
+Codex version's JSON-layer discovery or a developer's user-level feature defaults while
+using the same generated Lisa hook scripts and payloads.
 
 The harness preserves the real HOME and provider configuration so existing authentication
 remains available. It copies only the matched Codex project trust header/line into evidence,

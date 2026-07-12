@@ -220,6 +220,19 @@ create_fixture() {
         cat > "$root/.codex/config.toml" <<'CODEX_CONFIG'
 [features]
 hooks = true
+
+[[hooks.SessionStart]]
+matcher = "startup"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh"
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
 CODEX_CONFIG
     fi
     cat > "$root/.lisa.toml" <<'TOML'
