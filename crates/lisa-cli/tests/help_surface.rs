@@ -110,7 +110,11 @@ fn listing_offset(help: &str, command: &str) -> Option<usize> {
 /// three, which `--help` reaches even though they are absent from the listing.
 #[test]
 fn all_twelve_subcommands_resolve() {
-    assert_eq!(OWN_COMMANDS.len(), 12, "the pinned command set must be exactly 12");
+    assert_eq!(
+        OWN_COMMANDS.len(),
+        12,
+        "the pinned command set must be exactly 12"
+    );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);
         assert!(

@@ -9692,8 +9692,7 @@ mod tests {
     fn scheduler_records_provider_readiness_mode_at_dispatch() {
         // T-037-01-01: the scheduler reads the adapter's readiness mode at launch
         // dispatch and records it per pane, with no seat-state behavior change.
-        let (mut codex, _codex_dir) =
-            pane_name_schedule_state("codex", AgentClient::Codex, None);
+        let (mut codex, _codex_dir) = pane_name_schedule_state("codex", AgentClient::Codex, None);
         codex.schedule_ready_tickets();
         assert_eq!(
             codex.seat_readiness_mode(10),
@@ -9760,7 +9759,10 @@ mod tests {
             }) => assert_eq!(generation, lease.attempt_id),
             other => panic!("grace elapse must enter Delivering directly, got {other:?}"),
         }
-        assert!(!codex.seat_is_owned(10), "elapsed grace never publishes Owned");
+        assert!(
+            !codex.seat_is_owned(10),
+            "elapsed grace never publishes Owned"
+        );
         assert_eq!(
             codex.to_ui_state().seat_assignment_statuses.get(&1),
             Some(&ui::SeatAssignmentStatus::Delivering),
@@ -9923,7 +9925,10 @@ mod tests {
             1,
             "the grace elapse issues exactly the first paced send"
         );
-        assert!(!codex.seat_is_owned(10), "elapsed grace never publishes Owned");
+        assert!(
+            !codex.seat_is_owned(10),
+            "elapsed grace never publishes Owned"
+        );
 
         // Owned is gated solely on the exact current-attempt acknowledgement.
         assert!(

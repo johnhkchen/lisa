@@ -20,6 +20,15 @@
           }
         ],
         "matcher": "clear"
+      },
+      {
+        "hooks": [
+          {
+            "command": "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "startup"
       }
     ],
     "Stop": [
