@@ -117,6 +117,23 @@ pub(crate) struct SignalCapabilities {
     pub cleared: bool,
 }
 
+/// How a provider proves it is ready to receive its first prompt after a fresh
+/// launch. The scheduler reads this at launch dispatch to pick the bootstrap-
+/// readiness path (epic E-037). This is a classification only; the transition
+/// that consumes the `Grace` arm lands in T-037-01-02.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadinessMode {
+    /// A truthful pre-prompt process-start signal proves readiness (Claude
+    /// `SessionStart`): the seat advances `Starting → ReadyForAssignment` on
+    /// positive evidence before the first prompt is sent.
+    SessionStart,
+    /// No truthful pre-prompt readiness hook exists, so a bounded named startup
+    /// grace paces the first prompt (Codex 0.144.1 emits `SessionStart` only
+    /// *after* the first prompt). Elapsed time paces the send; it never proves
+    /// readiness or ownership.
+    Grace,
+}
+
 /// A pluggable agent client. Each integration *method* (native Claude Code,
 /// native Codex TUI, future ACP bridge) implements this to supply the
 /// behaviour that differs per method. See the [module docs](self) for how Codex
@@ -173,6 +190,10 @@ pub(crate) trait AgentAdapter {
     // No live scheduler consumer in the MVP; wired by T-022-02 / T-023-02.
     #[allow(dead_code)]
     fn signals(&self) -> SignalCapabilities;
+
+    /// Which bootstrap-readiness path this provider uses after a fresh launch
+    /// (see [`ReadinessMode`]). The scheduler reads this at launch dispatch.
+    fn readiness_mode(&self) -> ReadinessMode;
 }
 
 /// Native Claude Code adapter: the depth + reliability anchor leg. Delegates to
@@ -246,6 +267,12 @@ impl AgentAdapter for ClaudeCodeAdapter {
             awaiting: true,
             cleared: true,
         }
+    }
+
+    fn readiness_mode(&self) -> ReadinessMode {
+        // Native Claude Code emits SessionStart on process start: readiness is
+        // proven by positive pre-prompt evidence.
+        ReadinessMode::SessionStart
     }
 }
 
@@ -365,6 +392,13 @@ impl AgentAdapter for CodexAdapter {
             awaiting: false,
             cleared: true,
         }
+    }
+
+    fn readiness_mode(&self) -> ReadinessMode {
+        // Codex 0.144.1 emits SessionStart only after the first prompt creates a
+        // thread, so no truthful pre-prompt readiness hook exists: a bounded
+        // startup grace paces the first prompt (E-037).
+        ReadinessMode::Grace
     }
 }
 
@@ -741,6 +775,25 @@ mod tests {
                 awaiting: false,
                 cleared: true,
             }
+        );
+    }
+
+    #[test]
+    fn claude_reports_session_start_readiness() {
+        // Claude proves readiness via a pre-prompt SessionStart signal.
+        assert_eq!(
+            ClaudeCodeAdapter::default().readiness_mode(),
+            ReadinessMode::SessionStart
+        );
+    }
+
+    #[test]
+    fn codex_reports_grace_readiness() {
+        // Codex has no truthful pre-prompt readiness hook, so it paces the first
+        // prompt behind a bounded startup grace.
+        assert_eq!(
+            CodexAdapter::new(Some("/abs/lisa"), None).readiness_mode(),
+            ReadinessMode::Grace
         );
     }
 
