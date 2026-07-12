@@ -5934,6 +5934,8 @@ mod tests {
     use super::*;
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
 
+    mod signal_consumer_characterization;
+
     #[test]
     fn pane_signal_filename_parser_enforces_exact_grammar() {
         let cases = [
