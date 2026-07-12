@@ -778,7 +778,7 @@ impl State {
             .map_err(|error| format!("cannot serialize shell readiness lease: {error}"))?;
         let host_signal_dir = strip_host_prefix(signal_dir);
         let destination = host_signal_dir.join(format!("pane-{pane_id}.shell-ready"));
-        Ok(ShellPublication {
+        ShellPublication {
             path: PublicationPath {
                 destination,
                 temporary_name: TemporaryName::AttemptNonce {
@@ -788,7 +788,7 @@ impl State {
             },
             body: &body,
         }
-        .command())
+        .command()
     }
 
     /// Best-effort removal of pane-scoped predecessor lifecycle state. Exact
