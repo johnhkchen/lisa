@@ -2579,7 +2579,7 @@ impl State {
             // resident in the other client, select one for an explicit `/exit`
             // recycle instead of starving this provider forever. Busy panes are
             // excluded by `find_slot_for_client`.
-            let (slot_idx, recycle) = match self.find_slot_for_client(route.agent) {
+            let (slot_idx, cross_provider_recycle) = match self.find_slot_for_client(route.agent) {
                 Some(SlotSelection::Compatible(idx)) => (idx, false),
                 Some(SlotSelection::Recycle(idx)) => (idx, true),
                 None => {
@@ -2592,6 +2592,12 @@ impl State {
             // a reassigned physical seat and needs the pending-ack contract when
             // the incoming provider is Codex.
             let reused_seat = self.agent_slots[slot_idx].has_session;
+            // Some interactive providers have no reliable in-process reset
+            // boundary. Treat their compatible resident session exactly like a
+            // cross-provider recycle: `/exit`, allow the bounded exit grace,
+            // then launch a fresh process before attempting chat delivery.
+            let recycle = cross_provider_recycle
+                || (reused_seat && adapter.reset_strategy() == ResetStrategy::ExitThenFresh);
 
             // Build the host-relative ticket dir (strip /host/ prefix)
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
@@ -2759,6 +2765,9 @@ impl State {
                         self.agent_slots[slot_idx].transition_started_at =
                             Some(std::time::SystemTime::now());
                         launch_cmd = reuse_prompt;
+                    }
+                    ResetStrategy::ExitThenFresh => {
+                        unreachable!("exit-then-fresh sessions enter the recycle branch")
                     }
                     // Reuse-as-fresh-exec (headless/bridge adapters). The prior
                     // process left the pane's shell at its prompt, so there is no
@@ -9652,31 +9661,59 @@ mod tests {
         state.acknowledge_codex_assignment(pane_id, &payload.to_string())
     }
 
-    fn start_and_deliver_fresh_recovery(
+    /// Advance a provider policy that exits a resident TUI before launching a
+    /// fresh process, then elapse Codex's bounded startup grace into the first
+    /// tagged chat delivery. This mirrors the production timer sequence without
+    /// sleeping or inventing a pre-prompt Codex SessionStart signal.
+    fn exit_then_deliver_fresh_codex(
         state: &mut State,
         pane_id: u32,
         lease: &AttemptLease,
     ) -> std::time::SystemTime {
+        assert_eq!(
+            state
+                .agent_slots
+                .iter()
+                .find(|slot| slot.pane_id == pane_id)
+                .map(|slot| slot.transition_state),
+            Some(TransitionState::WaitingForExit)
+        );
         assert!(matches!(
             state.seat_assignment(pane_id),
-            Some(SeatAssignmentState::Starting { generation, .. })
-                if generation == lease.attempt_id
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: None,
+                ..
+            }) if generation == lease.attempt_id
         ));
-        assert!(state.acknowledge_process_start(pane_id, lease));
-        assert_eq!(
-            state.seat_assignment(pane_id),
-            Some(SeatAssignmentState::ReadyForAssignment {
-                generation: lease.attempt_id,
-            })
+
+        let slot = state
+            .agent_slots
+            .iter_mut()
+            .find(|slot| slot.pane_id == pane_id)
+            .unwrap();
+        slot.transition_started_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
         );
-        state.deliver_ready_assignments();
+        state.check_transition_timeouts();
+
+        let grace_deadline = match state.seat_assignment(pane_id) {
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+                ..
+            }) if generation == lease.attempt_id => deadline,
+            other => panic!("expected fresh Codex startup grace, got {other:?}"),
+        };
+        state.check_assignment_ack_timeouts_at(grace_deadline);
         match state.seat_assignment(pane_id) {
             Some(SeatAssignmentState::Delivering {
                 generation,
                 ack_deadline,
                 retries: 0,
             }) if generation == lease.attempt_id => ack_deadline,
-            other => panic!("expected fresh recovery chat delivery, got {other:?}"),
+            other => panic!("expected fresh Codex chat delivery, got {other:?}"),
         }
     }
 
@@ -10677,11 +10714,14 @@ mod tests {
     }
 
     #[test]
-    fn test_dashboard_snapshot_shows_recycled_codex_handoff_states() {
+    fn test_dashboard_snapshot_shows_fresh_codex_handoff_states() {
         let (mut acknowledged, _dir) =
             pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
         acknowledged.schedule_ready_tickets();
-        let pending_row = dashboard_thread_row(&acknowledged, "T-NAME");
+        let starting_row = dashboard_thread_row(&acknowledged, "T-NAME");
+        let lease = acknowledged.current_leases["T-NAME"].clone();
+        exit_then_deliver_fresh_codex(&mut acknowledged, 10, &lease);
+        let delivering_row = dashboard_thread_row(&acknowledged, "T-NAME");
 
         let matching = serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
@@ -10696,31 +10736,16 @@ mod tests {
         assert!(acknowledged.acknowledge_codex_assignment(10, &matching.to_string()));
         let owned_row = dashboard_thread_row(&acknowledged, "T-NAME");
 
-        let (mut timed_out, _dir) =
-            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
-        timed_out.config.assignment_ack_timeout_secs = 1;
-        timed_out.schedule_ready_tickets();
-        timed_out.handle_cleared_signal(10);
-        let deadline = match timed_out.seat_assignment(10) {
-            Some(SeatAssignmentState::AssignedPendingAck {
-                ack_deadline: Some(deadline),
-                ..
-            }) => deadline,
-            other => panic!("expected armed pending assignment, got {other:?}"),
-        };
-        timed_out.check_assignment_ack_timeouts_at(deadline);
-        let recovering_row = dashboard_thread_row(&timed_out, "T-NAME");
-
         let snapshot =
-            format!("pending\n{pending_row}\nowned\n{owned_row}\ntimeout\n{recovering_row}");
+            format!("starting\n{starting_row}\ndelivering\n{delivering_row}\nowned\n{owned_row}");
         assert_eq!(
             snapshot,
-            "pending\n\
-[1]    T-NAME       RES        codex          assigned-pending-ack <elapsed>\n\
+            "starting\n\
+[1]    T-NAME       RES        codex          starting             <elapsed>\n\
+delivering\n\
+[1]    T-NAME       RES        codex          delivering           <elapsed>\n\
 owned\n\
-[1]    T-NAME       RES        codex          owned                <elapsed>\n\
-timeout\n\
-[1]    T-NAME       RES        codex          recovering           <elapsed>"
+[1]    T-NAME       RES        codex          owned                <elapsed>"
         );
     }
 
@@ -10742,15 +10767,16 @@ timeout\n\
         );
         assert_eq!(
             state.agent_slots[0].transition_state,
-            TransitionState::WaitingForClear
+            TransitionState::WaitingForExit
         );
-        assert_eq!(
+        assert!(matches!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: first.attempt_id,
-                ack_deadline: None,
-            })
-        );
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: None,
+                ..
+            }) if generation == first.attempt_id
+        ));
         assert_eq!(first.attempt_id, 1);
         assert_eq!(state.agent_slots[0].attempt_lease.as_ref(), Some(&first));
         assert!(
@@ -10774,7 +10800,7 @@ timeout\n\
         // Abandon the first unacknowledged delivery and redispatch the same
         // ticket onto the resident Codex seat. The replacement gets a strictly
         // newer lease, and its marker generation is sourced from that lease.
-        state.handle_cleared_signal(10);
+        exit_then_deliver_fresh_codex(&mut state, 10, &first);
         state.release_slot_for_ticket(&"T-NAME".to_string());
         state.threads.remove("T-NAME");
         state.agent_slots[0].cooldown_until =
@@ -10788,13 +10814,15 @@ timeout\n\
         assert!(!first.is_current(Some(&second)));
         assert!(second.is_current(state.current_leases.get("T-NAME")));
         assert_eq!(state.agent_slots[0].attempt_lease.as_ref(), Some(&second));
-        assert_eq!(
+        exit_then_deliver_fresh_codex(&mut state, 10, &second);
+        assert!(matches!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: second.attempt_id,
-                ack_deadline: None,
-            })
-        );
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                retries: 0,
+                ..
+            }) if generation == second.attempt_id
+        ));
 
         let prior_lease_ack = serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
@@ -10807,12 +10835,15 @@ timeout\n\
             ),
         });
         assert!(!state.acknowledge_codex_assignment(10, &prior_lease_ack.to_string()));
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: second.attempt_id,
-                ack_deadline: None,
-            }),
+        assert!(
+            matches!(
+                state.seat_assignment(10),
+                Some(SeatAssignmentState::Delivering {
+                    generation,
+                    retries: 0,
+                    ..
+                }) if generation == second.attempt_id
+            ),
             "an acknowledgement carrying the prior lease cannot promote the replacement"
         );
         assert!(!state.seat_is_owned(10));
@@ -10852,22 +10883,11 @@ timeout\n\
         state.schedule_ready_tickets();
         let original_lease = state.current_leases["T-NAME"].clone();
         assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: original_lease.attempt_id,
-                ack_deadline: None,
-            }),
-            "the acceptance clock starts only after the reused-seat prompt is sent"
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit,
+            "Codex must exit before any next-ticket prompt is attempted"
         );
-
-        state.handle_cleared_signal(10);
-        let first_deadline = match state.seat_assignment(10) {
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: 1,
-                ack_deadline: Some(deadline),
-            }) => deadline,
-            other => panic!("expected armed original assignment, got {other:?}"),
-        };
+        let first_deadline = exit_then_deliver_fresh_codex(&mut state, 10, &original_lease);
 
         // Reproduce the field failure at its real transport seam: Codex accepted
         // the tagged prompt, but the pane-scoped event vanished before Lisa's
@@ -10891,28 +10911,15 @@ timeout\n\
         std::fs::remove_file(&ack_path).unwrap();
         state.check_codex_ack_signals();
 
-        // Before explicit assignment truth, these reservation and transport
-        // facts were the fire-and-forget success contract. With the event gone,
-        // they describe an apparent owner that could wait silently forever.
-        let legacy_open_loop_would_claim_ownership_without_ack =
-            state.agent_slots[0].ticket_id.as_deref() == Some("T-NAME")
-                && state.agent_slots[0].has_session
-                && state.agent_slots[0].transition_state == TransitionState::Idle
-                && state
-                    .threads
-                    .get("T-NAME")
-                    .is_some_and(|thread| thread.status == lisa_core::types::ThreadStatus::Running)
-                && !ack_path.exists();
         assert!(
-            legacy_open_loop_would_claim_ownership_without_ack,
-            "the old open-loop contract must reproduce owned-without-ack stall facts"
-        );
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: 1,
-                ack_deadline: Some(first_deadline),
-            }),
+            matches!(
+                state.seat_assignment(10),
+                Some(SeatAssignmentState::Delivering {
+                    generation: 1,
+                    ack_deadline,
+                    retries: 0,
+                }) if ack_deadline == first_deadline
+            ),
             "a dropped event cannot promote the acknowledgment-gated seat"
         );
         assert!(!state.seat_is_owned(10));
@@ -10923,72 +10930,13 @@ timeout\n\
         )));
 
         state.check_assignment_ack_timeouts_at(first_deadline);
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::Recovering {
-                generation: 2,
-                ack_deadline: None,
-            }),
-            "the first finite boundary must abandon the unacknowledged generation"
-        );
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForExit
-        );
-        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
-        assert!(!state.seat_is_owned(10));
-
-        state.agent_slots[0].transition_started_at = Some(
-            std::time::SystemTime::now()
-                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
-        );
-        state.check_transition_timeouts();
-        let recovery_lease = state.current_leases["T-NAME"].clone();
-        let recovery_deadline = start_and_deliver_fresh_recovery(&mut state, 10, &recovery_lease);
-        let recovery_launches = state
-            .activity_log
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.starts_with("sh '")
-                )
-            })
-            .count();
-        assert_eq!(
-            recovery_launches, 1,
-            "one fresh fallback for the same ticket"
-        );
-        assert!(!state.seat_is_owned(10));
-
-        state.check_transition_timeouts();
-        let launches_after_repeat = state
-            .activity_log
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.starts_with("sh '")
-                )
-            })
-            .count();
-        assert_eq!(
-            launches_after_repeat, 1,
-            "repeated polls cannot turn recovery into an unbounded launch loop"
-        );
-
-        // Drop the recovery acceptance as well. Its own finite boundary must
-        // surface an actionable failure rather than recreating the silent stall.
-        state.check_assignment_ack_timeouts_at(recovery_deadline);
         let retry_deadline = match state.seat_assignment(10) {
             Some(SeatAssignmentState::Delivering {
                 ack_deadline,
                 retries: 1,
                 ..
             }) => ack_deadline,
-            other => panic!("expected one recovery chat retry, got {other:?}"),
+            other => panic!("expected one bounded chat retry, got {other:?}"),
         };
         state.check_assignment_ack_timeouts_at(retry_deadline);
         assert_eq!(
@@ -11009,197 +10957,96 @@ timeout\n\
         )));
 
         state.check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(60));
-        let final_launches = state
-            .activity_log
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.starts_with("sh '")
-                )
-            })
-            .count();
-        assert_eq!(final_launches, 1);
+        assert_eq!(
+            state.current_leases.get("T-NAME"),
+            Some(&original_lease),
+            "chat retries do not mint duplicate attempts or processes"
+        );
     }
 
     #[test]
-    fn test_bounded_ack_wait_recovers_once_then_fails_actionably() {
+    fn test_bounded_fresh_delivery_retries_once_then_fails_actionably() {
         let (mut state, _dir) =
             pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
         state.config.assignment_ack_timeout_secs = 1;
 
         state.schedule_ready_tickets();
-        let original_lease = state.current_leases["T-NAME"].clone();
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: original_lease.attempt_id,
-                ack_deadline: None,
-            }),
-            "the ack clock must not start while /clear transport is pending"
-        );
-
-        state.handle_cleared_signal(10);
-        let first_deadline = match state.seat_assignment(10) {
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation,
-                ack_deadline: Some(deadline),
-            }) if generation == original_lease.attempt_id => deadline,
-            other => panic!("expected armed pending assignment, got {other:?}"),
-        };
+        let lease = state.current_leases["T-NAME"].clone();
+        let first_deadline = exit_then_deliver_fresh_codex(&mut state, 10, &lease);
         assert!(!state.seat_is_owned(10));
 
         state.check_assignment_ack_timeouts_at(first_deadline);
-        let recovery_lease = state.current_leases["T-NAME"].clone();
-        assert!(recovery_lease.attempt_id > original_lease.attempt_id);
-        assert!(!original_lease.is_current(Some(&recovery_lease)));
-        assert_eq!(state.lease_high_water.get("T-NAME"), Some(&recovery_lease));
-        assert_eq!(
-            state.agent_slots[0].attempt_lease.as_ref(),
-            Some(&recovery_lease)
-        );
-        assert_eq!(
-            state.threads["T-NAME"].attempt_lease.as_ref(),
-            Some(&recovery_lease)
-        );
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::Recovering {
-                generation: recovery_lease.attempt_id,
-                ack_deadline: None,
-            })
-        );
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForExit
-        );
-        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        let retry_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                ack_deadline,
+                retries: 1,
+            }) if generation == lease.attempt_id => ack_deadline,
+            other => panic!("expected one chat retry on the fresh process, got {other:?}"),
+        };
+        assert_eq!(state.current_leases.get("T-NAME"), Some(&lease));
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(!state.seat_is_owned(10));
 
-        let abandoned = serde_json::json!({
+        state.check_assignment_ack_timeouts_at(retry_deadline);
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::DeliveryFailed)
+        );
+        assert!(!state.seat_is_owned(10));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert_eq!(
+            state.threads["T-NAME"].status,
+            lisa_core::types::ThreadStatus::Failed
+        );
+        assert!(state.error_alerts.contains(&("T-NAME".to_string(), 10)));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message }
+                if message.contains("assignment delivery failed") && message.contains("reset the ticket")
+        )));
+
+        state.check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(60));
+        assert_eq!(state.current_leases.get("T-NAME"), Some(&lease));
+    }
+
+    #[test]
+    fn test_retry_ack_promotes_only_the_current_fresh_generation() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        state.config.assignment_ack_timeout_secs = 1;
+        state.schedule_ready_tickets();
+        let lease = state.current_leases["T-NAME"].clone();
+        let first_deadline = exit_then_deliver_fresh_codex(&mut state, 10, &lease);
+        state.check_assignment_ack_timeouts_at(first_deadline);
+        let retry_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Delivering {
+                generation: 1,
+                ack_deadline,
+                retries: 1,
+            }) => ack_deadline,
+            other => panic!("expected current-generation retry, got {other:?}"),
+        };
+
+        let stale = serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "prompt": codex_ack::tag_codex_assignment(
-                "late old work",
+                "wrong generation",
                 codex_ack::CodexAssignmentRef {
                     ticket_id: "T-NAME",
-                    generation: original_lease.attempt_id,
+                    generation: 2,
                 },
             ),
         });
-        assert!(
-            !state.acknowledge_codex_assignment(10, &abandoned.to_string()),
-            "the abandoned generation must be fenced before recovery input"
-        );
-
-        state.agent_slots[0].transition_started_at = Some(
-            std::time::SystemTime::now()
-                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
-        );
-        state.check_transition_timeouts();
-        let recovery_deadline = start_and_deliver_fresh_recovery(&mut state, 10, &recovery_lease);
-        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
-        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
-        let recovery_launches = state
-            .activity_log
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.starts_with("sh '")
-                )
-            })
-            .count();
-        assert_eq!(recovery_launches, 1, "exactly one fresh fallback launch");
-
-        state.check_transition_timeouts();
-        let launches_after_repeat = state
-            .activity_log
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.starts_with("sh '")
-                )
-            })
-            .count();
-        assert_eq!(launches_after_repeat, 1, "repeated polls cannot relaunch");
-
-        state.check_assignment_ack_timeouts_at(recovery_deadline);
-        let retry_deadline = match state.seat_assignment(10) {
-            Some(SeatAssignmentState::Delivering {
-                ack_deadline,
-                retries: 1,
-                ..
-            }) => ack_deadline,
-            other => panic!("expected one recovery chat retry, got {other:?}"),
-        };
-        state.check_assignment_ack_timeouts_at(retry_deadline);
-        assert_eq!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::DeliveryFailed)
-        );
-        assert!(!state.seat_is_owned(10));
-        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
-        assert_eq!(
-            state.threads["T-NAME"].status,
-            lisa_core::types::ThreadStatus::Failed
-        );
-        assert!(state.error_alerts.contains(&("T-NAME".to_string(), 10)));
-        assert!(state.activity_log.iter().any(|event| matches!(
-            event,
-            ActivityEvent::Error { message }
-                if message.contains("assignment delivery failed") && message.contains("reset the ticket")
-        )));
-
-        state.check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(60));
-        let final_launches = state
-            .activity_log
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, command, .. }
-                        if ticket_id == "T-NAME" && command.starts_with("sh '")
-                )
-            })
-            .count();
-        assert_eq!(final_launches, 1);
-    }
-
-    #[test]
-    fn test_recovery_ack_promotes_only_the_fresh_generation() {
-        let (mut state, _dir) =
-            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
-        state.config.assignment_ack_timeout_secs = 1;
-        state.schedule_ready_tickets();
-        state.handle_cleared_signal(10);
-        let first_deadline = match state.seat_assignment(10) {
-            Some(SeatAssignmentState::AssignedPendingAck {
-                ack_deadline: Some(deadline),
-                ..
-            }) => deadline,
-            other => panic!("expected pending deadline, got {other:?}"),
-        };
-        state.check_assignment_ack_timeouts_at(first_deadline);
-        state.agent_slots[0].transition_started_at = Some(
-            std::time::SystemTime::now()
-                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
-        );
-        state.check_transition_timeouts();
-        let recovery_lease = state.current_leases["T-NAME"].clone();
-        assert_eq!(recovery_lease.attempt_id, 2);
-        let recovery_deadline = start_and_deliver_fresh_recovery(&mut state, 10, &recovery_lease);
+        assert!(!state.acknowledge_codex_assignment(10, &stale.to_string()));
 
         let matching = serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "prompt": codex_ack::tag_codex_assignment(
-                "fresh recovery",
+                "fresh retry",
                 codex_ack::CodexAssignmentRef {
                     ticket_id: "T-NAME",
-                    generation: 2,
+                    generation: 1,
                 },
             ),
         });
@@ -11207,9 +11054,7 @@ timeout\n\
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
         assert!(state.seat_is_owned(10));
 
-        state.check_assignment_ack_timeouts_at(
-            recovery_deadline + std::time::Duration::from_secs(1),
-        );
+        state.check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(1));
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
         assert!(state.error_alerts.is_empty());
     }
@@ -11237,7 +11082,7 @@ timeout\n\
         let mut codex_tickets = std::collections::HashSet::new();
         let mut codex_panes = std::collections::HashSet::new();
         let mut ack_then_owned = 0usize;
-        let mut timeout_then_fallback = 0usize;
+        let mut timeout_then_retry = 0usize;
 
         for _round in 0..5 {
             codex.schedule_ready_tickets();
@@ -11252,88 +11097,46 @@ timeout\n\
                         .iter()
                         .find(|slot| slot.pane_id == *pane_id)
                         .map(|slot| slot.transition_state),
-                    Some(TransitionState::WaitingForClear),
-                    "native Codex reuses the shared clear transport handshake"
+                    Some(TransitionState::WaitingForExit),
+                    "native Codex exits the resident TUI before fresh delivery"
                 );
                 assert!(matches!(
                     codex.seat_assignment(*pane_id),
-                    Some(SeatAssignmentState::AssignedPendingAck {
-                        ack_deadline: None,
+                    Some(SeatAssignmentState::Starting {
+                        start_deadline: None,
                         ..
                     })
                 ));
-                codex.handle_cleared_signal(*pane_id);
-                let (original_generation, original_deadline) = match codex.seat_assignment(*pane_id)
-                {
-                    Some(SeatAssignmentState::AssignedPendingAck {
-                        generation,
-                        ack_deadline: Some(deadline),
-                    }) => (generation, deadline),
-                    other => panic!(
-                        "{ticket_id} on pane {pane_id} must begin pending ack, got {other:?}"
-                    ),
-                };
+                let lease = codex.current_leases[ticket_id].clone();
+                let original_generation = lease.attempt_id;
+                let original_deadline = exit_then_deliver_fresh_codex(&mut codex, *pane_id, &lease);
                 assert!(!codex.seat_is_owned(*pane_id));
 
                 let (outcome, fallback_launches) = if sequence == 6 {
-                    // Deterministically lose the original generation's acceptance.
-                    // Its exact finite deadline must start one fresh attempt.
+                    // Deterministically lose the first submitted acceptance. The
+                    // exact finite deadline permits one chat retry in the same
+                    // fresh process, never another process or attempt.
                     codex.check_assignment_ack_timeouts_at(original_deadline);
-                    let recovery_generation = match codex.seat_assignment(*pane_id) {
-                        Some(SeatAssignmentState::Recovering {
+                    let retry_deadline = match codex.seat_assignment(*pane_id) {
+                        Some(SeatAssignmentState::Delivering {
                             generation,
-                            ack_deadline: None,
-                        }) => generation,
-                        other => panic!(
-                            "{ticket_id} must enter unowned recovery after lost ack, got {other:?}"
-                        ),
+                            ack_deadline,
+                            retries: 1,
+                        }) if generation == original_generation => ack_deadline,
+                        other => {
+                            panic!("{ticket_id} must enter one bounded chat retry, got {other:?}")
+                        }
                     };
-                    assert_ne!(recovery_generation, original_generation);
                     assert!(!codex.seat_is_owned(*pane_id));
-                    assert_eq!(
-                        codex
-                            .agent_slots
-                            .iter()
-                            .find(|slot| slot.pane_id == *pane_id)
-                            .and_then(|slot| slot.ticket_id.as_deref()),
-                        Some(ticket_id.as_str())
-                    );
-
-                    let slot = codex
-                        .agent_slots
-                        .iter_mut()
-                        .find(|slot| slot.pane_id == *pane_id)
-                        .unwrap();
-                    slot.transition_started_at = Some(
-                        std::time::SystemTime::now()
-                            - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
-                    );
-                    let activity_before_fallback = codex.activity_log.len();
-                    codex.check_transition_timeouts();
-                    let fallback_launches = codex.activity_log[activity_before_fallback..]
-                        .iter()
-                        .filter(|event| {
-                            matches!(
-                                event,
-                                ActivityEvent::SessionLaunch {
-                                    ticket_id: launched_ticket,
-                                    ..
-                                } if launched_ticket == ticket_id
-                            )
-                        })
-                        .count();
-                    assert_eq!(fallback_launches, 1, "one fresh fallback is allowed");
-                    let recovery_lease = codex.current_leases[ticket_id].clone();
-                    assert_eq!(recovery_lease.attempt_id, recovery_generation);
-                    start_and_deliver_fresh_recovery(&mut codex, *pane_id, &recovery_lease);
                     assert!(acknowledge_assignment(
                         &mut codex,
                         *pane_id,
                         ticket_id,
-                        recovery_generation,
+                        original_generation,
                     ));
-                    timeout_then_fallback += 1;
-                    ("timeout-then-fallback", fallback_launches)
+                    codex.check_assignment_ack_timeouts_at(retry_deadline);
+                    timeout_then_retry += 1;
+                    ("timeout-then-retry", 0)
                 } else {
                     assert!(acknowledge_assignment(
                         &mut codex,
@@ -11378,7 +11181,7 @@ timeout\n\
         assert_eq!(codex_tickets.len(), 10);
         assert_eq!(codex_panes, std::collections::HashSet::from([10, 11]));
         assert_eq!(ack_then_owned, 9);
-        assert_eq!(timeout_then_fallback, 1);
+        assert_eq!(timeout_then_retry, 1);
         assert!(codex.error_alerts.is_empty());
 
         let (mut claude, _claude_dir) =
@@ -11452,7 +11255,7 @@ timeout\n\
         assert_eq!(claude_panes, std::collections::HashSet::from([20, 21]));
         assert!(claude.error_alerts.is_empty());
         println!(
-            "T0330302|summary|codex=10|ack_then_owned={ack_then_owned}|timeout_then_fallback={timeout_then_fallback}|claude=10|silent_stalls=0"
+            "T0330302|summary|codex=10|ack_then_owned={ack_then_owned}|timeout_then_retry={timeout_then_retry}|claude=10|silent_stalls=0"
         );
     }
 
@@ -14593,15 +14396,16 @@ timeout\n\
         );
         assert_eq!(
             state.agent_slots[1].transition_state,
-            TransitionState::WaitingForClear
+            TransitionState::WaitingForExit
         );
-        state.handle_cleared_signal(2);
+        exit_then_deliver_fresh_codex(&mut state, 2, &replacement);
         assert_eq!(state.agent_slots[1].transition_state, TransitionState::Idle);
         assert!(matches!(
             state.seat_assignment(2),
-            Some(SeatAssignmentState::AssignedPendingAck {
+            Some(SeatAssignmentState::Delivering {
                 generation,
-                ack_deadline: Some(_),
+                retries: 0,
+                ..
             }) if generation == replacement.attempt_id
         ));
         assert!(
@@ -14671,7 +14475,7 @@ timeout\n\
         assert_eq!(state.agent_slots[1].ticket_id.as_deref(), Some("T-SPLIT"));
         assert!(matches!(
             state.seat_assignment(2),
-            Some(SeatAssignmentState::AssignedPendingAck { generation, .. })
+            Some(SeatAssignmentState::Delivering { generation, .. })
                 if generation == replacement.attempt_id
         ));
         assert!(!state.seat_is_owned(2));

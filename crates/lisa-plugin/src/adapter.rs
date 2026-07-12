@@ -80,6 +80,11 @@ pub(crate) enum ResetStrategy {
     /// sending the next prompt (native Claude Code). This is the behaviour the
     /// scheduler's `TransitionState` handshake implements.
     ClearHandshake,
+    /// Gracefully exit the resident interactive client, allow the bounded exit
+    /// grace, then launch a fresh process for the next ticket. Codex
+    /// uses this because its interactive `/clear` hook is not a reliable
+    /// unattended delivery boundary.
+    ExitThenFresh,
     /// Reuse is a fresh launch; there is no in-place reset handshake, so the
     /// `TransitionState` machine does not apply (headless/ACP bridges).
     #[allow(dead_code)]
@@ -279,14 +284,15 @@ impl AgentAdapter for ClaudeCodeAdapter {
 /// Native Codex adapter: launches the official interactive CLI so Codex panes
 /// have the same first-class chat experience as Claude panes.
 ///
-/// Lisa-generated Codex hooks mirror the Claude transport contract: `Stop`
-/// writes `.stopped`, `SessionStart[clear]` writes `.cleared`, and `PostToolUse`
-/// writes `.heartbeat`. `UserPromptSubmit` additionally preserves the raw ack
-/// payload used for recycled-seat ownership. That lets Codex use
-/// [`ResetStrategy::ClearHandshake`] and keeps the live TUI resident across
-/// tickets. `--dangerously-bypass-hook-trust` is scoped to this invocation
-/// because lisa generated the hook definitions. Agent command execution uses
-/// Codex's full-access/no-approval mode, matching the existing Claude
+/// Lisa-generated Codex hooks provide liveness, stop, startup, and exact prompt
+/// acknowledgment signals. A completed Codex TUI is exited and freshly
+/// launched for the next ticket: this avoids making unattended delivery depend
+/// on the version-sensitive interactive `/clear` hook. The new process still
+/// receives its assignment only after the provider-aware startup grace and
+/// becomes owned only after the tagged `UserPromptSubmit` acknowledgment.
+/// `--dangerously-bypass-hook-trust` is scoped to this invocation because lisa
+/// generated the hook definitions. Agent command execution uses Codex's
+/// full-access/no-approval mode, matching the existing Claude
 /// `--dangerously-skip-permissions` contract and allowing the RDSPI workflow to
 /// commit through `.git`.
 pub(crate) struct CodexAdapter {
@@ -374,11 +380,15 @@ impl AgentAdapter for CodexAdapter {
         self.assignment_prompt(ctx)
     }
 
+    fn reset_strategy(&self) -> ResetStrategy {
+        ResetStrategy::ExitThenFresh
+    }
+
     fn signals(&self) -> SignalCapabilities {
         SignalCapabilities {
             idle: false,
             awaiting: false,
-            cleared: true,
+            cleared: false,
         }
     }
 
@@ -578,20 +588,20 @@ mod tests {
 
     #[test]
     fn resolver_codex_resolves_native_codex_adapter() {
-        // Codex now keeps a native TUI resident and participates in the same
-        // /clear handshake as Claude.
+        // Codex uses a fresh process boundary between tickets instead of the
+        // version-sensitive interactive /clear hook.
         let ticket = Ticket::new("T-002", "codex-example");
         assert_eq!(
             resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
-            ResetStrategy::ClearHandshake
+            ResetStrategy::ExitThenFresh
         );
         assert_eq!(
             resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
-            ResetStrategy::ClearHandshake
+            ResetStrategy::ExitThenFresh
         );
     }
 
@@ -603,7 +613,7 @@ mod tests {
         let mut ticket = Ticket::new("T-003", "routed-codex");
         ticket.agent = Some("codex".to_string());
         let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, Some("/abs/lisa"));
-        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert!(adapter
             .launch_command(&spawn_ctx(Path::new("docs/active/tickets"), "T-003", 1))
             .contains(" codex "));
@@ -617,7 +627,7 @@ mod tests {
         let mut ticket = Ticket::new("T-004", "bad-route");
         ticket.agent = Some("gpt".to_string());
         let (adapter, route) = resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"));
-        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(route.agent, AgentClient::Codex);
         assert!(route.substituted);
         assert!(route.note.unwrap().contains("gpt"));
@@ -635,7 +645,7 @@ mod tests {
         let (adapter_a, route_a) = resolve_adapter(&a, AgentClient::Claude, Some("/abs/lisa"));
         let (adapter_b, route_b) = resolve_adapter(&b, AgentClient::Claude, Some("/abs/lisa"));
 
-        assert_eq!(adapter_a.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(adapter_a.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(adapter_b.reset_strategy(), ResetStrategy::ClearHandshake);
         assert_eq!(route_a.agent, AgentClient::Codex);
         assert_eq!(route_a.model.as_deref(), Some("gpt-5"));
@@ -731,10 +741,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_reset_is_clear_handshake() {
+    fn codex_reset_exits_before_fresh_launch() {
         assert_eq!(
             CodexAdapter::new(Some("/abs/lisa"), None).reset_strategy(),
-            ResetStrategy::ClearHandshake
+            ResetStrategy::ExitThenFresh
         );
     }
 
@@ -755,13 +765,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_signals_include_clear_handshake() {
+    fn codex_signals_do_not_require_clear_handshake() {
         assert_eq!(
             CodexAdapter::new(Some("/abs/lisa"), None).signals(),
             SignalCapabilities {
                 idle: false,
                 awaiting: false,
-                cleared: true,
+                cleared: false,
             }
         );
     }
