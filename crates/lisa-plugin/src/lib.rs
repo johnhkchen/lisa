@@ -101,7 +101,7 @@ pub(crate) fn ticket_prompt(
 
 /// Build the full shell command to launch Claude Code in a fresh pane.
 /// Sets LISA_PANE_ID env var so the idle signal hook can identify the pane,
-/// and LISA_TICKET_ID for debugging/logging context.
+/// and ticket/attempt identity for attempt-scoped lifecycle signals.
 ///
 /// `lisa_bin` is the absolute `lisa` path (plugin config) exported as `LISA_BIN`
 /// so the `Stop` hook's `lisa capture-usage` (T-027-02) is reachable even when
@@ -113,6 +113,7 @@ pub(crate) fn build_claude_command(
     ticket_dir: &Path,
     ticket_id: &str,
     pane_id: u32,
+    attempt_id: u64,
     model: Option<&str>,
     lisa_bin: Option<&str>,
     artifact_dir: &Path,
@@ -135,10 +136,11 @@ pub(crate) fn build_claude_command(
         artifact_dir,
     );
     format!(
-        "{}LISA_PANE_ID={} LISA_TICKET_ID={} claude --dangerously-skip-permissions{} {}",
+        "{}LISA_PANE_ID={} LISA_TICKET_ID={} LISA_ATTEMPT_ID={} claude --dangerously-skip-permissions{} {}",
         lisa_bin_env,
         pane_id,
         shell_quote(ticket_id),
+        attempt_id,
         model_flag,
         shell_quote(&prompt),
     )
@@ -1901,6 +1903,7 @@ impl State {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                attempt_id: attempt_lease.attempt_id,
                 artifact_dir: &artifact_dir,
                 assignment_generation,
             };
@@ -3050,6 +3053,9 @@ impl State {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                attempt_id: self
+                    .pane_attempt_lease(pane_id)
+                    .map_or(0, |lease| lease.attempt_id),
                 artifact_dir: &artifact_dir,
                 assignment_generation: self.active_assignment_generation(pane_id),
             };
@@ -3175,6 +3181,9 @@ impl State {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
+                attempt_id: self
+                    .pane_attempt_lease(pane_id)
+                    .map_or(0, |lease| lease.attempt_id),
                 artifact_dir: &artifact_dir,
                 assignment_generation: self.active_assignment_generation(pane_id),
             };
@@ -3272,6 +3281,9 @@ impl State {
                     ticket_dir: &host_ticket_dir,
                     ticket_id: tid,
                     pane_id,
+                    attempt_id: self
+                        .pane_attempt_lease(pane_id)
+                        .map_or(0, |lease| lease.attempt_id),
                     artifact_dir: &artifact_dir,
                     assignment_generation: self.active_assignment_generation(pane_id),
                 };
@@ -5157,13 +5169,14 @@ mod tests {
             ticket_dir,
             "T-042-01",
             7,
+            1,
             None,
             None,
             Path::new(".lisa/attempts/T-042-01/1/work"),
         );
 
         assert!(cmd.starts_with(
-            "LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' claude --dangerously-skip-permissions "
+            "LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 claude --dangerously-skip-permissions "
         ));
         assert!(cmd.contains("docs/active/tickets/T-042-01.md"));
         assert!(cmd.contains("CLAUDE.md"));
@@ -5182,6 +5195,7 @@ mod tests {
             ticket_dir,
             "T-042-01",
             7,
+            1,
             Some("opus"),
             None,
             Path::new(".lisa/attempts/T-042-01/1/work"),
@@ -5201,14 +5215,15 @@ mod tests {
             ticket_dir,
             "T-042-01",
             42,
+            9,
             None,
             None,
             Path::new(".lisa/attempts/T-042-01/1/work"),
         );
 
         assert!(
-            cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID='T-042-01' "),
-            "command should set LISA_PANE_ID and LISA_TICKET_ID env vars, got: {}",
+            cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=9 "),
+            "command should set pane, ticket, and attempt env vars, got: {}",
             cmd
         );
     }
@@ -5219,6 +5234,7 @@ mod tests {
         let cmd = build_claude_command(
             ticket_dir,
             "T-001",
+            1,
             1,
             None,
             None,

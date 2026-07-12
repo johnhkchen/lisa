@@ -54,6 +54,8 @@ pub(crate) struct SpawnContext<'a> {
     pub ticket_dir: &'a Path,
     pub ticket_id: &'a str,
     pub pane_id: u32,
+    /// Immutable attempt identity inherited by native lifecycle hooks.
+    pub attempt_id: u64,
     /// Private workflow artifact directory for this exact attempt lease.
     pub artifact_dir: &'a Path,
     /// Identity for a recycled Codex delivery awaiting provider acknowledgment.
@@ -184,6 +186,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             ctx.ticket_dir,
             ctx.ticket_id,
             ctx.pane_id,
+            ctx.attempt_id,
             self.model.as_deref(),
             self.lisa_bin.as_deref(),
             ctx.artifact_dir,
@@ -293,7 +296,7 @@ impl CodexAdapter {
     fn interactive_line(&self, ctx: &SpawnContext) -> String {
         let prompt = self.assignment_prompt(ctx);
         format!(
-            "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} \
+            "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} LISA_ATTEMPT_ID={attempt} \
              codex --dangerously-bypass-approvals-and-sandbox \
              --dangerously-bypass-hook-trust{model} {prompt} || \
              {{ mkdir -p .lisa/signals; date -u +%Y-%m-%dT%H:%M:%SZ > \
@@ -301,6 +304,7 @@ impl CodexAdapter {
             bin = shell_quote(&self.lisa_bin),
             pane = ctx.pane_id,
             ticket = shell_quote(ctx.ticket_id),
+            attempt = ctx.attempt_id,
             model = self.model_flag(),
             prompt = shell_quote(&prompt),
         )
@@ -405,6 +409,7 @@ mod tests {
             ticket_dir: dir,
             ticket_id: id,
             pane_id: pane,
+            attempt_id: 1,
             artifact_dir: Path::new(".lisa/attempts/T-042-01/1/work"),
             assignment_generation: None,
         }
@@ -416,7 +421,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
             ClaudeCodeAdapter::default().launch_command(&ctx),
-            build_claude_command(dir, "T-042-01", 7, None, None, ctx.artifact_dir)
+            build_claude_command(dir, "T-042-01", 7, 1, None, None, ctx.artifact_dir)
         );
     }
 
@@ -428,7 +433,7 @@ mod tests {
         assert!(cmd.contains("--model 'opus'"), "got: {cmd}");
         assert_eq!(
             cmd,
-            build_claude_command(dir, "T-042-01", 7, Some("opus"), None, ctx.artifact_dir,)
+            build_claude_command(dir, "T-042-01", 7, 1, Some("opus"), None, ctx.artifact_dir,)
         );
     }
 
@@ -601,7 +606,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         let cmd = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
         assert!(cmd.starts_with(
-            "LISA_BIN='/abs/lisa' LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' codex "
+            "LISA_BIN='/abs/lisa' LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 codex "
         ));
         assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(cmd.contains("--dangerously-bypass-hook-trust"));
