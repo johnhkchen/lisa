@@ -175,16 +175,28 @@ pub(crate) trait AgentAdapter {
         "/exit"
     }
 
-    /// How a slot that already has a session is reset before new work.
-    fn reset_strategy(&self) -> ResetStrategy;
+    /// How a slot that already has a session is reset before new work. Native
+    /// interactive clients share the clear handshake; integrations with a
+    /// different transport override this default.
+    fn reset_strategy(&self) -> ResetStrategy {
+        ResetStrategy::ClearHandshake
+    }
 
     /// The bare next-prompt to inject into a *reused* session once it is ready
     /// (post-`.cleared` for Claude). Separate from [`Self::launch_command`]
     /// because reuse sends the prompt alone, not the wrapped launch invocation.
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String;
 
-    /// The follow-up nudge for a parked Review session.
-    fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp;
+    /// The follow-up nudge for a parked Review session. Native interactive
+    /// clients type the shared prompt into their live TUI; integrations with a
+    /// different delivery mechanism override this default.
+    fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
+        FollowUp::TypeIntoPane(finish_up_prompt(
+            ctx.ticket_dir,
+            ctx.work_dir,
+            ctx.ticket_id,
+        ))
+    }
 
     /// Which optional signals this adapter emits (see [`SignalCapabilities`]).
     // No live scheduler consumer in the MVP; wired by T-022-02 / T-023-02.
@@ -244,20 +256,8 @@ impl AgentAdapter for ClaudeCodeAdapter {
         )
     }
 
-    fn reset_strategy(&self) -> ResetStrategy {
-        ResetStrategy::ClearHandshake
-    }
-
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
         self.assignment_text(ctx)
-    }
-
-    fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
-        FollowUp::TypeIntoPane(finish_up_prompt(
-            ctx.ticket_dir,
-            ctx.work_dir,
-            ctx.ticket_id,
-        ))
     }
 
     fn signals(&self) -> SignalCapabilities {
@@ -370,20 +370,8 @@ impl AgentAdapter for CodexAdapter {
         )
     }
 
-    fn reset_strategy(&self) -> ResetStrategy {
-        ResetStrategy::ClearHandshake
-    }
-
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
         self.assignment_prompt(ctx)
-    }
-
-    fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
-        FollowUp::TypeIntoPane(finish_up_prompt(
-            ctx.ticket_dir,
-            ctx.work_dir,
-            ctx.ticket_id,
-        ))
     }
 
     fn signals(&self) -> SignalCapabilities {
