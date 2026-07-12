@@ -2059,7 +2059,7 @@ depends_on: [T-999]
         // Current version but missing new keys
         fs::write(
             dir.path().join(".lisa.toml"),
-            &format!(
+            format!(
                 "version = \"{}\"\n\n[scheduling]\nmax_threads = 4\n",
                 config::LISA_VERSION
             ),

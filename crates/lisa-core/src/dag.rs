@@ -741,8 +741,8 @@ mod tests {
 
         let blocked = dag.get_blocked_by(&"T-001".to_string());
         assert_eq!(blocked.len(), 2);
-        assert!(blocked.contains(&"T-002".to_string()));
-        assert!(blocked.contains(&"T-003".to_string()));
+        assert!(blocked.contains("T-002"));
+        assert!(blocked.contains("T-003"));
     }
 
     #[test]
@@ -893,8 +893,8 @@ mod tests {
 
         let deps = dag.get_dependencies(&"T-003".to_string());
         assert_eq!(deps.len(), 2);
-        assert!(deps.contains(&"T-001".to_string()));
-        assert!(deps.contains(&"T-002".to_string()));
+        assert!(deps.contains("T-001"));
+        assert!(deps.contains("T-002"));
 
         let no_deps = dag.get_dependencies(&"T-001".to_string());
         assert!(no_deps.is_empty());
@@ -926,22 +926,22 @@ mod tests {
         // Verify forward edges (depends_on)
         let deps_t2 = dag.get_dependencies(&"T-002".to_string());
         assert_eq!(deps_t2.len(), 1);
-        assert!(deps_t2.contains(&"T-001".to_string()));
+        assert!(deps_t2.contains("T-001"));
 
         let deps_t3 = dag.get_dependencies(&"T-003".to_string());
         assert_eq!(deps_t3.len(), 2);
-        assert!(deps_t3.contains(&"T-001".to_string()));
-        assert!(deps_t3.contains(&"T-002".to_string()));
+        assert!(deps_t3.contains("T-001"));
+        assert!(deps_t3.contains("T-002"));
 
         // Verify reverse edges (blocked-by) are computed from depends_on
         let blocked_by_t1 = dag.get_blocked_by(&"T-001".to_string());
         assert_eq!(blocked_by_t1.len(), 2);
-        assert!(blocked_by_t1.contains(&"T-002".to_string()));
-        assert!(blocked_by_t1.contains(&"T-003".to_string()));
+        assert!(blocked_by_t1.contains("T-002"));
+        assert!(blocked_by_t1.contains("T-003"));
 
         let blocked_by_t2 = dag.get_blocked_by(&"T-002".to_string());
         assert_eq!(blocked_by_t2.len(), 1);
-        assert!(blocked_by_t2.contains(&"T-003".to_string()));
+        assert!(blocked_by_t2.contains("T-003"));
 
         let blocked_by_t3 = dag.get_blocked_by(&"T-003".to_string());
         assert!(blocked_by_t3.is_empty());
@@ -1025,8 +1025,8 @@ mod tests {
         // Verify dependency edges
         let deps_t3 = dag.get_dependencies(&"T-003".to_string());
         assert_eq!(deps_t3.len(), 2);
-        assert!(deps_t3.contains(&"T-001".to_string()));
-        assert!(deps_t3.contains(&"T-002".to_string()));
+        assert!(deps_t3.contains("T-001"));
+        assert!(deps_t3.contains("T-002"));
 
         // Topological sort should have T-001 first
         let sorted = dag.topological_sort().unwrap();
