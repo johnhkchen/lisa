@@ -50,9 +50,9 @@ bytes), installs the freshly initialized Lisa `hooks.json` at that user layer, a
 `features.hooks`. Lisa then performs its normal canonical project-trust pregrant into this
 ephemeral config. Cleanup always deletes the temporary Codex home and credential symlink.
 
-The harness preserves the real HOME and provider configuration so existing authentication
-remains available. It copies only the matched Codex project trust header/line into evidence,
-never the complete user configuration.
+The harness preserves real HOME and Claude configuration. Codex authentication remains
+available through the temporary home's credential symlink. It copies only the matched
+Codex project trust header/line into evidence, never the complete user configuration.
 
 ## Canonical invocation
 
@@ -97,6 +97,8 @@ The following environment variables exist for focused diagnosis:
 - `PREPARE_ONLY=1` exits after build and deterministic preflight.
 - `LIVE_STARTUP_TIMEOUT_SECS=<seconds>` changes the per-provider completion bound; default
   is 1200 seconds.
+- `LIVE_PROVIDER_CASES=codex|claude|both` selects a focused provider control. The default
+  and only canonical acceptance value is `both`.
 - `KEEP_LIVE_FIXTURES=0` removes the original external temporary repositories after their
   evidence snapshots are captured. Default `1` retains both originals and snapshots.
 
@@ -199,6 +201,9 @@ The harness never edits the synthetic ticket to manufacture these receipts.
 
 Every wait is bounded. On failure the harness prints the evidence path and recent state,
 dashboard, terminal, and loop output.
+
+The pre-ownership wait is independently capped at 120 seconds, so provider-start or hook
+drift fails quickly instead of consuming the longer artifact-completion allowance.
 
 Do not repair the live terminal manually and then reuse that run as acceptance evidence.
 Fix the harness or product issue, start new fixtures, and rerun from the beginning.

@@ -13,6 +13,7 @@ SKIP_DETERMINISTIC_PREFLIGHT=${SKIP_DETERMINISTIC_PREFLIGHT:-0}
 PREPARE_ONLY=${PREPARE_ONLY:-0}
 KEEP_LIVE_FIXTURES=${KEEP_LIVE_FIXTURES:-1}
 LIVE_STARTUP_TIMEOUT_SECS=${LIVE_STARTUP_TIMEOUT_SECS:-1200}
+LIVE_PROVIDER_CASES=${LIVE_PROVIDER_CASES:-both}
 LISA_BIN=${LISA_BIN:-}
 FIXTURE_PARENT=${LISA_LIVE_FIXTURE_PARENT:-${TMPDIR:-/tmp}}
 
@@ -88,6 +89,7 @@ done
 [[ "$PREPARE_ONLY" =~ ^[01]$ ]] || fail "PREPARE_ONLY must be 0 or 1"
 [[ "$KEEP_LIVE_FIXTURES" =~ ^[01]$ ]] || fail "KEEP_LIVE_FIXTURES must be 0 or 1"
 [[ "$LIVE_STARTUP_TIMEOUT_SECS" =~ ^[1-9][0-9]*$ ]] || fail "LIVE_STARTUP_TIMEOUT_SECS must be positive"
+[[ "$LIVE_PROVIDER_CASES" =~ ^(both|codex|claude)$ ]] || fail "LIVE_PROVIDER_CASES must be both, codex, or claude"
 if [[ "$SKIP_BUILD" == 1 && -z "$LISA_BIN" ]]; then
     fail "SKIP_BUILD=1 requires an explicit LISA_BIN"
 fi
@@ -391,6 +393,12 @@ ticket_is_done() {
     grep -Fq 'status: done' "$ticket" && grep -Fq 'phase: done' "$ticket"
 }
 
+state_was_seen() {
+    local state=$1
+    awk -F '\t' -v value="$state" '$2 == value { found=1 } END { exit !found }' \
+        "$CURRENT_CASE/state-events.tsv"
+}
+
 verify_build_identity() {
     local layout="$CURRENT_ROOT/.lisa-layout.kdl"
     [[ -f "$layout" ]] || fail "generated layout is missing"
@@ -538,6 +546,7 @@ run_case() {
     else
         printf 'not-applicable: Claude does not use Codex project trust\n' > "$CURRENT_CASE/codex-trust.txt"
     fi
+    wait_until 120 "$provider first assignment ownership" state_was_seen owned
     wait_until "$LIVE_STARTUP_TIMEOUT_SECS" "$ticket_id completion" ticket_is_done "$CURRENT_ROOT/docs/active/tickets/$ticket_id.md"
     sleep 1
     capture_final_screens
@@ -559,7 +568,13 @@ if [[ "$PREPARE_ONLY" == 1 ]]; then
     exit 0
 fi
 
-run_case codex
-run_case claude
+case "$LIVE_PROVIDER_CASES" in
+    both)
+        run_case codex
+        run_case claude
+        ;;
+    codex) run_case codex ;;
+    claude) run_case claude ;;
+esac
 
 echo "fresh-loop-live-startup: PASS"
