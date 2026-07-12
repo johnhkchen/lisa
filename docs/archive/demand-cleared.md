@@ -6,4 +6,6 @@ to keep it lean. One line per epic: what it delivered. Full cards live in
 
 ---
 
-_Nothing cleared yet._
+- **E-041 + E-042 — Review completion convergence:** typed and property-tested the
+  completion transaction, then chained its production adapter, durable idempotency,
+  operator recovery, hostile-order regression, rebuild, and live Codex field gate.

@@ -1,10 +1,12 @@
 ---
 title: review-completion-livelock
-status: signal
+status: chained
 agent: codex
 observed_at: 2026-07-12
 evidence_repo: /Users/johnchen/swe/repos/arcade/games/midsummer
 evidence_ticket: T-009-01-01
+materialized_epics: [E-041, E-042]
+chain_after: T-040-03-04
 ---
 
 # Review completion livelock — Arcade field note

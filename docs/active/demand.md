@@ -7,7 +7,5 @@ one line in `docs/archive/demand-cleared.md` and are deleted from here.
 
 ---
 
-- **Review completion livelock:** make an admitted `review.md` a durable, idempotent
-  completion trigger across Codex stop/timeout/relaunch state, and make `[d]one` a
-  reliable operator recovery path; Arcade T-009-01-01 remained in Review after both
-  paths and completed only when the agent ran `lisa complete-ticket` itself.
+_No open demand yet — cast `vend steer` or `vend survey` off a seed to populate the
+board (IA-3/IA-4). Vend never seeds fabricated demand._
