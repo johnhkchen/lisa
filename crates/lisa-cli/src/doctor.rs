@@ -410,11 +410,19 @@ fn codex_home() -> Option<PathBuf> {
 /// this tree is already present the file is left untouched. Returns true if the
 /// trust entry is present (already-seeded or freshly written).
 ///
+/// Existing work trees are canonicalized before the header is built so the
+/// trusted path matches Codex's resolved cwd (notably macOS's `/var` ->
+/// `/private/var` temp-directory alias). If canonicalization fails, the supplied
+/// path is retained under the existing best-effort policy.
+///
 /// Per Codex issue #14345 this trust behaviour is version-volatile — the doctor
 /// surfaces the codex version alongside the seed rather than assuming it stable,
 /// and `--dangerously-bypass-approvals-and-sandbox` remains the escape hatch.
 pub(crate) fn pregrant_codex_trust_in(codex_home: &Path, work_tree: &Path) -> bool {
     let config_path = codex_home.join("config.toml");
+    let work_tree = work_tree
+        .canonicalize()
+        .unwrap_or_else(|_| work_tree.to_path_buf());
     let header = format!("[projects.\"{}\"]", work_tree.display());
 
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
@@ -805,6 +813,30 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("model = \"gpt-5\""));
         assert!(content.contains("[projects.\"/work/tree\"]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pregrant_codex_trust_matches_canonicalized_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let project_link = dir.path().join("project-link");
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&project, &project_link).unwrap();
+
+        let codex_cwd = project_link.canonicalize().unwrap();
+        assert_ne!(project_link, codex_cwd, "fixture must resolve a symlink");
+        assert!(pregrant_codex_trust_in(&codex_home, &project_link));
+
+        let content = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        let canonical_entry = format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"",
+            codex_cwd.display()
+        );
+        let alias_header = format!("[projects.\"{}\"]", project_link.display());
+        assert!(content.contains(&canonical_entry));
+        assert!(!content.contains(&alias_header));
     }
 
     #[test]
