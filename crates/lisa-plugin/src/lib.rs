@@ -1819,38 +1819,39 @@ impl State {
     /// Revoke an unproven original launch and begin the one permitted reset in
     /// the same physical pane. The successor marker is deliberately withheld
     /// until the shell probe proves a command boundary.
-    fn begin_startup_recovery(&mut self, pane_id: u32, now: std::time::SystemTime) {
+    fn begin_startup_recovery(
+        &mut self,
+        pane_id: u32,
+        now: std::time::SystemTime,
+    ) -> Option<FailureTransitionOutcome> {
         let Some(SeatAssignmentState::Starting {
             generation: prior_generation,
             relaunches: 0,
             ..
         }) = self.seat_assignment(pane_id)
         else {
-            return;
+            return None;
         };
         let Some(slot_idx) = self
             .agent_slots
             .iter()
             .position(|slot| slot.pane_id == pane_id && slot.ticket_id.is_some())
         else {
-            self.fail_startup(pane_id, "same-pane recovery reservation is missing");
-            return;
+            return self.fail_startup(pane_id, "same-pane recovery reservation is missing");
         };
         let ticket_id = self.agent_slots[slot_idx]
             .ticket_id
             .clone()
             .expect("startup recovery slot has a ticket");
         let Some(predecessor) = self.agent_slots[slot_idx].attempt_lease.clone() else {
-            self.fail_startup(pane_id, "same-pane recovery attempt lease is missing");
-            return;
+            return self.fail_startup(pane_id, "same-pane recovery attempt lease is missing");
         };
         let valid_predecessor = predecessor.ticket_id == ticket_id
             && predecessor.attempt_id == prior_generation
             && predecessor.is_current(self.current_leases.get(&ticket_id))
             && self.lease_high_water.get(&ticket_id) == Some(&predecessor);
         if !valid_predecessor {
-            self.fail_startup(pane_id, "same-pane recovery attempt lease is stale");
-            return;
+            return self.fail_startup(pane_id, "same-pane recovery attempt lease is stale");
         }
 
         self.revoke_current_lease(&ticket_id);
@@ -1864,11 +1865,10 @@ impl State {
                         reset_deadline: now,
                     },
                 );
-                self.fail_startup_recovery(
+                return self.fail_startup_recovery(
                     pane_id,
                     &format!("cannot mint same-pane recovery lease: {error}"),
                 );
-                return;
             }
         };
         self.lease_high_water
@@ -1893,8 +1893,7 @@ impl State {
         let probe = match Self::shell_readiness_probe(&self.signal_dir, pane_id, &successor) {
             Ok(probe) => probe,
             Err(error) => {
-                self.fail_startup_recovery(pane_id, &error);
-                return;
+                return self.fail_startup_recovery(pane_id, &error);
             }
         };
         self.interrupt_shell_input(pane_id);
@@ -1912,6 +1911,7 @@ impl State {
                 ticket_id, pane_id, successor.attempt_id
             ),
         });
+        None
     }
 
     /// Admit exact successor shell proof and submit the already-established
@@ -2035,16 +2035,11 @@ impl State {
         if !recoverable {
             return None;
         }
-        let Some(slot_idx) = self
+        let slot_idx = self
             .agent_slots
             .iter()
-            .position(|slot| slot.pane_id == pane_id)
-        else {
-            return None;
-        };
-        let Some(ticket_id) = self.agent_slots[slot_idx].ticket_id.clone() else {
-            return None;
-        };
+            .position(|slot| slot.pane_id == pane_id)?;
+        let ticket_id = self.agent_slots[slot_idx].ticket_id.clone()?;
 
         self.seat_assignments
             .insert(pane_id, SeatAssignmentState::StartupFailed);
@@ -2246,7 +2241,11 @@ impl State {
 
     /// Evaluate absolute acknowledgment deadlines at an injected time so native
     /// tests can cover the complete recovery contract without sleeping.
-    fn check_assignment_ack_timeouts_at(&mut self, now: std::time::SystemTime) {
+    fn check_assignment_ack_timeouts_at(
+        &mut self,
+        now: std::time::SystemTime,
+    ) -> Vec<FailureTransitionOutcome> {
+        let mut outcomes = Vec::new();
         let expired: Vec<(u32, SeatAssignmentState)> = self
             .seat_assignments
             .iter()
@@ -2302,23 +2301,31 @@ impl State {
                         if let Err(error) =
                             self.deliver_assignment_to_pane(pane_id, generation, 0, now)
                         {
-                            self.fail_assignment_delivery(pane_id, &error);
+                            if let Some(outcome) = self.fail_assignment_delivery(pane_id, &error) {
+                                outcomes.push(outcome);
+                            }
                         }
                     } else {
-                        self.begin_startup_recovery(pane_id, now);
+                        if let Some(outcome) = self.begin_startup_recovery(pane_id, now) {
+                            outcomes.push(outcome);
+                        }
                     }
                 }
                 SeatAssignmentState::Starting { .. } => {
-                    self.fail_startup_recovery(
+                    if let Some(outcome) = self.fail_startup_recovery(
                         pane_id,
                         "replacement provider process start was not observed before the deadline",
-                    );
+                    ) {
+                        outcomes.push(outcome);
+                    }
                 }
                 SeatAssignmentState::ResettingStartup { .. } => {
-                    self.fail_startup_recovery(
+                    if let Some(outcome) = self.fail_startup_recovery(
                         pane_id,
                         "positive shell readiness was not observed before the deadline",
-                    );
+                    ) {
+                        outcomes.push(outcome);
+                    }
                 }
                 SeatAssignmentState::Delivering {
                     generation,
@@ -2328,31 +2335,38 @@ impl State {
                     if let Err(error) =
                         self.deliver_assignment_to_pane(pane_id, generation, retries + 1, now)
                     {
-                        self.fail_assignment_delivery(pane_id, &error);
+                        if let Some(outcome) = self.fail_assignment_delivery(pane_id, &error) {
+                            outcomes.push(outcome);
+                        }
                     }
                 }
                 SeatAssignmentState::Delivering { .. } => {
-                    self.fail_assignment_delivery(
+                    if let Some(outcome) = self.fail_assignment_delivery(
                         pane_id,
                         "provider did not acknowledge the bounded chat assignment",
-                    );
+                    ) {
+                        outcomes.push(outcome);
+                    }
                 }
                 SeatAssignmentState::AssignedPendingAck { .. } => {
                     self.begin_assignment_recovery(pane_id, now);
                 }
                 SeatAssignmentState::Recovering { .. } => {
-                    self.fail_assignment_recovery(
+                    if let Some(outcome) = self.fail_assignment_recovery(
                         pane_id,
                         "fresh Codex session did not acknowledge before the deadline",
-                    );
+                    ) {
+                        outcomes.push(outcome);
+                    }
                 }
                 _ => {}
             }
         }
+        outcomes
     }
 
     fn check_assignment_ack_timeouts(&mut self) {
-        self.check_assignment_ack_timeouts_at(std::time::SystemTime::now());
+        let _ = self.check_assignment_ack_timeouts_at(std::time::SystemTime::now());
     }
 
     /// Whether a physical seat has acknowledged ownership of its assignment.
@@ -6845,6 +6859,10 @@ mod tests {
             e,
             ActivityEvent::Error { message } if message.contains("stale")
         )));
+        assert!(
+            state.detect_stale_threads().is_empty(),
+            "a reclaimed stale thread cannot be reclaimed again"
+        );
     }
 
     #[test]
@@ -10304,7 +10322,7 @@ mod tests {
             .count();
         assert_eq!(launch_count, 1);
 
-        state.check_assignment_ack_timeouts_at(deadline);
+        assert!(state.check_assignment_ack_timeouts_at(deadline).is_empty());
 
         let successor = state.current_leases["T-NAME"].clone();
         let reset_deadline = match state.seat_assignment(10) {
@@ -10336,12 +10354,20 @@ mod tests {
         assert!(!state.seat_is_owned(10));
         assert_eq!(state.error_alerts, Vec::<(String, u32)>::new());
 
-        state.check_assignment_ack_timeouts_at(reset_deadline);
+        assert_eq!(
+            state.check_assignment_ack_timeouts_at(reset_deadline),
+            vec![FailureTransitionOutcome::StartupRecoveryFailed {
+                pane_id: 10,
+                ticket_id: "T-NAME".to_string(),
+            }]
+        );
 
         for extra_secs in [1, 30, 300] {
-            state.check_assignment_ack_timeouts_at(
-                reset_deadline + std::time::Duration::from_secs(extra_secs),
-            );
+            assert!(state
+                .check_assignment_ack_timeouts_at(
+                    reset_deadline + std::time::Duration::from_secs(extra_secs),
+                )
+                .is_empty());
         }
 
         assert_eq!(
@@ -10386,6 +10412,55 @@ mod tests {
     }
 
     #[test]
+    fn invalid_startup_recovery_authority_fails_once_in_named_state() {
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        state.config.assignment_ack_timeout_secs = 1;
+        state.schedule_ready_tickets();
+
+        let original = state.current_leases["T-NAME"].clone();
+        let deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+                relaunches: 0,
+            }) => {
+                assert_eq!(generation, original.attempt_id);
+                deadline
+            }
+            other => panic!("expected initial startup wait, got {other:?}"),
+        };
+
+        state.agent_slots[0].attempt_lease = None;
+        assert_eq!(
+            state.check_assignment_ack_timeouts_at(deadline),
+            vec![FailureTransitionOutcome::StartupFailed {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            }]
+        );
+
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::StartupFailed)
+        );
+        assert_eq!(
+            state.threads["T-NAME"].status,
+            lisa_core::types::ThreadStatus::Failed
+        );
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert_eq!(state.current_leases.get("T-NAME"), Some(&original));
+        assert_eq!(state.lease_high_water.get("T-NAME"), Some(&original));
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
+
+        assert!(state
+            .check_assignment_ack_timeouts_at(deadline + std::time::Duration::from_secs(300),)
+            .is_empty());
+        assert_eq!(state.current_leases.get("T-NAME"), Some(&original));
+        assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
+    }
+
+    #[test]
     fn same_pane_replacement_requires_start_and_chat_ack_for_claude() {
         // SessionStart-mode (Claude) same-pane startup replacement contract: a
         // fresh Starting whose process-start signal is not observed before the
@@ -10408,7 +10483,9 @@ mod tests {
             other => panic!("expected initial Starting, got {other:?}"),
         };
 
-        state.check_assignment_ack_timeouts_at(first_deadline);
+        assert!(state
+            .check_assignment_ack_timeouts_at(first_deadline)
+            .is_empty());
         let successor = state.current_leases["T-NAME"].clone();
         assert_eq!(successor.attempt_id, predecessor.attempt_id + 1);
         let replacement_activity = state.agent_slots[0].last_activity_at;
@@ -10525,10 +10602,18 @@ mod tests {
             .count();
         assert_eq!(launches_before_failure, 2);
 
-        state.check_assignment_ack_timeouts_at(replacement_deadline);
-        state.check_assignment_ack_timeouts_at(
-            replacement_deadline + std::time::Duration::from_secs(300),
+        assert_eq!(
+            state.check_assignment_ack_timeouts_at(replacement_deadline),
+            vec![FailureTransitionOutcome::StartupRecoveryFailed {
+                pane_id: 10,
+                ticket_id: "T-NAME".to_string(),
+            }]
         );
+        assert!(state
+            .check_assignment_ack_timeouts_at(
+                replacement_deadline + std::time::Duration::from_secs(300),
+            )
+            .is_empty());
 
         assert_eq!(
             state.seat_assignment(10),
@@ -10582,7 +10667,9 @@ mod tests {
             .filter(|event| matches!(event, ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"))
             .count();
 
-        state.check_assignment_ack_timeouts_at(first_deadline);
+        assert!(state
+            .check_assignment_ack_timeouts_at(first_deadline)
+            .is_empty());
         let retry_deadline = match state.seat_assignment(10) {
             Some(SeatAssignmentState::Delivering {
                 generation,
@@ -10605,7 +10692,13 @@ mod tests {
             "one initial delivery plus exactly one retry"
         );
 
-        state.check_assignment_ack_timeouts_at(retry_deadline);
+        assert_eq!(
+            state.check_assignment_ack_timeouts_at(retry_deadline),
+            vec![FailureTransitionOutcome::AssignmentDeliveryFailed {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            }]
+        );
         assert_eq!(
             state.seat_assignment(10),
             Some(SeatAssignmentState::DeliveryFailed)
@@ -10634,8 +10727,9 @@ mod tests {
         });
         assert!(!state.acknowledge_codex_assignment(10, &late.to_string()));
 
-        state
-            .check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(300));
+        assert!(state
+            .check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(300),)
+            .is_empty());
         assert_eq!(
             state.seat_assignment(10),
             Some(SeatAssignmentState::DeliveryFailed)
@@ -10772,7 +10866,13 @@ mod tests {
             },
         );
         state.ledger_path = dir.path().join("provenance.jsonl");
-        state.check_assignment_ack_timeouts_at(recovery_deadline);
+        assert_eq!(
+            state.check_assignment_ack_timeouts_at(recovery_deadline),
+            vec![FailureTransitionOutcome::AssignmentRecoveryFailed {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            }]
+        );
 
         assert_eq!(
             state.seat_assignment(10),
@@ -10801,9 +10901,11 @@ mod tests {
         );
         assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
 
-        state.check_assignment_ack_timeouts_at(
-            recovery_deadline + std::time::Duration::from_secs(300),
-        );
+        assert!(state
+            .check_assignment_ack_timeouts_at(
+                recovery_deadline + std::time::Duration::from_secs(300),
+            )
+            .is_empty());
         assert_eq!(
             state.seat_assignment(10),
             Some(SeatAssignmentState::RecoveryFailed),
@@ -12859,6 +12961,10 @@ owned\n\
         assert_eq!(state.timeout_alerts.len(), 1);
         assert_eq!(state.timeout_alerts[0].0, "T-001");
         assert_eq!(state.timeout_alerts[0].2, Phase::Implement);
+        assert!(
+            state.check_session_timeouts().is_empty(),
+            "a reclaimed timed-out thread cannot be reclaimed again"
+        );
 
         state.schedule_ready_tickets();
 
@@ -13568,6 +13674,10 @@ owned\n\
             e,
             ActivityEvent::Error { message } if message.contains("T-001") && message.contains("error")
         )));
+        assert!(
+            state.check_error_signals().is_empty(),
+            "a consumed error signal cannot reclaim the thread again"
+        );
     }
 
     #[test]
