@@ -29,6 +29,16 @@ use lisa_core::types::{
 };
 use pane_name::{format_pane_name, PaneName};
 
+/// Parse the pane id from one `pane-<u32>.<suffix>` signal filename.
+fn pane_id_from_signal_filename(filename: &std::ffi::OsStr, suffix: &str) -> Option<u32> {
+    filename
+        .to_str()?
+        .strip_prefix("pane-")?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
 /// Encode one arbitrary UTF-8 value as one POSIX shell argument.
 ///
 /// Always single-quote, and leave/re-enter single quotes around literal `'`
@@ -3103,10 +3113,7 @@ impl State {
             let path = entry.path();
             let pane_id = match path
                 .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("pane-"))
-                .and_then(|n| n.strip_suffix(".heartbeat"))
-                .and_then(|id| id.parse::<u32>().ok())
+                .and_then(|name| pane_id_from_signal_filename(name, ".heartbeat"))
             {
                 Some(id) => id,
                 None => continue,
@@ -3153,10 +3160,7 @@ impl State {
             let path = entry.path();
             let pane_id = match path
                 .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("pane-"))
-                .and_then(|name| name.strip_suffix(".started"))
-                .and_then(|id| id.parse::<u32>().ok())
+                .and_then(|name| pane_id_from_signal_filename(name, ".started"))
             {
                 Some(id) => id,
                 None => continue,
@@ -3185,10 +3189,7 @@ impl State {
             let path = entry.path();
             let pane_id = match path
                 .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("pane-"))
-                .and_then(|name| name.strip_suffix(".shell-ready"))
-                .and_then(|id| id.parse::<u32>().ok())
+                .and_then(|name| pane_id_from_signal_filename(name, ".shell-ready"))
             {
                 Some(id) => id,
                 None => continue,
@@ -3217,10 +3218,7 @@ impl State {
             let path = entry.path();
             let pane_id = match path
                 .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("pane-"))
-                .and_then(|name| name.strip_suffix(".ack"))
-                .and_then(|id| id.parse::<u32>().ok())
+                .and_then(|name| pane_id_from_signal_filename(name, ".ack"))
             {
                 Some(id) => id,
                 None => continue,
@@ -3264,10 +3262,7 @@ impl State {
             let path = entry.path();
             let pane_id = match path
                 .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("pane-"))
-                .and_then(|n| n.strip_suffix(".awaiting"))
-                .and_then(|id| id.parse::<u32>().ok())
+                .and_then(|name| pane_id_from_signal_filename(name, ".awaiting"))
             {
                 Some(id) => id,
                 None => continue,
@@ -3551,22 +3546,28 @@ impl State {
             };
 
             // Only process .stopped and .cleared signals
-            if let Some(rest) = filename.strip_prefix("pane-") {
-                if let Some(id_str) = rest.strip_suffix(".stopped") {
+            if filename.strip_prefix("pane-").is_some() {
+                if filename.ends_with(".stopped") {
                     let _ = std::fs::remove_file(&path);
-                    let pane_id: u32 = match id_str.parse() {
-                        Ok(p) => p,
-                        Err(_) => continue,
+                    let pane_id = match pane_id_from_signal_filename(
+                        std::ffi::OsStr::new(&filename),
+                        ".stopped",
+                    ) {
+                        Some(id) => id,
+                        None => continue,
                     };
                     // A stop signal is recent life — restart the wind-down
                     // clock. Agents often keep working past their stop signal.
                     self.bump_pane_activity(pane_id);
                     self.handle_stopped_signal(pane_id);
-                } else if let Some(id_str) = rest.strip_suffix(".cleared") {
+                } else if filename.ends_with(".cleared") {
                     let _ = std::fs::remove_file(&path);
-                    let pane_id: u32 = match id_str.parse() {
-                        Ok(p) => p,
-                        Err(_) => continue,
+                    let pane_id = match pane_id_from_signal_filename(
+                        std::ffi::OsStr::new(&filename),
+                        ".cleared",
+                    ) {
+                        Some(id) => id,
+                        None => continue,
                     };
                     self.bump_pane_activity(pane_id);
                     self.handle_cleared_signal(pane_id);
@@ -3599,10 +3600,7 @@ impl State {
             let path = entry.path();
             let pane_id = match path
                 .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("pane-"))
-                .and_then(|n| n.strip_suffix(".error"))
-                .and_then(|id| id.parse::<u32>().ok())
+                .and_then(|name| pane_id_from_signal_filename(name, ".error"))
             {
                 Some(id) => id,
                 None => continue,
@@ -5935,6 +5933,42 @@ pub extern "C" fn host_run_plugin_command() {}
 mod tests {
     use super::*;
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
+
+    #[test]
+    fn pane_signal_filename_parser_enforces_exact_grammar() {
+        let cases = [
+            ("pane-0.heartbeat", ".heartbeat", Some(0)),
+            ("pane-42.started", ".started", Some(42)),
+            ("pane-4294967295.error", ".error", Some(u32::MAX)),
+            ("pane-0007.ack", ".ack", Some(7)),
+            ("seat-7.ack", ".ack", None),
+            ("pane-7.awaiting", ".ack", None),
+            ("pane-7.ack.backup", ".ack", None),
+            ("pane-.cleared", ".cleared", None),
+            ("pane-seven.stopped", ".stopped", None),
+            ("pane--1.error", ".error", None),
+            ("pane- 1.error", ".error", None),
+            ("pane-4294967296.error", ".error", None),
+            ("pane-7.error", "", None),
+        ];
+
+        for (filename, suffix, expected) in cases {
+            assert_eq!(
+                pane_id_from_signal_filename(std::ffi::OsStr::new(filename), suffix),
+                expected,
+                "filename={filename:?}, suffix={suffix:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_signal_filename_parser_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let filename = std::ffi::OsString::from_vec(b"pane-7.\xfferror".to_vec());
+        assert_eq!(pane_id_from_signal_filename(&filename, ".error"), None);
+    }
 
     /// Mirror production dispatch by installing one newly minted lease as the
     /// scheduler's high-water/current authority and stamping matching records.
