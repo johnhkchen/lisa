@@ -421,6 +421,11 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
             templates::LEGACY_ON_CLEAR_HOOKS,
         ),
         (
+            "on-start.sh",
+            templates::ON_START_HOOK,
+            templates::LEGACY_ON_START_HOOKS,
+        ),
+        (
             "on-heartbeat.sh",
             templates::ON_HEARTBEAT_HOOK,
             templates::LEGACY_ON_HEARTBEAT_HOOKS,
@@ -645,6 +650,7 @@ fn run_init_with_writer(root: &Path, dry_run: bool, out: &mut impl Write) -> Res
             "on-idle.sh",
             "on-stop.sh",
             "on-clear.sh",
+            "on-start.sh",
             "on-heartbeat.sh",
             "on-ack.sh",
         ] {
@@ -858,6 +864,7 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
                     ("on-notify", "Notification[attention]"),
                     ("\"Stop\"", "Stop"),
                     ("\"SessionStart\"", "SessionStart[clear]"),
+                    ("on-start.sh", "SessionStart[startup]"),
                     ("\"PostToolUse\"", "PostToolUse[heartbeat]"),
                     ("AskUserQuestion", "PreToolUse[AskUserQuestion]"),
                 ] {
@@ -936,6 +943,7 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         "on-idle.sh",
         "on-stop.sh",
         "on-clear.sh",
+        "on-start.sh",
         "on-heartbeat.sh",
         "on-ack.sh",
         "on-notify.sample",
@@ -1206,13 +1214,13 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   13 files (the project/context/config files, six shared hook files,
+        //   14 files (the project/context/config files, seven shared hook files,
         //   .lisa/.gitignore, Claude settings, and Codex hooks.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, InitAction::CreateDir(_) | InitAction::CreateFile { .. }))
             .collect();
-        assert_eq!(creates.len(), 21);
+        assert_eq!(creates.len(), 22);
     }
 
     #[test]
@@ -1332,6 +1340,7 @@ mod tests {
         assert!(dir.path().join(".lisa/hooks/on-idle.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-stop.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-clear.sh").exists());
+        assert!(dir.path().join(".lisa/hooks/on-start.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-notify.sample").exists());
         assert!(dir.path().join(".lisa/signals").exists());
         assert!(dir.path().join(".lisa/.gitignore").exists());
@@ -1343,6 +1352,7 @@ mod tests {
             ("on-idle.sh", ".idle"),
             ("on-stop.sh", ".stopped"),
             ("on-clear.sh", ".cleared"),
+            ("on-start.sh", ".started"),
         ] {
             let hook =
                 fs::read_to_string(dir.path().join(format!(".lisa/hooks/{}", name))).unwrap();
@@ -1378,6 +1388,7 @@ mod tests {
         let codex_hooks = fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
         assert!(codex_hooks.contains("\"Stop\""));
         assert!(codex_hooks.contains("\"SessionStart\""));
+        assert!(codex_hooks.contains("on-start.sh"));
         assert!(codex_hooks.contains("\"PostToolUse\""));
 
         // Check .lisa/.gitignore content
@@ -1486,6 +1497,7 @@ mod tests {
             ("on-idle.sh", templates::ON_IDLE_HOOK),
             ("on-stop.sh", templates::ON_STOP_HOOK),
             ("on-clear.sh", templates::ON_CLEAR_HOOK),
+            ("on-start.sh", templates::ON_START_HOOK),
             ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
             ("on-ack.sh", templates::ON_ACK_HOOK),
         ];
@@ -1858,6 +1870,7 @@ depends_on: [T-999]
         // New hook scripts should be created
         assert!(dir.path().join(".lisa/hooks/on-stop.sh").exists());
         assert!(dir.path().join(".lisa/hooks/on-clear.sh").exists());
+        assert!(dir.path().join(".lisa/hooks/on-start.sh").exists());
         // settings.local.json should be updated to include all hooks
         let settings = fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap();
         assert!(settings.contains("idle_prompt"));
@@ -2230,6 +2243,7 @@ depends_on: [T-999]
             ("on-idle.sh", templates::ON_IDLE_HOOK),
             ("on-stop.sh", templates::ON_STOP_HOOK),
             ("on-clear.sh", templates::ON_CLEAR_HOOK),
+            ("on-start.sh", templates::ON_START_HOOK),
             ("on-heartbeat.sh", templates::ON_HEARTBEAT_HOOK),
             ("on-notify.sample", templates::ON_NOTIFY_HOOK),
         ] {
@@ -2249,6 +2263,7 @@ depends_on: [T-999]
             "on-idle.sh",
             "on-stop.sh",
             "on-clear.sh",
+            "on-start.sh",
             "on-heartbeat.sh",
             "on-notify.sample",
             ".gitignore",
@@ -2590,6 +2605,7 @@ depends_on: [T-999]
             "on-idle.sh",
             "on-stop.sh",
             "on-clear.sh",
+            "on-start.sh",
             "on-heartbeat.sh",
             "on-notify.sample",
         ] {
@@ -2607,6 +2623,7 @@ depends_on: [T-999]
             "on-idle.sh",
             "on-stop.sh",
             "on-clear.sh",
+            "on-start.sh",
             "on-heartbeat.sh",
             "on-notify.sample",
         ] {
@@ -2939,6 +2956,7 @@ depends_on: [T-999]
         let hooks = fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
         assert!(hooks.contains("on-stop.sh"));
         assert!(hooks.contains("on-clear.sh"));
+        assert!(hooks.contains("on-start.sh"));
         assert!(hooks.contains("on-heartbeat.sh"));
     }
 
@@ -3171,11 +3189,12 @@ depends_on: [T-999]
                     && (d.path.contains("settings.local.json")
                         || d.path.contains("on-idle.sh")
                         || d.path.contains("on-stop.sh")
-                        || d.path.contains("on-clear.sh"))
+                        || d.path.contains("on-clear.sh")
+                        || d.path.contains("on-start.sh"))
             })
             .collect();
-        // 1 settings.local.json missing + 3 hook scripts missing = 4
-        assert_eq!(hook_errors.len(), 4);
+        // 1 settings.local.json missing + 4 selected hook scripts missing = 5
+        assert_eq!(hook_errors.len(), 5);
     }
 
     #[test]

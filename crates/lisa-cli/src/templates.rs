@@ -100,6 +100,37 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 "#];
 
+/// The provider-neutral native process-start hook, called by the native
+/// client's SessionStart[startup] event. It publishes the scheduler-owned
+/// attempt lease only when the immutable launch identity still matches the
+/// pane marker, so a stale predecessor cannot borrow a successor's identity.
+pub const ON_START_HOOK: &str = r#"#!/bin/sh
+# Lisa process-start signal hook — called when a native agent process starts.
+# Publishes only an exact pane/ticket/attempt-scoped scheduler lease.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ] && [ -n "$LISA_TICKET_ID" ] && [ -n "$LISA_ATTEMPT_ID" ]; then
+    case "$LISA_ATTEMPT_ID" in
+        *[!0-9]*) exit 0 ;;
+    esac
+    marker="$SIGNAL_DIR/pane-$LISA_PANE_ID.lease"
+    expected=$(printf '{"ticket_id":"%s","attempt_id":%s}' "$LISA_TICKET_ID" "$LISA_ATTEMPT_ID")
+    actual=$(cat "$marker" 2>/dev/null) || exit 0
+    [ "$actual" = "$expected" ] || exit 0
+
+    tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.started.tmp.$$"
+    if cp "$marker" "$tmp"; then
+        mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.started"
+    else
+        rm -f "$tmp"
+    fi
+fi
+"#;
+
+pub(crate) const LEGACY_ON_START_HOOKS: &[&str] = &[];
+
 /// The heartbeat hook script, called by the native client's PostToolUse event.
 /// Fires after every tool call, proving the session is actively working.
 /// The plugin uses the absence of recent heartbeats — not stop/idle signals,
@@ -287,6 +318,15 @@ pub fn settings_local_json() -> String {
     ],
     "SessionStart": [
       {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh"
+          }
+        ]
+      },
+      {
         "matcher": "clear",
         "hooks": [
           {
@@ -352,6 +392,15 @@ pub fn codex_hooks_json() -> String {
       }
     ],
     "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh"
+          }
+        ]
+      },
       {
         "matcher": "clear",
         "hooks": [
@@ -493,6 +542,12 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
     ensure_hook(
         hooks_obj,
         "SessionStart",
+        Some("startup"),
+        "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "SessionStart",
         Some("clear"),
         "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh",
     );
@@ -545,6 +600,12 @@ pub fn merge_codex_hooks(existing_json: &str) -> Result<String, String> {
         "Stop",
         None,
         "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh",
+    );
+    ensure_hook(
+        hooks_obj,
+        "SessionStart",
+        Some("startup"),
+        "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh",
     );
     ensure_hook(
         hooks_obj,
@@ -647,6 +708,8 @@ The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is inje
 mod tests {
     use super::*;
     use crate::detect::ProjectType;
+    use std::fs;
+    use std::process::Command;
 
     #[test]
     fn test_rdspi_workflow_embedded() {
@@ -747,6 +810,71 @@ mod tests {
     }
 
     #[test]
+    fn test_on_start_hook_content() {
+        assert!(ON_START_HOOK.starts_with("#!/bin/sh"));
+        assert!(ON_START_HOOK.contains("LISA_PANE_ID"));
+        assert!(ON_START_HOOK.contains("LISA_TICKET_ID"));
+        assert!(ON_START_HOOK.contains("LISA_ATTEMPT_ID"));
+        assert!(ON_START_HOOK.contains(".lease"));
+        assert!(ON_START_HOOK.contains(".started"));
+        assert!(ON_START_HOOK.contains("mv \"$tmp\""));
+    }
+
+    fn run_start_hook(marker: Option<&str>, ticket_id: &str, attempt_id: &str) -> bool {
+        let root = tempfile::tempdir().unwrap();
+        let signals = root.path().join(".lisa/signals");
+        fs::create_dir_all(&signals).unwrap();
+        let script = root.path().join("on-start.sh");
+        fs::write(&script, ON_START_HOOK).unwrap();
+        if let Some(body) = marker {
+            fs::write(signals.join("pane-7.lease"), body).unwrap();
+        }
+        let status = Command::new("/bin/sh")
+            .arg(&script)
+            .current_dir(root.path())
+            .env("LISA_PANE_ID", "7")
+            .env("LISA_TICKET_ID", ticket_id)
+            .env("LISA_ATTEMPT_ID", attempt_id)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let started = signals.join("pane-7.started");
+        if started.exists() {
+            assert_eq!(fs::read_to_string(&started).unwrap(), marker.unwrap());
+            true
+        } else {
+            assert!(fs::read_dir(&signals)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains("started.tmp")));
+            false
+        }
+    }
+
+    #[test]
+    fn test_start_hook_fixture_accepts_only_matching_attempt() {
+        let matching = r#"{"ticket_id":"T-035-01-01","attempt_id":2}"#;
+        assert!(run_start_hook(Some(matching), "T-035-01-01", "2"));
+        assert!(!run_start_hook(Some(matching), "T-035-01-01", "1"));
+        assert!(!run_start_hook(Some(matching), "T-OTHER", "2"));
+        assert!(!run_start_hook(None, "T-035-01-01", "2"));
+        assert!(!run_start_hook(Some(matching), "T-035-01-01", "bad"));
+    }
+
+    #[test]
+    fn test_no_provider_start_produces_no_signal() {
+        let root = tempfile::tempdir().unwrap();
+        let signals = root.path().join(".lisa/signals");
+        fs::create_dir_all(&signals).unwrap();
+        fs::write(
+            signals.join("pane-7.lease"),
+            r#"{"ticket_id":"T-035-01-01","attempt_id":2}"#,
+        )
+        .unwrap();
+        assert!(!signals.join("pane-7.started").exists());
+    }
+
+    #[test]
     fn test_on_heartbeat_hook_content() {
         assert!(ON_HEARTBEAT_HOOK.starts_with("#!/bin/sh"));
         assert!(ON_HEARTBEAT_HOOK.contains("LISA_PANE_ID"));
@@ -796,6 +924,7 @@ mod tests {
         // Hook commands
         assert!(json.contains("on-stop.sh"));
         assert!(json.contains("on-clear.sh"));
+        assert!(json.contains("on-start.sh"));
         assert!(json.contains("on-idle.sh"));
         assert!(json.contains("on-heartbeat.sh"));
         // Matchers
@@ -806,6 +935,8 @@ mod tests {
         assert!(json.contains("on-notify"));
         // The generated JSON must embed the exact catch-all command and parse cleanly.
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "startup");
+        assert_eq!(parsed["hooks"]["SessionStart"][1]["matcher"], "clear");
         let notifications = parsed["hooks"]["Notification"].as_array().unwrap();
         assert_eq!(notifications.len(), 2, "idle_prompt + catch-all attention");
         let cmd = notifications[1]["hooks"][0]["command"].as_str().unwrap();
@@ -834,8 +965,10 @@ mod tests {
         assert!(parsed["hooks"]["PostToolUse"].is_array());
         assert!(parsed["hooks"]["UserPromptSubmit"].is_array());
         assert_eq!(parsed["hooks"]["PostToolUse"][0]["matcher"], ".*");
-        assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "clear");
+        assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "startup");
+        assert_eq!(parsed["hooks"]["SessionStart"][1]["matcher"], "clear");
         assert!(json.contains("on-stop.sh"));
+        assert!(json.contains("on-start.sh"));
         assert!(json.contains("on-clear.sh"));
         assert!(json.contains("on-heartbeat.sh"));
         assert!(json.contains("on-ack.sh"));
@@ -850,12 +983,14 @@ mod tests {
         assert!(merged.contains("./mine.sh"));
         assert!(merged.contains("./my-heartbeat.sh"));
         assert!(merged.contains("on-stop.sh"));
+        assert!(merged.contains("on-start.sh"));
         assert!(merged.contains("on-clear.sh"));
         assert!(merged.contains("on-heartbeat.sh"));
         assert!(merged.contains("on-ack.sh"));
 
         let again = merge_codex_hooks(&merged).unwrap();
         assert_eq!(again.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
+        assert_eq!(again.matches("test -x .lisa/hooks/on-start.sh").count(), 1);
         assert_eq!(again.matches("test -x .lisa/hooks/on-clear.sh").count(), 1);
         assert_eq!(
             again.matches("test -x .lisa/hooks/on-heartbeat.sh").count(),
