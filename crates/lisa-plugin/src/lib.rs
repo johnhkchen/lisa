@@ -7128,6 +7128,7 @@ mod tests {
         ));
     }
 
+    mod hostile_order_regression;
     mod operator_recovery_matrix;
     mod signal_consumer_characterization;
     mod signal_ingestion_regression;
