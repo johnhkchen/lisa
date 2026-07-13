@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod claim;
 pub mod client;
 pub mod completion;
 pub mod dag;

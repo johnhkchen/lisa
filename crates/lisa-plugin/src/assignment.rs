@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lisa_core::types::AttemptLease;
+use lisa_core::{claim::assignment_file_name, types::AttemptLease};
 
 use crate::publication::{PublicationErrors, PublicationPath, RustPublication, TemporaryName};
 
@@ -16,10 +16,6 @@ pub(crate) struct AssignmentRef {
     pub(crate) lease: AttemptLease,
     pub(crate) nonce: u128,
     pub(crate) path: PathBuf,
-}
-
-fn assignment_file_name(attempt_id: u64, nonce: u128) -> String {
-    format!("assignment-{attempt_id}-{nonce}.md")
 }
 
 /// Publish complete assignment bytes through a same-directory temporary.
