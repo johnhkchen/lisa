@@ -1,5 +1,6 @@
 mod agent_exec;
 mod capture_usage;
+mod claim;
 mod config;
 mod detect;
 mod doctor;
@@ -13,6 +14,7 @@ mod templates;
 
 use clap::{Parser, Subcommand};
 use lisa_cli::commit_transaction;
+use lisa_core::claim::AssignmentClaim;
 use lisa_core::client::AgentClient;
 use lisa_core::completion::{AttemptId, CompletionGenerationId, CompletionId};
 use std::path::PathBuf;
@@ -25,6 +27,7 @@ use std::path::PathBuf;
     after_help = "Plumbing commands (called by Lisa and agent hooks):
   agent-exec       Run Codex and turn its output into Lisa's pane signals
   capture-usage    Record a native session's token usage from its Stop-hook payload on stdin
+  claim            Assert ownership of one exact ticket assignment
   commit-ticket    Commit this ticket's own files without touching the repo's ordinary git index
   complete-ticket  Mark a ticket done and commit its files in one step",
     version
@@ -150,8 +153,27 @@ enum Commands {
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
-    /// Commit this ticket's own files without touching the repo's ordinary git index.
+    /// Assert ownership of one exact nonce-bearing ticket assignment.
     #[command(display_order = 22, hide = true)]
+    Claim {
+        /// Project root containing Lisa's attempt and signal directories.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Ticket identifier carried by the assignment.
+        #[arg(long)]
+        ticket_id: String,
+
+        /// E-034 attempt generation carried by the assignment.
+        #[arg(long)]
+        attempt_id: u64,
+
+        /// Opaque nonce identifying the exact assignment file.
+        #[arg(long)]
+        nonce: u128,
+    },
+    /// Commit this ticket's own files without touching the repo's ordinary git index.
+    #[command(display_order = 23, hide = true)]
     CommitTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
@@ -170,7 +192,7 @@ enum Commands {
         includes: Vec<PathBuf>,
     },
     /// Mark a ticket done and commit its files in one step.
-    #[command(display_order = 23, hide = true)]
+    #[command(display_order = 24, hide = true)]
     CompleteTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
@@ -267,6 +289,35 @@ fn main() {
             if let Err(e) = capture_usage::run_capture_usage(&cwd) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::Claim {
+            path,
+            ticket_id,
+            attempt_id,
+            nonce,
+        } => {
+            let request = claim::ClaimRequest {
+                project_root: resolve_path(&path),
+                pane_id: std::env::var("LISA_PANE_ID").ok(),
+                claim: AssignmentClaim {
+                    ticket_id,
+                    attempt_id,
+                    nonce,
+                },
+            };
+            match claim::claim_assignment(request) {
+                Ok(receipt) => {
+                    let claim = receipt.claim;
+                    println!(
+                        "Claim accepted: {} attempt {} nonce {}",
+                        claim.ticket_id, claim.attempt_id, claim.nonce
+                    );
+                }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::CommitTicket {

@@ -1,10 +1,10 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 12 of Lisa's own subcommands still resolve,
+//!   (a) all 13 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
-//!   (d) the four machinery-invoked plumbing commands stay outside the
+//!   (d) the five machinery-invoked plumbing commands stay outside the
 //!       operator listing and the three internal commands stay hidden out of it,
 //!   (e) the about-line and operator help carry none of the banned category
 //!       jargon.
@@ -17,11 +17,12 @@ use std::process::{Command, Output};
 /// The five commands an operator runs, foregrounded in `--help`.
 const OPERATOR_COMMANDS: [&str; 5] = ["init", "validate", "status", "doctor", "loop"];
 
-/// The four machinery-invoked commands: omitted from Clap's generated list but
+/// The five machinery-invoked commands: omitted from Clap's generated list but
 /// still shown in the curated plumbing footer and directly invokable by name.
-const PLUMBING_COMMANDS: [&str; 4] = [
+const PLUMBING_COMMANDS: [&str; 5] = [
     "agent-exec",
     "capture-usage",
+    "claim",
     "commit-ticket",
     "complete-ticket",
 ];
@@ -52,6 +53,7 @@ Options:
 Plumbing commands (called by Lisa and agent hooks):
   agent-exec       Run Codex and turn its output into Lisa's pane signals
   capture-usage    Record a native session's token usage from its Stop-hook payload on stdin
+  claim            Assert ownership of one exact ticket assignment
   commit-ticket    Commit this ticket's own files without touching the repo's ordinary git index
   complete-ticket  Mark a ticket done and commit its files in one step
 "#;
@@ -137,7 +139,7 @@ Example: lisa loop --path ./my-project --max-threads 3
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 12] = [
+const OWN_COMMANDS: [&str; 13] = [
     "init",
     "validate",
     "status",
@@ -145,6 +147,7 @@ const OWN_COMMANDS: [&str; 12] = [
     "loop",
     "agent-exec",
     "capture-usage",
+    "claim",
     "commit-ticket",
     "complete-ticket",
     "setup-guide",
@@ -214,14 +217,14 @@ fn listing_offset(help: &str, command: &str) -> Option<usize> {
     help.find(&format!("\n  {command} "))
 }
 
-/// (a) Every one of the 12 own subcommands resolves — including the hidden
+/// (a) Every one of the 13 own subcommands resolves — including the hidden
 /// three, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_twelve_subcommands_resolve() {
+fn all_thirteen_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        12,
-        "the pinned command set must be exactly 12"
+        13,
+        "the pinned command set must be exactly 13"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);
