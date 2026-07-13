@@ -29,8 +29,9 @@ use deadline::{
 use lisa_core::client::AgentClient;
 use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
-    reduce as reduce_completion, AttemptId, CompletionEvent, CompletionGenerationId, CompletionId,
-    CompletionRejection, CompletionState, EffectCommand,
+    reconcile as reconcile_completion, reduce as reduce_completion, AttemptId, CompletionEvent,
+    CompletionGenerationId, CompletionId, CompletionRejection, CompletionState,
+    CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand, Reconciliation,
 };
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
@@ -433,6 +434,7 @@ enum SeatAssignmentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionSource {
     Artifact,
+    Reconcile,
     Idle,
     Stopped(u32),
     Manual,
@@ -445,6 +447,10 @@ enum CompletionSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompletionInput {
     Artifact {
+        ticket_id: TicketId,
+        source_lease: AttemptLease,
+    },
+    Reconcile {
         ticket_id: TicketId,
         source_lease: AttemptLease,
     },
@@ -1321,86 +1327,204 @@ impl State {
         true
     }
 
-    /// Convert scheduler/operator evidence into a typed core event and execute
-    /// only the effect returned by the pure reducer.
-    fn dispatch_completion(&mut self, input: CompletionInput) -> bool {
-        let (ticket_id, source, authority, review_lease) = match input {
-            CompletionInput::Artifact {
-                ticket_id,
-                source_lease,
-            } => (
-                ticket_id,
-                CompletionSource::Artifact,
-                Some(CompletionAuthority::Attempt(source_lease.clone())),
-                Some(source_lease),
-            ),
-            CompletionInput::Stopped {
-                ticket_id,
-                pane_id,
-                source_lease,
-            } => (
-                ticket_id,
-                CompletionSource::Stopped(pane_id),
-                Some(CompletionAuthority::Attempt(source_lease.clone())),
-                Some(source_lease),
-            ),
-            CompletionInput::Idle {
-                ticket_id,
-                source_lease,
-            } => (
-                ticket_id,
-                CompletionSource::Idle,
-                Some(CompletionAuthority::Attempt(source_lease.clone())),
-                Some(source_lease),
-            ),
-            CompletionInput::ObservedDone {
-                ticket_id,
-                source_lease,
-            } => (
-                ticket_id,
-                CompletionSource::ObservedDone,
-                source_lease.map(CompletionAuthority::Attempt),
-                None,
-            ),
-            CompletionInput::Manual {
-                ticket_id,
-                authority,
-            } => (ticket_id, CompletionSource::Manual, authority, None),
-        };
-
-        let state = if self.pending_completions.contains_key(&ticket_id) {
+    /// Reconstruct the aggregate state from facts the adapter can currently
+    /// prove. Pending masks durable Done until the attributed command result is
+    /// verified, matching `rebuild_dag`'s transaction boundary.
+    fn reconciliation_state(&self, ticket_id: &str) -> CompletionState {
+        if self.pending_completions.contains_key(ticket_id) {
             CompletionState::Requested
+        } else if self
+            .dag
+            .get_ticket(&ticket_id.to_string())
+            .map(|ticket| ticket.phase == Phase::Done && ticket.status == TicketStatus::Done)
+            .unwrap_or(false)
+        {
+            CompletionState::Confirmed
         } else {
             CompletionState::Eligible
-        };
-        let attempt_id = match authority.as_ref() {
-            Some(CompletionAuthority::Attempt(lease)) => lease.attempt_id.to_string(),
-            Some(CompletionAuthority::Operator) => "operator".to_string(),
-            None => "missing-authority".to_string(),
-        };
-        let attempt_id = AttemptId::new(attempt_id);
-        let completion_id = CompletionId::new(ticket_id.clone());
-        let correlation = Self::completion_correlation(completion_id.clone(), attempt_id.clone());
-
-        if let Some(review_lease) = review_lease.as_ref() {
-            if !self.admit_correlated_review(&ticket_id, review_lease, &correlation) {
-                return false;
-            }
         }
+    }
 
-        let event = CompletionEvent::Request {
-            attempt_id,
-            completion_id,
-        };
-        let transition = match reduce_completion(state, event) {
-            Ok(transition) => transition,
-            Err(rejection) => {
-                self.log_completion_rejection(&ticket_id, &correlation, &rejection);
-                return false;
+    /// Re-derive the durable inputs for one exact current attempt. Missing or
+    /// unreadable evidence remains fail-closed and cannot create admission.
+    fn review_completion_inputs(
+        &mut self,
+        ticket_id: &str,
+        source_lease: &AttemptLease,
+    ) -> DurableCompletionInputs {
+        const REVIEW_ARTIFACT: &str = "review.md";
+        const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
+
+        let artifact_admission = match self.admit_artifact(
+            ticket_id,
+            Some(source_lease),
+            REVIEW_ARTIFACT,
+        ) {
+            Ok(true) => Some(CurrentLeaseArtifactAdmission {
+                attempt_id: AttemptId::new(source_lease.attempt_id.to_string()),
+                completion_id: CompletionId::new(ticket_id),
+            }),
+            Ok(false) => None,
+            Err(reason) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Completion reconciliation could not admit {REVIEW_ARTIFACT} for {ticket_id}: {reason}"
+                    ),
+                });
+                None
             }
         };
 
-        match transition.effect {
+        let disposition =
+            match self.admit_artifact(ticket_id, Some(source_lease), DISPOSITION_ARTIFACT) {
+                Ok(true) => parse_review_disposition(
+                    self.config
+                        .work_dir
+                        .join(ticket_id)
+                        .join(DISPOSITION_ARTIFACT),
+                ),
+                Ok(false) => ReviewDisposition::Invalid {
+                    reason: format!("missing required {DISPOSITION_ARTIFACT}"),
+                },
+                Err(reason) => ReviewDisposition::Invalid {
+                    reason: format!("could not admit {DISPOSITION_ARTIFACT}: {reason}"),
+                },
+            };
+
+        DurableCompletionInputs {
+            artifact_admission,
+            disposition,
+        }
+    }
+
+    /// Convert scheduler/operator evidence into a typed core decision and
+    /// execute only the effect returned by the pure reducer or reconciler.
+    fn dispatch_completion(&mut self, input: CompletionInput) -> bool {
+        let (ticket_id, source, authority, effect) = match input {
+            CompletionInput::Reconcile {
+                ticket_id,
+                source_lease,
+            } => {
+                let attempt_id = AttemptId::new(source_lease.attempt_id.to_string());
+                let completion_id = CompletionId::new(ticket_id.clone());
+                let correlation =
+                    Self::completion_correlation(completion_id.clone(), attempt_id.clone());
+                if !self.review_lease_is_current(&ticket_id, &source_lease) {
+                    self.reject_stale_lease(
+                        &ticket_id,
+                        &correlation,
+                        source_lease.attempt_id.to_string(),
+                    );
+                    return false;
+                }
+
+                let durable_inputs = self.review_completion_inputs(&ticket_id, &source_lease);
+                let state = self.reconciliation_state(&ticket_id);
+                let effect = match reconcile_completion(&durable_inputs, &state) {
+                    Reconciliation::Effect(effect) => Some(effect),
+                    Reconciliation::None => None,
+                    Reconciliation::CommandInFlightActionRequired { correlation } => {
+                        self.log_activity(ActivityEvent::Warning {
+                            message: format!(
+                                "Completion reconciliation for {ticket_id} requires action on in-flight correlation {correlation}"
+                            ),
+                        });
+                        None
+                    }
+                };
+                (
+                    ticket_id,
+                    CompletionSource::Reconcile,
+                    Some(CompletionAuthority::Attempt(source_lease)),
+                    effect,
+                )
+            }
+            input => {
+                let (ticket_id, source, authority, review_lease) = match input {
+                    CompletionInput::Artifact {
+                        ticket_id,
+                        source_lease,
+                    } => (
+                        ticket_id,
+                        CompletionSource::Artifact,
+                        Some(CompletionAuthority::Attempt(source_lease.clone())),
+                        Some(source_lease),
+                    ),
+                    CompletionInput::Stopped {
+                        ticket_id,
+                        pane_id,
+                        source_lease,
+                    } => (
+                        ticket_id,
+                        CompletionSource::Stopped(pane_id),
+                        Some(CompletionAuthority::Attempt(source_lease.clone())),
+                        Some(source_lease),
+                    ),
+                    CompletionInput::Idle {
+                        ticket_id,
+                        source_lease,
+                    } => (
+                        ticket_id,
+                        CompletionSource::Idle,
+                        Some(CompletionAuthority::Attempt(source_lease.clone())),
+                        Some(source_lease),
+                    ),
+                    CompletionInput::ObservedDone {
+                        ticket_id,
+                        source_lease,
+                    } => (
+                        ticket_id,
+                        CompletionSource::ObservedDone,
+                        source_lease.map(CompletionAuthority::Attempt),
+                        None,
+                    ),
+                    CompletionInput::Manual {
+                        ticket_id,
+                        authority,
+                    } => (ticket_id, CompletionSource::Manual, authority, None),
+                    CompletionInput::Reconcile { .. } => unreachable!("handled above"),
+                };
+
+                // Event-driven sources preserve their existing semantics:
+                // ObservedDone still enters the isolated transaction rather
+                // than treating externally edited frontmatter as confirmation.
+                let state = if self.pending_completions.contains_key(&ticket_id) {
+                    CompletionState::Requested
+                } else {
+                    CompletionState::Eligible
+                };
+                let attempt_id = match authority.as_ref() {
+                    Some(CompletionAuthority::Attempt(lease)) => lease.attempt_id.to_string(),
+                    Some(CompletionAuthority::Operator) => "operator".to_string(),
+                    None => "missing-authority".to_string(),
+                };
+                let attempt_id = AttemptId::new(attempt_id);
+                let completion_id = CompletionId::new(ticket_id.clone());
+                let correlation =
+                    Self::completion_correlation(completion_id.clone(), attempt_id.clone());
+
+                if let Some(review_lease) = review_lease.as_ref() {
+                    if !self.admit_correlated_review(&ticket_id, review_lease, &correlation) {
+                        return false;
+                    }
+                }
+
+                let event = CompletionEvent::Request {
+                    attempt_id,
+                    completion_id,
+                };
+                let effect = match reduce_completion(state, event) {
+                    Ok(transition) => transition.effect,
+                    Err(rejection) => {
+                        self.log_completion_rejection(&ticket_id, &correlation, &rejection);
+                        return false;
+                    }
+                };
+                (ticket_id, source, authority, effect)
+            }
+        };
+
+        match effect {
             Some(effect) => self.execute_completion_effect(effect, ticket_id, source, authority),
             None => false,
         }
@@ -3536,6 +3660,36 @@ impl State {
         }
     }
 
+    /// Re-derive every current Review attempt's completion obligation from
+    /// admitted artifacts and aggregate state. This is intentionally safe to
+    /// call at every scheduler observation boundary.
+    fn reconcile_review_completions(&mut self) {
+        let candidates: Vec<(TicketId, AttemptLease)> = self
+            .threads
+            .iter()
+            .filter(|(_, thread)| thread.status != lisa_core::types::ThreadStatus::Completed)
+            .filter_map(|(ticket_id, thread)| {
+                let source_lease = thread.attempt_lease.clone()?;
+                if source_lease.ticket_id != *ticket_id
+                    || !source_lease.is_current(self.current_leases.get(ticket_id))
+                {
+                    return None;
+                }
+                let dag_phase = self.dag.get_ticket(ticket_id).map(|ticket| ticket.phase);
+                (thread.current_phase == Phase::Review
+                    || matches!(dag_phase, Some(Phase::Review | Phase::Done)))
+                .then_some((ticket_id.clone(), source_lease))
+            })
+            .collect();
+
+        for (ticket_id, source_lease) in candidates {
+            self.dispatch_completion(CompletionInput::Reconcile {
+                ticket_id,
+                source_lease,
+            });
+        }
+    }
+
     /// Record observed activity for a pane: updates the slot's activity clock
     /// and, if a thread is running in that pane, the thread's inactivity clock.
     fn bump_pane_activity(&mut self, pane_id: u32) {
@@ -4583,6 +4737,36 @@ impl State {
         }
     }
 
+    /// A pending transaction or an admitted Review makes the generic
+    /// write-your-review follow-up false. Admission errors are also suppressed:
+    /// their activity entry is the actionable signal, not another pane prompt.
+    fn review_completion_suppresses_finish_up(&mut self, ticket_id: &str) -> bool {
+        if self.pending_completions.contains_key(ticket_id) {
+            return true;
+        }
+        let Some(source_lease) = self
+            .threads
+            .get(ticket_id)
+            .and_then(|thread| thread.attempt_lease.clone())
+        else {
+            return false;
+        };
+        if !self.review_lease_is_current(ticket_id, &source_lease) {
+            return false;
+        }
+        match self.admit_artifact(ticket_id, Some(&source_lease), "review.md") {
+            Ok(admitted) => admitted,
+            Err(reason) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Suppressed finish-up for {ticket_id}: current Review admission failed: {reason}"
+                    ),
+                });
+                true
+            }
+        }
+    }
+
     /// Check for running Review threads that have exceeded the review timeout.
     ///
     /// When a thread has been running in Review phase longer than `review_timeout_secs`
@@ -4612,6 +4796,9 @@ impl State {
         for action in actions {
             let ticket_id = action.ticket_id;
             let pane_id = action.pane_id;
+            if self.review_completion_suppresses_finish_up(&ticket_id) {
+                continue;
+            }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let host_work_dir = match self
                 .threads
@@ -4930,6 +5117,10 @@ impl State {
 
         // Check for idle signals and advance phases / generate alerts
         self.check_idle_signals();
+
+        // Level-triggered completion is re-derived after every source of phase
+        // advancement and before Review timeout policy can inject a follow-up.
+        self.reconcile_review_completions();
 
         // Process .stopped and .cleared signals for session transitions
         self.check_transition_signals();
@@ -5820,6 +6011,11 @@ impl ZellijPlugin for State {
                 // DAG errors already logged by diagnostics
             }
         }
+
+        // A fresh State normally has no reconstructed attempt authority here,
+        // making this a safe no-op. Any authority-preserving load path uses the
+        // same level-triggered reconciliation boundary as polling.
+        self.reconcile_review_completions();
 
         // Mark as initialized
         self.initialized = true;
@@ -7364,6 +7560,112 @@ mod tests {
         // Ticket remains Review until the native transaction prepares Done.
         let updated = fs::read_to_string(tickets_dir.join("T-002.md")).unwrap();
         assert!(updated.contains("phase: review"));
+    }
+
+    #[test]
+    fn poll_then_reload_reconciles_review_once_without_finish_up() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        let ticket_file = tickets_dir.join("T-LEVEL.md");
+        fs::write(
+            &ticket_file,
+            "---\nid: T-LEVEL\ntitle: level-triggered\ntype: task\nstatus: open\npriority: critical\nphase: implement\n---\n",
+        )
+        .unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
+                review_timeout_secs: 10,
+                wind_down_secs: 10,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        let mut thread = Thread::new("T-LEVEL", 7);
+        thread.current_phase = Phase::Implement;
+        state.threads.insert("T-LEVEL".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-LEVEL");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+
+        // The Review exists before the Implement→Review observation. Leave the
+        // disposition absent for that edge so only the later level-triggered
+        // poll can recover the obligation.
+        fs::write(staged.join("review.md"), "# Review\nReady.\n").unwrap();
+        state.check_artifact_advances();
+        assert_eq!(state.threads["T-LEVEL"].current_phase, Phase::Review);
+        assert!(!state.pending_completions.contains_key("T-LEVEL"));
+        assert!(state.launched_completion_effects.is_empty());
+
+        write_passing_review_disposition(&state, &lease);
+        state.reconcile_review_completions();
+
+        assert_eq!(state.launched_completion_effects.len(), 1);
+        assert_eq!(
+            state.launched_completion_effects[0],
+            EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new(lease.attempt_id.to_string()),
+                completion_id: CompletionId::new("T-LEVEL"),
+            }
+        );
+        let pending = state.pending_completions.get("T-LEVEL").unwrap();
+        assert_eq!(pending.source, CompletionSource::Reconcile);
+
+        // Pending completion and the admitted current-attempt Review both make
+        // the generic finish-up prompt false, even past both deadline bars.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let thread = state.threads.get_mut("T-LEVEL").unwrap();
+        thread.last_phase_change = old;
+        thread.last_activity = old;
+        state.check_review_timeouts();
+        assert!(!state.finish_up_sent.contains("T-LEVEL"));
+        assert!(!state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-LEVEL"
+        )));
+
+        // A reload observation sees Requested and cannot emit a second effect.
+        state.reconcile_review_completions();
+        assert_eq!(state.launched_completion_effects.len(), 1);
+
+        // Durable Done reconstructs Confirmed once no command is pending.
+        state.pending_completions.remove("T-LEVEL");
+        fs::write(
+            &ticket_file,
+            "---\nid: T-LEVEL\ntitle: level-triggered\ntype: task\nstatus: done\npriority: critical\nphase: done\n---\n",
+        )
+        .unwrap();
+        state.dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&tickets_dir).unwrap()).unwrap();
+        state.reconcile_review_completions();
+        assert_eq!(state.launched_completion_effects.len(), 1);
+
+        // A blocked E-040 disposition is likewise never eligible.
+        fs::write(
+            &ticket_file,
+            "---\nid: T-LEVEL\ntitle: level-triggered\ntype: task\nstatus: review\npriority: critical\nphase: review\n---\n",
+        )
+        .unwrap();
+        state.dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&tickets_dir).unwrap()).unwrap();
+        write_review_disposition(
+            &state,
+            &lease,
+            r#"{"disposition":"block","reason":"resolve the failing audit"}"#,
+        );
+        state.reconcile_review_completions();
+        assert_eq!(state.launched_completion_effects.len(), 1);
+        assert!(!state.pending_completions.contains_key("T-LEVEL"));
+        state.check_review_timeouts();
+        assert!(!state.finish_up_sent.contains("T-LEVEL"));
     }
 
     #[test]
