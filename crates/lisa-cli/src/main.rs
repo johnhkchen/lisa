@@ -242,10 +242,11 @@ fn main() {
             }
         }
         Commands::CaptureUsage { cwd } => {
-            // Best-effort: a hook must never fail the session. Errors (e.g. an
-            // unwritable `.lisa/claude`) are swallowed; tokens stay null.
             let cwd = resolve_path(&cwd);
-            let _ = capture_usage::run_capture_usage(&cwd);
+            if let Err(e) = capture_usage::run_capture_usage(&cwd) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
         Commands::CommitTicket {
             path,

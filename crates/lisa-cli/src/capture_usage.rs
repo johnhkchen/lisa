@@ -13,19 +13,24 @@
 //! Write-after and never-fabricate: Stop fires at *turn* boundaries (not per
 //! tool call — the heartbeat hook stays trivial). Each successful observation is
 //! appended to `.lisa/<client>/captures.jsonl` with its pane, provider session,
-//! capture time, and totals. Ticket attribution is deliberately deferred to the
-//! scheduler, which has the pane-ownership history the hook process lacks. Every
-//! missing input (no `transcript_path`, unreadable transcript, malformed lines,
-//! no assistant messages) currently writes nothing and returns `Ok(())`.
+//! capture time, and totals. An identified Stop with a missing, unreadable, or
+//! empty transcript appends its reason to `no-captures.jsonl` instead. Ticket
+//! attribution is deliberately deferred to the scheduler, which has the
+//! pane-ownership history the hook process lacks.
 
-use std::io::Read;
+use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
 use lisa_core::capture::{append_capture_record, CaptureRecord};
 use lisa_core::provenance::system_time_to_epoch;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const MISSING_TRANSCRIPT_PATH: &str = "missing-transcript-path";
+const UNREADABLE_TRANSCRIPT: &str = "unreadable-transcript";
+const EMPTY_TRANSCRIPT: &str = "empty-transcript";
 
 /// Facts supplied by the native client's Stop-hook payload.
 #[derive(Debug, Deserialize)]
@@ -34,6 +39,15 @@ struct StopPayload {
     transcript_path: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+}
+
+/// One identified Stop whose transcript usage could not be observed.
+#[derive(Debug, Serialize)]
+struct NoCaptureMarker<'a> {
+    pane_id: u32,
+    session_id: &'a str,
+    captured_at: u64,
+    reason: &'static str,
 }
 
 /// Summed, provider-native totals in the shape the plugin reader expects.
@@ -104,49 +118,105 @@ fn codex_transcript_usage(jsonl: &str) -> UsageTotals {
     latest
 }
 
+/// Append one durable no-capture marker and make it immediately visible.
+fn append_no_capture_marker(
+    client_dir: &Path,
+    pane_id: u32,
+    session_id: &str,
+    reason: &'static str,
+) -> std::io::Result<()> {
+    let marker = NoCaptureMarker {
+        pane_id,
+        session_id,
+        captured_at: system_time_to_epoch(SystemTime::now()),
+        reason,
+    };
+    let mut line = serde_json::to_string(&marker)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push('\n');
+
+    fs::create_dir_all(client_dir)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(client_dir.join("no-captures.jsonl"))?;
+    file.write_all(line.as_bytes())?;
+
+    eprintln!("lisa capture-usage: no capture for pane {pane_id} session {session_id}: {reason}");
+    Ok(())
+}
+
 /// Read the Stop-hook payload from stdin, sum the transcript's usage, and write
-/// one append-only `.lisa/<client>/captures.jsonl` row under `cwd`. Best-effort
-/// throughout: any absent input returns `Ok(())` writing nothing.
+/// one append-only outcome row under `cwd`.
+///
+/// Successful observations go to `.lisa/<client>/captures.jsonl`; identified
+/// Stops without observable usage go to `.lisa/<client>/no-captures.jsonl`.
+/// Missing capture identity and persistence failures are returned to the caller.
 pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
     let mut stdin = String::new();
-    if std::io::stdin().read_to_string(&mut stdin).is_err() {
-        return Ok(());
-    }
-    let payload: StopPayload = match serde_json::from_str(&stdin) {
-        Ok(p) => p,
-        Err(_) => return Ok(()),
-    };
-    let Some(transcript_path) = payload.transcript_path else {
-        return Ok(());
-    };
+    std::io::stdin()
+        .read_to_string(&mut stdin)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("could not read Stop payload: {error}"),
+            )
+        })?;
+    let payload: StopPayload = serde_json::from_str(&stdin).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid Stop payload: {error}"),
+        )
+    })?;
+    let is_codex = std::env::var("LISA_AGENT_CLIENT").is_ok_and(|v| v == "codex");
     let Some(session_id) = payload.session_id.filter(|value| !value.is_empty()) else {
-        return Ok(());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Stop payload is missing session_id",
+        ));
     };
     let Some(pane_id) = std::env::var("LISA_PANE_ID")
         .ok()
         .filter(|value| !value.is_empty())
         .and_then(|value| value.parse::<u32>().ok())
     else {
-        return Ok(());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "LISA_PANE_ID is missing or invalid",
+        ));
+    };
+    let client_dir = cwd
+        .join(".lisa")
+        .join(if is_codex { "codex" } else { "claude" });
+    let Some(transcript_path) = payload.transcript_path.filter(|value| !value.is_empty()) else {
+        return append_no_capture_marker(
+            &client_dir,
+            pane_id,
+            &session_id,
+            MISSING_TRANSCRIPT_PATH,
+        );
     };
     let jsonl = match std::fs::read_to_string(&transcript_path) {
         Ok(s) => s,
-        Err(_) => return Ok(()), // transcript gone/unreadable → leave tokens null
+        Err(_) => {
+            return append_no_capture_marker(
+                &client_dir,
+                pane_id,
+                &session_id,
+                UNREADABLE_TRANSCRIPT,
+            );
+        }
     };
-    let is_codex = std::env::var("LISA_AGENT_CLIENT").is_ok_and(|v| v == "codex");
     let usage = if is_codex {
         codex_transcript_usage(&jsonl)
     } else {
         sum_claude_transcript_usage(&jsonl)
     };
-    // Nothing observed → do not write a zero-token artifact (never fabricate a
-    // "we measured 0" where we actually measured nothing).
+    // Nothing observed → record why no totals were written rather than
+    // fabricating a measured zero or silently dropping the Stop.
     if usage == UsageTotals::default() {
-        return Ok(());
+        return append_no_capture_marker(&client_dir, pane_id, &session_id, EMPTY_TRANSCRIPT);
     }
-    let client_dir = cwd
-        .join(".lisa")
-        .join(if is_codex { "codex" } else { "claude" });
     append_capture_record(
         &client_dir.join("captures.jsonl"),
         &CaptureRecord {
