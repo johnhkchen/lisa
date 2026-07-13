@@ -7151,6 +7151,104 @@ mod tests {
         }
     }
 
+    /// Regression for the T-039-06-02 field boundary: an already-written
+    /// review with an explicit blocking disposition is not completion intent.
+    #[test]
+    fn test_t039_06_02_blocking_review_never_prepares_done() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        let ledger_path = dir.path().join("provenance.jsonl");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-REVIEW.md"),
+            "---\nid: T-REVIEW\ntitle: hostile review\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            tickets_dir.join("T-DEPENDENT.md"),
+            "---\nid: T-DEPENDENT\ntitle: blocked downstream\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [T-REVIEW]\n---\n",
+        )
+        .unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            ledger_path: ledger_path.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 39,
+            ticket_id: Some("T-REVIEW".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+        let mut thread = Thread::new("T-REVIEW", 39);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-REVIEW".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-REVIEW");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review\nBlocking finding.\n").unwrap();
+        write_review_disposition(
+            &state,
+            &lease,
+            r#"{"disposition":"block","reason":"resolve the hostile review finding"}"#,
+        );
+
+        state.check_artifact_advances();
+
+        assert!(
+            !state.pending_completions.contains_key("T-REVIEW"),
+            "a block must not prepare Done; the pre-T-040-01-03 unconditional path did"
+        );
+        let thread = state.threads.get("T-REVIEW").unwrap();
+        assert_eq!(thread.current_phase, Phase::Review);
+        assert_eq!(thread.status, ThreadStatus::Running);
+        assert_eq!(
+            state.agent_slots[0].ticket_id.as_deref(),
+            Some("T-REVIEW"),
+            "the blocking ticket must stay assigned"
+        );
+        assert_eq!(state.agent_slots[0].attempt_lease.as_ref(), Some(&lease));
+        assert_eq!(state.current_leases.get("T-REVIEW"), Some(&lease));
+
+        let ticket = fs::read_to_string(tickets_dir.join("T-REVIEW.md")).unwrap();
+        assert!(ticket.contains("status: review"), "ticket: {ticket}");
+        assert!(ticket.contains("phase: review"), "ticket: {ticket}");
+        assert!(
+            !ledger_path.exists(),
+            "a blocking Review must produce no authoritative Done provenance"
+        );
+        assert!(
+            !state.dag.all_dependencies_done(&"T-DEPENDENT".to_string()),
+            "the dependent must remain blocked"
+        );
+        assert!(
+            !state.threads.contains_key("T-DEPENDENT"),
+            "the blocked dependent must not be scheduled"
+        );
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message }
+                if message.contains("Completion blocked")
+                    && message.contains("resolve the hostile review finding")
+        )));
+    }
+
     #[test]
     fn test_check_all_done_true() {
         use std::fs;
