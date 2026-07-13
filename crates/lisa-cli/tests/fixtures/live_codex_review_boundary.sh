@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live, metered reproduction of the Codex Review-recovery delivery boundary.
-# This launches authenticated Codex twice. See
+# This launches authenticated Codex for one legacy and two current Review turns. See
 # docs/knowledge/live-codex-review-boundary.md before running it.
 set -euo pipefail
 
@@ -17,7 +17,9 @@ FIELD_TIMEOUT_SECS=${FIELD_TIMEOUT_SECS:-1200}
 LEGACY_DELAY_SECS=${LEGACY_DELAY_SECS:-35}
 CURRENT_CLAIM_DELAY_SECS=${CURRENT_CLAIM_DELAY_SECS:-1}
 FIXTURE_PARENT=${LISA_FIELD_FIXTURE_PARENT:-${TMPDIR:-/tmp}}
-TICKET_ID=T-FIELD-REVIEW
+PRIMARY_TICKET_ID=T-FIELD-REVIEW-01
+SUCCESSOR_TICKET_ID=T-FIELD-REVIEW-02
+TICKET_IDS=("$PRIMARY_TICKET_ID" "$SUCCESSOR_TICKET_ID")
 
 CURRENT_CASE=
 CURRENT_KIND=
@@ -59,6 +61,9 @@ fail() {
         echo "evidence: $CURRENT_CASE" >&2
         sed -n '1,200p' "$CURRENT_CASE/state-events.tsv" >&2 2>/dev/null || true
         sed -n '1,200p' "$CURRENT_CASE/signal-events.tsv" >&2 2>/dev/null || true
+        sed -n '1,200p' "$CURRENT_CASE/process-events.tsv" >&2 2>/dev/null || true
+        sed -n '1,200p' "$CURRENT_CASE/lease-events.tsv" >&2 2>/dev/null || true
+        sed -n '1,80p' "$CURRENT_CASE/stale-claim.stderr" >&2 2>/dev/null || true
         sed -n '1,160p' "$CURRENT_CASE/dashboard-final.txt" >&2 2>/dev/null || true
         sed -n '1,160p' "$CURRENT_CASE/terminal-final.txt" >&2 2>/dev/null || true
         tail -160 "$CURRENT_CASE/process-snapshots.txt" >&2 2>/dev/null || true
@@ -163,6 +168,10 @@ wait_until() {
     shift 2
     local deadline=$(( $(date +%s) + timeout ))
     while (( $(date +%s) <= deadline )); do
+        if [[ -n "$CURRENT_CASE" && -f "$CURRENT_CASE/.sampler-failure" ]]; then
+            fail "sampler failed: $(<"$CURRENT_CASE/.sampler-failure")"
+            return 1
+        fi
         if "$@"; then
             return 0
         fi
@@ -186,7 +195,7 @@ discover_panes() {
     CURRENT_PLUGIN_PANE=$(jq -r \
         '[.[] | select(.is_plugin == true and ((.plugin_url // "") | startswith("file:")))][0] | if . then "plugin_\(.id)" else empty end' \
         <<<"$panes")
-    CURRENT_AGENT_PANE=$(jq -r --arg ticket "$TICKET_ID" \
+    CURRENT_AGENT_PANE=$(jq -r --arg ticket "$PRIMARY_TICKET_ID" \
         '[.[] | select(.is_plugin == false and ((.title // "") | contains($ticket)))][0] | if . then "terminal_\(.id)" else empty end' \
         <<<"$panes")
     if [[ -z "$CURRENT_AGENT_PANE" ]]; then
@@ -256,7 +265,8 @@ create_fixture() {
     printf '%s\n' "$root" >> "$EVIDENCE_DIR/fixture-roots.txt"
     "$lisa_bin" init --path "$root" > "$EVIDENCE_DIR/$kind-init.log"
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories" \
-        "$root/docs/active/work/$TICKET_ID"
+        "$root/docs/active/work/$PRIMARY_TICKET_ID" \
+        "$root/docs/active/work/$SUCCESSOR_TICKET_ID"
     cat > "$root/.lisa.toml" <<'TOML'
 version = "0.4.0"
 
@@ -285,11 +295,11 @@ status: active
 
 # Live Review recovery field fixture
 STORY
-    cat > "$root/docs/active/tickets/$TICKET_ID.md" <<'TICKET'
+    cat > "$root/docs/active/tickets/$PRIMARY_TICKET_ID.md" <<'TICKET'
 ---
-id: T-FIELD-REVIEW
+id: T-FIELD-REVIEW-01
 story: S-FIELD
-title: recover-existing-review
+title: recover-existing-review-predecessor
 type: task
 status: open
 priority: high
@@ -307,12 +317,37 @@ then publish a current-attempt Review disposition. Do not change product source.
 
 - [x] Prior work required no product source changes.
 TICKET
-    cat > "$root/docs/active/work/$TICKET_ID/review.md" <<'REVIEW'
+    cat > "$root/docs/active/tickets/$SUCCESSOR_TICKET_ID.md" <<'TICKET'
+---
+id: T-FIELD-REVIEW-02
+story: S-FIELD
+title: recover-existing-review-successor
+type: task
+status: open
+priority: high
+agent: codex
+phase: review
+depends_on: [T-FIELD-REVIEW-01]
+---
+
+## Context
+
+This ticket already reached Review in a prior session. After its predecessor completes, inspect
+its existing canonical review, then publish a current-attempt Review disposition. Do not change
+product source.
+
+## Acceptance Criteria
+
+- [x] Prior work required no product source changes.
+TICKET
+    for ticket_id in "${TICKET_IDS[@]}"; do
+        cat > "$root/docs/active/work/$ticket_id/review.md" <<'REVIEW'
 # Prior Review evidence
 
 The earlier attempt completed an artifact-only field note. It changed no product source and its
 focused checks passed. Recovery should admit a fresh attempt-private Review and disposition only.
 REVIEW
+    done
     write_agents_protocol "$root"
     write_zellij_wrapper "$root"
     (
@@ -350,7 +385,7 @@ start_loop() {
     local runner="$CURRENT_CASE/run-loop.sh"
     cat > "$runner" <<RUNNER
 #!/usr/bin/env bash
-stty rows 50 cols 140 2>/dev/null || true
+    stty rows 80 cols 140 2>/dev/null || true
 exec env -u ZELLIJ -u ZELLIJ_PANE_ID -u ZELLIJ_SESSION_NAME \\
   PATH=$(printf '%q' "$CURRENT_ROOT/bin:$PATH") \\
   CODEX_HOME=$(printf '%q' "$CURRENT_CODEX_HOME") \\
@@ -371,18 +406,102 @@ RUNNER
     wait_until 30 "Lisa plugin and Codex pane" discover_panes
 }
 
-record_state_once() {
-    local state=$1
-    local dashboard=$2
-    local seen="$CURRENT_CASE/.state-$state"
-    if grep -Fqi "$state" <<<"$dashboard" && [[ ! -e "$seen" ]]; then
-        : > "$seen"
-        printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$state" \
-            >> "$CURRENT_CASE/state-events.tsv"
-        if [[ "$CURRENT_KIND" == current && "$state" == delivered-awaiting-claim ]]; then
-            date -u +%Y-%m-%dT%H:%M:%SZ \
-                > "$CURRENT_ROOT/.lisa/attempts/$TICKET_ID/1/work/.field-claim-gate"
+record_sampler_failure() {
+    printf '%s\n' "$1" > "$CURRENT_CASE/.sampler-failure"
+}
+
+pane_for_ticket() {
+    local ticket_id=$1
+    local lease pane_id
+    while IFS= read -r lease; do
+        if jq -e --arg ticket "$ticket_id" \
+            '.ticket_id == $ticket and .attempt_id == 1' "$lease" >/dev/null 2>&1; then
+            pane_id=${lease##*/pane-}
+            pane_id=${pane_id%.lease}
+            printf '%s\n' "$pane_id"
+            return 0
         fi
+    done < <(find "$CURRENT_ROOT/.lisa/signals" -maxdepth 1 -type f \
+        -name 'pane-*.lease' -print 2>/dev/null | sort)
+    return 1
+}
+
+probe_stale_successor_claim() {
+    local marker="$CURRENT_CASE/.stale-probe-complete"
+    [[ ! -e "$marker" ]] || return 0
+    local pane_id
+    if ! pane_id=$(pane_for_ticket "$SUCCESSOR_TICKET_ID"); then
+        record_sampler_failure "successor pane lease was unavailable for the stale probe"
+        return 1
+    fi
+    local status
+    if env LISA_PANE_ID="$pane_id" "$CURRENT_LISA_BIN" claim \
+        --path "$CURRENT_ROOT" \
+        --ticket-id "$SUCCESSOR_TICKET_ID" \
+        --attempt-id 0 \
+        --nonce 0 \
+        > "$CURRENT_CASE/stale-claim.stdout" \
+        2> "$CURRENT_CASE/stale-claim.stderr"; then
+        status=0
+    else
+        status=$?
+    fi
+    printf '%s\n' "$status" > "$CURRENT_CASE/stale-claim.status"
+    if (( status == 0 )); then
+        record_sampler_failure "stale successor claim was unexpectedly accepted"
+        return 1
+    fi
+    if ! grep -Fq 'claim rejected [stale-attempt]' "$CURRENT_CASE/stale-claim.stderr"; then
+        record_sampler_failure "stale successor claim did not report stale-attempt"
+        return 1
+    fi
+    : > "$marker"
+}
+
+open_claim_gate() {
+    local ticket_id=$1
+    local gate="$CURRENT_ROOT/.lisa/attempts/$ticket_id/1/work/.field-claim-gate"
+    [[ ! -e "$gate" ]] || return 0
+    if [[ "$ticket_id" == "$SUCCESSOR_TICKET_ID" ]]; then
+        probe_stale_successor_claim || return 1
+    fi
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$gate"
+}
+
+ticket_dashboard_row() {
+    local ticket_id=$1
+    local dashboard=$2
+    awk -v ticket="$ticket_id" \
+        '$0 ~ /^\[[0-9]+\]/ && index($0, ticket) { print; exit }' <<<"$dashboard"
+}
+
+record_ticket_state() {
+    local ticket_id=$1
+    local dashboard=$2
+    local row state candidate
+    state=
+    row=$(ticket_dashboard_row "$ticket_id" "$dashboard")
+    for candidate in starting delivering delivered-awaiting-claim owned claim-timed-out delivery-failed; do
+        if grep -Fq "$candidate" <<<"$row"; then
+            state=$candidate
+            break
+        fi
+    done
+    if [[ -z "$state" ]] && grep -Fq "FAILED $ticket_id" <<<"$dashboard"; then
+        state=FAILED
+    fi
+    [[ -n "$state" ]] || return 0
+
+    local last_state_file="$CURRENT_CASE/.last-state-$ticket_id"
+    local last_state=
+    [[ -f "$last_state_file" ]] && last_state=$(<"$last_state_file")
+    [[ "$last_state" != "$state" ]] || return 0
+    printf '%s\n' "$state" > "$last_state_file"
+    printf '%s\t%s\t%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$ticket_id" "$state" \
+        >> "$CURRENT_CASE/state-events.tsv"
+    if [[ "$CURRENT_KIND" == current && "$state" == delivered-awaiting-claim ]]; then
+        open_claim_gate "$ticket_id"
     fi
 }
 
@@ -407,9 +526,91 @@ sample_signals() {
     done < <(find "$signal_dir" -maxdepth 1 -type f -print 2>/dev/null | sort)
 }
 
+sample_process_events() {
+    local processes=$1
+    local row pid ppid command ticket_id role assignment key
+    while IFS= read -r row; do
+        read -r pid ppid command <<<"$row"
+        [[ -n "${pid:-}" && -n "${ppid:-}" && -n "${command:-}" ]] || continue
+        for ticket_id in "${TICKET_IDS[@]}"; do
+            [[ "$command" == *".lisa/attempts/$ticket_id/1/work/assignment-1-"* ]] || continue
+            role=
+            if [[ "$command" == *" launch-codex -- "* ]]; then
+                role=launcher
+            elif [[ "$command" =~ (^|[[:space:]/])codex[[:space:]].*assignment-1- ]]; then
+                role=codex
+            fi
+            [[ -n "$role" ]] || continue
+            assignment=$(grep -oE \
+                "\\.lisa/attempts/$ticket_id/1/work/assignment-1-[0-9]+\\.md" \
+                <<<"$command" | head -1)
+            [[ -n "$assignment" ]] || continue
+            key="$ticket_id:$role:$pid"
+            grep -Fqx "$key" "$CURRENT_CASE/.seen-processes" 2>/dev/null && continue
+            printf '%s\n' "$key" >> "$CURRENT_CASE/.seen-processes"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$ticket_id" "$role" \
+                "$pid" "$ppid" "$assignment" >> "$CURRENT_CASE/process-events.tsv"
+        done
+    done <<<"$processes"
+}
+
+record_lease_state() {
+    local pane_id=$1
+    local lease_path="$CURRENT_ROOT/.lisa/signals/pane-$pane_id.lease"
+    local identity status ticket_id attempt_id
+    if [[ -f "$lease_path" ]] \
+        && ticket_id=$(jq -er '.ticket_id' "$lease_path" 2>/dev/null) \
+        && attempt_id=$(jq -er '.attempt_id' "$lease_path" 2>/dev/null); then
+        identity="$ticket_id:$attempt_id"
+        status=present
+    else
+        identity=absent
+        status=absent
+        ticket_id=-
+        attempt_id=-
+    fi
+    local last_identity=
+    local last_lease_file="$CURRENT_CASE/.last-lease-$pane_id"
+    [[ -f "$last_lease_file" ]] && last_identity=$(<"$last_lease_file")
+    [[ "$last_identity" != "$identity" ]] || return 0
+    printf '%s\n' "$identity" > "$last_lease_file"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pane_id" "$status" "$ticket_id" "$attempt_id" \
+        >> "$CURRENT_CASE/lease-events.tsv"
+}
+
+sample_lease_states() {
+    local lease pane_id
+    while IFS= read -r lease; do
+        pane_id=${lease##*/pane-}
+        pane_id=${pane_id%.lease}
+        if ! grep -Fqx "$pane_id" "$CURRENT_CASE/.seen-lease-panes" 2>/dev/null; then
+            printf '%s\n' "$pane_id" >> "$CURRENT_CASE/.seen-lease-panes"
+        fi
+    done < <(find "$CURRENT_ROOT/.lisa/signals" -maxdepth 1 -type f \
+        -name 'pane-*.lease' -print 2>/dev/null | sort)
+    while IFS= read -r pane_id; do
+        [[ -n "$pane_id" ]] && record_lease_state "$pane_id"
+    done < "$CURRENT_CASE/.seen-lease-panes"
+}
+
+sample_ticket_terminals() {
+    local ticket_id pane_id timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    for ticket_id in "${TICKET_IDS[@]}"; do
+        pane_id=$(pane_for_ticket "$ticket_id" 2>/dev/null || true)
+        [[ -n "$pane_id" ]] || continue
+        {
+            printf '\n===== %s pane-%s =====\n' "$timestamp" "$pane_id"
+            dump_pane "terminal_$pane_id" 2>/dev/null || true
+        } >> "$CURRENT_CASE/terminal-snapshots-$ticket_id.txt"
+    done
+}
+
 sample_once() {
     discover_panes || return 0
-    local dashboard terminal timestamp
+    local dashboard terminal timestamp processes
     dashboard=$(dump_pane "$CURRENT_PLUGIN_PANE" 2>/dev/null || true)
     terminal=$(dump_pane "$CURRENT_AGENT_PANE" 2>/dev/null || true)
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -421,22 +622,20 @@ sample_once() {
         printf '\n===== %s =====\n' "$timestamp"
         printf '%s\n' "$terminal"
     } >> "$CURRENT_CASE/terminal-snapshots.txt"
-    record_state_once starting "$dashboard"
-    record_state_once delivering "$dashboard"
-    record_state_once delivered-awaiting-claim "$dashboard"
-    record_state_once owned "$dashboard"
-    record_state_once claim-timed-out "$dashboard"
-    if grep -Fq "FAILED $TICKET_ID" <<<"$dashboard"; then
-        record_state_once "FAILED $TICKET_ID" "$dashboard"
-    fi
+    local ticket_id
+    for ticket_id in "${TICKET_IDS[@]}"; do
+        record_ticket_state "$ticket_id" "$dashboard"
+    done
+    processes=$(ps -axo pid=,ppid=,command=)
     {
         printf '\n===== %s =====\n' "$timestamp"
-        # shellcheck disable=SC2009 # Retain full command lines as field evidence.
-        ps -axo pid=,ppid=,command= \
-            | grep -E "($CURRENT_ROOT|launch-codex.*assignment-|[ /]codex .*assignment-)" \
+        grep -E "($CURRENT_ROOT|launch-codex.*assignment-|[ /]codex .*assignment-)" <<<"$processes" \
             | grep -v grep || true
     } >> "$CURRENT_CASE/process-snapshots.txt"
+    sample_process_events "$processes"
     sample_signals
+    sample_lease_states
+    sample_ticket_terminals
 }
 
 start_sampler() {
@@ -446,7 +645,15 @@ start_sampler() {
     : > "$CURRENT_CASE/dashboard-snapshots.txt"
     : > "$CURRENT_CASE/terminal-snapshots.txt"
     : > "$CURRENT_CASE/process-snapshots.txt"
+    : > "$CURRENT_CASE/process-events.tsv"
+    : > "$CURRENT_CASE/lease-events.tsv"
     : > "$CURRENT_CASE/.seen-signals"
+    : > "$CURRENT_CASE/.seen-processes"
+    : > "$CURRENT_CASE/.seen-lease-panes"
+    local ticket_id
+    for ticket_id in "${TICKET_IDS[@]}"; do
+        : > "$CURRENT_CASE/terminal-snapshots-$ticket_id.txt"
+    done
     (
         while :; do
             sample_once
@@ -457,19 +664,32 @@ start_sampler() {
 }
 
 state_was_seen() {
-    local state=$1
-    awk -F '\t' -v state="$state" '$2 == state { found=1 } END { exit !found }' \
+    local ticket_id=$1
+    local state=$2
+    awk -F '\t' -v ticket="$ticket_id" -v state="$state" \
+        '$2 == ticket && $3 == state { found=1 } END { exit !found }' \
         "$CURRENT_CASE/state-events.tsv"
 }
 
 claim_was_captured() {
-    awk -F '\t' '$3 ~ /\.claim$/ { found=1 } END { exit !found }' \
-        "$CURRENT_CASE/signal-events.tsv"
+    local ticket_id=$1
+    local claim
+    while IFS= read -r claim; do
+        jq -e --arg ticket "$ticket_id" \
+            '.ticket_id == $ticket and .attempt_id == 1' "$claim" >/dev/null 2>&1 \
+            && return 0
+    done < <(find "$CURRENT_CASE/captured-signals" -type f -name '*-pane-*.claim' -print 2>/dev/null)
+    return 1
 }
 
 ticket_is_done() {
-    local ticket="$CURRENT_ROOT/docs/active/tickets/$TICKET_ID.md"
+    local ticket_id=$1
+    local ticket="$CURRENT_ROOT/docs/active/tickets/$ticket_id.md"
     grep -Fq 'status: done' "$ticket" && grep -Fq 'phase: done' "$ticket"
+}
+
+all_current_tickets_are_done() {
+    ticket_is_done "$PRIMARY_TICKET_ID" && ticket_is_done "$SUCCESSOR_TICKET_ID"
 }
 
 capture_final_screens() {
@@ -483,16 +703,23 @@ capture_fixture_evidence() {
     capture_final_screens
     git -C "$CURRENT_ROOT" status --short > "$CURRENT_CASE/fixture-status.txt"
     git -C "$CURRENT_ROOT" log --oneline --decorate -10 > "$CURRENT_CASE/git-log.txt"
-    cp "$CURRENT_ROOT/docs/active/tickets/$TICKET_ID.md" "$CURRENT_CASE/ticket-final.md"
     cp "$CURRENT_ROOT/.lisa-layout.kdl" "$CURRENT_CASE/layout.kdl" 2>/dev/null || true
     cp "$CURRENT_ROOT/.lisa/provenance.jsonl" "$CURRENT_CASE/provenance.jsonl" 2>/dev/null || true
     cp "$CURRENT_ROOT/.lisa/completion-journal.jsonl" "$CURRENT_CASE/completion-journal.jsonl" \
         2>/dev/null || true
-    mkdir -p "$CURRENT_CASE/attempt-snapshot" "$CURRENT_CASE/work-snapshot"
-    cp -R "$CURRENT_ROOT/.lisa/attempts/$TICKET_ID/." "$CURRENT_CASE/attempt-snapshot/" \
-        2>/dev/null || true
-    cp -R "$CURRENT_ROOT/docs/active/work/$TICKET_ID/." "$CURRENT_CASE/work-snapshot/" \
-        2>/dev/null || true
+    mkdir -p "$CURRENT_CASE/tickets-final" "$CURRENT_CASE/attempt-snapshot" \
+        "$CURRENT_CASE/work-snapshot"
+    local ticket_id
+    for ticket_id in "${TICKET_IDS[@]}"; do
+        cp "$CURRENT_ROOT/docs/active/tickets/$ticket_id.md" \
+            "$CURRENT_CASE/tickets-final/$ticket_id.md"
+        mkdir -p "$CURRENT_CASE/attempt-snapshot/$ticket_id" \
+            "$CURRENT_CASE/work-snapshot/$ticket_id"
+        cp -R "$CURRENT_ROOT/.lisa/attempts/$ticket_id/." \
+            "$CURRENT_CASE/attempt-snapshot/$ticket_id/" 2>/dev/null || true
+        cp -R "$CURRENT_ROOT/docs/active/work/$ticket_id/." \
+            "$CURRENT_CASE/work-snapshot/$ticket_id/" 2>/dev/null || true
+    done
     local extracted_wasm
     extracted_wasm=$(sed -n 's/.*plugin location="file:\/\/\([^\"]*lisa-plugin-[^\"]*\.wasm\)".*/\1/p' \
         "$CURRENT_ROOT/.lisa-layout.kdl" 2>/dev/null | head -1)
@@ -517,9 +744,191 @@ prepare_case() {
     CURRENT_ROOT=$(cd "$CURRENT_ROOT" && pwd -P)
     CURRENT_SESSION="lisa-field-$kind-$$"
     prepare_codex_home "$kind"
-    printf 'kind=%s\nticket_id=%s\nfixture_root=%s\nsession=%s\nlisa_bin=%s\n' \
-        "$kind" "$TICKET_ID" "$CURRENT_ROOT" "$CURRENT_SESSION" "$lisa_bin" \
+    printf 'kind=%s\nprimary_ticket_id=%s\nsuccessor_ticket_id=%s\nfixture_root=%s\nsession=%s\nlisa_bin=%s\n' \
+        "$kind" "$PRIMARY_TICKET_ID" "$SUCCESSOR_TICKET_ID" "$CURRENT_ROOT" \
+        "$CURRENT_SESSION" "$lisa_bin" \
         > "$CURRENT_CASE/case.txt"
+}
+
+assert_exact_state_sequence() {
+    local ticket_id=$1
+    local actual
+    actual=$(awk -F '\t' -v ticket="$ticket_id" '$2 == ticket { print $3 }' \
+        "$CURRENT_CASE/state-events.tsv" | paste -sd, -)
+    [[ "$actual" == 'starting,delivering,delivered-awaiting-claim,owned' ]] \
+        || fail "$ticket_id state sequence was unexpected: $actual"
+}
+
+assert_no_duplicate_injection() {
+    local ticket_id=$1
+    local marker="LISA_ASSIGNMENT {\"ticket_id\":\"$ticket_id\""
+    awk -v marker="$marker" '
+        function finish_screen() { if (count > 1) bad = 1 }
+        /^===== / { finish_screen(); count = 0; next }
+        index($0, marker) { count++ }
+        END { finish_screen(); exit bad }
+    ' "$CURRENT_CASE/terminal-snapshots-$ticket_id.txt" \
+        || fail "$ticket_id displayed more than one tagged assignment in one screen"
+}
+
+assert_current_ticket() {
+    local ticket_id=$1
+    local work="$CURRENT_ROOT/.lisa/attempts/$ticket_id/1/work"
+    local launch_scripts=() assignments=()
+    local path
+    while IFS= read -r path; do launch_scripts+=("$path"); done < <(
+        find "$work" -name '.lisa-launch-*.sh' -type f | sort
+    )
+    while IFS= read -r path; do assignments+=("$path"); done < <(
+        find "$work" -name 'assignment-1-*.md' -type f | sort
+    )
+    (( ${#launch_scripts[@]} == 1 )) \
+        || fail "$ticket_id expected one launch script, found ${#launch_scripts[@]}"
+    (( ${#assignments[@]} == 1 )) \
+        || fail "$ticket_id expected one nonce assignment, found ${#assignments[@]}"
+    grep -Fq ' launch-codex' "${launch_scripts[0]}" \
+        || fail "$ticket_id launch did not invoke launch-codex"
+    local pane_assignment_path=${assignments[0]#"$CURRENT_ROOT"/}
+    grep -Fq "$pane_assignment_path" "${launch_scripts[0]}" \
+        || fail "$ticket_id launch did not carry the exact assignment path"
+
+    local nonce=${assignments[0]##*-}
+    nonce=${nonce%.md}
+    local ticket_claims=0 exact_claims=0 claim
+    while IFS= read -r claim; do
+        if jq -e --arg ticket "$ticket_id" \
+            '.ticket_id == $ticket and .attempt_id == 1' "$claim" >/dev/null 2>&1; then
+            ticket_claims=$((ticket_claims + 1))
+            if grep -Fq "\"nonce\":$nonce" "$claim"; then
+                exact_claims=$((exact_claims + 1))
+            fi
+        fi
+    done < <(find "$CURRENT_CASE/captured-signals" -type f -name '*-pane-*.claim' -print)
+    (( ticket_claims == 1 && exact_claims == 1 )) \
+        || fail "$ticket_id expected one exact captured claim, found $exact_claims of $ticket_claims"
+
+    assert_exact_state_sequence "$ticket_id"
+    assert_no_duplicate_injection "$ticket_id"
+    local role
+    for role in launcher codex; do
+        local process_count
+        process_count=$(awk -F '\t' -v ticket="$ticket_id" -v role="$role" \
+            '$2 == ticket && $3 == role { count++ } END { print count + 0 }' \
+            "$CURRENT_CASE/process-events.tsv")
+        (( process_count == 1 )) \
+            || fail "$ticket_id expected one $role process, found $process_count"
+        awk -F '\t' -v ticket="$ticket_id" -v role="$role" \
+            '$2 == ticket && $3 == role && index($6, ".lisa/attempts/" ticket "/1/work/assignment-1-") { found=1 } END { exit !found }' \
+            "$CURRENT_CASE/process-events.tsv" \
+            || fail "$ticket_id $role process did not carry its exact assignment"
+    done
+}
+
+captured_lease_exists() {
+    local ticket_id=$1
+    local lease
+    while IFS= read -r lease; do
+        jq -e --arg ticket "$ticket_id" \
+            '.ticket_id == $ticket and .attempt_id == 1' "$lease" >/dev/null 2>&1 \
+            && return 0
+    done < <(find "$CURRENT_CASE/captured-signals" -type f -name '*-pane-*.lease' -print)
+    return 1
+}
+
+assert_fresh_boundary() {
+    local primary_launcher successor_launcher primary_codex successor_codex
+    primary_launcher=$(awk -F '\t' -v ticket="$PRIMARY_TICKET_ID" \
+        '$2 == ticket && $3 == "launcher" { print $4 }' "$CURRENT_CASE/process-events.tsv")
+    successor_launcher=$(awk -F '\t' -v ticket="$SUCCESSOR_TICKET_ID" \
+        '$2 == ticket && $3 == "launcher" { print $4 }' "$CURRENT_CASE/process-events.tsv")
+    primary_codex=$(awk -F '\t' -v ticket="$PRIMARY_TICKET_ID" \
+        '$2 == ticket && $3 == "codex" { print $4 }' "$CURRENT_CASE/process-events.tsv")
+    successor_codex=$(awk -F '\t' -v ticket="$SUCCESSOR_TICKET_ID" \
+        '$2 == ticket && $3 == "codex" { print $4 }' "$CURRENT_CASE/process-events.tsv")
+    [[ -n "$primary_launcher" && "$primary_launcher" != "$successor_launcher" ]] \
+        || fail "successor did not receive a fresh Lisa launcher process"
+    [[ -n "$primary_codex" && "$primary_codex" != "$successor_codex" ]] \
+        || fail "successor did not receive a fresh Codex process"
+
+    captured_lease_exists "$PRIMARY_TICKET_ID" \
+        || fail "predecessor lease body was not captured"
+    captured_lease_exists "$SUCCESSOR_TICKET_ID" \
+        || fail "successor lease body was not captured"
+    local ticket_id pane_id
+    for ticket_id in "${TICKET_IDS[@]}"; do
+        pane_id=$(awk -F '\t' -v ticket="$ticket_id" \
+            '$3 == "present" && $4 == ticket && $5 == 1 { print $2; exit }' \
+            "$CURRENT_CASE/lease-events.tsv")
+        [[ -n "$pane_id" ]] || fail "$ticket_id live pane lease identity was not observed"
+        jq -e --argjson pane "$pane_id" \
+            'any(.[]; .is_plugin == false and .id == $pane and (.title | contains("idle")))' \
+            "$CURRENT_CASE/panes-final.json" >/dev/null \
+            || fail "$ticket_id terminal pane did not return to an idle shell boundary"
+    done
+
+    [[ -s "$CURRENT_CASE/stale-claim.status" ]] \
+        || fail "stale successor claim status was not recorded"
+    [[ "$(<"$CURRENT_CASE/stale-claim.status")" != 0 ]] \
+        || fail "stale successor claim was accepted"
+    grep -Fq 'claim rejected [stale-attempt]' "$CURRENT_CASE/stale-claim.stderr" \
+        || fail "stale successor claim lacked the stable rejection reason"
+    [[ ! -s "$CURRENT_CASE/stale-claim.stdout" ]] \
+        || fail "stale successor claim unexpectedly wrote an acceptance receipt"
+    local claim
+    while IFS= read -r claim; do
+        if jq -e '.attempt_id == 0' "$claim" >/dev/null 2>&1; then
+            fail "stale attempt-zero claim was unexpectedly published"
+            return 1
+        fi
+    done < <(find "$CURRENT_CASE/captured-signals" -type f -name '*-pane-*.claim' -print)
+}
+
+assignment_processes_exited() {
+    local pid
+    while IFS= read -r pid; do
+        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+            return 1
+        fi
+    done < <(awk -F '\t' '$3 == "launcher" || $3 == "codex" { print $4 }' \
+        "$CURRENT_CASE/process-events.tsv")
+    return 0
+}
+
+assert_exact_completions() {
+    local journal="$CURRENT_CASE/completion-journal.jsonl"
+    local provenance="$CURRENT_CASE/provenance.jsonl"
+    [[ -s "$journal" ]] || fail "current completion journal was not captured"
+    [[ -s "$provenance" ]] || fail "current provenance ledger was not captured"
+    local ticket_id
+    for ticket_id in "${TICKET_IDS[@]}"; do
+        jq -s -e --arg ticket "$ticket_id" '
+            ([.[] | select(.completion_id == $ticket and .state == "requested")] | length) == 1 and
+            ([.[] | select(.completion_id == $ticket and .state == "command-in-flight")] | length) == 1 and
+            ([.[] | select(.completion_id == $ticket and .state == "confirmed")] | length) == 1 and
+            all(.[] | select(.completion_id == $ticket); .attempt_id == "1" and .generation == 1) and
+            all(.[] | select(.completion_id == $ticket and .state == "confirmed");
+                .commit_id | test("^[0-9a-f]{40}$"))
+        ' "$journal" >/dev/null \
+            || fail "$ticket_id did not have exactly one valid completion transaction"
+        jq -s -e --arg ticket "$ticket_id" '
+            ([.[] | select(.ticket_id == $ticket)] | length) == 1 and
+            all(.[] | select(.ticket_id == $ticket);
+                .attempt_lease.attempt_id == 1 and
+                .outcome == "done" and
+                .authoritative == true and
+                .fenced == false and
+                .actual.method == "codex")
+        ' "$provenance" >/dev/null \
+            || fail "$ticket_id did not have one authoritative Codex Done provenance row"
+    done
+    jq -s -e --arg primary "$PRIMARY_TICKET_ID" --arg successor "$SUCCESSOR_TICKET_ID" \
+        '[.[] | select(.completion_id == $primary or .completion_id == $successor)] | length == 6' \
+        "$journal" >/dev/null \
+        || fail "current case did not contain exactly two completion triples"
+    jq -s -e --arg primary "$PRIMARY_TICKET_ID" --arg successor "$SUCCESSOR_TICKET_ID" \
+        '[.[] | select(.ticket_id == $primary or .ticket_id == $successor)] | length == 2' \
+        "$provenance" >/dev/null \
+        || fail "current case did not contain exactly two completion provenance rows"
 }
 
 run_legacy_case() {
@@ -527,11 +936,13 @@ run_legacy_case() {
     echo "legacy: launching $CURRENT_SESSION"
     start_loop "$LEGACY_LISA_BIN"
     start_sampler
-    wait_until 90 "legacy false delivery failure" state_was_seen "FAILED $TICKET_ID"
+    wait_until 90 "legacy false delivery failure" \
+        state_was_seen "$PRIMARY_TICKET_ID" FAILED
     stop_sampler
     capture_fixture_evidence
     local launch_script
-    launch_script=$(find "$CURRENT_ROOT/.lisa/attempts/$TICKET_ID" -name '.lisa-launch-*.sh' \
+    launch_script=$(find "$CURRENT_ROOT/.lisa/attempts/$PRIMARY_TICKET_ID" \
+        -name '.lisa-launch-*.sh' \
         -type f -print -quit)
     [[ -f "$launch_script" ]] || fail "legacy case did not publish a launch script"
     grep -Fq ' codex --dangerously-bypass-approvals-and-sandbox' "$launch_script" \
@@ -539,10 +950,11 @@ run_legacy_case() {
     if grep -Fq 'launch-codex' "$launch_script"; then
         fail "legacy launch unexpectedly used the current native launcher"
     fi
-    if claim_was_captured; then
+    if claim_was_captured "$PRIMARY_TICKET_ID"; then
         fail "legacy case unexpectedly published an assignment claim"
     fi
-    if find "$CURRENT_ROOT/.lisa/attempts/$TICKET_ID" -name review.md -type f -print -quit \
+    if find "$CURRENT_ROOT/.lisa/attempts/$PRIMARY_TICKET_ID" \
+        -name review.md -type f -print -quit \
         | grep -q .; then
         fail "legacy attempt wrote Review output before false failure was captured"
     fi
@@ -555,11 +967,25 @@ run_current_case() {
     echo "current: launching $CURRENT_SESSION"
     start_loop "$CURRENT_LISA_BIN"
     start_sampler
-    wait_until 90 "current delivered-awaiting-claim state" \
-        state_was_seen delivered-awaiting-claim
-    wait_until 30 "current exact claim signal capture" claim_was_captured
-    wait_until 30 "current claim-owned seat" state_was_seen owned
-    wait_until "$FIELD_TIMEOUT_SECS" "current Review ticket completion" ticket_is_done
+    wait_until 90 "primary delivered-awaiting-claim state" \
+        state_was_seen "$PRIMARY_TICKET_ID" delivered-awaiting-claim
+    wait_until 30 "primary exact claim signal capture" \
+        claim_was_captured "$PRIMARY_TICKET_ID"
+    wait_until 30 "primary claim-owned seat" \
+        state_was_seen "$PRIMARY_TICKET_ID" owned
+    wait_until "$FIELD_TIMEOUT_SECS" "primary Review ticket completion" \
+        ticket_is_done "$PRIMARY_TICKET_ID"
+    wait_until 90 "successor delivered-awaiting-claim state" \
+        state_was_seen "$SUCCESSOR_TICKET_ID" delivered-awaiting-claim
+    wait_until 10 "stale successor claim rejection" \
+        test -f "$CURRENT_CASE/.stale-probe-complete"
+    wait_until 30 "successor exact claim signal capture" \
+        claim_was_captured "$SUCCESSOR_TICKET_ID"
+    wait_until 30 "successor claim-owned seat" \
+        state_was_seen "$SUCCESSOR_TICKET_ID" owned
+    wait_until "$FIELD_TIMEOUT_SECS" "both current Review ticket completions" \
+        all_current_tickets_are_done
+    wait_until 30 "both completed Codex process trees to exit" assignment_processes_exited
     sleep 1
     stop_sampler
     capture_fixture_evidence
@@ -567,27 +993,16 @@ run_current_case() {
         "$CURRENT_CASE/dashboard-snapshots.txt"; then
         fail "current path exposed a delivery or claim failure"
     fi
-    local launch_scripts=() assignments=()
-    while IFS= read -r path; do launch_scripts+=("$path"); done < <(
-        find "$CURRENT_ROOT/.lisa/attempts/$TICKET_ID/1/work" -name '.lisa-launch-*.sh' -type f | sort
-    )
-    while IFS= read -r path; do assignments+=("$path"); done < <(
-        find "$CURRENT_ROOT/.lisa/attempts/$TICKET_ID/1/work" -name 'assignment-1-*.md' -type f | sort
-    )
-    (( ${#launch_scripts[@]} == 1 )) \
-        || fail "current case expected one attempt-one launch script, found ${#launch_scripts[@]}"
-    (( ${#assignments[@]} == 1 )) \
-        || fail "current case expected one nonce assignment, found ${#assignments[@]}"
-    grep -Fq ' launch-codex' "${launch_scripts[0]}" \
-        || fail "current launch did not invoke launch-codex"
-    local pane_assignment_path=${assignments[0]#"$CURRENT_ROOT"/}
-    grep -Fq "$pane_assignment_path" "${launch_scripts[0]}" \
-        || fail "current launch did not carry the exact assignment path"
-    jq -e --arg ticket "$TICKET_ID" \
-        'select(.ticket_id == $ticket and .attempt_id == 1 and (.nonce | type == "number"))' \
-        "$CURRENT_CASE"/captured-signals/*-pane-*.claim >/dev/null \
-        || fail "captured claim did not name the exact ticket and attempt"
-    printf 'current-claim-delivery: OBSERVED\n' | tee "$CURRENT_CASE/result.txt"
+    assert_current_ticket "$PRIMARY_TICKET_ID"
+    assert_current_ticket "$SUCCESSOR_TICKET_ID"
+    assert_fresh_boundary
+    assert_exact_completions
+    {
+        printf 'current-slow-claim-no-reinjection: ASSERTED\n'
+        printf 'current-stale-claim: REJECTED\n'
+        printf 'current-fresh-tui-boundary: ASSERTED\n'
+        printf 'current-exact-completions: ASSERTED\n'
+    } | tee "$CURRENT_CASE/result.txt"
     stop_case
 }
 
