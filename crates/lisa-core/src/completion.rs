@@ -9,6 +9,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::disposition::ReviewDisposition;
+
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -59,6 +61,28 @@ string_id!(
     /// Correlates an asynchronous command launch with its result.
     CorrelationId
 );
+
+/// A completion artifact admitted as belonging to the authoritative attempt.
+///
+/// The adapter is responsible for checking the current lease before creating
+/// this value. Reconciliation consumes the admitted fact without depending on
+/// scheduler or filesystem types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentLeaseArtifactAdmission {
+    /// Attempt whose artifact passed the lease boundary.
+    pub attempt_id: AttemptId,
+    /// Completion aggregate associated with the admitted artifact.
+    pub completion_id: CompletionId,
+}
+
+/// Durable facts from which completion eligibility is re-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCompletionInputs {
+    /// Current-attempt artifact admission, absent until authority is proven.
+    pub artifact_admission: Option<CurrentLeaseArtifactAdmission>,
+    /// Fail-closed Review verdict parsed at the adapter boundary.
+    pub disposition: ReviewDisposition,
+}
 
 /// Whether a rejected completion can be retried without operator action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -223,6 +247,20 @@ pub struct Transition {
     pub state: CompletionState,
     /// The only external command requested by the transition, if any.
     pub effect: Option<EffectCommand>,
+}
+
+/// One level-triggered completion reconciliation decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciliation {
+    /// The durable obligation requests one external command.
+    Effect(EffectCommand),
+    /// No new action is required.
+    None,
+    /// A launched command remains unresolved and needs bounded intervention.
+    CommandInFlightActionRequired {
+        /// Identity of the exact unresolved command.
+        correlation: CorrelationId,
+    },
 }
 
 /// Fold one typed event through the completion aggregate.
@@ -419,13 +457,58 @@ pub fn reduce(
     }
 }
 
+/// Re-derive the completion obligation from durable facts and aggregate state.
+///
+/// Repeated calls remain level-triggered: eligible durable facts request a
+/// launch whenever no pending, confirmed, or action-required transaction state
+/// suppresses it. This function returns inert decision data and performs no I/O.
+pub fn reconcile(
+    durable_inputs: &DurableCompletionInputs,
+    state: &CompletionState,
+) -> Reconciliation {
+    match state {
+        CompletionState::CommandInFlight { correlation } => {
+            return Reconciliation::CommandInFlightActionRequired {
+                correlation: correlation.clone(),
+            };
+        }
+        CompletionState::Requested
+        | CompletionState::Confirmed
+        | CompletionState::Rejected {
+            retryability: Retryability::ActionRequired,
+            ..
+        } => return Reconciliation::None,
+        CompletionState::Eligible
+        | CompletionState::Rejected {
+            retryability: Retryability::Retryable,
+            ..
+        } => {}
+    }
+
+    let Some(admission) = durable_inputs.artifact_admission.as_ref() else {
+        return Reconciliation::None;
+    };
+    if !matches!(durable_inputs.disposition, ReviewDisposition::Pass) {
+        return Reconciliation::None;
+    }
+
+    Reconciliation::Effect(request_effect(
+        admission.attempt_id.clone(),
+        admission.completion_id.clone(),
+    ))
+}
+
 fn request_transition(attempt_id: AttemptId, completion_id: CompletionId) -> Transition {
     Transition {
         state: CompletionState::Requested,
-        effect: Some(EffectCommand::LaunchCompletion {
-            attempt_id,
-            completion_id,
-        }),
+        effect: Some(request_effect(attempt_id, completion_id)),
+    }
+}
+
+fn request_effect(attempt_id: AttemptId, completion_id: CompletionId) -> EffectCommand {
+    EffectCommand::LaunchCompletion {
+        attempt_id,
+        completion_id,
     }
 }
 
@@ -530,6 +613,123 @@ mod tests {
 
         assert_eq!(requested.effect, Some(effect));
         assert_eq!(confirmed.effect, None);
+    }
+
+    fn eligible_durable_inputs() -> DurableCompletionInputs {
+        DurableCompletionInputs {
+            artifact_admission: Some(CurrentLeaseArtifactAdmission {
+                attempt_id: AttemptId::new("attempt-1"),
+                completion_id: CompletionId::new("completion-1"),
+            }),
+            disposition: ReviewDisposition::Pass,
+        }
+    }
+
+    #[test]
+    fn reconcile_eligible_durable_inputs_returns_the_request_effect() {
+        assert_eq!(
+            reconcile(&eligible_durable_inputs(), &CompletionState::Eligible),
+            Reconciliation::Effect(EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new("attempt-1"),
+                completion_id: CompletionId::new("completion-1"),
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_missing_artifact_admission_is_ineligible() {
+        let inputs = DurableCompletionInputs {
+            artifact_admission: None,
+            disposition: ReviewDisposition::Pass,
+        };
+
+        assert_eq!(
+            reconcile(&inputs, &CompletionState::Eligible),
+            Reconciliation::None
+        );
+    }
+
+    #[test]
+    fn reconcile_non_passing_dispositions_are_ineligible() {
+        for disposition in [
+            ReviewDisposition::Block {
+                reason: "fix the failing test".into(),
+            },
+            ReviewDisposition::Invalid {
+                reason: "missing reason field".into(),
+            },
+        ] {
+            let inputs = DurableCompletionInputs {
+                disposition,
+                ..eligible_durable_inputs()
+            };
+
+            assert_eq!(
+                reconcile(&inputs, &CompletionState::Eligible),
+                Reconciliation::None
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_pending_and_confirmed_transactions_return_none() {
+        for state in [CompletionState::Requested, CompletionState::Confirmed] {
+            assert_eq!(
+                reconcile(&eligible_durable_inputs(), &state),
+                Reconciliation::None
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_retries_only_retryable_rejections() {
+        let reason = CompletionRejection::LaunchFailed {
+            source: LaunchFailure::new("commit unavailable"),
+        };
+
+        assert_eq!(
+            reconcile(
+                &eligible_durable_inputs(),
+                &CompletionState::Rejected {
+                    reason: reason.clone(),
+                    retryability: Retryability::Retryable,
+                },
+            ),
+            Reconciliation::Effect(EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new("attempt-1"),
+                completion_id: CompletionId::new("completion-1"),
+            })
+        );
+        assert_eq!(
+            reconcile(
+                &eligible_durable_inputs(),
+                &CompletionState::Rejected {
+                    reason,
+                    retryability: Retryability::ActionRequired,
+                },
+            ),
+            Reconciliation::None
+        );
+    }
+
+    #[test]
+    fn reconcile_in_flight_is_bounded_and_correlation_tagged() {
+        let state = CompletionState::CommandInFlight {
+            correlation: CorrelationId::new("command-17"),
+        };
+        let inputs = DurableCompletionInputs {
+            artifact_admission: None,
+            disposition: ReviewDisposition::Invalid {
+                reason: "durable inputs unavailable during recovery".into(),
+            },
+        };
+
+        assert_eq!(
+            reconcile(&inputs, &state),
+            Reconciliation::CommandInFlightActionRequired {
+                correlation: CorrelationId::new("command-17"),
+            }
+        );
     }
 
     #[test]
