@@ -30,6 +30,7 @@ use deadline::{
     StaleInput, SystemClock, TransitionAction, TransitionInput, TransitionPolicy,
 };
 
+use lisa_core::capture::CaptureRecord;
 use lisa_core::client::AgentClient;
 use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
@@ -4910,7 +4911,7 @@ impl State {
     /// fabricate usage. Capture rows contain no dollar-cost observation, so
     /// `cost_usd` remains `None`.
     fn read_usage(
-        &self,
+        &mut self,
         client: AgentClient,
         current: &ProvenanceRecord,
     ) -> (Option<u64>, Option<u64>, Option<f64>) {
@@ -4938,18 +4939,37 @@ impl State {
             .unwrap_or_default();
 
         let mut totals = None;
-        for capture in raw
-            .lines()
-            .filter_map(|line| serde_json::from_str::<lisa_core::capture::CaptureRecord>(line).ok())
-        {
-            if capture.pane_id != current.pane_id
-                || ownership::owner_at(
-                    prior_records.iter().chain(std::iter::once(current)),
-                    capture.pane_id,
-                    capture.captured_at,
-                ) != Some(current.ticket_id.as_str())
-            {
+        for (source_index, line) in raw.lines().enumerate() {
+            let Ok(capture) = serde_json::from_str::<CaptureRecord>(line) else {
                 continue;
+            };
+            if capture.pane_id != current.pane_id || capture.captured_at > current.ended_at {
+                continue;
+            }
+
+            match ownership::owner_at(
+                prior_records.iter().chain(std::iter::once(current)),
+                capture.pane_id,
+                capture.captured_at,
+            ) {
+                Some(owner) if owner == current.ticket_id.as_str() => {}
+                Some(_) => continue,
+                None => {
+                    let Some(source_line) = u64::try_from(source_index)
+                        .ok()
+                        .and_then(|index| index.checked_add(1))
+                    else {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "usage capture quarantine failed: {} capture ledger line is not representable as u64",
+                                client
+                            ),
+                        });
+                        break;
+                    };
+                    self.quarantine_capture(client, source_line, &capture);
+                    continue;
+                }
             }
 
             let (input_tokens, output_tokens) = totals.unwrap_or((0_u64, 0_u64));
@@ -4965,6 +4985,51 @@ impl State {
         match totals {
             Some((input_tokens, output_tokens)) => (Some(input_tokens), Some(output_tokens), None),
             None => (None, None, None),
+        }
+    }
+
+    /// Persist one valid capture that has no unique pane-time owner and make
+    /// that quarantine visible without assigning its tokens to any ticket.
+    fn quarantine_capture(
+        &mut self,
+        client: AgentClient,
+        source_line: u64,
+        capture: &CaptureRecord,
+    ) {
+        let provider_dir = match client {
+            AgentClient::Codex => self.codex_dir.clone(),
+            AgentClient::Claude => self.claude_dir.clone(),
+        };
+        let path = quarantine::session_path(&provider_dir, &capture.session_id);
+
+        match quarantine::append(&provider_dir, source_line, capture) {
+            Ok(quarantine::AppendOutcome::Appended(path)) => {
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!(
+                        "usage capture quarantined: client={} session={:?} pane=#{} captured_at={} path={}",
+                        client,
+                        capture.session_id,
+                        capture.pane_id,
+                        capture.captured_at,
+                        path.display(),
+                    ),
+                });
+            }
+            Ok(quarantine::AppendOutcome::AlreadyPresent(_)) => {}
+            Err(error) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "usage capture quarantine failed: client={} session={:?} pane=#{} captured_at={} source_line={} path={}: {}",
+                        client,
+                        capture.session_id,
+                        capture.pane_id,
+                        capture.captured_at,
+                        source_line,
+                        path.display(),
+                        error,
+                    ),
+                });
+            }
         }
     }
 
@@ -17983,6 +18048,10 @@ owned\n\
         };
         let (tokens_in, tokens_out, cost_usd) =
             state.read_usage(AgentClient::Codex, &a_without_usage);
+        assert!(
+            !state.codex_dir.join("quarantine").exists(),
+            "captures after A's closed interval must remain pending for B"
+        );
         let a_record = ProvenanceRecord {
             tokens_in,
             tokens_out,
@@ -18014,6 +18083,125 @@ owned\n\
         assert_eq!(records[1].ticket_id, TICKET_B);
         assert_eq!(records[1].tokens_in, Some(300));
         assert_eq!(records[1].tokens_out, Some(100));
+    }
+
+    /// T-043-03-02 AC: a valid capture with no pane-time owner is held in its
+    /// session's quarantine and surfaced as a visible warning, never usage.
+    #[test]
+    fn provenance_unattributable_capture_is_quarantined_by_session_and_visible() {
+        use lisa_core::capture::{append_capture_record, CaptureRecord};
+
+        const PANE_ID: u32 = 7;
+        const SESSION_ID: &str = "session-unowned";
+
+        let (mut state, dir) = codex_state_with_dag();
+        with_ledger(&mut state, &dir);
+        let capture = CaptureRecord {
+            pane_id: PANE_ID,
+            session_id: SESSION_ID.to_string(),
+            captured_at: 150,
+            input_tokens: 999,
+            output_tokens: 111,
+        };
+        append_capture_record(&state.codex_dir.join("captures.jsonl"), &capture).unwrap();
+
+        let route = Route::from_client(AgentClient::Codex);
+        let current = ProvenanceRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            ticket_id: "T-CDX-01".to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: "T-CDX-01".to_string(),
+                attempt_id: 1,
+            },
+            outcome: RunOutcome::Done,
+            authoritative: true,
+            fenced: false,
+            requested: route.clone(),
+            actual: route,
+            started_at: 200,
+            ended_at: 300,
+            wall_clock_secs: 100,
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            concurrency_at_spawn: 0,
+            pane_id: PANE_ID,
+        };
+
+        assert_eq!(
+            state.read_usage(AgentClient::Codex, &current),
+            (None, None, None),
+            "unowned tokens must not blend into the current ticket"
+        );
+
+        let quarantine_path = quarantine::session_path(&state.codex_dir, SESSION_ID);
+        let rows: Vec<quarantine::QuarantinedCaptureRecord> =
+            std::fs::read_to_string(&quarantine_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            rows,
+            vec![quarantine::QuarantinedCaptureRecord {
+                source_line: 1,
+                capture: capture.clone(),
+            }]
+        );
+        assert!(
+            !state.codex_dir.join("quarantine.jsonl").exists(),
+            "quarantine must not use a provider-wide shared bucket"
+        );
+        assert!(!state.codex_dir.join("last").exists());
+        assert!(!state.codex_dir.join("last.usage.json").exists());
+
+        let warning = state
+            .activity_log
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::Warning { message }
+                        if message.contains("usage capture quarantined")
+                            && message.contains(SESSION_ID)
+                )
+            })
+            .expect("new quarantine should raise an activity warning");
+        let entry = activity_event_to_ui_entry(warning)
+            .expect("quarantine warning should be visible in the dashboard activity feed");
+        assert!(matches!(
+            entry.activity,
+            ui::ActivityType::Warning { message, .. }
+                if message.contains("usage capture quarantined")
+                    && message.contains(SESSION_ID)
+        ));
+
+        assert_eq!(
+            state.read_usage(AgentClient::Codex, &current),
+            (None, None, None)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&quarantine_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a rescan must not duplicate the quarantined row"
+        );
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ActivityEvent::Warning { message }
+                        if message.contains("usage capture quarantined")
+                            && message.contains(SESSION_ID)
+                ))
+                .count(),
+            1,
+            "a rescan must not repeat the operator warning"
+        );
     }
 
     /// AC: Claude records carry null cost/tokens until T-027-02 (no artifact).
