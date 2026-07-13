@@ -12933,7 +12933,6 @@ mod tests {
 
     #[test]
     fn codex_completion_exits_revokes_and_launches_next_fresh_tui() {
-        use lisa_core::types::ThreadStatus;
         use std::fs;
 
         const PREDECESSOR: &str = "T-BOUNDARY-01";
@@ -12942,6 +12941,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tickets_dir = dir.path().join("tickets");
+        let completion_journal = dir.path().join("completion-journal.jsonl");
+        let provenance_ledger = dir.path().join("provenance.jsonl");
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join(format!("{PREDECESSOR}.md")),
@@ -12971,8 +12972,13 @@ mod tests {
                 assignment_ack_timeout_secs: 1,
                 ..PluginConfig::new()
             },
+            project_root: dir.path().to_path_buf(),
+            git_root: dir.path().to_path_buf(),
             signal_dir: dir.path().join("signals"),
             attempt_dir: dir.path().join("attempts"),
+            ledger_path: provenance_ledger.clone(),
+            completion_journal_path: completion_journal.clone(),
+            completion_journal_healthy: true,
             permissions_granted: true,
             slots_discovered: true,
             ..State::default()
@@ -13012,12 +13018,114 @@ mod tests {
             predecessor_claim.attempt_id, predecessor_claim.nonce
         );
 
-        ticket::update_ticket_done(tickets_dir.join(format!("{PREDECESSOR}.md"))).unwrap();
+        ticket::update_ticket_phase(tickets_dir.join(format!("{PREDECESSOR}.md")), Phase::Review)
+            .unwrap();
         refresh_fixture_dag(&mut state);
-        state.threads.get_mut(PREDECESSOR).unwrap().complete();
-        assert_eq!(state.threads[PREDECESSOR].status, ThreadStatus::Completed);
-        state.release_completed_slot_for_ticket(&PREDECESSOR.to_string());
-        state.threads.remove(PREDECESSOR);
+        state.threads.get_mut(PREDECESSOR).unwrap().current_phase = Phase::Review;
+        let predecessor_work = state.attempt_work_dir(&predecessor_lease);
+        fs::create_dir_all(&predecessor_work).unwrap();
+        fs::write(
+            predecessor_work.join("review.md"),
+            "# Review\n\nThe claimed Codex attempt is ready to complete.\n",
+        )
+        .unwrap();
+        write_passing_review_disposition(&state, &predecessor_lease);
+
+        state.check_artifact_advances();
+        let pending = state.pending_completions[PREDECESSOR].clone();
+        assert_eq!(pending.source, CompletionSource::Artifact);
+        assert_eq!(
+            pending.authority,
+            CompletionAuthority::Attempt(predecessor_lease.clone())
+        );
+        assert_eq!(
+            state.launched_completion_effects,
+            vec![EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new(predecessor_lease.attempt_id.to_string()),
+                completion_id: CompletionId::new(PREDECESSOR),
+            }]
+        );
+        let in_flight_journal = fs::read_to_string(&completion_journal).unwrap();
+        assert_eq!(in_flight_journal.lines().count(), 2);
+        assert_eq!(
+            in_flight_journal.matches("\"state\":\"requested\"").count(),
+            1
+        );
+        assert_eq!(
+            in_flight_journal
+                .matches("\"state\":\"command-in-flight\"")
+                .count(),
+            1
+        );
+
+        state.check_artifact_advances();
+        assert!(!state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: PREDECESSOR.to_string(),
+            source_lease: predecessor_lease.clone(),
+        }));
+        assert_eq!(state.launched_completion_effects.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&completion_journal).unwrap(),
+            in_flight_journal,
+            "repeated Review evidence must not inject another completion command"
+        );
+
+        ticket::update_ticket_done(tickets_dir.join(format!("{PREDECESSOR}.md"))).unwrap();
+        let commit_id = vec![b'c'; 40];
+        state.handle_completion_result(PREDECESSOR, Some(0), commit_id.clone(), Vec::new());
+
+        assert!(!state.pending_completions.contains_key(PREDECESSOR));
+        assert!(!state.threads.contains_key(PREDECESSOR));
+        let aggregate = &state.completion_aggregates[PREDECESSOR];
+        assert_eq!(aggregate.completion_key(), &pending.completion_key);
+        assert_eq!(aggregate.state(), &CompletionState::Confirmed);
+        assert_eq!(
+            aggregate.confirmed_commit_id(),
+            Some(String::from_utf8_lossy(&commit_id).as_ref())
+        );
+
+        let confirmed_journal = fs::read_to_string(&completion_journal).unwrap();
+        let confirmed_provenance = fs::read_to_string(&provenance_ledger).unwrap();
+        state.handle_completion_result(PREDECESSOR, Some(0), commit_id, Vec::new());
+        assert_eq!(
+            fs::read_to_string(&completion_journal).unwrap(),
+            confirmed_journal,
+            "duplicate result delivery must not append a second confirmation"
+        );
+        assert_eq!(
+            fs::read_to_string(&provenance_ledger).unwrap(),
+            confirmed_provenance,
+            "duplicate result delivery must not append a second completion record"
+        );
+        assert_eq!(state.launched_completion_effects.len(), 1);
+        assert_eq!(confirmed_journal.lines().count(), 3);
+        assert_eq!(
+            confirmed_journal.matches("\"state\":\"requested\"").count(),
+            1
+        );
+        assert_eq!(
+            confirmed_journal
+                .matches("\"state\":\"command-in-flight\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            confirmed_journal.matches("\"state\":\"confirmed\"").count(),
+            1
+        );
+        let completion_records = read_ledger(&provenance_ledger);
+        assert_eq!(completion_records.len(), 1);
+        assert_eq!(completion_records[0].ticket_id, PREDECESSOR);
+        assert_eq!(
+            completion_records[0].attempt_lease,
+            predecessor_lease.clone()
+        );
+        assert_eq!(completion_records[0].outcome, RunOutcome::Done);
+        assert!(completion_records[0].authoritative);
+        assert!(!completion_records[0].fenced);
+        println!(
+            "T0450402|completion|ticket={PREDECESSOR}|effects=1|confirmed=1|authoritative=1|duplicate_result=ignored"
+        );
 
         assert_eq!(
             state.attempt_lifecycle,
