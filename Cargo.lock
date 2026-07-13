@@ -1586,6 +1586,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

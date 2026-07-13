@@ -1,4 +1,5 @@
 pub mod client;
+pub mod completion;
 pub mod dag;
 pub mod diagnostics;
 pub mod disposition;

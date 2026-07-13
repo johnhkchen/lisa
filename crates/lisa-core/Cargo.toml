@@ -15,6 +15,7 @@ readme = "../../README.md"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.9"
 serde_json = "1.0"
+thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
