@@ -41,8 +41,8 @@ use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
 use lisa_core::disposition::{parse_review_disposition, ReviewDisposition};
 use lisa_core::provenance::{
-    self, AssignmentState, AssignmentTransitionRecord, ProvenanceRecord, ProvenanceRecordType,
-    Route, RunOutcome,
+    self, AssignmentState, AssignmentTransitionRecord, ProvenanceLedgerRecord, ProvenanceRecord,
+    ProvenanceRecordType, Route, RunOutcome,
 };
 use lisa_core::ticket;
 use lisa_core::types::{
@@ -677,13 +677,12 @@ pub struct State {
     /// Latest typed completion aggregate state reconstructed from the journal.
     completion_aggregates: HashMap<TicketId, CompletionJournalAggregate>,
 
-    /// Directory native Codex usage capture (or the headless fallback) writes
-    /// artifacts into (`.lisa/codex/` under /host/).
+    /// Directory native Codex usage capture writes its append-only
+    /// `captures.jsonl` ledger into (`.lisa/codex/` under /host/).
     codex_dir: PathBuf,
 
-    /// Directory the Claude `Stop` hook's `lisa capture-usage` writes usage
-    /// artifacts into (`.lisa/claude/` under /host/). Read at teardown for Claude
-    /// tokens (T-027-02); same `{ ..., usage }` shape as the Codex artifact.
+    /// Directory the Claude `Stop` hook's `lisa capture-usage` writes its
+    /// append-only `captures.jsonl` ledger into (`.lisa/claude/` under /host/).
     claude_dir: PathBuf,
 
     /// Idle-without-artifact alerts detected during the current poll cycle.
@@ -4885,7 +4884,7 @@ impl State {
             concurrency_at_spawn: thread.concurrency_at_spawn,
             pane_id: thread.pane_id,
         };
-        let (tokens_in, tokens_out, cost_usd) = self.read_usage(client, ticket_id);
+        let (tokens_in, tokens_out, cost_usd) = self.read_usage(client, &record);
         let record = ProvenanceRecord {
             tokens_in,
             tokens_out,
@@ -4901,41 +4900,70 @@ impl State {
         true
     }
 
-    /// Read tokens/cost from a run's usage artifact, selecting the per-provider
-    /// directory by client:
-    /// - Codex → `.lisa/codex/<ticket>.usage.json` (written by the native Stop
-    ///   hook's `lisa capture-usage`, or by the JSON fallback).
-    /// - Claude → `.lisa/claude/<ticket>.usage.json` (written by the Stop hook's
-    ///   `lisa capture-usage`, T-027-02).
+    /// Sum capture rows uniquely owned by the current ticket's pane-time window.
     ///
-    /// Both writers emit the same `{ ..., usage: { input_tokens, output_tokens } }`
-    /// shape, so the read spine is shared. A run with no artifact (missing file,
-    /// bad JSON) yields all `None` — never fabricated. Claude carries no
-    /// `cost_usd`; that stays `None` (cost is derived downstream from tokens +
-    /// pricing, T-027-02 design).
+    /// Prior execution records provide durable ownership for recycled panes;
+    /// `current` closes the still-in-memory interval that has not been appended
+    /// yet. Assignment-transition rows never establish provider ownership. A
+    /// missing ledger, malformed row, or capture without a unique owner cannot
+    /// fabricate usage. Capture rows contain no dollar-cost observation, so
+    /// `cost_usd` remains `None`.
     fn read_usage(
         &self,
         client: AgentClient,
-        ticket_id: &str,
+        current: &ProvenanceRecord,
     ) -> (Option<u64>, Option<u64>, Option<f64>) {
         let dir = match client {
             AgentClient::Codex => &self.codex_dir,
             AgentClient::Claude => &self.claude_dir,
         };
-        let path = dir.join(format!("{}.usage.json", ticket_id));
-        let raw = match std::fs::read_to_string(&path) {
+        let raw = match std::fs::read_to_string(dir.join("captures.jsonl")) {
             Ok(s) => s,
             Err(_) => return (None, None, None),
         };
-        let value: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => return (None, None, None),
-        };
-        // The artifact is `{ key, thread_id, success, usage }`; the token/cost
-        // fields ride on the nested `usage` object.
-        match value.get("usage") {
-            Some(usage) if !usage.is_null() => provenance::extract_usage(usage),
-            _ => (None, None, None),
+
+        let prior_records: Vec<ProvenanceRecord> = std::fs::read_to_string(&self.ledger_path)
+            .ok()
+            .map(|ledger| {
+                ledger
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
+                    .filter_map(|record| match record {
+                        ProvenanceLedgerRecord::Execution(record) => Some(record),
+                        ProvenanceLedgerRecord::AssignmentTransition(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut totals = None;
+        for capture in raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<lisa_core::capture::CaptureRecord>(line).ok())
+        {
+            if capture.pane_id != current.pane_id
+                || ownership::owner_at(
+                    prior_records.iter().chain(std::iter::once(current)),
+                    capture.pane_id,
+                    capture.captured_at,
+                ) != Some(current.ticket_id.as_str())
+            {
+                continue;
+            }
+
+            let (input_tokens, output_tokens) = totals.unwrap_or((0_u64, 0_u64));
+            let Some(input_tokens) = input_tokens.checked_add(capture.input_tokens) else {
+                return (None, None, None);
+            };
+            let Some(output_tokens) = output_tokens.checked_add(capture.output_tokens) else {
+                return (None, None, None);
+            };
+            totals = Some((input_tokens, output_tokens));
+        }
+
+        match totals {
+            Some((input_tokens, output_tokens)) => (Some(input_tokens), Some(output_tokens), None),
+            None => (None, None, None),
         }
     }
 
@@ -17842,24 +17870,28 @@ owned\n\
         )));
     }
 
-    /// AC: Codex tokens flow from its usage artifact into the record.
+    /// AC: Codex captures flow into the owning provenance record.
     #[test]
     fn provenance_codex_usage_flows_into_record() {
+        use lisa_core::capture::{append_capture_record, CaptureRecord};
         use lisa_core::types::Thread;
-        use std::fs;
 
         let (mut state, dir) = codex_state_with_dag();
         let ledger = with_ledger(&mut state, &dir);
-        fs::create_dir_all(&state.codex_dir).unwrap();
-        fs::write(
-            state.codex_dir.join("T-CDX-01.usage.json"),
-            r#"{"key":"T-CDX-01","thread_id":"abc","success":true,
-                "usage":{"input_tokens":120,"output_tokens":34}}"#,
-        )
-        .unwrap();
 
         let mut thread = Thread::new("T-CDX-01", 1);
         thread.client = AgentClient::Codex;
+        append_capture_record(
+            &state.codex_dir.join("captures.jsonl"),
+            &CaptureRecord {
+                pane_id: thread.pane_id,
+                session_id: "codex-session".to_string(),
+                captured_at: provenance::system_time_to_epoch(std::time::SystemTime::now()),
+                input_tokens: 120,
+                output_tokens: 34,
+            },
+        )
+        .unwrap();
         state.threads.insert("T-CDX-01".to_string(), thread);
         install_current_attempt(&mut state, "T-CDX-01");
         state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
@@ -17871,6 +17903,116 @@ owned\n\
             records[0].cost_usd, None,
             "no cost field → null, never fabricated"
         );
+    }
+
+    /// T-043-03-01 AC: a physical pane recycled from A to B attributes each
+    /// capture to its pane-time owner, sums per ticket, and appends B without
+    /// rewriting A's terminal provenance row.
+    #[test]
+    fn provenance_recycled_pane_attributes_capture_sums_to_each_ticket() {
+        use lisa_core::capture::{append_capture_record, CaptureRecord};
+        use lisa_core::types::Thread;
+
+        const PANE_ID: u32 = 7;
+        const TICKET_A: &str = "T-CDX-01";
+        const TICKET_B: &str = "T-CDX-02";
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        let captures = state.codex_dir.join("captures.jsonl");
+        let now = provenance::system_time_to_epoch(std::time::SystemTime::now());
+        let a_started = now.saturating_sub(1_000);
+        let a_ended = now.saturating_sub(800);
+        let b_started = now.saturating_sub(600);
+
+        for capture in [
+            CaptureRecord {
+                pane_id: PANE_ID,
+                session_id: "session-a".to_string(),
+                captured_at: a_started + 50,
+                input_tokens: 10,
+                output_tokens: 3,
+            },
+            CaptureRecord {
+                pane_id: PANE_ID,
+                session_id: "session-a".to_string(),
+                captured_at: a_started + 100,
+                input_tokens: 20,
+                output_tokens: 7,
+            },
+            CaptureRecord {
+                pane_id: PANE_ID,
+                session_id: "session-b".to_string(),
+                captured_at: b_started + 50,
+                input_tokens: 100,
+                output_tokens: 40,
+            },
+            CaptureRecord {
+                pane_id: PANE_ID,
+                session_id: "session-b".to_string(),
+                captured_at: b_started + 100,
+                input_tokens: 200,
+                output_tokens: 60,
+            },
+        ] {
+            append_capture_record(&captures, &capture).unwrap();
+        }
+
+        let route = Route::from_client(AgentClient::Codex);
+        let a_without_usage = ProvenanceRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            ticket_id: TICKET_A.to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: TICKET_A.to_string(),
+                attempt_id: 1,
+            },
+            outcome: RunOutcome::Done,
+            authoritative: true,
+            fenced: false,
+            requested: route.clone(),
+            actual: route,
+            started_at: a_started,
+            ended_at: a_ended,
+            wall_clock_secs: a_ended.saturating_sub(a_started),
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            concurrency_at_spawn: 0,
+            pane_id: PANE_ID,
+        };
+        let (tokens_in, tokens_out, cost_usd) =
+            state.read_usage(AgentClient::Codex, &a_without_usage);
+        let a_record = ProvenanceRecord {
+            tokens_in,
+            tokens_out,
+            cost_usd,
+            ..a_without_usage
+        };
+        provenance::append_record(&ledger, &a_record).unwrap();
+
+        let after_a = read_ledger(&ledger);
+        assert_eq!(after_a.len(), 1);
+        assert_eq!(after_a[0].ticket_id, TICKET_A);
+        assert_eq!(after_a[0].tokens_in, Some(30));
+        assert_eq!(after_a[0].tokens_out, Some(10));
+
+        let mut b_thread = Thread::new(TICKET_B, PANE_ID);
+        b_thread.client = AgentClient::Codex;
+        b_thread.started_at = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(b_started))
+            .unwrap();
+        state.threads.insert(TICKET_B.to_string(), b_thread);
+        install_current_attempt(&mut state, TICKET_B);
+        assert!(state.emit_provenance(TICKET_B, RunOutcome::Done, false));
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records.len(), 2, "B must append rather than overwrite A");
+        assert_eq!(records[0].ticket_id, TICKET_A);
+        assert_eq!(records[0].tokens_in, Some(30));
+        assert_eq!(records[0].tokens_out, Some(10));
+        assert_eq!(records[1].ticket_id, TICKET_B);
+        assert_eq!(records[1].tokens_in, Some(300));
+        assert_eq!(records[1].tokens_out, Some(100));
     }
 
     /// AC: Claude records carry null cost/tokens until T-027-02 (no artifact).
@@ -17900,25 +18042,29 @@ owned\n\
         );
     }
 
-    /// T-027-02 AC: a Claude run's tokens flow from the `.lisa/claude` usage
-    /// artifact (written by the Stop hook's `capture-usage`) into the record;
-    /// `cost_usd` stays null (derived downstream, never fabricated).
+    /// T-027-02 AC: a Claude run's capture flows from `.lisa/claude` into the
+    /// record; `cost_usd` stays null (derived downstream, never fabricated).
     #[test]
     fn provenance_claude_usage_flows_into_record() {
+        use lisa_core::capture::{append_capture_record, CaptureRecord};
         use lisa_core::types::Thread;
-        use std::fs;
 
         let (mut state, dir) = codex_state_with_dag();
         let ledger = with_ledger(&mut state, &dir);
-        fs::create_dir_all(&state.claude_dir).unwrap();
-        fs::write(
-            state.claude_dir.join("T-CDX-01.usage.json"),
-            r#"{"key":"T-CDX-01","usage":{"input_tokens":167,"output_tokens":37}}"#,
-        )
-        .unwrap();
 
         let mut thread = Thread::new("T-CDX-01", 1);
         thread.client = AgentClient::Claude;
+        append_capture_record(
+            &state.claude_dir.join("captures.jsonl"),
+            &CaptureRecord {
+                pane_id: thread.pane_id,
+                session_id: "claude-session".to_string(),
+                captured_at: provenance::system_time_to_epoch(std::time::SystemTime::now()),
+                input_tokens: 167,
+                output_tokens: 37,
+            },
+        )
+        .unwrap();
         state.threads.insert("T-CDX-01".to_string(), thread);
         install_current_attempt(&mut state, "T-CDX-01");
         state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
