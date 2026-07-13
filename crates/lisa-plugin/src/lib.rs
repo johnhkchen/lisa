@@ -27,9 +27,10 @@ use deadline::{
 };
 
 use lisa_core::client::AgentClient;
+use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
     reduce as reduce_completion, AttemptId, CompletionEvent, CompletionGenerationId, CompletionId,
-    CompletionState, EffectCommand,
+    CompletionRejection, CompletionState, EffectCommand,
 };
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
@@ -40,7 +41,8 @@ use lisa_core::provenance::{
 };
 use lisa_core::ticket;
 use lisa_core::types::{
-    ActivityEvent, AttemptLease, Phase, PluginConfig, Thread, TicketId, TicketStatus,
+    ActivityEvent, AttemptLease, CompletionRejectionKind, Phase, PluginConfig, Thread, TicketId,
+    TicketStatus,
 };
 use pane_name::{format_pane_name, PaneName};
 use publication::{
@@ -1198,26 +1200,20 @@ impl State {
         &mut self,
         ticket_id: &str,
         source_lease: Option<&AttemptLease>,
-    ) -> bool {
+    ) -> Result<(), CompletionRejection> {
         const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
 
         match self.admit_artifact(ticket_id, source_lease, DISPOSITION_ARTIFACT) {
             Ok(true) => {}
             Ok(false) => {
-                self.log_activity(ActivityEvent::Error {
-                    message: format!(
-                        "Completion refused for {ticket_id}: missing required {DISPOSITION_ARTIFACT}"
-                    ),
+                return Err(CompletionRejection::DispositionBlocked {
+                    reason: format!("missing required {DISPOSITION_ARTIFACT}"),
                 });
-                return false;
             }
             Err(reason) => {
-                self.log_activity(ActivityEvent::Error {
-                    message: format!(
-                        "Completion refused for {ticket_id}: could not admit {DISPOSITION_ARTIFACT}: {reason}"
-                    ),
+                return Err(CompletionRejection::DispositionBlocked {
+                    reason: format!("could not admit {DISPOSITION_ARTIFACT}: {reason}"),
                 });
-                return false;
             }
         }
 
@@ -1227,22 +1223,102 @@ impl State {
             .join(ticket_id)
             .join(DISPOSITION_ARTIFACT);
         match parse_review_disposition(disposition_path) {
-            ReviewDisposition::Pass => true,
+            ReviewDisposition::Pass => Ok(()),
             ReviewDisposition::Block { reason } => {
-                self.log_activity(ActivityEvent::Warning {
-                    message: format!("Completion blocked for {ticket_id}: {reason}"),
-                });
-                false
+                Err(CompletionRejection::DispositionBlocked { reason })
             }
-            ReviewDisposition::Invalid { reason } => {
-                self.log_activity(ActivityEvent::Error {
+            ReviewDisposition::Invalid { reason } => Err(CompletionRejection::DispositionBlocked {
+                reason: format!("invalid review disposition: {reason}"),
+            }),
+        }
+    }
+
+    fn log_completion_rejection(
+        &mut self,
+        ticket_id: &str,
+        correlation: &CompletionGenerationId,
+        rejection: &CompletionRejection,
+    ) {
+        let (kind, detail) = match rejection {
+            CompletionRejection::AlreadyPending { .. } => (
+                CompletionRejectionKind::AlreadyPending,
+                rejection.to_string(),
+            ),
+            CompletionRejection::StaleLease { .. } => {
+                (CompletionRejectionKind::StaleLease, rejection.to_string())
+            }
+            CompletionRejection::DispositionBlocked { reason } => {
+                (CompletionRejectionKind::DispositionBlocked, reason.clone())
+            }
+            CompletionRejection::DependencyBlocked { reason } => {
+                (CompletionRejectionKind::DependencyBlocked, reason.clone())
+            }
+            CompletionRejection::LaunchFailed { source } => (
+                CompletionRejectionKind::LaunchFailed,
+                source.message().to_string(),
+            ),
+            CompletionRejection::UnexpectedEvent { .. }
+            | CompletionRejection::CorrelationMismatch { .. } => {
+                self.log_activity(ActivityEvent::Warning {
                     message: format!(
-                        "Completion refused for {ticket_id}: invalid review disposition: {reason}"
+                        "Completion rejected for {ticket_id} [correlation {correlation}]: {rejection}"
                     ),
                 });
-                false
+                return;
             }
+        };
+
+        self.log_activity(ActivityEvent::CompletionRejected {
+            ticket_id: ticket_id.to_string(),
+            kind,
+            correlation_id: correlation.to_string(),
+            detail,
+        });
+    }
+
+    fn completion_correlation(
+        completion_id: CompletionId,
+        attempt_id: AttemptId,
+    ) -> CompletionGenerationId {
+        CompletionGenerationId::new(completion_id, attempt_id, 1)
+    }
+
+    fn reject_stale_lease(
+        &mut self,
+        ticket_id: &str,
+        correlation: &CompletionGenerationId,
+        attempt_id: impl Into<String>,
+    ) {
+        self.log_completion_rejection(
+            ticket_id,
+            correlation,
+            &CompletionRejection::StaleLease {
+                attempt_id: AttemptId::new(attempt_id),
+            },
+        );
+    }
+
+    fn review_lease_is_current(&self, ticket_id: &str, lease: &AttemptLease) -> bool {
+        lease.ticket_id == ticket_id && lease.is_current(self.current_leases.get(ticket_id))
+    }
+
+    fn admit_correlated_review(
+        &mut self,
+        ticket_id: &str,
+        lease: &AttemptLease,
+        correlation: &CompletionGenerationId,
+    ) -> bool {
+        if !self.review_lease_is_current(ticket_id, lease) {
+            self.reject_stale_lease(ticket_id, correlation, lease.attempt_id.to_string());
+            return false;
         }
+
+        if let Err(rejection) = self.admit_passing_review(ticket_id, Some(lease)) {
+            self.log_completion_rejection(ticket_id, correlation, &rejection);
+            return false;
+        }
+
+        true
     }
 
     /// Convert scheduler/operator evidence into a typed core event and execute
@@ -1292,12 +1368,6 @@ impl State {
             } => (ticket_id, CompletionSource::Manual, authority, None),
         };
 
-        if let Some(review_lease) = review_lease.as_ref() {
-            if !self.admit_passing_review(&ticket_id, Some(review_lease)) {
-                return false;
-            }
-        }
-
         let state = if self.pending_completions.contains_key(&ticket_id) {
             CompletionState::Requested
         } else {
@@ -1308,16 +1378,24 @@ impl State {
             Some(CompletionAuthority::Operator) => "operator".to_string(),
             None => "missing-authority".to_string(),
         };
+        let attempt_id = AttemptId::new(attempt_id);
+        let completion_id = CompletionId::new(ticket_id.clone());
+        let correlation = Self::completion_correlation(completion_id.clone(), attempt_id.clone());
+
+        if let Some(review_lease) = review_lease.as_ref() {
+            if !self.admit_correlated_review(&ticket_id, review_lease, &correlation) {
+                return false;
+            }
+        }
+
         let event = CompletionEvent::Request {
-            attempt_id: AttemptId::new(attempt_id),
-            completion_id: CompletionId::new(ticket_id.clone()),
+            attempt_id,
+            completion_id,
         };
         let transition = match reduce_completion(state, event) {
             Ok(transition) => transition,
             Err(rejection) => {
-                self.log_activity(ActivityEvent::Warning {
-                    message: format!("Completion rejected for {ticket_id}: {rejection}"),
-                });
+                self.log_completion_rejection(&ticket_id, &correlation, &rejection);
                 return false;
             }
         };
@@ -1344,7 +1422,7 @@ impl State {
             } => (attempt_id, completion_id),
         };
         let completion_key =
-            CompletionGenerationId::new(effect_completion_id.clone(), effect_attempt_id.clone(), 1);
+            Self::completion_correlation(effect_completion_id.clone(), effect_attempt_id.clone());
         let effect_matches_authority = effect_completion_id.as_str() == ticket_id
             && match authority.as_ref() {
                 Some(CompletionAuthority::Attempt(lease)) => {
@@ -1374,6 +1452,10 @@ impl State {
             Some(CompletionAuthority::Operator) if source == CompletionSource::Manual => {
                 CompletionAuthority::Operator
             }
+            Some(CompletionAuthority::Attempt(lease)) => {
+                self.reject_stale_lease(&ticket_id, &completion_key, lease.attempt_id.to_string());
+                return false;
+            }
             authority => {
                 self.log_activity(ActivityEvent::Warning {
                     message: format!(
@@ -1384,12 +1466,13 @@ impl State {
             }
         };
         if !self.dag.all_dependencies_done(&ticket_id) {
-            self.log_activity(ActivityEvent::Error {
-                message: format!(
-                    "Cannot complete {}: its dependencies are not all done",
-                    ticket_id
-                ),
-            });
+            self.log_completion_rejection(
+                &ticket_id,
+                &completion_key,
+                &CompletionRejection::DependencyBlocked {
+                    reason: "dependencies are not all done".to_string(),
+                },
+            );
             return false;
         }
         let (ticket_file, ticket_phase, ticket_status) = match self.dag.get_ticket(&ticket_id) {
@@ -1439,9 +1522,13 @@ impl State {
                 #[cfg(not(test))]
                 {
                     self.pending_completions.remove(&ticket_id);
-                    self.log_activity(ActivityEvent::Error {
-                        message: format!("Cannot start completion for {ticket_id}: {error}"),
-                    });
+                    self.log_completion_rejection(
+                        &ticket_id,
+                        &completion_key,
+                        &CompletionRejection::LaunchFailed {
+                            source: LaunchFailure::new(error),
+                        },
+                    );
                     return false;
                 }
             }
@@ -1476,6 +1563,12 @@ impl State {
             Some(pending) => pending,
             None => return,
         };
+        let result_attempt_id = match &pending.authority {
+            CompletionAuthority::Attempt(lease) => AttemptId::new(lease.attempt_id.to_string()),
+            CompletionAuthority::Operator => AttemptId::new("operator"),
+        };
+        let correlation =
+            Self::completion_correlation(CompletionId::new(ticket_id), result_attempt_id.clone());
         let authority_is_current = match &pending.authority {
             CompletionAuthority::Attempt(lease) => {
                 lease.is_current(self.current_leases.get(ticket_id))
@@ -1485,20 +1578,26 @@ impl State {
         if !authority_is_current {
             self.pending_completions.remove(ticket_id);
             self.rebuild_dag();
-            self.log_activity(ActivityEvent::Warning {
-                message: format!(
-                    "Rejected completion result for {}: pending authority {:?} is no longer current",
-                    ticket_id, pending.authority
-                ),
-            });
+            match &pending.authority {
+                CompletionAuthority::Attempt(_) => {
+                    self.reject_stale_lease(ticket_id, &correlation, result_attempt_id.to_string());
+                }
+                CompletionAuthority::Operator => {
+                    self.log_activity(ActivityEvent::Warning {
+                        message: format!(
+                            "Rejected completion result for {}: pending authority {:?} is no longer current",
+                            ticket_id, pending.authority
+                        ),
+                    });
+                }
+            }
             return;
         }
         if exit_code != Some(0) || !Self::is_commit_id(&stdout) {
             self.pending_completions.remove(ticket_id);
             self.rebuild_dag();
             let detail = String::from_utf8_lossy(&stderr);
-            self.log_activity(ActivityEvent::Error {
-                message: format!(
+            let failure = format!(
                     "Completion commit failed for {} authority {:?} ({:?}, exit {:?}): {}. Ticket remains recoverable for retry",
                     ticket_id,
                     pending.authority,
@@ -1509,8 +1608,14 @@ impl State {
                     } else {
                         detail.trim()
                     }
-                ),
-            });
+                );
+            self.log_completion_rejection(
+                ticket_id,
+                &correlation,
+                &CompletionRejection::LaunchFailed {
+                    source: LaunchFailure::new(failure),
+                },
+            );
             return;
         }
 
@@ -5011,6 +5116,15 @@ impl State {
                 format!("CommitMade: {} {}", ticket_id, commit_hash)
             }
             ActivityEvent::Error { message } => format!("Error: {}", message),
+            ActivityEvent::CompletionRejected {
+                ticket_id,
+                kind,
+                correlation_id,
+                detail,
+            } => format!(
+                "CompletionRejected: {} {} correlation={} detail={}",
+                ticket_id, kind, correlation_id, detail
+            ),
             ActivityEvent::DagRecomputed { ticket_count } => {
                 format!("DagRecomputed: {} tickets", ticket_count)
             }
@@ -6135,6 +6249,17 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
             ticket_id: String::new(),
             message: message.clone(),
         },
+        ActivityEvent::CompletionRejected {
+            ticket_id,
+            kind,
+            correlation_id,
+            detail,
+        } => ui::ActivityType::CompletionRejected {
+            ticket_id: ticket_id.clone(),
+            kind: *kind,
+            correlation_id: correlation_id.clone(),
+            detail: detail.clone(),
+        },
         ActivityEvent::HealthStateChanged {
             ticket_id,
             new_health,
@@ -6263,6 +6388,69 @@ mod tests {
             1,
             "completion effects must have one host command launch boundary"
         );
+    }
+
+    #[test]
+    fn named_completion_rejections_become_distinct_correlated_activity_events() {
+        use lisa_core::completion::LaunchFailure;
+
+        let mut state = State::default();
+        let correlation =
+            CompletionGenerationId::new(CompletionId::new("T-REJECT"), AttemptId::new("7"), 1);
+        let cases = [
+            (
+                CompletionRejection::AlreadyPending {
+                    completion_id: CompletionId::new("T-REJECT"),
+                },
+                CompletionRejectionKind::AlreadyPending,
+            ),
+            (
+                CompletionRejection::StaleLease {
+                    attempt_id: AttemptId::new("6"),
+                },
+                CompletionRejectionKind::StaleLease,
+            ),
+            (
+                CompletionRejection::DispositionBlocked {
+                    reason: "review requires action".to_string(),
+                },
+                CompletionRejectionKind::DispositionBlocked,
+            ),
+            (
+                CompletionRejection::DependencyBlocked {
+                    reason: "T-BLOCK is not done".to_string(),
+                },
+                CompletionRejectionKind::DependencyBlocked,
+            ),
+            (
+                CompletionRejection::LaunchFailed {
+                    source: LaunchFailure::new("host command unavailable"),
+                },
+                CompletionRejectionKind::LaunchFailed,
+            ),
+        ];
+
+        for (rejection, _) in &cases {
+            state.log_completion_rejection("T-REJECT", &correlation, rejection);
+        }
+
+        assert_eq!(state.activity_log.len(), cases.len());
+        for (event, (_, expected_kind)) in state.activity_log.iter().zip(cases) {
+            match event {
+                ActivityEvent::CompletionRejected {
+                    ticket_id,
+                    kind,
+                    correlation_id,
+                    detail,
+                } => {
+                    assert_eq!(ticket_id, "T-REJECT");
+                    assert_eq!(*kind, expected_kind);
+                    assert_eq!(correlation_id, &correlation.to_string());
+                    assert!(!detail.is_empty());
+                }
+                other => panic!("expected structured completion rejection, got {other:?}"),
+            }
+        }
     }
 
     /// Mirror production dispatch by installing one newly minted lease as the
@@ -6399,6 +6587,28 @@ mod tests {
                 assert_eq!(message, "something broke");
             }
             other => panic!("Expected Error, got {:?}", other),
+        }
+
+        let entry = activity_event_to_ui_entry(&ActivityEvent::CompletionRejected {
+            ticket_id: "T-003".to_string(),
+            kind: CompletionRejectionKind::StaleLease,
+            correlation_id: "corr-3".to_string(),
+            detail: "attempt 2 is stale".to_string(),
+        })
+        .unwrap();
+        match entry.activity {
+            ui::ActivityType::CompletionRejected {
+                ticket_id,
+                kind,
+                correlation_id,
+                detail,
+            } => {
+                assert_eq!(ticket_id, "T-003");
+                assert_eq!(kind, CompletionRejectionKind::StaleLease);
+                assert_eq!(correlation_id, "corr-3");
+                assert_eq!(detail, "attempt 2 is stale");
+            }
+            other => panic!("Expected CompletionRejected, got {other:?}"),
         }
     }
 
@@ -7716,8 +7926,11 @@ mod tests {
             if !visible_reason.is_empty() {
                 assert!(
                     state.activity_log.iter().any(|event| match event {
-                        ActivityEvent::Warning { message } | ActivityEvent::Error { message } =>
-                            message.contains(visible_reason),
+                        ActivityEvent::CompletionRejected {
+                            kind: CompletionRejectionKind::DispositionBlocked,
+                            detail,
+                            ..
+                        } => detail.contains(visible_reason),
                         _ => false,
                     }),
                     "{case}: refusal reason must be operator-visible"
@@ -7818,9 +8031,11 @@ mod tests {
         );
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
-            ActivityEvent::Warning { message }
-                if message.contains("Completion blocked")
-                    && message.contains("resolve the hostile review finding")
+            ActivityEvent::CompletionRejected {
+                kind: CompletionRejectionKind::DispositionBlocked,
+                detail,
+                ..
+            } if detail.contains("resolve the hostile review finding")
         )));
     }
 
@@ -9460,6 +9675,15 @@ mod tests {
                     new_phase: Phase::Design,
                 },
                 "TicketPhaseChanged: T-002 research -> design",
+            ),
+            (
+                ActivityEvent::CompletionRejected {
+                    ticket_id: "T-003".to_string(),
+                    kind: CompletionRejectionKind::LaunchFailed,
+                    correlation_id: "corr-launch".to_string(),
+                    detail: "host unavailable".to_string(),
+                },
+                "CompletionRejected: T-003 launch-failed correlation=corr-launch detail=host unavailable",
             ),
         ];
 
@@ -13805,9 +14029,11 @@ owned\n\
             .contains("phase: review"));
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
-            ActivityEvent::Warning { message }
-                if message.contains("Completion blocked")
-                    && message.contains("rerun the release suite")
+            ActivityEvent::CompletionRejected {
+                kind: CompletionRejectionKind::DispositionBlocked,
+                detail,
+                ..
+            } if detail.contains("rerun the release suite")
         )));
     }
 
@@ -15510,7 +15736,11 @@ owned\n\
         );
         assert!(state.activity_log.iter().any(|e| matches!(
             e,
-            ActivityEvent::Error { message } if message.contains("dependencies are not all done")
+            ActivityEvent::CompletionRejected {
+                kind: CompletionRejectionKind::DependencyBlocked,
+                detail,
+                ..
+            } if detail.contains("dependencies are not all done")
         )));
         assert!(fs::read_to_string(&t2).unwrap().contains("phase: review"));
 
@@ -16278,11 +16508,21 @@ owned\n\
         assert!(!state.pending_completions.contains_key("T-CDX-01"));
         assert!(state.threads.contains_key("T-CDX-01"));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-CDX-01"));
+        let stale_correlation = CompletionGenerationId::new(
+            CompletionId::new("T-CDX-01"),
+            AttemptId::new(stale.attempt_id.to_string()),
+            1,
+        )
+        .to_string();
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
-            ActivityEvent::Warning { message }
-                if message.contains("Rejected completion")
-                    && message.contains("does not hold the current lease")
+            ActivityEvent::CompletionRejected {
+                kind: CompletionRejectionKind::StaleLease,
+                correlation_id,
+                detail,
+                ..
+            } if correlation_id == &stale_correlation
+                && detail.contains(&stale.attempt_id.to_string())
         )));
 
         assert!(state.dispatch_completion(CompletionInput::ObservedDone {
@@ -16854,8 +17094,14 @@ owned\n\
         assert!(!ledger.exists(), "failed attempts must not emit provenance");
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
-            ActivityEvent::Error { message }
-                if message.contains("identity unavailable") && message.contains("recoverable")
+            ActivityEvent::CompletionRejected {
+                kind: CompletionRejectionKind::LaunchFailed,
+                detail,
+                correlation_id,
+                ..
+            } if detail.contains("identity unavailable")
+                && detail.contains("recoverable")
+                && !correlation_id.is_empty()
         )));
 
         state.mark_ticket_done("T-CDX-01");

@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use lisa_core::types::CompletionRejectionKind;
+
 /// ANSI color codes for terminal output
 mod colors {
     pub const RESET: &str = "\x1b[0m";
@@ -234,12 +236,36 @@ pub struct SlotInfo {
 /// Activity log entry types
 #[derive(Debug, Clone)]
 pub enum ActivityType {
-    PhaseCompleted { ticket_id: String, phase: Phase },
-    Commit { ticket_id: String, message: String },
-    Error { ticket_id: String, message: String },
-    Warning { ticket_id: String, message: String },
-    ThreadStarted { ticket_id: String, phase: Phase },
-    Info { ticket_id: String, message: String },
+    PhaseCompleted {
+        ticket_id: String,
+        phase: Phase,
+    },
+    Commit {
+        ticket_id: String,
+        message: String,
+    },
+    Error {
+        ticket_id: String,
+        message: String,
+    },
+    Warning {
+        ticket_id: String,
+        message: String,
+    },
+    ThreadStarted {
+        ticket_id: String,
+        phase: Phase,
+    },
+    Info {
+        ticket_id: String,
+        message: String,
+    },
+    CompletionRejected {
+        ticket_id: String,
+        kind: CompletionRejectionKind,
+        correlation_id: String,
+        detail: String,
+    },
 }
 
 /// A single activity log entry
@@ -845,6 +871,15 @@ pub(crate) fn render_threads(state: &PluginState, output: &mut Vec<String>) {
 // Activity Log Rendering
 // =============================================================================
 
+fn format_completion_rejection(
+    ticket_id: &str,
+    kind: CompletionRejectionKind,
+    correlation_id: &str,
+    detail: &str,
+) -> String {
+    format!("{ticket_id} completion {kind} [correlation {correlation_id}]: {detail}")
+}
+
 /// Render the activity log
 fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec<String>) {
     output.push(format!("{}{}=== Recent Activity ==={}", BOLD, BLUE, RESET));
@@ -919,6 +954,16 @@ fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec
                 };
                 ("ℹ", CYAN, format!("{}{}", prefix, msg))
             }
+            ActivityType::CompletionRejected {
+                ticket_id,
+                kind,
+                correlation_id,
+                detail,
+            } => (
+                "⊘",
+                BRIGHT_YELLOW,
+                format_completion_rejection(ticket_id, *kind, correlation_id, detail),
+            ),
         };
 
         output.push(format!(
@@ -930,7 +975,7 @@ fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec
 
 /// Render a filtered activity log showing only high-priority entries.
 ///
-/// Only includes Error, Warning, and PhaseCompleted events — the entries
+/// Only includes Error, Warning, CompletionRejected, and PhaseCompleted events — the entries
 /// that need human attention. Info, Commit, and ThreadStarted events are
 /// available on the dedicated Activity view.
 fn render_filtered_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec<String>) {
@@ -950,6 +995,7 @@ fn render_filtered_activity_log(state: &PluginState, max_entries: usize, output:
                 ActivityType::PhaseCompleted { .. }
                     | ActivityType::Error { .. }
                     | ActivityType::Warning { .. }
+                    | ActivityType::CompletionRejected { .. }
             )
         })
         .take(max_entries)
@@ -995,6 +1041,16 @@ fn render_filtered_activity_log(state: &PluginState, max_entries: usize, output:
                 };
                 ("⚠", BRIGHT_YELLOW, format!("{}warn: {}", prefix, msg))
             }
+            ActivityType::CompletionRejected {
+                ticket_id,
+                kind,
+                correlation_id,
+                detail,
+            } => (
+                "⊘",
+                BRIGHT_YELLOW,
+                format_completion_rejection(ticket_id, *kind, correlation_id, detail),
+            ),
             // Other types filtered out above
             _ => continue,
         };
@@ -1596,6 +1652,63 @@ mod tests {
 
         assert!(!output.is_empty());
         // Newest first, so T-002 should appear before T-001
+    }
+
+    #[test]
+    fn completion_rejections_render_distinct_kinds_and_correlations_in_both_activity_views() {
+        let cases = [
+            (CompletionRejectionKind::AlreadyPending, "corr-pending"),
+            (CompletionRejectionKind::StaleLease, "corr-stale"),
+            (
+                CompletionRejectionKind::DispositionBlocked,
+                "corr-disposition",
+            ),
+            (
+                CompletionRejectionKind::DependencyBlocked,
+                "corr-dependency",
+            ),
+            (CompletionRejectionKind::LaunchFailed, "corr-launch"),
+        ];
+        let activity_log = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (kind, correlation_id))| ActivityEntry {
+                timestamp: Duration::from_secs(index as u64),
+                activity: ActivityType::CompletionRejected {
+                    ticket_id: format!("T-REJECT-{index}"),
+                    kind: *kind,
+                    correlation_id: (*correlation_id).to_string(),
+                    detail: format!("actionable detail {index}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        assert!(activity_log
+            .iter()
+            .all(|entry| matches!(entry.activity, ActivityType::CompletionRejected { .. })));
+
+        let state = PluginState {
+            activity_log,
+            current_time: Duration::from_secs(60),
+            ..PluginState::default()
+        };
+        let mut full = Vec::new();
+        render_activity_log(&state, cases.len(), &mut full);
+        let full = full.join("\n");
+        let mut alerts = Vec::new();
+        render_filtered_activity_log(&state, cases.len(), &mut alerts);
+        let alerts = alerts.join("\n");
+
+        for (kind, correlation_id) in cases {
+            let label = kind.to_string();
+            assert!(
+                full.contains(&label) && full.contains(correlation_id),
+                "full Activity view lost {label} or {correlation_id}: {full}"
+            );
+            assert!(
+                alerts.contains(&label) && alerts.contains(correlation_id),
+                "Operations activity view lost {label} or {correlation_id}: {alerts}"
+            );
+        }
     }
 
     #[test]

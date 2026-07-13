@@ -879,6 +879,28 @@ impl Default for PluginConfig {
     }
 }
 
+/// Stable operator-visible categories for a refused completion obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompletionRejectionKind {
+    AlreadyPending,
+    StaleLease,
+    DispositionBlocked,
+    DependencyBlocked,
+    LaunchFailed,
+}
+
+impl fmt::Display for CompletionRejectionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::AlreadyPending => "already-pending",
+            Self::StaleLease => "stale-lease",
+            Self::DispositionBlocked => "disposition-blocked",
+            Self::DependencyBlocked => "dependency-blocked",
+            Self::LaunchFailed => "launch-failed",
+        })
+    }
+}
+
 /// Activity events for the dashboard log.
 ///
 /// These events are logged and displayed in the plugin's activity feed.
@@ -928,6 +950,14 @@ pub enum ActivityEvent {
 
     /// An error occurred
     Error { message: String },
+
+    /// A completion obligation was refused with typed, correlated evidence.
+    CompletionRejected {
+        ticket_id: TicketId,
+        kind: CompletionRejectionKind,
+        correlation_id: String,
+        detail: String,
+    },
 
     /// DAG was recomputed
     DagRecomputed { ticket_count: usize },
@@ -1349,6 +1379,27 @@ mod tests {
                 assert_eq!(*new_health, HealthStatus::Stuck);
             }
             _ => panic!("Expected HealthStateChanged"),
+        }
+    }
+
+    #[test]
+    fn completion_rejection_kind_has_stable_operator_labels() {
+        let cases = [
+            (CompletionRejectionKind::AlreadyPending, "already-pending"),
+            (CompletionRejectionKind::StaleLease, "stale-lease"),
+            (
+                CompletionRejectionKind::DispositionBlocked,
+                "disposition-blocked",
+            ),
+            (
+                CompletionRejectionKind::DependencyBlocked,
+                "dependency-blocked",
+            ),
+            (CompletionRejectionKind::LaunchFailed, "launch-failed"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(kind.to_string(), expected);
         }
     }
 
