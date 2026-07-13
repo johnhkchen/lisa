@@ -18085,6 +18085,284 @@ owned\n\
         assert_eq!(records[1].tokens_out, Some(100));
     }
 
+    /// T-043-03-03 AC: replay the field incident as one deterministic chain.
+    /// Tickets 2 through 7 are the six recycled-pane Stops that the old writer
+    /// keyed to ticket 1's inherited environment and overwrote in place.
+    #[test]
+    fn provenance_field_repro_keeps_six_recycles_distinct_and_surfaces_failures() {
+        use lisa_cli::capture_usage::run_capture_usage_for_test;
+        use lisa_core::capture::CaptureRecord;
+        use serde::Deserialize;
+
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        struct NoCaptureMarker {
+            pane_id: u32,
+            session_id: String,
+            captured_at: u64,
+            reason: String,
+        }
+
+        const PANE_ID: u32 = 43;
+        const UNOWNED_SESSION: &str = "session-unattributable";
+        const NO_CAPTURE_SESSION: &str = "session-no-capture";
+        const TICKETS: [&str; 7] = [
+            "T-FIELD-01",
+            "T-FIELD-02",
+            "T-FIELD-03",
+            "T-FIELD-04",
+            "T-FIELD-05",
+            "T-FIELD-06",
+            "T-FIELD-07",
+        ];
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        state.claude_dir = dir.path().join(".lisa/claude");
+
+        let write_stop = |session_id: &str,
+                          transcript: &std::path::Path,
+                          captured_at: u64,
+                          diagnostics: &mut Vec<u8>| {
+            let payload = serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": transcript,
+            });
+            run_capture_usage_for_test(
+                dir.path(),
+                payload.to_string().as_bytes(),
+                false,
+                PANE_ID,
+                captured_at,
+                diagnostics,
+            )
+            .unwrap();
+        };
+
+        let unowned_transcript = dir.path().join("unowned.jsonl");
+        std::fs::write(
+            &unowned_transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":9999,"output_tokens":888}}}
+"#,
+        )
+        .unwrap();
+        let unowned_capture = CaptureRecord {
+            pane_id: PANE_ID,
+            session_id: UNOWNED_SESSION.to_string(),
+            captured_at: 50,
+            input_tokens: 9_999,
+            output_tokens: 888,
+        };
+        let mut successful_diagnostics = Vec::new();
+        write_stop(
+            UNOWNED_SESSION,
+            &unowned_transcript,
+            unowned_capture.captured_at,
+            &mut successful_diagnostics,
+        );
+
+        let mut expected_captures = vec![unowned_capture.clone()];
+        let mut expected_usage = Vec::new();
+        for (index, ticket_id) in TICKETS.iter().enumerate() {
+            let sequence = u64::try_from(index).unwrap() + 1;
+            let input_tokens = sequence * 100 + 7;
+            let output_tokens = sequence * 10 + 3;
+            let captured_at = 110 + u64::try_from(index).unwrap() * 100;
+            let session_id = format!("session-field-{sequence}");
+            let transcript = dir.path().join(format!("field-{sequence}.jsonl"));
+            let transcript_line = serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    }
+                }
+            });
+            std::fs::write(&transcript, format!("{transcript_line}\n")).unwrap();
+            write_stop(
+                &session_id,
+                &transcript,
+                captured_at,
+                &mut successful_diagnostics,
+            );
+            expected_captures.push(CaptureRecord {
+                pane_id: PANE_ID,
+                session_id,
+                captured_at,
+                input_tokens,
+                output_tokens,
+            });
+            expected_usage.push(((*ticket_id).to_string(), input_tokens, output_tokens));
+        }
+        assert!(
+            successful_diagnostics.is_empty(),
+            "successful captures should not emit no-capture diagnostics"
+        );
+
+        let empty_transcript = dir.path().join("empty.jsonl");
+        std::fs::write(&empty_transcript, "").unwrap();
+        let mut no_capture_diagnostics = Vec::new();
+        write_stop(
+            NO_CAPTURE_SESSION,
+            &empty_transcript,
+            75,
+            &mut no_capture_diagnostics,
+        );
+
+        let captures_path = state.claude_dir.join("captures.jsonl");
+        let captures: Vec<CaptureRecord> = std::fs::read_to_string(&captures_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            captures, expected_captures,
+            "the unowned observation and all seven ticket Stops must survive"
+        );
+        assert_eq!(captures.len(), 8);
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.session_id != NO_CAPTURE_SESSION),
+            "a failed observation must not become measured zero usage"
+        );
+        assert!(!state.claude_dir.join("T-FIELD-01.usage.json").exists());
+        assert!(!state.claude_dir.join("last.usage.json").exists());
+
+        let no_capture_rows: Vec<NoCaptureMarker> =
+            std::fs::read_to_string(state.claude_dir.join("no-captures.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            no_capture_rows,
+            vec![NoCaptureMarker {
+                pane_id: PANE_ID,
+                session_id: NO_CAPTURE_SESSION.to_string(),
+                captured_at: 75,
+                reason: "empty-transcript".to_string(),
+            }]
+        );
+        let no_capture_diagnostics = String::from_utf8(no_capture_diagnostics).unwrap();
+        assert!(no_capture_diagnostics.contains("lisa capture-usage: no capture"));
+        assert!(no_capture_diagnostics.contains(NO_CAPTURE_SESSION));
+        assert!(no_capture_diagnostics.contains("empty-transcript"));
+
+        let route = Route::from_client(AgentClient::Claude);
+        for (index, (ticket_id, input_tokens, output_tokens)) in expected_usage.iter().enumerate() {
+            let started_at = 100 + u64::try_from(index).unwrap() * 100;
+            let ended_at = started_at + 49;
+            let current = ProvenanceRecord {
+                schema_version: provenance::SCHEMA_VERSION,
+                ticket_id: ticket_id.clone(),
+                attempt_lease: AttemptLease {
+                    ticket_id: ticket_id.clone(),
+                    attempt_id: 1,
+                },
+                outcome: RunOutcome::Done,
+                authoritative: true,
+                fenced: false,
+                requested: route.clone(),
+                actual: route.clone(),
+                started_at,
+                ended_at,
+                wall_clock_secs: ended_at - started_at,
+                tokens_in: None,
+                tokens_out: None,
+                cost_usd: None,
+                concurrency_at_spawn: 0,
+                pane_id: PANE_ID,
+            };
+            let usage = state.read_usage(AgentClient::Claude, &current);
+            assert_eq!(
+                usage,
+                (Some(*input_tokens), Some(*output_tokens), None),
+                "{ticket_id} must receive only its pane-time capture"
+            );
+            provenance::append_record(
+                &ledger,
+                &ProvenanceRecord {
+                    tokens_in: usage.0,
+                    tokens_out: usage.1,
+                    cost_usd: usage.2,
+                    ..current
+                },
+            )
+            .unwrap();
+        }
+
+        let records = read_ledger(&ledger);
+        assert_eq!(records.len(), TICKETS.len());
+        let actual_usage: Vec<_> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.ticket_id.clone(),
+                    record.tokens_in.unwrap(),
+                    record.tokens_out.unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual_usage, expected_usage,
+            "all six later pane recycles must append without rewriting ticket 1"
+        );
+        assert!(records.iter().all(|record| record.cost_usd.is_none()));
+        assert!(records.iter().all(|record| {
+            record.tokens_in != Some(unowned_capture.input_tokens)
+                && record.tokens_out != Some(unowned_capture.output_tokens)
+        }));
+
+        let quarantine_path = quarantine::session_path(&state.claude_dir, UNOWNED_SESSION);
+        let quarantined: Vec<quarantine::QuarantinedCaptureRecord> =
+            std::fs::read_to_string(&quarantine_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            quarantined,
+            vec![quarantine::QuarantinedCaptureRecord {
+                source_line: 1,
+                capture: unowned_capture,
+            }]
+        );
+        assert!(!state.claude_dir.join("quarantine.jsonl").exists());
+
+        let quarantine_warnings: Vec<_> = state
+            .activity_log
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::Warning { message }
+                        if message.contains("usage capture quarantined")
+                            && message.contains(UNOWNED_SESSION)
+                )
+            })
+            .collect();
+        assert_eq!(
+            quarantine_warnings.len(),
+            1,
+            "ledger rescans must not duplicate quarantine visibility"
+        );
+        let entry = activity_event_to_ui_entry(quarantine_warnings[0])
+            .expect("quarantine warning should reach the dashboard activity feed");
+        assert!(matches!(
+            entry.activity,
+            ui::ActivityType::Warning { message, .. }
+                if message.contains(UNOWNED_SESSION)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(quarantine_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
     /// T-043-03-02 AC: a valid capture with no pane-time owner is held in its
     /// session's quarantine and surfaced as a visible warning, never usage.
     #[test]
