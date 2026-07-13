@@ -1,8 +1,10 @@
 //! Execution-provenance ledger: append-only JSONL learning data.
 //!
-//! One [`ProvenanceRecord`] is appended to `.lisa/provenance.jsonl` per
-//! terminal execution attempt, written by the plugin *after* the attempt ends
-//! (write-after; it never races the agent and never touches the agent-owned
+//! The ledger contains terminal execution [`ProvenanceRecord`] rows and
+//! pre-ownership [`AssignmentTransitionRecord`] rows. Use
+//! [`ProvenanceLedgerRecord`] to read a ledger containing both shapes. Terminal
+//! execution rows are written by the plugin *after* the attempt ends
+//! (write-after; they never race the agent and never touch the agent-owned
 //! ticket frontmatter — epic E-001 Decision 2). `.lisa/` gitignores only
 //! `signals/`, so the ledger is committable, queryable-across-runs data.
 //!
@@ -31,7 +33,7 @@ use crate::types::AttemptLease;
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -76,6 +78,25 @@ pub enum RunOutcome {
     TimedOut,
 }
 
+/// Explicit JSON-level kind for a pre-ownership provenance row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvenanceRecordType {
+    AssignmentTransition,
+}
+
+/// Stable, operator-visible assignment state retained in provenance.
+///
+/// This is evidence vocabulary, not scheduler authority: the plugin's private
+/// assignment state machine may carry additional deadlines and retry counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AssignmentState {
+    DeliveryFailed,
+    RecoveryFailed,
+    StartupFailed,
+}
+
 /// One append-only ledger record. Timestamps are UTC epoch seconds (matching the
 /// `SystemTime` convention used across `lisa-core`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +134,40 @@ pub struct ProvenanceRecord {
     pub pane_id: u32,
 }
 
+/// One attempt-scoped transition that ended before provider ownership.
+///
+/// Timestamps are UTC epoch seconds. `started_at` is the beginning of the
+/// bounded transition, `ended_at` is the terminal observation, and
+/// `wall_clock_secs` is their saturating difference supplied by the writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentTransitionRecord {
+    pub schema_version: u32,
+    pub record_type: ProvenanceRecordType,
+    pub ticket_id: String,
+    pub attempt_lease: AttemptLease,
+    pub pane_id: u32,
+    /// Vendor serving the assignment (`"anthropic"` or `"openai"` today).
+    pub provider: String,
+    pub state: AssignmentState,
+    pub reason: String,
+    pub started_at: u64,
+    pub ended_at: u64,
+    pub wall_clock_secs: u64,
+}
+
+/// A row read from a potentially mixed-version, mixed-shape provenance ledger.
+///
+/// Untagged representation preserves the exact schema-v2 execution JSON shape,
+/// which predates an explicit record discriminator. The new assignment shape
+/// has a required `record_type`, `state`, and `reason`, so the variants remain
+/// distinguishable without rewriting old ledger lines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProvenanceLedgerRecord {
+    AssignmentTransition(AssignmentTransitionRecord),
+    Execution(ProvenanceRecord),
+}
+
 /// Convert a `SystemTime` to UTC epoch seconds, saturating pre-epoch times to 0.
 pub fn system_time_to_epoch(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
@@ -147,6 +202,18 @@ pub fn extract_usage(usage: &Value) -> (Option<u64>, Option<u64>, Option<f64>) {
 /// parent directory if absent. True append — existing lines are never rewritten,
 /// so retries/resets of the same ticket accumulate additional records.
 pub fn append_record(path: &Path, record: &ProvenanceRecord) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+/// Append one pre-ownership assignment transition as a single JSONL row.
+pub fn append_assignment_transition_record(
+    path: &Path,
+    record: &AssignmentTransitionRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+fn append_serialized<T: Serialize + ?Sized>(path: &Path, record: &T) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -187,6 +254,27 @@ mod tests {
         }
     }
 
+    fn sample_assignment_transition() -> AssignmentTransitionRecord {
+        AssignmentTransitionRecord {
+            schema_version: SCHEMA_VERSION,
+            record_type: ProvenanceRecordType::AssignmentTransition,
+            ticket_id: "T-040-02-01".to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: "T-040-02-01".to_string(),
+                attempt_id: 7,
+            },
+            pane_id: 12,
+            provider: "openai".to_string(),
+            state: AssignmentState::DeliveryFailed,
+            reason: "provider did not acknowledge the bounded chat assignment".to_string(),
+            started_at: 1_752_000_000,
+            ended_at: 1_752_000_030,
+            wall_clock_secs: 30,
+        }
+    }
+
+    const SCHEMA_V2_EXECUTION_JSON: &str = r#"{"schema_version":2,"ticket_id":"T-027-01","attempt_lease":{"ticket_id":"T-027-01","attempt_id":2},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}"#;
+
     #[test]
     fn route_from_client_maps_provider() {
         let c = Route::from_client(AgentClient::Claude);
@@ -218,7 +306,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"schema_version\":3"));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
         assert!(json.contains("\"authoritative\":true"));
@@ -227,6 +315,76 @@ mod tests {
         // Round-trips back to an equal record.
         let back: ProvenanceRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, sample());
+    }
+
+    #[test]
+    fn assignment_transition_serializes_to_one_compact_line() {
+        let record = sample_assignment_transition();
+        let json = serde_json::to_string(&record).unwrap();
+
+        assert!(!json.contains('\n'), "record must be single-line: {json}");
+        assert!(json.contains("\"schema_version\":3"));
+        assert!(json.contains("\"record_type\":\"assignment-transition\""));
+        assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
+        assert!(json.contains("\"pane_id\":12"));
+        assert!(json.contains("\"provider\":\"openai\""));
+        assert!(json.contains("\"state\":\"delivery-failed\""));
+        assert!(json
+            .contains("\"reason\":\"provider did not acknowledge the bounded chat assignment\""));
+        assert!(json.contains("\"started_at\":1752000000"));
+        assert!(json.contains("\"ended_at\":1752000030"));
+        assert!(json.contains("\"wall_clock_secs\":30"));
+
+        let back: AssignmentTransitionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn assignment_transition_appends_as_exactly_one_jsonl_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.jsonl");
+        let record = sample_assignment_transition();
+
+        append_assignment_transition_record(&path, &record).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let back: AssignmentTransitionRecord = serde_json::from_slice(&bytes[..bytes.len() - 1])
+            .expect("the only JSONL row remains a complete assignment record");
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn mixed_ledger_reads_schema_v2_execution_and_schema_v3_assignment_transition() {
+        let legacy: ProvenanceRecord = serde_json::from_str(SCHEMA_V2_EXECUTION_JSON).unwrap();
+        assert_eq!(legacy.schema_version, 2);
+        assert_eq!(legacy.attempt_lease.attempt_id, 2);
+        assert_eq!(legacy.outcome, RunOutcome::Done);
+        assert!(legacy.authoritative);
+
+        let transition = sample_assignment_transition();
+        let ledger = format!(
+            "{}\n{}\n",
+            SCHEMA_V2_EXECUTION_JSON,
+            serde_json::to_string(&transition).unwrap()
+        );
+        let rows: Vec<ProvenanceLedgerRecord> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ProvenanceLedgerRecord::Execution(legacy),
+            "the unchanged schema-v2 line remains an execution record"
+        );
+        assert_eq!(
+            rows[1],
+            ProvenanceLedgerRecord::AssignmentTransition(transition),
+            "the schema-v3 line is recognized as pre-ownership evidence"
+        );
     }
 
     #[test]
