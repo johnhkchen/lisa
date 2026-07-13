@@ -1,10 +1,11 @@
-//! Regression lock for the legible `--help` surface (S-036-01).
+//! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
-//! Pins three properties so they cannot silently regress:
+//! Pins four properties so they cannot silently regress:
 //!   (a) all 12 of Lisa's own subcommands still resolve,
-//!   (b) the four machinery-invoked hook commands stay set apart from the
+//!   (b) top-level help matches the operator-oriented snapshot,
+//!   (c) the four machinery-invoked plumbing commands stay outside the
 //!       operator listing and the three internal commands stay hidden out of it,
-//!   (c) the about-line and operator help carry none of the banned category
+//!   (d) the about-line and operator help carry none of the banned category
 //!       jargon.
 //!
 //! Black-box against the built binary (`CARGO_BIN_EXE_lisa`), matching the
@@ -27,6 +28,33 @@ const HOOK_COMMANDS: [&str; 4] = [
 
 /// Hidden out of the primary listing (`hide = true`) but still resolvable.
 const HIDDEN_COMMANDS: [&str; 3] = ["setup-guide", "hooks-guide", "version"];
+
+const PLUMBING_HEADING: &str = "Plumbing commands (called by Lisa and agent hooks):";
+
+const TOP_LEVEL_HELP_SNAPSHOT: &str = r#"Everyday path: init → validate → status → loop
+
+Runs your coding agents through a project's tickets.
+
+Usage: lisa <COMMAND>
+
+Commands:
+  init      Set up a project to run with Lisa
+  validate  Check your tickets and project setup for problems before a run
+  status    Show which tickets are ready to run and which are waiting, and why
+  doctor    Check that the tools Lisa needs are installed
+  loop      Start a run: work through the ready tickets, in parallel where they don't collide
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Plumbing commands (called by Lisa and agent hooks):
+  agent-exec       Run Codex and turn its output into Lisa's pane signals
+  capture-usage    Record a native session's token usage from its Stop-hook payload on stdin
+  commit-ticket    Commit this ticket's own files without touching the repo's ordinary git index
+  complete-ticket  Mark a ticket done and commit its files in one step
+"#;
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
 const OWN_COMMANDS: [&str; 12] = [
@@ -126,23 +154,36 @@ fn all_twelve_subcommands_resolve() {
     }
 }
 
-/// (b) The four hook commands trail the operator block in `--help` (set apart),
-/// and the three internal commands are hidden out of the listing entirely.
+/// (b) The complete top-level help screen is a deliberate, reviewable surface.
 #[test]
-fn hook_commands_are_set_apart_and_internal_hidden() {
-    let help = help_stdout(&["--help"]);
+fn top_level_help_matches_snapshot() {
+    assert_eq!(help_stdout(&["--help"]), TOP_LEVEL_HELP_SNAPSHOT);
+}
 
-    // Anchor on the last operator command; every hook command must appear after
-    // it. Guard against a false pass if `loop` itself went missing.
-    let loop_pos =
-        listing_offset(&help, "loop").expect("operator command `loop` missing from --help listing");
+/// (c) Plumbing has its own footer rather than leaking into the generated
+/// operator list, and the three internal commands remain hidden entirely.
+#[test]
+fn plumbing_commands_are_separate_and_internal_hidden() {
+    let help = help_stdout(&["--help"]);
+    let (operator_help, plumbing_help) = help
+        .split_once(PLUMBING_HEADING)
+        .expect("top-level help is missing the plumbing section heading");
+
+    for operator in OPERATOR_COMMANDS {
+        assert!(
+            listing_offset(operator_help, operator).is_some(),
+            "operator command `{operator}` is missing from the generated command list",
+        );
+    }
 
     for hook in HOOK_COMMANDS {
-        let pos = listing_offset(&help, hook)
-            .unwrap_or_else(|| panic!("hook command `{hook}` missing from --help listing"));
         assert!(
-            pos > loop_pos,
-            "hook command `{hook}` is not set apart — it renders within/above the operator block instead of trailing it",
+            listing_offset(operator_help, hook).is_none(),
+            "plumbing command `{hook}` leaked into the generated operator list",
+        );
+        assert!(
+            listing_offset(plumbing_help, hook).is_some(),
+            "plumbing command `{hook}` is missing from the plumbing section",
         );
     }
 
@@ -154,7 +195,7 @@ fn hook_commands_are_set_apart_and_internal_hidden() {
     }
 }
 
-/// (c) The about-line and each operator command's help contain no banned jargon.
+/// (d) The about-line and each operator command's help contain no banned jargon.
 /// Hook-command help is intentionally NOT gated — it carries domain vocabulary
 /// (codex exec, provenance ledger) the epic deliberately left alone.
 #[test]
@@ -163,7 +204,7 @@ fn about_line_and_operator_help_are_jargon_free() {
 
     let about = help
         .lines()
-        .find(|l| !l.trim().is_empty())
+        .find(|line| line.to_lowercase().contains("coding agents"))
         .expect("`lisa --help` produced no about-line");
     // Positive anchor: the plain masthead must actually be present, so the test
     // can't pass by reading empty/rerouted output.
