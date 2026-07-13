@@ -2739,6 +2739,61 @@ impl State {
         true
     }
 
+    /// Promote a delivered assignment from recognized workflow output only
+    /// after the caller has admitted that output from this exact current
+    /// attempt's private work directory. Returning the pane identifies the
+    /// one pending-to-owned edge for activity bookkeeping.
+    fn admit_artifact_ownership(
+        &mut self,
+        ticket_id: &str,
+        candidate: &AttemptLease,
+    ) -> Option<u32> {
+        if candidate.ticket_id != ticket_id
+            || !candidate.is_current(self.current_leases.get(ticket_id))
+        {
+            return None;
+        }
+        let pane_id = self
+            .agent_slots
+            .iter()
+            .find(|slot| {
+                slot.ticket_id.as_deref() == Some(ticket_id)
+                    && slot.attempt_lease.as_ref() == Some(candidate)
+            })?
+            .pane_id;
+        if self.active_assignment_generation(pane_id) != Some(candidate.attempt_id) {
+            return None;
+        }
+
+        self.seat_assignments
+            .insert(pane_id, SeatAssignmentState::Owned);
+        Some(pane_id)
+    }
+
+    /// Record the weaker, bounded ownership fallback offered by one artifact
+    /// that has already crossed `admit_artifact` successfully.
+    fn record_artifact_ownership(
+        &mut self,
+        ticket_id: &str,
+        candidate: Option<&AttemptLease>,
+        artifact_name: &str,
+    ) {
+        let Some(candidate) = candidate else {
+            return;
+        };
+        let Some(pane_id) = self.admit_artifact_ownership(ticket_id, candidate) else {
+            return;
+        };
+
+        self.bump_pane_activity(pane_id);
+        self.log_activity(ActivityEvent::Info {
+            message: format!(
+                "Pane {} established ownership of {} attempt {} from current-attempt {}",
+                pane_id, ticket_id, candidate.attempt_id, artifact_name
+            ),
+        });
+    }
+
     /// Retain a started-but-unassigned provider as an explicit terminal failure
     /// after bounded chat delivery is exhausted.
     fn fail_assignment_delivery(
@@ -4164,15 +4219,21 @@ impl State {
                 // progress.md is a living Implement artifact: publish current
                 // bytes for durability/review, but never use it as a phase edge.
                 if current_phase == Phase::Implement {
-                    if let Err(error) =
-                        self.admit_artifact(&ticket_id, source_lease.as_ref(), "progress.md")
-                    {
-                        self.log_activity(ActivityEvent::Error {
-                            message: format!(
-                                "Rejected progress publication for {}: {}",
-                                ticket_id, error
-                            ),
-                        });
+                    match self.admit_artifact(&ticket_id, source_lease.as_ref(), "progress.md") {
+                        Ok(true) => self.record_artifact_ownership(
+                            &ticket_id,
+                            source_lease.as_ref(),
+                            "progress.md",
+                        ),
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.log_activity(ActivityEvent::Error {
+                                message: format!(
+                                    "Rejected progress publication for {}: {}",
+                                    ticket_id, error
+                                ),
+                            });
+                        }
                     }
                 }
                 // Determine which artifact signals completion of this phase.
@@ -4187,7 +4248,11 @@ impl State {
                 };
 
                 match self.admit_artifact(&ticket_id, source_lease.as_ref(), artifact_name) {
-                    Ok(true) => {}
+                    Ok(true) => self.record_artifact_ownership(
+                        &ticket_id,
+                        source_lease.as_ref(),
+                        artifact_name,
+                    ),
                     Ok(false) => continue,
                     Err(error) => {
                         self.log_activity(ActivityEvent::Error {
@@ -5883,16 +5948,16 @@ impl State {
         // shell probe positively executes in the same pane.
         self.check_shell_ready_signals();
 
-        // A valid exact assignment claim is sufficient ownership proof even
-        // when no provider hook evidence arrives.
+        // The exact assignment claim is authoritative and gets the first
+        // opportunity to own when multiple evidence tiers arrive together.
         self.check_claim_signals();
 
-        // Existing provider prompt evidence remains available for the evidence
-        // hierarchy refined by the next scheduler ticket. Both consumers run
-        // before timeout/recovery evaluation.
+        // Matching provider prompt evidence remains a supplemental fast path
+        // while the claim is pending.
         self.check_codex_ack_signals();
 
-        // Check for new artifacts and advance phases before rebuilding DAG
+        // Admitted current-attempt workflow output is the final bounded
+        // ownership fallback before timeout policy, as well as a phase edge.
         self.check_artifact_advances();
 
         // Check for idle signals and advance phases / generate alerts
@@ -14087,6 +14152,144 @@ owned\n\
             event,
             ActivityEvent::Info { message }
                 if message.contains("claimed T-NAME attempt 1 assignment")
+        )));
+    }
+
+    #[test]
+    fn matching_hook_accelerates_pending_claim_ownership() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        std::fs::create_dir_all(&state.signal_dir).unwrap();
+        state.schedule_ready_tickets();
+
+        let lease = state.current_leases["T-NAME"].clone();
+        exit_then_deliver_fresh_codex(&mut state, 10, &lease);
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                retries: 0,
+                ..
+            }) if generation == lease.attempt_id
+        ));
+        assert!(!state.seat_is_owned(10));
+        assert!(!state.signal_dir.join("pane-10.claim").exists());
+
+        let matching = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "supplemental ownership evidence",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-NAME",
+                    generation: lease.attempt_id,
+                },
+            ),
+        });
+        let hook_path = state.signal_dir.join("pane-10.ack");
+        std::fs::write(&hook_path, matching.to_string()).unwrap();
+        state.check_codex_ack_signals();
+
+        assert!(!hook_path.exists());
+        assert!(!state.signal_dir.join("pane-10.claim").exists());
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Info { message }
+                if message.contains("Pane 10 acknowledged its assignment")
+        )));
+    }
+
+    #[test]
+    fn current_artifact_is_bounded_fallback_and_stale_evidence_is_ignored() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        std::fs::create_dir_all(&state.signal_dir).unwrap();
+        state.schedule_ready_tickets();
+
+        let predecessor = state.current_leases["T-NAME"].clone();
+        exit_then_deliver_fresh_codex(&mut state, 10, &predecessor);
+        state.release_slot_for_ticket(&"T-NAME".to_string());
+        state.threads.remove("T-NAME");
+        state.agent_slots[0].cooldown_until =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        state.agent_slots[0].last_activity_at =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        state.schedule_ready_tickets();
+
+        let replacement = state.current_leases["T-NAME"].clone();
+        assert_eq!(replacement.attempt_id, predecessor.attempt_id + 1);
+        exit_then_deliver_fresh_codex(&mut state, 10, &replacement);
+        state.threads.get_mut("T-NAME").unwrap().current_phase = Phase::Research;
+        let old_activity = std::time::SystemTime::UNIX_EPOCH;
+        state.threads.get_mut("T-NAME").unwrap().last_activity = old_activity;
+        state.agent_slots[0].last_activity_at = Some(old_activity);
+
+        let stale_hook = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": codex_ack::tag_codex_assignment(
+                "predecessor ownership evidence",
+                codex_ack::CodexAssignmentRef {
+                    ticket_id: "T-NAME",
+                    generation: predecessor.attempt_id,
+                },
+            ),
+        });
+        let hook_path = state.signal_dir.join("pane-10.ack");
+        std::fs::write(&hook_path, stale_hook.to_string()).unwrap();
+        let predecessor_stage = state.attempt_work_dir(&predecessor);
+        std::fs::create_dir_all(&predecessor_stage).unwrap();
+        std::fs::write(
+            predecessor_stage.join("research.md"),
+            "predecessor output must remain private\n",
+        )
+        .unwrap();
+
+        state.check_codex_ack_signals();
+        state.check_artifact_advances();
+
+        assert!(!hook_path.exists(), "stale hook evidence remains one-shot");
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Delivering { generation, .. })
+                if generation == replacement.attempt_id
+        ));
+        assert_eq!(state.threads["T-NAME"].last_activity, old_activity);
+        assert_eq!(state.agent_slots[0].last_activity_at, Some(old_activity));
+        assert_eq!(state.threads["T-NAME"].current_phase, Phase::Research);
+        assert!(!state.config.work_dir.join("T-NAME/research.md").exists());
+        assert!(
+            state
+                .admit_artifact("T-NAME", Some(&predecessor), "research.md")
+                .is_err(),
+            "a predecessor artifact cannot cross the current lease boundary"
+        );
+        assert_eq!(
+            std::fs::read_to_string(predecessor_stage.join("research.md")).unwrap(),
+            "predecessor output must remain private\n"
+        );
+
+        let replacement_stage = state.attempt_work_dir(&replacement);
+        std::fs::create_dir_all(&replacement_stage).unwrap();
+        std::fs::write(
+            replacement_stage.join("research.md"),
+            "replacement output is current\n",
+        )
+        .unwrap();
+        state.check_artifact_advances();
+
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
+        assert_eq!(state.threads["T-NAME"].current_phase, Phase::Design);
+        assert!(state.threads["T-NAME"].last_activity > old_activity);
+        assert!(state.agent_slots[0].last_activity_at.unwrap() > old_activity);
+        assert_eq!(
+            std::fs::read_to_string(state.config.work_dir.join("T-NAME/research.md")).unwrap(),
+            "replacement output is current\n"
+        );
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Info { message }
+                if message.contains("Pane 10 established ownership of T-NAME attempt 2")
+                    && message.contains("current-attempt research.md")
         )));
     }
 
