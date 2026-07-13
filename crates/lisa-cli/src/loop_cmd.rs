@@ -19,6 +19,21 @@ fn configured_clients(root: &Path, config: &ResolvedConfig) -> HashSet<AgentClie
     clients
 }
 
+/// Refuse to launch a scheduler whose project setup predates the binary's
+/// machine-readable protocol version. `lisa init` upgrades known templates and
+/// preserves customized files, while the live assignment prompt independently
+/// carries mandatory protocol instructions.
+fn validate_project_protocol(config: &ResolvedConfig) -> Result<(), String> {
+    if crate::config::version_is_stale(&config.project_version, crate::config::LISA_VERSION) {
+        return Err(format!(
+            "Project Lisa protocol {} is older than this binary ({}). Run `lisa init` and review its reported file actions before starting the loop.",
+            config.project_version,
+            crate::config::LISA_VERSION,
+        ));
+    }
+    Ok(())
+}
+
 /// Run the lisa loop: write embedded WASM, generate layout, exec zellij.
 ///
 /// In dry-run mode, scans tickets, builds the DAG, and prints what would happen
@@ -34,6 +49,8 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
             config.ticket_dir
         ));
     }
+
+    validate_project_protocol(config)?;
 
     if dry_run {
         return run_dry(root, config);
@@ -645,6 +662,22 @@ mod tests {
         let config = default_config();
         let result = run_loop(dir.path(), &config, true);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_loop_rejects_stale_release_candidate_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# test").unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        let config = ResolvedConfig {
+            project_version: "0.4.0-rc.5".to_string(),
+            ..default_config()
+        };
+
+        let error = run_loop(dir.path(), &config, true).unwrap_err();
+        assert!(error.contains("0.4.0-rc.5"));
+        assert!(error.contains(crate::config::LISA_VERSION));
+        assert!(error.contains("lisa init"));
     }
 
     #[test]

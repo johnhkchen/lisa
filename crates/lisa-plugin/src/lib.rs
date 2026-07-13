@@ -117,13 +117,18 @@ pub(crate) fn ticket_prompt(
          During Implement, commit each meaningful ticket-owned source unit only with \
          lisa commit-ticket and exact repository-relative --include paths. Do not use ordinary-index git add, \
          git add -A, or git commit for ticket work, and do not leave ticket-owned files staged, modified, or untracked. \
-         After Review is complete (review.md written summarizing changes, test coverage, and open concerns), \
+         During Review, write review.md summarizing changes, test coverage, and open concerns, and also write \
+         {artifact_dir}/review-disposition.json with exactly {pass_json} when the work is ready to complete, \
+         or {block_json} with a non-empty actionable reason when it is blocked. Both Review artifacts are required. \
+         After Review is complete, \
          remain on this ticket and stop. Do not start another ticket until Lisa confirms the completion commit; \
          Lisa handles Done publication and seat release.",
         path = ticket_path.display(),
         context = context_file,
         id = ticket_id,
         artifact_dir = artifact_dir.display(),
+        pass_json = r#"{"disposition":"pass","reason":null}"#,
+        block_json = r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#,
     )
 }
 
@@ -172,13 +177,20 @@ pub(crate) fn finish_up_prompt(
     _ticket_id: &str,
 ) -> String {
     let review_path = artifact_dir.join("review.md");
+    let disposition_path = artifact_dir.join("review-disposition.json");
     format!(
-        "You have been in the Review phase for a while. Please finish writing your review artifact at {}. \
+        "You have been in the Review phase for a while. Please finish both required Review artifacts. \
+         Write the narrative review at {}. \
          It should cover: what changes were made, files created/modified/deleted, test coverage, \
          any open concerns or TODOs, and critical issues to surface for human review. \
+         Write {} with exactly {pass_json} when the work is ready to complete, or {block_json} with a \
+         non-empty actionable reason when it is blocked. \
          Do NOT update the ticket's phase or status fields or use ordinary-index git add/git commit to publish completion. \
          Remain on this ticket and wait until Lisa confirms the completion commit before starting another ticket.",
         review_path.display(),
+        disposition_path.display(),
+        pass_json = r#"{"disposition":"pass","reason":null}"#,
+        block_json = r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#,
     )
 }
 
@@ -5351,9 +5363,10 @@ impl State {
         }
     }
 
-    /// A pending transaction or an admitted Review makes the generic
-    /// write-your-review follow-up false. Admission errors are also suppressed:
-    /// their activity entry is the actionable signal, not another pane prompt.
+    /// A pending transaction or a complete, valid Review makes the generic
+    /// finish-your-review follow-up false. A narrative `review.md` alone is not
+    /// enough: completion also requires an explicit pass/block disposition, so
+    /// missing or malformed disposition evidence must keep the prompt armed.
     fn review_completion_suppresses_finish_up(&mut self, ticket_id: &str) -> bool {
         if self.pending_completions.contains_key(ticket_id) {
             return true;
@@ -5368,16 +5381,55 @@ impl State {
         if !self.review_lease_is_current(ticket_id, &source_lease) {
             return false;
         }
-        match self.admit_artifact(ticket_id, Some(&source_lease), "review.md") {
-            Ok(admitted) => admitted,
-            Err(reason) => {
-                self.log_activity(ActivityEvent::Error {
-                    message: format!(
-                        "Suppressed finish-up for {ticket_id}: current Review admission failed: {reason}"
-                    ),
-                });
-                true
-            }
+        let inputs = self.review_completion_inputs(ticket_id, &source_lease);
+        inputs.artifact_admission.is_some()
+            && matches!(
+                inputs.disposition,
+                ReviewDisposition::Pass | ReviewDisposition::Block { .. }
+            )
+    }
+
+    /// Explain an attempt-local Review protocol blocker without mutating or
+    /// publishing artifacts. This feeds the attention banner, where a precise
+    /// missing/invalid disposition is more useful than generic phase inactivity.
+    fn review_protocol_blocker(&self, ticket_id: &str) -> Option<(String, Vec<String>)> {
+        let thread = self.threads.get(ticket_id)?;
+        if thread.current_phase != Phase::Review {
+            return None;
+        }
+        let lease = thread.attempt_lease.as_ref()?;
+        if !self.review_lease_is_current(ticket_id, lease) {
+            return None;
+        }
+        let attempt_dir = self.attempt_work_dir(lease);
+        if !attempt_dir.join("review.md").is_file() {
+            return None;
+        }
+
+        let disposition_path = attempt_dir.join("review-disposition.json");
+        if !disposition_path.is_file() {
+            return Some((
+                "Missing review-disposition.json".to_string(),
+                vec![
+                    "Write pass/block disposition".to_string(),
+                    "Check pane".to_string(),
+                ],
+            ));
+        }
+
+        match parse_review_disposition(&disposition_path) {
+            ReviewDisposition::Pass => None,
+            ReviewDisposition::Block { reason } => Some((
+                format!("Review blocked: {reason}"),
+                vec![
+                    "Resolve review blocker".to_string(),
+                    "Check pane".to_string(),
+                ],
+            )),
+            ReviewDisposition::Invalid { reason } => Some((
+                format!("Invalid review disposition: {reason}"),
+                vec!["Fix disposition JSON".to_string(), "Check pane".to_string()],
+            )),
         }
     }
 
@@ -6865,15 +6917,25 @@ impl State {
             .filter_map(|t| {
                 let health = t.health(now, threshold);
                 match health {
-                    lisa_core::types::HealthStatus::Stuck => Some(ui::HealthAlert {
-                        ticket_id: t.ticket_id.clone(),
-                        alert_type: ui::AlertType::Stuck,
-                        detail: format!("No phase change for {}+ min", threshold.as_secs() / 60),
-                        suggested_actions: vec![
-                            "Check pane".to_string(),
-                            "Restart session".to_string(),
-                        ],
-                    }),
+                    lisa_core::types::HealthStatus::Stuck => {
+                        let (detail, suggested_actions) = self
+                            .review_protocol_blocker(&t.ticket_id)
+                            .unwrap_or_else(|| {
+                                (
+                                    format!(
+                                        "No phase change for {}+ min",
+                                        threshold.as_secs() / 60
+                                    ),
+                                    vec!["Check pane".to_string(), "Restart session".to_string()],
+                                )
+                            });
+                        Some(ui::HealthAlert {
+                            ticket_id: t.ticket_id.clone(),
+                            alert_type: ui::AlertType::Stuck,
+                            detail,
+                            suggested_actions,
+                        })
+                    }
                     lisa_core::types::HealthStatus::Failed => Some(ui::HealthAlert {
                         ticket_id: t.ticket_id.clone(),
                         alert_type: ui::AlertType::Failed,
@@ -8140,6 +8202,12 @@ mod tests {
         assert!(prompt.contains("Do not use ordinary-index git add"));
         assert!(prompt.contains("git add -A"));
         assert!(prompt.contains("do not leave ticket-owned files staged, modified, or untracked"));
+        assert!(prompt.contains("review-disposition.json"));
+        assert!(prompt.contains(r#"{"disposition":"pass","reason":null}"#));
+        assert!(
+            prompt.contains(r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#)
+        );
+        assert!(prompt.contains("Both Review artifacts are required"));
         assert!(prompt.contains("Do not start another ticket until Lisa confirms"));
     }
 
@@ -8189,6 +8257,11 @@ mod tests {
         );
 
         assert!(prompt.contains(".lisa/attempts/T-024-03/1/work/review.md"));
+        assert!(prompt.contains(".lisa/attempts/T-024-03/1/work/review-disposition.json"));
+        assert!(prompt.contains(r#"{"disposition":"pass","reason":null}"#));
+        assert!(
+            prompt.contains(r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#)
+        );
         assert!(prompt.contains("Do NOT update the ticket's phase or status"));
         assert!(prompt.contains("ordinary-index git add/git commit"));
         assert!(prompt.contains("wait until Lisa confirms the completion commit"));
@@ -9604,6 +9677,41 @@ mod tests {
         assert_eq!(ui_state.alerts.len(), 1);
         assert_eq!(ui_state.alerts[0].ticket_id, "T-001");
         assert_eq!(ui_state.alerts[0].alert_type, ui::AlertType::Stuck);
+    }
+
+    #[test]
+    fn review_protocol_blocker_replaces_generic_stuck_detail() {
+        use lisa_core::types::Thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State {
+            attempt_dir: dir.path().join("attempts"),
+            ..State::default()
+        };
+        state.config.stuck_threshold_secs = 600;
+
+        let mut thread = Thread::new("T-REVIEW", 1);
+        thread.current_phase = Phase::Review;
+        thread.last_phase_change =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(700);
+        thread.last_activity = thread.last_phase_change;
+        state.threads.insert("T-REVIEW".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-REVIEW");
+        std::fs::create_dir_all(state.attempt_work_dir(&lease)).unwrap();
+        std::fs::write(
+            state.attempt_work_dir(&lease).join("review.md"),
+            "# Review\n",
+        )
+        .unwrap();
+
+        let ui_state = state.to_ui_state();
+
+        assert_eq!(ui_state.alerts.len(), 1);
+        assert_eq!(ui_state.alerts[0].detail, "Missing review-disposition.json");
+        assert_eq!(
+            ui_state.alerts[0].suggested_actions,
+            vec!["Write pass/block disposition", "Check pane"]
+        );
     }
 
     #[test]
@@ -15568,6 +15676,50 @@ owned\n\
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn review_timeout_prompts_when_disposition_is_missing_after_review() {
+        use std::fs;
+
+        const TICKET_ID: &str = "T-TIMEOUT-DISPOSITION";
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("project");
+        let tickets_dir = project_root.join("tickets");
+        let work_dir = project_root.join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join(format!("{TICKET_ID}.md")),
+            format!(
+                "---\nid: {TICKET_ID}\ntitle: missing-disposition\ntype: bug\nstatus: open\npriority: critical\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let (mut state, lease) = review_timeout_state(
+            TICKET_ID,
+            tickets_dir,
+            work_dir,
+            project_root,
+            dir.path().to_path_buf(),
+            PathBuf::new(),
+        );
+        fs::write(
+            state.attempt_work_dir(&lease).join("review.md"),
+            "# Review\n\nReady, but an old workflow omitted the disposition.\n",
+        )
+        .unwrap();
+
+        state.reconcile_review_completions();
+        assert!(!state.pending_completions.contains_key(TICKET_ID));
+        state.check_review_timeouts();
+
+        assert!(state.finish_up_sent.contains(TICKET_ID));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::FinishUpPromptSent { ticket_id, pane_id }
+                if ticket_id == TICKET_ID && *pane_id == 42
+        )));
     }
 
     #[test]

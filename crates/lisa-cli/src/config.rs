@@ -56,6 +56,8 @@ pub struct SchedulingConfig {
 /// Fully resolved configuration with all defaults applied.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
+    /// Machine-readable project setup/protocol version from `.lisa.toml`.
+    pub project_version: String,
     pub ticket_dir: String,
     pub story_dir: String,
     pub work_dir: String,
@@ -75,6 +77,7 @@ pub struct ResolvedConfig {
 impl Default for ResolvedConfig {
     fn default() -> Self {
         Self {
+            project_version: LISA_VERSION.to_string(),
             ticket_dir: PluginConfig::DEFAULT_TICKET_DIR.to_string(),
             story_dir: PluginConfig::DEFAULT_STORY_DIR.to_string(),
             work_dir: PluginConfig::DEFAULT_WORK_DIR.to_string(),
@@ -135,6 +138,10 @@ pub fn resolve_config(
         .unwrap_or(defaults.client);
 
     ResolvedConfig {
+        project_version: config
+            .version
+            .clone()
+            .unwrap_or_else(|| defaults.project_version.clone()),
         client,
         ticket_dir: config.dirs.tickets.clone().unwrap_or(defaults.ticket_dir),
         story_dir: config.dirs.stories.clone().unwrap_or(defaults.story_dir),
@@ -295,25 +302,68 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
 pub const LISA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns true if `project_version` is older than `current_version`.
-/// Uses simple tuple comparison of (major, minor, patch) parsed from semver strings.
+/// Compares SemVer core and prerelease identifiers, including rc generations.
 /// Returns true (needs update) if parsing fails.
 pub fn version_is_stale(project_version: &str, current_version: &str) -> bool {
-    fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
-        // Strip any pre-release / build-metadata suffix (e.g. "0.3.0-rc.1" or
-        // "0.3.0+build") so prerelease versions parse to their core triple.
-        let core = s.split(['-', '+']).next().unwrap_or(s);
+    #[derive(Debug, PartialEq, Eq)]
+    struct ParsedVersion<'a> {
+        core: (u32, u32, u32),
+        prerelease: Option<Vec<&'a str>>,
+    }
+
+    fn parse_semver(s: &str) -> Option<ParsedVersion<'_>> {
+        let without_build = s.split('+').next().unwrap_or(s);
+        let (core, prerelease) = match without_build.split_once('-') {
+            Some((core, prerelease)) if !prerelease.is_empty() => {
+                (core, Some(prerelease.split('.').collect()))
+            }
+            Some(_) => return None,
+            None => (without_build, None),
+        };
         let parts: Vec<&str> = core.split('.').collect();
         if parts.len() != 3 {
             return None;
         }
-        Some((
-            parts[0].parse().ok()?,
-            parts[1].parse().ok()?,
-            parts[2].parse().ok()?,
-        ))
+        Some(ParsedVersion {
+            core: (
+                parts[0].parse().ok()?,
+                parts[1].parse().ok()?,
+                parts[2].parse().ok()?,
+            ),
+            prerelease,
+        })
     }
+
+    fn prerelease_cmp(left: &[&str], right: &[&str]) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        for (left, right) in left.iter().zip(right.iter()) {
+            let ordering = match (left.parse::<u64>(), right.parse::<u64>()) {
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => left.cmp(right),
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        left.len().cmp(&right.len())
+    }
+
     match (parse_semver(project_version), parse_semver(current_version)) {
-        (Some(proj), Some(curr)) => proj < curr,
+        (Some(project), Some(current)) => match project.core.cmp(&current.core) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => match (&project.prerelease, &current.prerelease) {
+                (None, None) => false,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(project), Some(current)) => {
+                    prerelease_cmp(project, current) == std::cmp::Ordering::Less
+                }
+            },
+        },
         _ => true,
     }
 }
@@ -663,6 +713,25 @@ foo = 1
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.version, Some("0.2.1".to_string()));
         assert_eq!(config.scheduling.max_threads, Some(4));
+        assert_eq!(resolve_config(&config, None, None).project_version, "0.2.1");
+    }
+
+    #[test]
+    fn version_staleness_compares_release_candidate_generations() {
+        assert!(version_is_stale("0.4.0-rc.5", "0.4.0-rc.8"));
+        assert!(version_is_stale("0.4.0-rc.7", "0.4.0-rc.8"));
+        assert!(!version_is_stale("0.4.0-rc.8", "0.4.0-rc.8"));
+        assert!(!version_is_stale("0.4.0-rc.9", "0.4.0-rc.8"));
+    }
+
+    #[test]
+    fn version_staleness_obeys_semver_prerelease_ordering() {
+        assert!(version_is_stale("0.4.0-rc.8", "0.4.0"));
+        assert!(!version_is_stale("0.4.0", "0.4.0-rc.8"));
+        assert!(version_is_stale("0.4.0-alpha.10", "0.4.0-beta.1"));
+        assert!(version_is_stale("0.4.0-rc.8", "0.4.1-alpha.1"));
+        assert!(!version_is_stale("0.5.0-alpha.1", "0.4.9"));
+        assert!(version_is_stale("not-semver", "0.4.0-rc.8"));
     }
 
     #[test]
