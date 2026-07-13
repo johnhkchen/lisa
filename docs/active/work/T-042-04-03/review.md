@@ -313,3 +313,21 @@ Block with the actionable reason recorded in `review-disposition.json`.
 
 Review is complete. This attempt remains on `T-042-04-03` for Lisa or a human
 reviewer to process the blocked result.
+
+## Replacement review addendum
+
+**Pass.**
+
+The operator authorized a corrected replacement run. It passed the previously
+missing held-lock and `[d]one` recovery path and retained the required durable
+journal, provenance, commit-tree, build-identity, teardown, and test evidence.
+
+The first replacement invocation also exposed a private harness-only issue:
+Zellij returns a nonzero status when `focus-pane-id` targets the pane that is
+already focused. Making that focus operation idempotent allowed the unchanged
+product path to complete. No product source changed for this correction.
+
+The canonical machine-readable disposition is now Pass. See
+`field-rerun-evidence.md` for the compact evidence record. This addendum
+supersedes the earlier Block as the final ticket disposition while preserving
+the earlier attempt's facts.

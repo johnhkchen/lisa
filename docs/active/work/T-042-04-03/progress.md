@@ -480,3 +480,19 @@ It must also record an explicit reviewer decision on the settled 10.139151%
 WASM movement from the last documented measurement.
 
 Until those actions are complete, the epic done-signal remains blocked.
+
+## Corrected replacement run
+
+The operator authorized the replacement run after the loop sweep. The private
+harness was corrected to retain consumed acknowledgements and to treat an
+already-focused Zellij plugin pane as an idempotent focus success.
+
+The corrected run passed. It captured the normal nested completion, the
+retryable held-lock rejection, literal `d` plus Enter operator recovery, two
+completion commits, two authoritative Done provenance rows, an empty ordinary
+index, exact embedded/runtime WASM identity, complete teardown, and a green
+workspace test suite. The compact durable record is in
+`field-rerun-evidence.md`.
+
+The previous blocking verdict describes the first incomplete attempt and is
+retained as history. The replacement evidence closes its missing requirements.
