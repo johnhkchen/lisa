@@ -124,11 +124,11 @@ enum Commands {
         #[arg(long, default_value = ".lisa/signals")]
         signal_dir: PathBuf,
     },
-    /// Record a Claude session's token usage from its Stop-hook payload on stdin,
-    /// writing `.lisa/claude/<ticket>.usage.json` for the provenance ledger.
+    /// Record a native session's token usage from its Stop-hook payload on stdin,
+    /// appending observed facts to `.lisa/<client>/captures.jsonl`.
     #[command(display_order = 21)]
     CaptureUsage {
-        /// Project root the `.lisa/claude` artifact is written under.
+        /// Project root the `.lisa/<client>` capture ledger is written under.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },

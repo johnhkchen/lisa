@@ -11,25 +11,29 @@
 //! parser and `.lisa/codex/`; absence preserves the Claude behavior.
 //!
 //! Write-after and never-fabricate: Stop fires at *turn* boundaries (not per
-//! tool call — the heartbeat hook stays trivial), and the artifact is overwritten
-//! each Stop with the cumulative transcript total. The plugin reads it only at
-//! terminal teardown, so last-write-wins is the final total and nothing races the
-//! agent-owned frontmatter. Every missing input (no `transcript_path`, unreadable
-//! transcript, malformed lines, no assistant messages) writes nothing and returns
-//! `Ok(())` — tokens stay `null`, never guessed.
+//! tool call — the heartbeat hook stays trivial). Each successful observation is
+//! appended to `.lisa/<client>/captures.jsonl` with its pane, provider session,
+//! capture time, and totals. Ticket attribution is deliberately deferred to the
+//! scheduler, which has the pane-ownership history the hook process lacks. Every
+//! missing input (no `transcript_path`, unreadable transcript, malformed lines,
+//! no assistant messages) currently writes nothing and returns `Ok(())`.
 
 use std::io::Read;
 use std::path::Path;
+use std::time::SystemTime;
 
+use lisa_core::capture::{append_capture_record, CaptureRecord};
+use lisa_core::provenance::system_time_to_epoch;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// The Stop-hook stdin payload. Only `transcript_path` is required; everything
-/// else the native client sends (session_id, cwd, …) is ignored.
+/// Facts supplied by the native client's Stop-hook payload.
 #[derive(Debug, Deserialize)]
 struct StopPayload {
     #[serde(default)]
     transcript_path: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 /// Summed, provider-native totals in the shape the plugin reader expects.
@@ -100,34 +104,9 @@ fn codex_transcript_usage(jsonl: &str) -> UsageTotals {
     latest
 }
 
-/// Build the artifact JSON `{ key, usage: { input_tokens, output_tokens } }` —
-/// the same nested-`usage` shape `provenance::extract_usage` reads.
-fn usage_artifact(key: &str, u: &UsageTotals) -> Value {
-    serde_json::json!({
-        "key": key,
-        "usage": {
-            "input_tokens": u.input_tokens,
-            "output_tokens": u.output_tokens,
-        },
-    })
-}
-
-/// Resolve the artifact key the way the Codex wrapper does
-/// (`LISA_TICKET_ID` → `pane-<LISA_PANE_ID>` → `"last"`), so the plugin's reader
-/// finds `<ticket>.usage.json` under `.lisa/claude` exactly as under `.lisa/codex`.
-fn resolve_key() -> String {
-    let ticket = std::env::var("LISA_TICKET_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let pane = std::env::var("LISA_PANE_ID").ok().filter(|s| !s.is_empty());
-    ticket
-        .or_else(|| pane.map(|p| format!("pane-{}", p)))
-        .unwrap_or_else(|| "last".to_string())
-}
-
 /// Read the Stop-hook payload from stdin, sum the transcript's usage, and write
-/// `.lisa/<client>/<key>.usage.json` under `cwd`. Best-effort throughout: any
-/// absent input returns `Ok(())` writing nothing.
+/// one append-only `.lisa/<client>/captures.jsonl` row under `cwd`. Best-effort
+/// throughout: any absent input returns `Ok(())` writing nothing.
 pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
     let mut stdin = String::new();
     if std::io::stdin().read_to_string(&mut stdin).is_err() {
@@ -138,6 +117,16 @@ pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
         Err(_) => return Ok(()),
     };
     let Some(transcript_path) = payload.transcript_path else {
+        return Ok(());
+    };
+    let Some(session_id) = payload.session_id.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(pane_id) = std::env::var("LISA_PANE_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
         return Ok(());
     };
     let jsonl = match std::fs::read_to_string(&transcript_path) {
@@ -155,15 +144,18 @@ pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
     if usage == UsageTotals::default() {
         return Ok(());
     }
-    let key = resolve_key();
     let client_dir = cwd
         .join(".lisa")
         .join(if is_codex { "codex" } else { "claude" });
-    std::fs::create_dir_all(&client_dir)?;
-    let artifact = usage_artifact(&key, &usage);
-    std::fs::write(
-        client_dir.join(format!("{}.usage.json", key)),
-        serde_json::to_string_pretty(&artifact).unwrap_or_else(|_| "{}".to_string()),
+    append_capture_record(
+        &client_dir.join("captures.jsonl"),
+        &CaptureRecord {
+            pane_id,
+            session_id,
+            captured_at: system_time_to_epoch(SystemTime::now()),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        },
     )
 }
 
@@ -208,23 +200,6 @@ mod tests {
         let u = sum_claude_transcript_usage(jsonl);
         assert_eq!(u.input_tokens, 0);
         assert_eq!(u.output_tokens, 9);
-    }
-
-    #[test]
-    fn artifact_shape_matches_extract_usage() {
-        // The artifact's nested `usage` must be readable by the shared extractor
-        // the plugin uses — this is the cross-crate contract.
-        let u = UsageTotals {
-            input_tokens: 167,
-            output_tokens: 37,
-        };
-        let artifact = usage_artifact("T-027-02", &u);
-        let usage = artifact.get("usage").unwrap();
-        let (tin, tout, cost) = lisa_core::provenance::extract_usage(usage);
-        assert_eq!(tin, Some(167));
-        assert_eq!(tout, Some(37));
-        assert_eq!(cost, None); // Claude records no dollar cost (design Q3)
-        assert_eq!(artifact.get("key").unwrap(), "T-027-02");
     }
 
     #[test]
