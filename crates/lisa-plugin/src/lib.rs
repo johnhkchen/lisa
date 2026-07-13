@@ -429,6 +429,7 @@ enum FailureTransitionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttemptLifecycleEvent {
     LeaseRevoked { ticket_id: TicketId },
+    CleanExitRequested { ticket_id: TicketId, pane_id: u32 },
     ShellInterrupted { ticket_id: TicketId, pane_id: u32 },
     ShellRelaunched { ticket_id: TicketId, pane_id: u32 },
     PaneFenced { ticket_id: TicketId, pane_id: u32 },
@@ -2329,7 +2330,7 @@ impl State {
             thread.complete();
         }
         self.emit_provenance(ticket_id, RunOutcome::Done, false);
-        self.release_slot_for_ticket(&ticket_id_owned);
+        self.release_completed_slot_for_ticket(&ticket_id_owned);
         self.threads.remove(ticket_id);
         self.schedule_ready_tickets();
     }
@@ -3836,6 +3837,64 @@ impl State {
                 message: format!("No slot found for {}", ticket_id),
             }),
         }
+    }
+
+    /// Release a durably completed ticket and gracefully retire a resident
+    /// Codex TUI before this physical pane can accept another assignment.
+    ///
+    /// Generic release remains provider-neutral and is also used by failure
+    /// paths. Successful completion alone owns this clean process boundary:
+    /// revoke the predecessor authority first, then exit its TUI, and leave the
+    /// unassigned pane unavailable until the existing exit grace proves a
+    /// clean shell.
+    fn release_completed_slot_for_ticket(&mut self, ticket_id: &TicketId) {
+        let clean_exit = self
+            .agent_slots
+            .iter()
+            .find(|slot| slot.ticket_id.as_ref() == Some(ticket_id))
+            .filter(|slot| {
+                slot.transition_state != TransitionState::Fenced
+                    && slot.has_session
+                    && slot.last_client == Some(AgentClient::Codex)
+            })
+            .map(|slot| {
+                let (adapter, _) = resolve_adapter_or_native(
+                    None,
+                    AgentClient::Codex,
+                    self.config.lisa_bin.as_deref(),
+                );
+                (slot.pane_id, adapter.exit_command())
+            });
+
+        self.release_slot_for_ticket(ticket_id);
+
+        let Some((pane_id, exit_command)) = clean_exit else {
+            return;
+        };
+
+        self.send_line_to_pane(exit_command, PaneId::Terminal(pane_id));
+        if let Some(slot) = self
+            .agent_slots
+            .iter_mut()
+            .find(|slot| slot.pane_id == pane_id)
+        {
+            slot.transition_state = TransitionState::WaitingForExit;
+            slot.transition_started_at = Some(std::time::SystemTime::now());
+            slot.has_session = false;
+            slot.cooldown_until = None;
+        }
+        #[cfg(test)]
+        self.attempt_lifecycle
+            .push(AttemptLifecycleEvent::CleanExitRequested {
+                ticket_id: ticket_id.clone(),
+                pane_id,
+            });
+        self.log_activity(ActivityEvent::Info {
+            message: format!(
+                "Completion boundary revoked {} and requested clean Codex exit on pane {}",
+                ticket_id, pane_id
+            ),
+        });
     }
 
     /// Schedule ready tickets into idle agent slots.
@@ -12872,6 +12931,220 @@ mod tests {
         assert_eq!(launch_paths.len(), 2);
     }
 
+    #[test]
+    fn codex_completion_exits_revokes_and_launches_next_fresh_tui() {
+        use lisa_core::types::ThreadStatus;
+        use std::fs;
+
+        const PREDECESSOR: &str = "T-BOUNDARY-01";
+        const SUCCESSOR: &str = "T-BOUNDARY-02";
+        const PANE_ID: u32 = 10;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join(format!("{PREDECESSOR}.md")),
+            format!(
+                "---\nid: {PREDECESSOR}\ntitle: completed boundary\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: codex\n---\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tickets_dir.join(format!("{SUCCESSOR}.md")),
+            format!(
+                "---\nid: {SUCCESSOR}\ntitle: fresh successor\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: codex\ndepends_on: [{PREDECESSOR}]\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
+                client: AgentClient::Codex,
+                lisa_bin: Some("/fixture/lisa".to_string()),
+                max_threads: 1,
+                wind_down_secs: 0,
+                assignment_ack_timeout_secs: 1,
+                ..PluginConfig::new()
+            },
+            signal_dir: dir.path().join("signals"),
+            attempt_dir: dir.path().join("attempts"),
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.push(fresh_slot(PANE_ID, None));
+
+        state.schedule_ready_tickets();
+        let predecessor_lease = state.current_leases[PREDECESSOR].clone();
+        let predecessor_assignment = state.assignment_refs[PREDECESSOR].clone();
+        let startup_deadline = match state.seat_assignment(PANE_ID) {
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(deadline),
+                relaunches: 0,
+            }) if generation == predecessor_lease.attempt_id => deadline,
+            other => panic!("expected fresh predecessor startup, got {other:?}"),
+        };
+        state.check_assignment_ack_timeouts_at(startup_deadline);
+        assert!(matches!(
+            state.seat_assignment(PANE_ID),
+            Some(SeatAssignmentState::Delivering { generation, .. })
+                if generation == predecessor_lease.attempt_id
+        ));
+
+        let predecessor_claim = AssignmentClaim {
+            ticket_id: PREDECESSOR.to_string(),
+            attempt_id: predecessor_lease.attempt_id,
+            nonce: predecessor_assignment.nonce,
+        };
+        assert!(state.admit_assignment_claim(PANE_ID, &predecessor_claim));
+        assert_eq!(
+            state.seat_assignment(PANE_ID),
+            Some(SeatAssignmentState::Owned)
+        );
+        println!(
+            "T0450401|boundary|step=claimed|ticket={PREDECESSOR}|pane={PANE_ID}|attempt={}|nonce={}",
+            predecessor_claim.attempt_id, predecessor_claim.nonce
+        );
+
+        ticket::update_ticket_done(tickets_dir.join(format!("{PREDECESSOR}.md"))).unwrap();
+        refresh_fixture_dag(&mut state);
+        state.threads.get_mut(PREDECESSOR).unwrap().complete();
+        assert_eq!(state.threads[PREDECESSOR].status, ThreadStatus::Completed);
+        state.release_completed_slot_for_ticket(&PREDECESSOR.to_string());
+        state.threads.remove(PREDECESSOR);
+
+        assert_eq!(
+            state.attempt_lifecycle,
+            vec![
+                AttemptLifecycleEvent::LeaseRevoked {
+                    ticket_id: PREDECESSOR.to_string(),
+                },
+                AttemptLifecycleEvent::SlotReleased {
+                    ticket_id: PREDECESSOR.to_string(),
+                },
+                AttemptLifecycleEvent::CleanExitRequested {
+                    ticket_id: PREDECESSOR.to_string(),
+                    pane_id: PANE_ID,
+                },
+            ]
+        );
+        assert!(!state.current_leases.contains_key(PREDECESSOR));
+        assert_eq!(
+            state.lease_high_water.get(PREDECESSOR),
+            Some(&predecessor_lease)
+        );
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        assert!(state.agent_slots[0].attempt_lease.is_none());
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert!(!state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
+        assert_eq!(state.seat_assignment(PANE_ID), None);
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Info { message }
+                if message.contains("Completion boundary revoked")
+                    && message.contains(PREDECESSOR)
+                    && message.contains(&PANE_ID.to_string())
+        )));
+
+        assert!(
+            !state.admit_assignment_claim(PANE_ID, &predecessor_claim),
+            "the exact predecessor nonce must lose authority at completion"
+        );
+        assert_eq!(state.seat_assignment(PANE_ID), None);
+        println!(
+            "T0450401|boundary|step=exit-requested|ticket={PREDECESSOR}|pane={PANE_ID}|lease=revoked|late_claim=rejected"
+        );
+
+        let launches_before_exit = state
+            .activity_log
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == SUCCESSOR
+                )
+            })
+            .count();
+        state.schedule_ready_tickets();
+        assert!(!state.current_leases.contains_key(SUCCESSOR));
+        assert!(!state.assignment_refs.contains_key(SUCCESSOR));
+        assert!(!state.threads.contains_key(SUCCESSOR));
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == SUCCESSOR
+                ))
+                .count(),
+            launches_before_exit,
+            "the successor cannot launch while the predecessor TUI exits"
+        );
+
+        state.agent_slots[0].transition_started_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+        );
+        state.check_transition_timeouts();
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(!state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, None);
+        assert_eq!(
+            state.last_pane_names.get(&PANE_ID).map(String::as_str),
+            Some("lisa · idle")
+        );
+        println!(
+            "T0450401|boundary|step=shell-ready|pane={PANE_ID}|resident=none|next_reserved=false"
+        );
+
+        state.schedule_ready_tickets();
+        let successor_lease = state.current_leases[SUCCESSOR].clone();
+        let successor_assignment = state.assignment_refs[SUCCESSOR].clone();
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some(SUCCESSOR));
+        assert_eq!(
+            state.agent_slots[0].attempt_lease.as_ref(),
+            Some(&successor_lease)
+        );
+        assert!(state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(matches!(
+            state.seat_assignment(PANE_ID),
+            Some(SeatAssignmentState::Starting { generation, .. })
+                if generation == successor_lease.attempt_id
+        ));
+        assert_ne!(successor_assignment.path, predecessor_assignment.path);
+        assert_ne!(successor_assignment.nonce, predecessor_assignment.nonce);
+        let launch_path = state
+            .attempt_work_dir(&successor_lease)
+            .join(format!(".lisa-launch-{PANE_ID}.sh"));
+        let launch_script = fs::read_to_string(launch_path).unwrap();
+        assert!(launch_script.contains("'/fixture/lisa' launch-codex"));
+        assert!(launch_script.contains(&shell_quote(
+            &strip_host_prefix(&successor_assignment.path).to_string_lossy()
+        )));
+        assert!(
+            !state.admit_assignment_claim(PANE_ID, &predecessor_claim),
+            "a new TUI cannot make the predecessor nonce authoritative again"
+        );
+        assert!(!state.seat_is_owned(PANE_ID));
+        println!(
+            "T0450401|boundary|step=fresh-launch|ticket={SUCCESSOR}|pane={PANE_ID}|attempt={}|nonce={}|state=starting|predecessor_claim=rejected",
+            successor_lease.attempt_id, successor_assignment.nonce
+        );
+    }
+
     fn acknowledge_assignment(
         state: &mut State,
         pane_id: u32,
@@ -20018,6 +20291,12 @@ owned\n\
         assert!(!state.pending_completions.contains_key("T-CDX-01"));
         assert!(!state.threads.contains_key("T-CDX-01"));
         assert!(state.agent_slots[0].ticket_id.is_none());
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit,
+            "verified completion must retire the resident Codex TUI"
+        );
+        assert!(!state.agent_slots[0].has_session);
         assert_eq!(
             state.last_pane_names.get(&1).map(String::as_str),
             Some("codex · idle")
