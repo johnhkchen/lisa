@@ -2,7 +2,7 @@
 id: S-031
 title: atomic-ticket-completion
 type: story
-status: open
+status: done
 priority: critical
 tickets: [T-031-01, T-031-02, T-031-03]
 ---

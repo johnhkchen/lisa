@@ -2,7 +2,7 @@
 id: S-030
 title: non-destructive-upgrades
 type: story
-status: open
+status: done
 priority: critical
 tickets: [T-030-01, T-030-02]
 ---

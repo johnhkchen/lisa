@@ -2,7 +2,7 @@
 id: S-032-01
 title: informative-pane-names
 type: story
-status: open
+status: done
 priority: medium
 tickets: [T-032-01]
 ---
