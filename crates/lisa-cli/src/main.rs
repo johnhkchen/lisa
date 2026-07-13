@@ -1,6 +1,7 @@
 mod agent_exec;
 mod capture_usage;
 mod claim;
+mod codex_launcher;
 mod config;
 mod detect;
 mod doctor;
@@ -153,6 +154,20 @@ enum Commands {
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
+    /// Start interactive Codex with one exact assignment-file argument.
+    #[command(hide = true)]
+    LaunchCodex {
+        /// Exact atomically published assignment file used as Codex's initial prompt.
+        assignment: PathBuf,
+
+        /// Codex executable to invoke.
+        #[arg(long, default_value = "codex")]
+        codex_bin: PathBuf,
+
+        /// Routed Codex model; omit to use Codex's configured default.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Assert ownership of one exact nonce-bearing ticket assignment.
     #[command(display_order = 22, hide = true)]
     Claim {
@@ -289,6 +304,25 @@ fn main() {
             if let Err(e) = capture_usage::run_capture_usage(&cwd) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::LaunchCodex {
+            assignment,
+            codex_bin,
+            model,
+        } => {
+            let args = codex_launcher::CodexLauncherArgs {
+                assignment_path: assignment,
+                codex_bin,
+                model,
+            };
+            match codex_launcher::run_codex_launcher(args) {
+                Ok(status) if status.success() => {}
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Claim {
