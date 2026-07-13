@@ -7,7 +7,10 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use lisa_core::types::{AttemptLease, TicketId};
+use lisa_core::{
+    claim::AssignmentClaim,
+    types::{AttemptLease, TicketId},
+};
 
 /// The logical signal family one consumer requests from the shared directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +18,7 @@ pub(crate) enum SignalRequest {
     Heartbeats,
     ProcessStarts,
     ShellReady,
+    Claims,
     CodexAcknowledgements,
     Awaiting,
     Idle,
@@ -35,15 +39,41 @@ pub(crate) enum IdleTarget {
 /// consumers cannot accidentally treat provider-specific evidence uniformly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SignalRecord {
-    Heartbeat { pane_id: u32, lease: AttemptLease },
-    ProcessStarted { pane_id: u32, lease: AttemptLease },
-    ShellReady { pane_id: u32, lease: AttemptLease },
-    CodexAcknowledgement { pane_id: u32, payload: String },
-    Awaiting { pane_id: u32 },
-    Idle { target: IdleTarget },
-    Stopped { pane_id: u32 },
-    Cleared { pane_id: u32 },
-    Error { pane_id: u32 },
+    Heartbeat {
+        pane_id: u32,
+        lease: AttemptLease,
+    },
+    ProcessStarted {
+        pane_id: u32,
+        lease: AttemptLease,
+    },
+    ShellReady {
+        pane_id: u32,
+        lease: AttemptLease,
+    },
+    Claim {
+        pane_id: u32,
+        claim: AssignmentClaim,
+    },
+    CodexAcknowledgement {
+        pane_id: u32,
+        payload: String,
+    },
+    Awaiting {
+        pane_id: u32,
+    },
+    Idle {
+        target: IdleTarget,
+    },
+    Stopped {
+        pane_id: u32,
+    },
+    Cleared {
+        pane_id: u32,
+    },
+    Error {
+        pane_id: u32,
+    },
 }
 
 /// Consume the records owned by one signal consumer.
@@ -84,6 +114,14 @@ fn ingest_path(path: PathBuf, request: SignalRequest) -> Option<SignalRecord> {
                 pane_id,
                 lease,
             })
+        }
+        SignalRequest::Claims => {
+            let pane_id = pane_id_from_signal_filename(path.file_name()?, ".claim")?;
+            let claim = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|body| serde_json::from_str::<AssignmentClaim>(&body).ok());
+            let _ = std::fs::remove_file(path);
+            claim.map(|claim| SignalRecord::Claim { pane_id, claim })
         }
         SignalRequest::CodexAcknowledgements => {
             let pane_id = pane_id_from_signal_filename(path.file_name()?, ".ack")?;
@@ -221,6 +259,27 @@ mod tests {
         );
         assert!(!ack.exists());
         assert!(!awaiting.exists());
+    }
+
+    #[test]
+    fn claim_payload_is_typed_and_malformed_payload_is_still_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("pane-7.claim");
+        let malformed = dir.path().join("pane-8.claim");
+        let claim = AssignmentClaim {
+            ticket_id: "T-CLAIM".to_string(),
+            attempt_id: 17,
+            nonce: u128::from(u64::MAX) + 42,
+        };
+        fs::write(&valid, serde_json::to_string(&claim).unwrap()).unwrap();
+        fs::write(&malformed, "not a claim").unwrap();
+
+        assert_eq!(
+            ingest(dir.path(), SignalRequest::Claims),
+            vec![SignalRecord::Claim { pane_id: 7, claim }]
+        );
+        assert!(!valid.exists());
+        assert!(!malformed.exists());
     }
 
     #[test]

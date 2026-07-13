@@ -31,7 +31,7 @@ fn add_running_attempt(state: &mut State) -> AttemptLease {
 }
 
 #[test]
-fn poll_tick_preserves_the_eight_consumer_order() {
+fn poll_tick_preserves_the_nine_consumer_order() {
     let source = include_str!("../lib.rs");
     let poll_tick = source
         .split_once("    fn poll_tick(&mut self) {")
@@ -45,6 +45,7 @@ fn poll_tick_preserves_the_eight_consumer_order() {
         "self.check_awaiting_signals();",
         "self.check_process_start_signals();",
         "self.check_shell_ready_signals();",
+        "self.check_claim_signals();",
         "self.check_codex_ack_signals();",
         "self.check_idle_signals();",
         "self.check_transition_signals();",
@@ -66,6 +67,7 @@ fn recognized_records_are_one_shot_before_payload_or_state_admission() {
         ("heartbeat", "pane-7.heartbeat", "not-json"),
         ("process-start", "pane-7.started", "not-json"),
         ("shell-ready", "pane-7.shell-ready", "not-json"),
+        ("claim", "pane-7.claim", "not-json"),
         ("codex-ack", "pane-7.ack", "not-json"),
         ("awaiting", "pane-7.awaiting", "body-is-ignored"),
         ("idle", "pane-7.idle", "body-is-ignored"),
@@ -82,6 +84,7 @@ fn recognized_records_are_one_shot_before_payload_or_state_admission() {
             "heartbeat" => state.check_heartbeat_signals(),
             "process-start" => state.check_process_start_signals(),
             "shell-ready" => state.check_shell_ready_signals(),
+            "claim" => state.check_claim_signals(),
             "codex-ack" => state.check_codex_ack_signals(),
             "awaiting" => state.check_awaiting_signals(),
             "idle" => state.check_idle_signals(),
@@ -105,6 +108,7 @@ fn idle_alone_admits_the_legacy_ticket_filename_family() {
         ("heartbeat", "T-LEGACY.heartbeat"),
         ("process-start", "T-LEGACY.started"),
         ("shell-ready", "T-LEGACY.shell-ready"),
+        ("claim", "T-LEGACY.claim"),
         ("codex-ack", "T-LEGACY.ack"),
         ("awaiting", "T-LEGACY.awaiting"),
         ("idle", "T-LEGACY.idle"),
@@ -121,6 +125,7 @@ fn idle_alone_admits_the_legacy_ticket_filename_family() {
             "heartbeat" => state.check_heartbeat_signals(),
             "process-start" => state.check_process_start_signals(),
             "shell-ready" => state.check_shell_ready_signals(),
+            "claim" => state.check_claim_signals(),
             "codex-ack" => state.check_codex_ack_signals(),
             "awaiting" => state.check_awaiting_signals(),
             "idle" => state.check_idle_signals(),
@@ -300,6 +305,58 @@ fn codex_ack_requires_the_exact_tag_then_promotes_and_bumps_activity() {
     assert!(state.activity_log.iter().any(|event| matches!(
         event,
         ActivityEvent::Info { message } if message.contains("acknowledged its assignment")
+    )));
+}
+
+#[test]
+fn claim_requires_the_exact_retained_assignment_then_promotes_and_bumps_activity() {
+    let (mut state, dir) = state_with_signal_dir();
+    let lease = add_running_attempt(&mut state);
+    state.seat_assignments.insert(
+        PANE_ID,
+        SeatAssignmentState::Delivering {
+            generation: lease.attempt_id,
+            ack_deadline: SystemTime::now() + Duration::from_secs(30),
+            retries: 0,
+        },
+    );
+    state.assignment_refs.insert(
+        TICKET_ID.to_string(),
+        AssignmentRef {
+            lease: lease.clone(),
+            nonce: 8675309,
+            path: dir.path().join("assignment.md"),
+        },
+    );
+    let path = state.signal_dir.join("pane-7.claim");
+
+    let wrong_nonce = lisa_core::claim::AssignmentClaim {
+        ticket_id: TICKET_ID.to_string(),
+        attempt_id: lease.attempt_id,
+        nonce: 8675310,
+    };
+    fs::write(&path, serde_json::to_string(&wrong_nonce).unwrap()).unwrap();
+    state.check_claim_signals();
+    assert!(!path.exists());
+    assert!(!state.seat_is_owned(PANE_ID));
+    assert!(state.agent_slots[0].last_activity_at.is_none());
+
+    let exact = lisa_core::claim::AssignmentClaim {
+        nonce: 8675309,
+        ..wrong_nonce
+    };
+    fs::write(&path, serde_json::to_string(&exact).unwrap()).unwrap();
+    state.check_claim_signals();
+    assert!(!path.exists());
+    assert_eq!(
+        state.seat_assignment(PANE_ID),
+        Some(SeatAssignmentState::Owned)
+    );
+    assert!(state.agent_slots[0].last_activity_at.is_some());
+    assert!(state.activity_log.iter().any(|event| matches!(
+        event,
+        ActivityEvent::Info { message }
+            if message.contains("claimed T-SIGNAL attempt 1 assignment")
     )));
 }
 

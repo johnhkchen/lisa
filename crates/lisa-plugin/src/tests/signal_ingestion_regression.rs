@@ -76,13 +76,26 @@ fn every_request_produces_its_exact_typed_record_contract() {
     );
     assert!(!shell_ready.exists());
 
-    let ack = dir.path().join("pane-4.ack");
+    let claim_path = dir.path().join("pane-4.claim");
+    let claim = lisa_core::claim::AssignmentClaim {
+        ticket_id: TICKET_ID.to_string(),
+        attempt_id: 41,
+        nonce: u128::from(u64::MAX) + 42,
+    };
+    fs::write(&claim_path, serde_json::to_string(&claim).unwrap()).unwrap();
+    assert_eq!(
+        signal::ingest(dir.path(), SignalRequest::Claims),
+        vec![SignalRecord::Claim { pane_id: 4, claim }]
+    );
+    assert!(!claim_path.exists());
+
+    let ack = dir.path().join("pane-5.ack");
     let provider_payload = r#"{"hook_event_name":"UserPromptSubmit","provider":"codex"}"#;
     fs::write(&ack, provider_payload).unwrap();
     assert_eq!(
         signal::ingest(dir.path(), SignalRequest::CodexAcknowledgements),
         vec![SignalRecord::CodexAcknowledgement {
-            pane_id: 4,
+            pane_id: 5,
             payload: provider_payload.to_string(),
         }]
     );
@@ -240,6 +253,7 @@ fn poll_tick_preserves_signal_admission_and_timeout_interleaving() {
         "self.deliver_ready_assignments();",
         "self.check_process_start_signals();",
         "self.check_shell_ready_signals();",
+        "self.check_claim_signals();",
         "self.check_codex_ack_signals();",
         "self.check_artifact_advances();",
         "self.check_idle_signals();",

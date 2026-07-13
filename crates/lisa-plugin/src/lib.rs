@@ -33,6 +33,7 @@ use deadline::{
 };
 
 use lisa_core::capture::CaptureRecord;
+use lisa_core::claim::AssignmentClaim;
 use lisa_core::client::AgentClient;
 use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
@@ -973,6 +974,7 @@ impl State {
             "error",
             "awaiting",
             "shell-ready",
+            "claim",
         ] {
             let _ = std::fs::remove_file(self.signal_dir.join(format!("pane-{pane_id}.{suffix}")));
         }
@@ -2699,6 +2701,44 @@ impl State {
         true
     }
 
+    /// Promote a delivered assignment only when a pane-routed claim identifies
+    /// the exact scheduler-retained current lease and assignment nonce.
+    /// Returning true means this call performed the one pending-to-owned edge.
+    fn admit_assignment_claim(&mut self, pane_id: u32, claim: &AssignmentClaim) -> bool {
+        if self.seat_is_owned(pane_id) {
+            return false;
+        }
+        let Some(generation) = self.active_assignment_generation(pane_id) else {
+            return false;
+        };
+        let Some((ticket_id, attempt_lease)) = self
+            .agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id)
+            .and_then(|slot| Some((slot.ticket_id.as_ref()?, slot.attempt_lease.as_ref()?)))
+        else {
+            return false;
+        };
+        if claim.ticket_id != *ticket_id
+            || claim.attempt_id != generation
+            || attempt_lease.ticket_id != *ticket_id
+            || attempt_lease.attempt_id != claim.attempt_id
+            || !attempt_lease.is_current(self.current_leases.get(ticket_id))
+        {
+            return false;
+        }
+        let Some(assignment) = self.assignment_refs.get(ticket_id) else {
+            return false;
+        };
+        if assignment.lease != *attempt_lease || assignment.nonce != claim.nonce {
+            return false;
+        }
+
+        self.seat_assignments
+            .insert(pane_id, SeatAssignmentState::Owned);
+        true
+    }
+
     /// Retain a started-but-unassigned provider as an explicit terminal failure
     /// after bounded chat delivery is exhausted.
     fn fail_assignment_delivery(
@@ -2975,11 +3015,16 @@ impl State {
             assignment_generation: None,
         };
         let assignment = adapter.assignment_text(&ctx);
-        if let Err(error) = self.prepare_assignment(&attempt_artifact_dir, candidate, &assignment) {
-            self.fail_startup_recovery(pane_id, &error);
-            return false;
-        }
-        let payload = adapter.launch_command(&ctx);
+        let assignment_ref =
+            match self.prepare_assignment(&attempt_artifact_dir, candidate, &assignment) {
+                Ok(assignment_ref) => assignment_ref,
+                Err(error) => {
+                    self.fail_startup_recovery(pane_id, &error);
+                    return false;
+                }
+            };
+        let assignment_path = strip_host_prefix(&assignment_ref.path);
+        let payload = adapter.launch_command(&ctx, &assignment_path);
         let command = match Self::prepare_fresh_launch(&attempt_artifact_dir, pane_id, &payload) {
             Ok(command) => command,
             Err(error) => {
@@ -3785,19 +3830,25 @@ impl State {
             // input. Fresh launch scripts are deliberately bare; exact
             // SessionStart later unlocks only a bounded reference to this file.
             let assignment_text = adapter.assignment_text(&ctx);
-            if let Err(error) =
-                self.prepare_assignment(&attempt_artifact_dir, &attempt_lease, &assignment_text)
-            {
-                self.revoke_current_lease(&ticket_id);
-                self.log_activity(ActivityEvent::Error {
-                    message: format!(
-                        "Cannot dispatch {} on pane {}: {}",
-                        ticket_id, pane_id, error
-                    ),
-                });
-                unscheduled += 1;
-                continue;
-            }
+            let assignment_ref = match self.prepare_assignment(
+                &attempt_artifact_dir,
+                &attempt_lease,
+                &assignment_text,
+            ) {
+                Ok(assignment_ref) => assignment_ref,
+                Err(error) => {
+                    self.revoke_current_lease(&ticket_id);
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "Cannot dispatch {} on pane {}: {}",
+                            ticket_id, pane_id, error
+                        ),
+                    });
+                    unscheduled += 1;
+                    continue;
+                }
+            };
+            let assignment_path = strip_host_prefix(&assignment_ref.path);
 
             // Replace any previous ticket/idle title before the first lifecycle
             // input for this assignment (/exit, /clear, or a fresh launch).
@@ -3827,7 +3878,7 @@ impl State {
                     self.config.lisa_bin.as_deref(),
                 );
                 let exit_command = resident_adapter.exit_command();
-                let payload = adapter.launch_command(&ctx);
+                let payload = adapter.launch_command(&ctx, &assignment_path);
                 launch_cmd =
                     match Self::prepare_fresh_launch(&attempt_artifact_dir, pane_id, &payload) {
                         Ok(command) => command,
@@ -3890,7 +3941,7 @@ impl State {
                     // transition_state untouched (Idle) keeps the .cleared/
                     // clear-timeout machinery inert for this pane.
                     ResetStrategy::FreshExec => {
-                        let payload = adapter.launch_command(&ctx);
+                        let payload = adapter.launch_command(&ctx, &assignment_path);
                         launch_cmd = match Self::prepare_fresh_launch(
                             &attempt_artifact_dir,
                             pane_id,
@@ -3914,7 +3965,7 @@ impl State {
                 }
             } else {
                 // Fresh pane — launch the agent from the shell.
-                let payload = adapter.launch_command(&ctx);
+                let payload = adapter.launch_command(&ctx, &assignment_path);
                 launch_cmd =
                     match Self::prepare_fresh_launch(&attempt_artifact_dir, pane_id, &payload) {
                         Ok(command) => command,
@@ -4321,6 +4372,26 @@ impl State {
                 continue;
             };
             self.acknowledge_shell_ready(pane_id, &candidate, std::time::SystemTime::now());
+        }
+    }
+
+    /// Consume agent-issued assignment claims and promote only the exact
+    /// current nonce-bearing assignment retained for the addressed pane.
+    fn check_claim_signals(&mut self) {
+        for record in signal::ingest(&self.signal_dir, SignalRequest::Claims) {
+            let SignalRecord::Claim { pane_id, claim } = record else {
+                continue;
+            };
+
+            if self.admit_assignment_claim(pane_id, &claim) {
+                self.bump_pane_activity(pane_id);
+                self.log_activity(ActivityEvent::Info {
+                    message: format!(
+                        "Pane {} claimed {} attempt {} assignment",
+                        pane_id, claim.ticket_id, claim.attempt_id
+                    ),
+                });
+            }
         }
     }
 
@@ -5259,22 +5330,28 @@ impl State {
                 assignment_generation: self.active_assignment_generation(pane_id),
             };
             let assignment_text = adapter.assignment_text(&ctx);
-            if let Err(error) =
-                self.prepare_assignment(&launch_artifact_dir, &launch_lease, &assignment_text)
-            {
-                if recovering {
-                    self.fail_assignment_recovery(pane_id, &error);
-                } else {
-                    self.log_activity(ActivityEvent::Error {
-                        message: format!(
-                            "Cannot prepare assignment for {} on pane {} after exit: {}",
-                            ticket_id, pane_id, error
-                        ),
-                    });
+            let assignment_ref = match self.prepare_assignment(
+                &launch_artifact_dir,
+                &launch_lease,
+                &assignment_text,
+            ) {
+                Ok(assignment_ref) => assignment_ref,
+                Err(error) => {
+                    if recovering {
+                        self.fail_assignment_recovery(pane_id, &error);
+                    } else {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Cannot prepare assignment for {} on pane {} after exit: {}",
+                                ticket_id, pane_id, error
+                            ),
+                        });
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let payload = adapter.launch_command(&ctx);
+            };
+            let assignment_path = strip_host_prefix(&assignment_ref.path);
+            let payload = adapter.launch_command(&ctx, &assignment_path);
             let command = match Self::prepare_fresh_launch(&launch_artifact_dir, pane_id, &payload)
             {
                 Ok(command) => command,
@@ -5806,8 +5883,13 @@ impl State {
         // shell probe positively executes in the same pane.
         self.check_shell_ready_signals();
 
-        // Promote ownership only from a matching native prompt submission.
-        // This runs before timeout/recovery evaluation.
+        // A valid exact assignment claim is sufficient ownership proof even
+        // when no provider hook evidence arrives.
+        self.check_claim_signals();
+
+        // Existing provider prompt evidence remains available for the evidence
+        // hierarchy refined by the next scheduler ticket. Both consumers run
+        // before timeout/recovery evaluation.
         self.check_codex_ack_signals();
 
         // Check for new artifacts and advance phases before rebuilding DAG
@@ -13855,6 +13937,60 @@ delivering\n\
 owned\n\
 [1]    T-NAME       RES        codex          owned                <elapsed>"
         );
+    }
+
+    #[test]
+    fn delivered_assignment_becomes_owned_on_exact_claim_without_hook() {
+        let (mut state, _dir) =
+            pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
+        std::fs::create_dir_all(&state.signal_dir).unwrap();
+        state.schedule_ready_tickets();
+
+        let lease = state.current_leases["T-NAME"].clone();
+        exit_then_deliver_fresh_codex(&mut state, 10, &lease);
+        let nonce = state.assignment_refs["T-NAME"].nonce;
+
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Delivering {
+                generation,
+                retries: 0,
+                ..
+            }) if generation == lease.attempt_id
+        ));
+        assert!(!state.seat_is_owned(10));
+        assert!(dashboard_thread_row(&state, "T-NAME").contains("delivering"));
+        assert!(!state.signal_dir.join("pane-10.ack").exists());
+
+        let claim_path = state.signal_dir.join("pane-10.claim");
+        let wrong_nonce = AssignmentClaim {
+            ticket_id: lease.ticket_id.clone(),
+            attempt_id: lease.attempt_id,
+            nonce: nonce + 1,
+        };
+        std::fs::write(&claim_path, serde_json::to_string(&wrong_nonce).unwrap()).unwrap();
+        state.check_claim_signals();
+        assert!(!claim_path.exists());
+        assert!(!state.seat_is_owned(10));
+        assert!(dashboard_thread_row(&state, "T-NAME").contains("delivering"));
+
+        let exact = AssignmentClaim {
+            nonce,
+            ..wrong_nonce
+        };
+        std::fs::write(&claim_path, serde_json::to_string(&exact).unwrap()).unwrap();
+        state.check_claim_signals();
+
+        assert!(!claim_path.exists());
+        assert!(!state.signal_dir.join("pane-10.ack").exists());
+        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
+        assert!(state.seat_is_owned(10));
+        assert!(dashboard_thread_row(&state, "T-NAME").contains("owned"));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Info { message }
+                if message.contains("claimed T-NAME attempt 1 assignment")
+        )));
     }
 
     #[test]
