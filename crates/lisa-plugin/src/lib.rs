@@ -6888,6 +6888,117 @@ mod tests {
         write_review_disposition(state, lease, r#"{"disposition":"pass","reason":null}"#);
     }
 
+    /// Construct an expired Review attempt around real scanned ticket and work
+    /// paths. A non-empty journal path also selects production launch-error
+    /// handling in the native completion executor.
+    fn review_timeout_state(
+        ticket_id: &str,
+        tickets_dir: PathBuf,
+        work_dir: PathBuf,
+        project_root: PathBuf,
+        git_root: PathBuf,
+        completion_journal_path: PathBuf,
+    ) -> (State, AttemptLease) {
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir,
+                lisa_bin: Some("lisa".to_string()),
+                review_timeout_secs: 1,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            project_root,
+            git_root,
+            completion_journal_path,
+            completion_journal_healthy: true,
+            ..State::default()
+        };
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let mut thread = lisa_core::types::Thread::new(ticket_id, 42);
+        thread.current_phase = Phase::Review;
+        thread.last_phase_change = old;
+        thread.last_activity = old;
+        state.threads.insert(ticket_id.to_string(), thread);
+        let lease = install_current_attempt(&mut state, ticket_id);
+        std::fs::create_dir_all(state.attempt_work_dir(&lease)).unwrap();
+        (state, lease)
+    }
+
+    fn write_private_review(state: &State, lease: &AttemptLease) {
+        std::fs::write(
+            state.attempt_work_dir(lease).join("review.md"),
+            "# Review\n\nReady to complete.\n",
+        )
+        .unwrap();
+        write_passing_review_disposition(state, lease);
+    }
+
+    fn assert_no_finish_up(state: &State, ticket_id: &str) {
+        assert!(!state.finish_up_sent.contains(ticket_id));
+        assert!(!state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::FinishUpPromptSent { ticket_id: actual, .. }
+                if actual == ticket_id
+        )));
+    }
+
+    fn correlated_launch_failure<'a>(
+        state: &'a State,
+        ticket_id: &str,
+        correlation: &CompletionGenerationId,
+    ) -> &'a ActivityEvent {
+        state
+            .activity_log
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    ActivityEvent::CompletionRejected {
+                        ticket_id: actual,
+                        kind: CompletionRejectionKind::LaunchFailed,
+                        correlation_id,
+                        ..
+                    } if actual == ticket_id && correlation_id == &correlation.to_string()
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing correlated launch failure for {ticket_id} ({correlation}): {:?}",
+                    state.activity_log
+                )
+            })
+    }
+
+    fn assert_rejection_renders_unchanged(event: &ActivityEvent) {
+        let ActivityEvent::CompletionRejected {
+            ticket_id,
+            kind,
+            correlation_id,
+            detail,
+        } = event
+        else {
+            panic!("expected completion rejection, got {event:?}");
+        };
+        let entry = activity_event_to_ui_entry(event).unwrap();
+        match entry.activity {
+            ui::ActivityType::CompletionRejected {
+                ticket_id: rendered_ticket,
+                kind: rendered_kind,
+                correlation_id: rendered_correlation,
+                detail: rendered_detail,
+            } => {
+                assert_eq!(rendered_ticket, *ticket_id);
+                assert_eq!(rendered_kind, *kind);
+                assert_eq!(rendered_correlation, *correlation_id);
+                assert_eq!(rendered_detail, *detail);
+            }
+            other => panic!("expected rendered completion rejection, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_phase_to_ui_phase() {
         assert_eq!(phase_to_ui_phase(Phase::Ready), ui::Phase::Ready);
@@ -14694,6 +14805,253 @@ owned\n\
             e,
             ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-001"
         )));
+    }
+
+    #[test]
+    fn review_timeout_prompts_only_when_current_attempt_review_is_missing() {
+        use std::fs;
+
+        const TICKET_ID: &str = "T-TIMEOUT-MISSING";
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("games/midsummer");
+        let tickets_dir = project_root.join("tickets");
+        let work_dir = project_root.join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join(format!("{TICKET_ID}.md")),
+            format!(
+                "---\nid: {TICKET_ID}\ntitle: missing-review\ntype: bug\nstatus: review\npriority: high\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let (mut state, lease) = review_timeout_state(
+            TICKET_ID,
+            tickets_dir,
+            work_dir,
+            project_root,
+            dir.path().to_path_buf(),
+            PathBuf::new(),
+        );
+        assert!(!state.attempt_work_dir(&lease).join("review.md").exists());
+
+        state.check_review_timeouts();
+
+        assert!(state.finish_up_sent.contains(TICKET_ID));
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ActivityEvent::FinishUpPromptSent { ticket_id, pane_id }
+                        if ticket_id == TICKET_ID && *pane_id == 42
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn review_timeout_suppresses_admitted_pending_and_confirmed_completion() {
+        use std::fs;
+
+        const TICKET_ID: &str = "T-TIMEOUT-PENDING";
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("games/midsummer");
+        let tickets_dir = project_root.join("tickets");
+        let work_dir = project_root.join("work");
+        let ticket_file = tickets_dir.join(format!("{TICKET_ID}.md"));
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            &ticket_file,
+            format!(
+                "---\nid: {TICKET_ID}\ntitle: pending-review\ntype: bug\nstatus: review\npriority: high\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let journal = dir.path().join(".lisa/completion-journal.jsonl");
+        let (mut state, lease) = review_timeout_state(
+            TICKET_ID,
+            tickets_dir,
+            work_dir,
+            project_root,
+            dir.path().to_path_buf(),
+            journal,
+        );
+        write_private_review(&state, &lease);
+        let completion_key = CompletionGenerationId::new(
+            CompletionId::new(TICKET_ID),
+            AttemptId::new(lease.attempt_id.to_string()),
+            1,
+        );
+
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease,
+        }));
+        assert!(state.pending_completions.contains_key(TICKET_ID));
+        assert!(matches!(
+            state.completion_aggregates[TICKET_ID].state(),
+            CompletionState::CommandInFlight { correlation }
+                if correlation.as_str() == completion_key.to_string()
+        ));
+
+        state.reconcile_review_completions();
+        assert_eq!(state.launched_completion_effects.len(), 1);
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message }
+                if message.contains("requires action on in-flight correlation")
+                    && message.contains(&completion_key.to_string())
+        )));
+
+        state.check_review_timeouts();
+        assert_no_finish_up(&state, TICKET_ID);
+        assert!(state.pending_completions.contains_key(TICKET_ID));
+
+        lisa_core::ticket::update_ticket_done(&ticket_file).unwrap();
+        state.handle_completion_result(TICKET_ID, Some(0), vec![b'a'; 40], Vec::new());
+        assert!(matches!(
+            state.completion_aggregates[TICKET_ID].state(),
+            CompletionState::Confirmed
+        ));
+        assert!(!state.threads.contains_key(TICKET_ID));
+
+        state.check_review_timeouts();
+        assert_no_finish_up(&state, TICKET_ID);
+    }
+
+    #[test]
+    fn review_timeout_preserves_nested_path_launch_rejection() {
+        use std::fs;
+
+        const TICKET_ID: &str = "T-TIMEOUT-PATH";
+        let dir = tempfile::tempdir().unwrap();
+        let git_root = dir.path().join("repo");
+        let project_root = git_root.join("games/midsummer");
+        let tickets_dir = dir.path().join("outside/tickets");
+        let work_dir = project_root.join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(
+            tickets_dir.join(format!("{TICKET_ID}.md")),
+            format!(
+                "---\nid: {TICKET_ID}\ntitle: outside-git-root\ntype: bug\nstatus: review\npriority: high\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let journal = git_root.join(".lisa/completion-journal.jsonl");
+        let (mut state, lease) = review_timeout_state(
+            TICKET_ID,
+            tickets_dir,
+            work_dir,
+            project_root,
+            git_root,
+            journal,
+        );
+        write_private_review(&state, &lease);
+        let completion_key = CompletionGenerationId::new(
+            CompletionId::new(TICKET_ID),
+            AttemptId::new(lease.attempt_id.to_string()),
+            1,
+        );
+
+        assert!(!state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease,
+        }));
+        assert!(!state.pending_completions.contains_key(TICKET_ID));
+        assert!(!state.completion_aggregates.contains_key(TICKET_ID));
+        let rejection = correlated_launch_failure(&state, TICKET_ID, &completion_key);
+        assert!(matches!(
+            rejection,
+            ActivityEvent::CompletionRejected { detail, .. }
+                if detail.contains("completion path outside Git root")
+                    && detail.contains("outside/tickets")
+        ));
+        assert_rejection_renders_unchanged(rejection);
+
+        state.check_review_timeouts();
+        assert_no_finish_up(&state, TICKET_ID);
+    }
+
+    #[test]
+    fn review_timeout_preserves_retryable_command_failure() {
+        use std::fs;
+
+        const TICKET_ID: &str = "T-TIMEOUT-RETRY";
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("games/midsummer");
+        let tickets_dir = project_root.join("tickets");
+        let work_dir = project_root.join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join(format!("{TICKET_ID}.md")),
+            format!(
+                "---\nid: {TICKET_ID}\ntitle: retry-review\ntype: bug\nstatus: review\npriority: high\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let journal = dir.path().join(".lisa/completion-journal.jsonl");
+        let (mut state, lease) = review_timeout_state(
+            TICKET_ID,
+            tickets_dir,
+            work_dir,
+            project_root,
+            dir.path().to_path_buf(),
+            journal,
+        );
+        write_private_review(&state, &lease);
+        let completion_key = CompletionGenerationId::new(
+            CompletionId::new(TICKET_ID),
+            AttemptId::new(lease.attempt_id.to_string()),
+            1,
+        );
+
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease.clone(),
+        }));
+        state.handle_completion_result(
+            TICKET_ID,
+            Some(1),
+            Vec::new(),
+            b"nested identity unavailable".to_vec(),
+        );
+
+        assert!(!state.pending_completions.contains_key(TICKET_ID));
+        assert!(state.threads.contains_key(TICKET_ID));
+        assert_eq!(state.current_leases.get(TICKET_ID), Some(&lease));
+        assert!(matches!(
+            state.completion_aggregates[TICKET_ID].state(),
+            CompletionState::Rejected {
+                reason: CompletionRejection::LaunchFailed { source },
+                retryability: Retryability::Retryable,
+            } if source.message().contains("nested identity unavailable")
+                && source.message().contains("recoverable for retry")
+        ));
+        let rejection = correlated_launch_failure(&state, TICKET_ID, &completion_key);
+        assert!(matches!(
+            rejection,
+            ActivityEvent::CompletionRejected { detail, .. }
+                if detail.contains("nested identity unavailable")
+                    && detail.contains("recoverable for retry")
+        ));
+        assert_rejection_renders_unchanged(rejection);
+
+        state.check_review_timeouts();
+        assert_no_finish_up(&state, TICKET_ID);
+        assert!(matches!(
+            state.reconciliation_state(TICKET_ID),
+            CompletionState::Rejected {
+                retryability: Retryability::Retryable,
+                ..
+            }
+        ));
     }
 
     #[test]
