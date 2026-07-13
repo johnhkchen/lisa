@@ -201,6 +201,47 @@ fn normalize_includes(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, CommitTransac
     Ok(normalized.into_iter().collect())
 }
 
+/// Resolve a path supplied relative to the caller's requested project root,
+/// then express it relative to the enclosing Git repository root.
+///
+/// Lisa projects may live below the repository root (for example,
+/// `games/midsummer`). Git pathspecs are always repository-relative, so passing
+/// the project-relative `docs/...` path through unchanged would select the
+/// wrong location after repository discovery.
+fn completion_repo_relative_path(
+    repo: &Repository,
+    requested_root: &Path,
+    path: PathBuf,
+    description: &str,
+) -> Result<PathBuf, CommitTransactionError> {
+    let path = normalize_includes(vec![path])?
+        .pop()
+        .ok_or_else(|| CommitTransactionError::new(format!("{description} path is required")))?;
+    let requested_root = requested_root.canonicalize().map_err(|e| {
+        CommitTransactionError::new(format!(
+            "cannot resolve requested project root {}: {e}",
+            requested_root.display()
+        ))
+    })?;
+    let absolute = requested_root.join(&path).canonicalize().map_err(|e| {
+        CommitTransactionError::new(format!(
+            "cannot resolve {description} {} from project root {}: {e}",
+            path.display(),
+            requested_root.display()
+        ))
+    })?;
+    absolute
+        .strip_prefix(&repo.root)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            CommitTransactionError::new(format!(
+                "{description} {} is outside Git repository {}",
+                absolute.display(),
+                repo.root.display()
+            ))
+        })
+}
+
 fn has_done_frontmatter(content: &str) -> bool {
     let trimmed = content.trim_start();
     let Some(after_opening) = trimmed.strip_prefix("---") else {
@@ -665,24 +706,31 @@ pub(crate) fn commit_ticket(
 pub(crate) fn complete_ticket(
     request: CompleteTicketRequest,
 ) -> Result<CommitTransactionResult, CommitTransactionError> {
-    let ticket_file = normalize_includes(vec![request.ticket_file])?
-        .pop()
-        .ok_or_else(|| CommitTransactionError::new("completion ticket file path is required"))?;
+    let repo = Repository::discover(&request.repo_root)?;
+    let ticket_file = completion_repo_relative_path(
+        &repo,
+        &request.repo_root,
+        request.ticket_file,
+        "completion ticket file",
+    )?;
     if ticket_file.extension() != Some(OsStr::new("md")) {
         return Err(CommitTransactionError::new(
             "completion ticket file must be a Markdown path",
         ));
     }
-    let work_dir = normalize_includes(vec![request.work_dir])?
-        .pop()
-        .ok_or_else(|| CommitTransactionError::new("completion work directory is required"))?;
+    let work_dir = completion_repo_relative_path(
+        &repo,
+        &request.repo_root,
+        request.work_dir,
+        "completion work directory",
+    )?;
     if ticket_file == work_dir {
         return Err(CommitTransactionError::new(
             "completion ticket file and work directory must be distinct",
         ));
     }
     let includes = vec![ticket_file.clone(), work_dir];
-    let ticket_path = request.repo_root.join(&ticket_file);
+    let ticket_path = repo.root.join(&ticket_file);
     let original = fs::read(&ticket_path).map_err(|e| {
         CommitTransactionError::new(format!(
             "cannot read completion ticket {}: {e}",
@@ -692,7 +740,6 @@ pub(crate) fn complete_ticket(
 
     let already_done = std::str::from_utf8(&original).is_ok_and(has_done_frontmatter);
     if already_done {
-        let repo = Repository::discover(&request.repo_root)?;
         let mut status_args: Vec<&OsStr> = vec![
             OsStr::new("status"),
             OsStr::new("--porcelain"),
@@ -728,7 +775,7 @@ pub(crate) fn complete_ticket(
     })?;
 
     let result = commit_ticket(CommitTransactionRequest {
-        repo_root: request.repo_root,
+        repo_root: repo.root,
         ticket_id: request.ticket_id,
         message: request.message,
         includes,
@@ -1097,6 +1144,49 @@ mod tests {
             repo.git(["ls-files", "--stage", "-z", "--", "foreign.txt"])
                 .stdout,
             foreign_before.stdout
+        );
+    }
+
+    #[test]
+    fn complete_ticket_normalizes_nested_project_paths_to_git_root() {
+        let repo = GitRepo::new();
+        let project = repo.root().join("games/midsummer");
+        let project_ticket = "docs/active/tickets/T-009-02-01.md";
+        let project_work = "docs/active/work/T-009-02-01";
+        let repo_ticket = format!("games/midsummer/{project_ticket}");
+        let repo_work = format!("games/midsummer/{project_work}");
+
+        repo.write(
+            &repo_ticket,
+            "---\nid: T-009-02-01\nstatus: open\nphase: review\n---\nBody\n",
+        );
+        repo.write("docs/root-sentinel.md", "root docs remain untouched\n");
+        repo.base_commit();
+        repo.write(&format!("{repo_work}/review.md"), "# Review\n");
+
+        let result = complete_ticket(CompleteTicketRequest {
+            repo_root: project,
+            ticket_id: "T-009-02-01".to_string(),
+            message: "Complete T-009-02-01".to_string(),
+            ticket_file: PathBuf::from(project_ticket),
+            work_dir: PathBuf::from(project_work),
+        })
+        .unwrap();
+
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), result.commit_id);
+        assert_eq!(
+            result.committed_paths,
+            vec![
+                PathBuf::from(&repo_ticket),
+                PathBuf::from(format!("{repo_work}/review.md")),
+            ]
+        );
+        assert!(repo
+            .git_string(["show", &format!("HEAD:{repo_ticket}")])
+            .contains("phase: done"));
+        assert_eq!(
+            repo.git_string(["show", "HEAD:docs/root-sentinel.md"]),
+            "root docs remain untouched"
         );
     }
 
