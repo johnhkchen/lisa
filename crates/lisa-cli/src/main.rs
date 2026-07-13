@@ -7,6 +7,7 @@ mod doctor;
 mod hooks_guide;
 mod init;
 mod loop_cmd;
+mod preownership_status;
 mod setup_guide;
 mod status;
 mod templates;
@@ -305,7 +306,7 @@ fn main() {
                     Some(ledger) => path.join(ledger),
                     None => path.join(".lisa/provenance.jsonl"),
                 };
-                status::run_preownership_status(&ledger_path, &ticket_id)
+                preownership_status::run_preownership_status(&ledger_path, &ticket_id)
             } else {
                 status::run_status(&path)
             };

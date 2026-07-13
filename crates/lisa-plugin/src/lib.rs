@@ -5981,6 +5981,14 @@ mod tests {
     use super::*;
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
 
+    #[allow(dead_code)]
+    mod preownership_status_surface {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lisa-cli/src/preownership_status.rs"
+        ));
+    }
+
     mod signal_consumer_characterization;
     mod signal_ingestion_regression;
 
@@ -15199,6 +15207,83 @@ owned\n\
         state.seat_assignments.insert(10, seat);
         let ledger = with_ledger(&mut state, &dir);
         (state, dir, lease, ledger)
+    }
+
+    #[test]
+    fn rc6_preownership_delivery_miss_is_durable_and_cli_retrievable() {
+        use lisa_core::provenance::{
+            AssignmentState, ProvenanceLedgerRecord, ProvenanceRecordType,
+        };
+
+        const REASON: &str = "provider did not acknowledge the bounded chat assignment";
+        let deadline = std::time::SystemTime::now();
+        let (mut state, _dir, lease, ledger) = preownership_failure_state(
+            SeatAssignmentState::Delivering {
+                generation: 6,
+                ack_deadline: deadline,
+                retries: MAX_ASSIGNMENT_DELIVERY_RETRIES,
+            },
+            AgentClient::Codex,
+        );
+
+        let outcomes = state.check_assignment_ack_timeouts_at(
+            deadline
+                .checked_add(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            outcomes,
+            vec![FailureTransitionOutcome::AssignmentDeliveryFailed {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            }]
+        );
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::DeliveryFailed),
+            "a missed assignment must remain explicitly failed, never owned"
+        );
+
+        let raw = std::fs::read_to_string(&ledger)
+            .expect("the pre-ownership miss must create a durable ledger");
+        assert_eq!(
+            raw.lines().count(),
+            1,
+            "one terminal miss must append exactly one physical row"
+        );
+        let value: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert!(value.get("authoritative").is_none());
+        assert!(value.get("outcome").is_none());
+
+        let record: ProvenanceLedgerRecord = serde_json::from_str(raw.trim()).unwrap();
+        let ProvenanceLedgerRecord::AssignmentTransition(record) = record else {
+            panic!("a pre-ownership miss must append assignment-transition evidence");
+        };
+        assert_eq!(record.schema_version, lisa_core::provenance::SCHEMA_VERSION);
+        assert_eq!(
+            record.record_type,
+            ProvenanceRecordType::AssignmentTransition
+        );
+        assert_eq!(record.ticket_id, "T-NAME");
+        assert_eq!(record.attempt_lease, lease);
+        assert_eq!(record.pane_id, 10);
+        assert_eq!(record.provider, "openai");
+        assert_eq!(record.state, AssignmentState::DeliveryFailed);
+        assert_eq!(record.reason, REASON);
+
+        let mut report = Vec::new();
+        preownership_status_surface::write_preownership_status(&ledger, "T-NAME", &mut report)
+            .expect("lisa status must retrieve the scheduler-written row");
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.starts_with("Pre-ownership failures for T-NAME (1):\n"));
+        assert!(report.contains(&format!("Attempt {} (pane 10)\n", lease.attempt_id)));
+        assert!(report.contains("  state: delivery-failed\n"));
+        assert!(report.contains(&format!("  reason: {REASON}\n")));
+        assert!(report.contains("  provider: openai\n"));
+        assert!(report.contains("  started_at: "));
+        assert!(report.contains("  ended_at: "));
+        assert!(report.contains("  wall_clock_secs: "));
     }
 
     #[test]
