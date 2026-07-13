@@ -11,8 +11,8 @@ use std::fs;
 use std::path::Path;
 
 use lisa_core::completion::{
-    reduce, AttemptId, CompletionEvent, CompletionGenerationId, CompletionId, CompletionState,
-    CorrelationId, LaunchFailure, Retryability,
+    reduce, AttemptId, CompletionDeadline, CompletionEvent, CompletionGenerationId, CompletionId,
+    CompletionState, CorrelationId, LaunchFailure, Retryability,
 };
 use lisa_core::types::{Phase, TicketId, TicketStatus};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ pub(crate) enum CompletionJournalTransition {
     CommandInFlight {
         key: CompletionGenerationId,
         correlation: CorrelationId,
+        deadline: CompletionDeadline,
     },
     Rejected {
         key: CompletionGenerationId,
@@ -93,7 +94,12 @@ impl CompletionJournalAggregate {
     pub(crate) fn masks_durable_done(&self) -> bool {
         matches!(
             self.state,
-            CompletionState::Requested | CompletionState::CommandInFlight { .. }
+            CompletionState::Requested
+                | CompletionState::CommandInFlight { .. }
+                | CompletionState::Rejected {
+                    retryability: Retryability::ActionRequired,
+                    ..
+                }
         )
     }
 }
@@ -120,6 +126,8 @@ enum JournalRecordBody {
         attempt_id: String,
         generation: u64,
         correlation_id: String,
+        #[serde(default)]
+        reconciliation_deadline_unix_ms: Option<u64>,
     },
     Rejected {
         completion_id: String,
@@ -177,14 +185,17 @@ impl JournalRecord {
                 prior_phase: *prior_phase,
                 prior_status: *prior_status,
             },
-            CompletionJournalTransition::CommandInFlight { key, correlation } => {
-                JournalRecordBody::CommandInFlight {
-                    completion_id: key.completion_id().to_string(),
-                    attempt_id: key.attempt_id().to_string(),
-                    generation: key.generation(),
-                    correlation_id: correlation.to_string(),
-                }
-            }
+            CompletionJournalTransition::CommandInFlight {
+                key,
+                correlation,
+                deadline,
+            } => JournalRecordBody::CommandInFlight {
+                completion_id: key.completion_id().to_string(),
+                attempt_id: key.attempt_id().to_string(),
+                generation: key.generation(),
+                correlation_id: correlation.to_string(),
+                reconciliation_deadline_unix_ms: Some(deadline.unix_millis()),
+            },
             CompletionJournalTransition::Rejected {
                 key,
                 correlation,
@@ -240,9 +251,13 @@ impl JournalRecord {
                 attempt_id,
                 generation,
                 correlation_id,
+                reconciliation_deadline_unix_ms,
             } => CompletionJournalTransition::CommandInFlight {
                 key: generation_key(completion_id, attempt_id, generation),
                 correlation: CorrelationId::new(correlation_id),
+                deadline: CompletionDeadline::from_unix_millis(
+                    reconciliation_deadline_unix_ms.unwrap_or(0),
+                ),
             },
             JournalRecordBody::Rejected {
                 completion_id,
@@ -430,11 +445,18 @@ fn apply_transition(
                 confirmed_commit_id: None,
             }
         }
-        CompletionJournalTransition::CommandInFlight { key, correlation } => {
+        CompletionJournalTransition::CommandInFlight {
+            key,
+            correlation,
+            deadline,
+        } => {
             let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key)?;
             let reduced = reduce(
                 aggregate.state.clone(),
-                CompletionEvent::CommandLaunched { correlation },
+                CompletionEvent::CommandLaunched {
+                    correlation,
+                    deadline,
+                },
             )
             .map_err(|error| {
                 format!("command-in-flight transition rejected for {ticket_id}: {error}")
@@ -563,6 +585,10 @@ mod tests {
         CorrelationId::new(value)
     }
 
+    fn deadline(value: u64) -> CompletionDeadline {
+        CompletionDeadline::from_unix_millis(value)
+    }
+
     #[test]
     fn requested_in_flight_and_confirmed_reconstruct_after_each_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -592,13 +618,15 @@ mod tests {
             CompletionJournalTransition::CommandInFlight {
                 key: generation.clone(),
                 correlation: command.clone(),
+                deadline: deadline(42),
             },
         )
         .unwrap();
         assert_eq!(
             in_flight.state(),
             &CompletionState::CommandInFlight {
-                correlation: command.clone()
+                correlation: command.clone(),
+                deadline: deadline(42),
             }
         );
         assert!(in_flight.masks_durable_done());
@@ -624,6 +652,11 @@ mod tests {
         assert_eq!(body.matches("\"schema_version\":1").count(), 3);
         assert_eq!(body.matches("\"state\":\"requested\"").count(), 1);
         assert_eq!(body.matches("\"state\":\"command-in-flight\"").count(), 1);
+        assert_eq!(
+            body.matches("\"reconciliation_deadline_unix_ms\":42")
+                .count(),
+            1
+        );
         assert_eq!(body.matches("\"state\":\"confirmed\"").count(), 1);
         assert!(body.ends_with('\n'));
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
@@ -650,6 +683,7 @@ mod tests {
             CompletionJournalTransition::CommandInFlight {
                 key: first.clone(),
                 correlation: command.clone(),
+                deadline: deadline(42),
             },
         )
         .unwrap();
@@ -670,6 +704,7 @@ mod tests {
                 ..
             }
         ));
+        assert!(!rejected.masks_durable_done());
 
         let second = key("T-RETRY", "4", 2);
         let requested = append(
@@ -706,6 +741,7 @@ mod tests {
             CompletionJournalTransition::CommandInFlight {
                 key: first.clone(),
                 correlation: command.clone(),
+                deadline: deadline(42),
             },
         )
         .unwrap();
@@ -783,6 +819,7 @@ mod tests {
             CompletionJournalTransition::CommandInFlight {
                 key: key("T-STRICT", "1", 2),
                 correlation: correlation("command-a"),
+                deadline: deadline(42),
             },
         )
         .unwrap_err();
@@ -794,6 +831,7 @@ mod tests {
             CompletionJournalTransition::CommandInFlight {
                 key: expected.clone(),
                 correlation: correlation("command-a"),
+                deadline: deadline(42),
             },
         )
         .unwrap();
@@ -822,5 +860,47 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("already pending"));
         assert_eq!(fs::read(&path).unwrap(), in_flight_bytes);
+    }
+
+    #[test]
+    fn legacy_in_flight_without_deadline_loads_expired_and_action_required_masks_done() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"schema_version\":1,\"state\":\"requested\",\"completion_id\":\"T-LEGACY\",\"attempt_id\":\"1\",\"generation\":1,\"prior_phase\":\"review\",\"prior_status\":\"review\"}\n",
+                "{\"schema_version\":1,\"state\":\"command-in-flight\",\"completion_id\":\"T-LEGACY\",\"attempt_id\":\"1\",\"generation\":1,\"correlation_id\":\"legacy-command\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let aggregate = load(&path).unwrap().remove("T-LEGACY").unwrap();
+        assert_eq!(
+            aggregate.state(),
+            &CompletionState::CommandInFlight {
+                correlation: correlation("legacy-command"),
+                deadline: deadline(0),
+            }
+        );
+
+        let rejected = append(
+            &path,
+            CompletionJournalTransition::Rejected {
+                key: key("T-LEGACY", "1", 1),
+                correlation: Some(correlation("legacy-command")),
+                reason: "reconciliation deadline exceeded".to_string(),
+                retryability: Retryability::ActionRequired,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            rejected.state(),
+            CompletionState::Rejected {
+                retryability: Retryability::ActionRequired,
+                ..
+            }
+        ));
+        assert!(rejected.masks_durable_done());
     }
 }
