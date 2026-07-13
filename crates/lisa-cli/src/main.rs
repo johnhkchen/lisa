@@ -21,6 +21,12 @@ use std::path::PathBuf;
 #[command(
     name = "lisa",
     about = "Runs your coding agents through a project's tickets.",
+    before_help = "Everyday path: init → validate → status → loop",
+    after_help = "Plumbing commands (called by Lisa and agent hooks):
+  agent-exec       Run Codex and turn its output into Lisa's pane signals
+  capture-usage    Record a native session's token usage from its Stop-hook payload on stdin
+  commit-ticket    Commit this ticket's own files without touching the repo's ordinary git index
+  complete-ticket  Mark a ticket done and commit its files in one step",
     version
 )]
 struct Cli {
@@ -94,7 +100,7 @@ enum Commands {
     /// translates its event stream into `.lisa/signals/pane-<id>.*` files, and
     /// renders the conversation to stdout. `lisa loop` uses the native Codex TUI;
     /// this remains available for diagnostics and headless automation.
-    #[command(display_order = 20)]
+    #[command(display_order = 20, hide = true)]
     AgentExec {
         /// The prompt to send to codex.
         prompt: String,
@@ -126,14 +132,14 @@ enum Commands {
     },
     /// Record a native session's token usage from its Stop-hook payload on stdin,
     /// appending observed facts to `.lisa/<client>/captures.jsonl`.
-    #[command(display_order = 21)]
+    #[command(display_order = 21, hide = true)]
     CaptureUsage {
         /// Project root the `.lisa/<client>` capture ledger is written under.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
     },
     /// Commit this ticket's own files without touching the repo's ordinary git index.
-    #[command(display_order = 22)]
+    #[command(display_order = 22, hide = true)]
     CommitTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
@@ -152,7 +158,7 @@ enum Commands {
         includes: Vec<PathBuf>,
     },
     /// Mark a ticket done and commit its files in one step.
-    #[command(display_order = 23)]
+    #[command(display_order = 23, hide = true)]
     CompleteTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
