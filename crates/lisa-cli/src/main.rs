@@ -56,6 +56,14 @@ enum Commands {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
+
+        /// Show retained pre-ownership failures for this ticket
+        #[arg(long)]
+        ticket: Option<String>,
+
+        /// Provenance ledger to read (defaults to .lisa/provenance.jsonl)
+        #[arg(long, requires = "ticket")]
+        ledger: Option<PathBuf>,
     },
     /// Print setup instructions for an agent to follow.
     #[command(hide = true)]
@@ -285,9 +293,23 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Status { path } => {
+        Commands::Status {
+            path,
+            ticket,
+            ledger,
+        } => {
             let path = resolve_path(&path);
-            if let Err(e) = status::run_status(&path) {
+            let result = if let Some(ticket_id) = ticket {
+                let ledger_path = match ledger {
+                    Some(ledger) if ledger.is_absolute() => ledger,
+                    Some(ledger) => path.join(ledger),
+                    None => path.join(".lisa/provenance.jsonl"),
+                };
+                status::run_preownership_status(&ledger_path, &ticket_id)
+            } else {
+                status::run_status(&path)
+            };
+            if let Err(e) = result {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
