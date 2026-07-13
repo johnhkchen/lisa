@@ -6,6 +6,7 @@
 
 mod adapter;
 mod codex_ack;
+mod completion_journal;
 mod deadline;
 mod pane_name;
 mod publication;
@@ -21,6 +22,7 @@ use adapter::{
     resolve_adapter_or_native, FollowUp, FollowUpContext, ReadinessMode, ResetStrategy,
     SpawnContext,
 };
+use completion_journal::{CompletionJournalAggregate, CompletionJournalTransition};
 use deadline::{
     AcknowledgementInput, DeadlineEvaluator, HealthInput, ReviewInput, SessionAction, SessionInput,
     StaleInput, SystemClock, TransitionAction, TransitionInput, TransitionPolicy,
@@ -30,8 +32,9 @@ use lisa_core::client::AgentClient;
 use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
     reconcile as reconcile_completion, reduce as reduce_completion, AttemptId, CompletionEvent,
-    CompletionGenerationId, CompletionId, CompletionRejection, CompletionState,
+    CompletionGenerationId, CompletionId, CompletionRejection, CompletionState, CorrelationId,
     CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand, Reconciliation,
+    Retryability,
 };
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
@@ -481,6 +484,8 @@ enum CompletionAuthority {
 
 #[derive(Debug, Clone)]
 struct PendingCompletion {
+    completion_key: CompletionGenerationId,
+    correlation: CorrelationId,
     prior_phase: Phase,
     prior_status: TicketStatus,
     source: CompletionSource,
@@ -612,6 +617,17 @@ pub struct State {
     /// Empty until `load()` runs — a native test that does not set it skips the
     /// write, so unrelated teardown-triggering tests never write to disk.
     ledger_path: PathBuf,
+
+    /// Atomic append-only completion transition journal. Empty before `load()`
+    /// so legacy native fixtures remain disk-free.
+    completion_journal_path: PathBuf,
+
+    /// False after a failed production journal restore. Completion effects fail
+    /// closed until the durable history can be read unambiguously.
+    completion_journal_healthy: bool,
+
+    /// Latest typed completion aggregate state reconstructed from the journal.
+    completion_aggregates: HashMap<TicketId, CompletionJournalAggregate>,
 
     /// Directory native Codex usage capture (or the headless fallback) writes
     /// artifacts into (`.lisa/codex/` under /host/).
@@ -1327,11 +1343,78 @@ impl State {
         true
     }
 
+    /// Restore the durable completion aggregate before initial DAG authority is
+    /// derived. A malformed history is visible and fail-closed.
+    fn restore_completion_journal(&mut self) {
+        match completion_journal::load(&self.completion_journal_path) {
+            Ok(aggregates) => {
+                self.completion_aggregates = aggregates;
+                self.completion_journal_healthy = true;
+            }
+            Err(error) => {
+                self.completion_aggregates.clear();
+                self.completion_journal_healthy = false;
+                self.log_activity(ActivityEvent::Error {
+                    message: format!("Completion journal restore failed: {error}"),
+                });
+            }
+        }
+    }
+
+    /// Publish one transition before updating the in-memory aggregate. Empty
+    /// paths retain the existing disk-free behavior of pre-load native tests.
+    fn journal_completion_transition(
+        &mut self,
+        transition: CompletionJournalTransition,
+    ) -> Result<(), String> {
+        if self.completion_journal_path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if !self.completion_journal_healthy {
+            return Err("completion journal is unavailable after a failed restore".to_string());
+        }
+        let aggregate = completion_journal::append(&self.completion_journal_path, transition)?;
+        self.completion_aggregates.insert(
+            aggregate.completion_key().completion_id().to_string(),
+            aggregate,
+        );
+        Ok(())
+    }
+
+    /// Mask Done bytes written by a completion command until its correlated
+    /// result is durably confirmed. Live pending state takes precedence; after
+    /// restart the journal supplies the same prior phase/status facts.
+    fn mask_completion_transaction(&self, scanned: &mut lisa_core::types::Ticket) {
+        if let Some(pending) = self.pending_completions.get(&scanned.id) {
+            scanned.phase = pending.prior_phase;
+            scanned.status = pending.prior_status;
+        } else if let Some(aggregate) = self.completion_aggregates.get(&scanned.id) {
+            if aggregate.masks_durable_done() {
+                scanned.phase = aggregate.prior_phase();
+                scanned.status = aggregate.prior_status();
+            }
+        }
+    }
+
     /// Reconstruct the aggregate state from facts the adapter can currently
-    /// prove. Pending masks durable Done until the attributed command result is
-    /// verified, matching `rebuild_dag`'s transaction boundary.
+    /// prove. Journal state survives plugin restart; pending and DAG facts keep
+    /// pre-load native fixtures and repositories without a journal compatible.
     fn reconciliation_state(&self, ticket_id: &str) -> CompletionState {
-        if self.pending_completions.contains_key(ticket_id) {
+        if let Some(aggregate) = self.completion_aggregates.get(ticket_id) {
+            if matches!(aggregate.state(), CompletionState::Confirmed)
+                && self
+                    .dag
+                    .get_ticket(&ticket_id.to_string())
+                    .map(|ticket| {
+                        ticket.phase != Phase::Done || ticket.status != TicketStatus::Done
+                    })
+                    .unwrap_or(false)
+            {
+                CompletionState::Eligible
+            } else {
+                aggregate.state().clone()
+            }
+        } else if self.pending_completions.contains_key(ticket_id) {
             CompletionState::Requested
         } else if self
             .dag
@@ -1488,11 +1571,7 @@ impl State {
                 // Event-driven sources preserve their existing semantics:
                 // ObservedDone still enters the isolated transaction rather
                 // than treating externally edited frontmatter as confirmation.
-                let state = if self.pending_completions.contains_key(&ticket_id) {
-                    CompletionState::Requested
-                } else {
-                    CompletionState::Eligible
-                };
+                let state = self.reconciliation_state(&ticket_id);
                 let attempt_id = match authority.as_ref() {
                     Some(CompletionAuthority::Attempt(lease)) => lease.attempt_id.to_string(),
                     Some(CompletionAuthority::Operator) => "operator".to_string(),
@@ -1564,7 +1643,25 @@ impl State {
             return false;
         }
 
-        if self.pending_completions.contains_key(&ticket_id) {
+        if self.pending_completions.contains_key(&ticket_id)
+            || self
+                .completion_aggregates
+                .get(&ticket_id)
+                .map(|aggregate| {
+                    matches!(
+                        aggregate.state(),
+                        CompletionState::Requested | CompletionState::CommandInFlight { .. }
+                    ) || (matches!(aggregate.state(), CompletionState::Confirmed)
+                        && self
+                            .dag
+                            .get_ticket(&ticket_id)
+                            .map(|ticket| {
+                                ticket.phase == Phase::Done && ticket.status == TicketStatus::Done
+                            })
+                            .unwrap_or(false))
+                })
+                .unwrap_or(false)
+        {
             return false;
         }
         let authority = match authority {
@@ -1622,30 +1719,24 @@ impl State {
             ticket_status
         };
 
-        self.pending_completions.insert(
-            ticket_id.clone(),
-            PendingCompletion {
-                prior_phase,
-                prior_status,
-                source,
-                authority,
-            },
-        );
-
-        #[cfg(test)]
-        self.launched_completion_effects.push(effect);
-
-        let (argv, context) = match self.build_completion_command(&completion_key, &ticket_file) {
-            Ok(command) => command,
+        let command = match self.build_completion_command(&completion_key, &ticket_file) {
+            Ok(command) => Some(command),
             Err(error) => {
                 #[cfg(test)]
-                {
-                    let _ = error;
-                    return true;
+                if self.completion_journal_path.as_os_str().is_empty() {
+                    None
+                } else {
+                    self.log_completion_rejection(
+                        &ticket_id,
+                        &completion_key,
+                        &CompletionRejection::LaunchFailed {
+                            source: LaunchFailure::new(error),
+                        },
+                    );
+                    return false;
                 }
                 #[cfg(not(test))]
                 {
-                    self.pending_completions.remove(&ticket_id);
                     self.log_completion_rejection(
                         &ticket_id,
                         &completion_key,
@@ -1656,6 +1747,62 @@ impl State {
                     return false;
                 }
             }
+        };
+        let correlation = CorrelationId::new(completion_key.to_string());
+
+        if let Err(error) =
+            self.journal_completion_transition(CompletionJournalTransition::Requested {
+                key: completion_key.clone(),
+                prior_phase,
+                prior_status,
+            })
+        {
+            self.log_completion_rejection(
+                &ticket_id,
+                &completion_key,
+                &CompletionRejection::LaunchFailed {
+                    source: LaunchFailure::new(format!(
+                        "could not persist completion request: {error}"
+                    )),
+                },
+            );
+            return false;
+        }
+        if let Err(error) =
+            self.journal_completion_transition(CompletionJournalTransition::CommandInFlight {
+                key: completion_key.clone(),
+                correlation: correlation.clone(),
+            })
+        {
+            self.log_completion_rejection(
+                &ticket_id,
+                &completion_key,
+                &CompletionRejection::LaunchFailed {
+                    source: LaunchFailure::new(format!(
+                        "could not persist in-flight completion command: {error}"
+                    )),
+                },
+            );
+            return false;
+        }
+
+        self.pending_completions.insert(
+            ticket_id.clone(),
+            PendingCompletion {
+                completion_key: completion_key.clone(),
+                correlation,
+                prior_phase,
+                prior_status,
+                source,
+                authority,
+            },
+        );
+
+        #[cfg(test)]
+        self.launched_completion_effects.push(effect);
+
+        let Some((argv, context)) = command else {
+            return true;
         };
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         run_command_with_env_variables_and_cwd(
@@ -1687,12 +1834,8 @@ impl State {
             Some(pending) => pending,
             None => return,
         };
-        let result_attempt_id = match &pending.authority {
-            CompletionAuthority::Attempt(lease) => AttemptId::new(lease.attempt_id.to_string()),
-            CompletionAuthority::Operator => AttemptId::new("operator"),
-        };
-        let correlation =
-            Self::completion_correlation(CompletionId::new(ticket_id), result_attempt_id.clone());
+        let completion_key = pending.completion_key.clone();
+        let correlation = pending.correlation.clone();
         let authority_is_current = match &pending.authority {
             CompletionAuthority::Attempt(lease) => {
                 lease.is_current(self.current_leases.get(ticket_id))
@@ -1700,11 +1843,34 @@ impl State {
             CompletionAuthority::Operator => pending.source == CompletionSource::Manual,
         };
         if !authority_is_current {
+            let reason = format!(
+                "completion result authority {:?} is no longer current",
+                pending.authority
+            );
+            if let Err(error) =
+                self.journal_completion_transition(CompletionJournalTransition::Rejected {
+                    key: completion_key.clone(),
+                    correlation: Some(correlation.clone()),
+                    reason,
+                    retryability: Retryability::Retryable,
+                })
+            {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Completion result for {ticket_id} remains in-flight because rejection could not be persisted: {error}"
+                    ),
+                });
+                return;
+            }
             self.pending_completions.remove(ticket_id);
             self.rebuild_dag();
             match &pending.authority {
                 CompletionAuthority::Attempt(_) => {
-                    self.reject_stale_lease(ticket_id, &correlation, result_attempt_id.to_string());
+                    self.reject_stale_lease(
+                        ticket_id,
+                        &completion_key,
+                        completion_key.attempt_id().to_string(),
+                    );
                 }
                 CompletionAuthority::Operator => {
                     self.log_activity(ActivityEvent::Warning {
@@ -1718,8 +1884,6 @@ impl State {
             return;
         }
         if exit_code != Some(0) || !Self::is_commit_id(&stdout) {
-            self.pending_completions.remove(ticket_id);
-            self.rebuild_dag();
             let detail = String::from_utf8_lossy(&stderr);
             let failure = format!(
                     "Completion commit failed for {} authority {:?} ({:?}, exit {:?}): {}. Ticket remains recoverable for retry",
@@ -1733,9 +1897,26 @@ impl State {
                         detail.trim()
                     }
                 );
+            if let Err(error) =
+                self.journal_completion_transition(CompletionJournalTransition::Rejected {
+                    key: completion_key.clone(),
+                    correlation: Some(correlation),
+                    reason: failure.clone(),
+                    retryability: Retryability::Retryable,
+                })
+            {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Completion result for {ticket_id} remains in-flight because failure could not be persisted: {error}"
+                    ),
+                });
+                return;
+            }
+            self.pending_completions.remove(ticket_id);
+            self.rebuild_dag();
             self.log_completion_rejection(
                 ticket_id,
-                &correlation,
+                &completion_key,
                 &CompletionRejection::LaunchFailed {
                     source: LaunchFailure::new(failure),
                 },
@@ -1743,17 +1924,14 @@ impl State {
             return;
         }
 
-        self.pending_completions.remove(ticket_id);
-        self.rebuild_dag();
+        let commit_id = String::from_utf8_lossy(&stdout).trim().to_string();
         let ticket_id_owned = ticket_id.to_string();
-        let durable_done = self
-            .dag
-            .get_ticket(&ticket_id_owned)
+        let durable_done = ticket::scan_tickets(&self.config.ticket_dir)
+            .ok()
+            .and_then(|tickets| tickets.into_iter().find(|ticket| ticket.id == ticket_id))
             .map(|ticket| ticket.phase == Phase::Done && ticket.status == TicketStatus::Done)
             .unwrap_or(false);
         if !durable_done {
-            self.pending_completions
-                .insert(ticket_id.to_string(), pending);
             self.rebuild_dag();
             self.log_activity(ActivityEvent::Error {
                 message: format!(
@@ -1763,6 +1941,25 @@ impl State {
             });
             return;
         }
+
+        if let Err(error) =
+            self.journal_completion_transition(CompletionJournalTransition::Confirmed {
+                key: completion_key,
+                correlation,
+                commit_id: commit_id.clone(),
+            })
+        {
+            self.rebuild_dag();
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion command succeeded for {ticket_id} but confirmation could not be persisted: {error}; scheduler state remains blocked"
+                ),
+            });
+            return;
+        }
+
+        self.pending_completions.remove(ticket_id);
+        self.rebuild_dag();
 
         self.log_activity(ActivityEvent::PhaseCompleted {
             ticket_id: ticket_id.to_string(),
@@ -1776,9 +1973,7 @@ impl State {
         self.log_activity(ActivityEvent::Info {
             message: format!(
                 "Completion commit verified for {} authority {:?} at {}",
-                ticket_id,
-                pending.authority,
-                String::from_utf8_lossy(&stdout).trim()
+                ticket_id, pending.authority, commit_id
             ),
         });
         if let Some(thread) = self.threads.get_mut(ticket_id) {
@@ -1811,10 +2006,7 @@ impl State {
         };
 
         for scanned in &mut tickets {
-            if let Some(pending) = self.pending_completions.get(&scanned.id) {
-                scanned.phase = pending.prior_phase;
-                scanned.status = pending.prior_status;
-            }
+            self.mask_completion_transaction(scanned);
         }
 
         let ticket_count = tickets.len();
@@ -3073,7 +3265,12 @@ impl State {
 
     /// Schedule ready tickets into idle agent slots.
     fn schedule_ready_tickets(&mut self) {
-        if !self.permissions_granted || !self.slots_discovered || self.paused {
+        if (!self.completion_journal_path.as_os_str().is_empty()
+            && !self.completion_journal_healthy)
+            || !self.permissions_granted
+            || !self.slots_discovered
+            || self.paused
+        {
             return;
         }
 
@@ -5075,7 +5272,8 @@ impl State {
 
     /// Check if all tickets are done and no threads are still running.
     fn check_all_done(&self) -> bool {
-        !self.dag.is_empty()
+        (self.completion_journal_path.as_os_str().is_empty() || self.completion_journal_healthy)
+            && !self.dag.is_empty()
             && self.dag.tickets().all(|t| t.phase == Phase::Done)
             && !self
                 .threads
@@ -5945,6 +6143,8 @@ impl ZellijPlugin for State {
 
         // Provenance ledger + per-provider usage-artifact directories.
         self.ledger_path = host.join(".lisa/provenance.jsonl");
+        self.completion_journal_path = host.join(".lisa/completion-journal.jsonl");
+        self.restore_completion_journal();
         self.codex_dir = host.join(".lisa/codex");
         self.claude_dir = host.join(".lisa/claude");
 
@@ -5974,7 +6174,7 @@ impl ZellijPlugin for State {
 
         // Initial DAG build with startup diagnostics
         let commit_lock_path = PathBuf::from("/host/.lisa-commit.lock");
-        let scan_result = match ticket::scan_tickets_with_diagnostics(&self.config.ticket_dir) {
+        let mut scan_result = match ticket::scan_tickets_with_diagnostics(&self.config.ticket_dir) {
             Ok(result) => result,
             Err(e) => {
                 self.log_activity(ActivityEvent::Error {
@@ -5987,6 +6187,10 @@ impl ZellijPlugin for State {
                 }
             }
         };
+
+        for scanned in &mut scan_result.tickets {
+            self.mask_completion_transaction(scanned);
+        }
 
         let dag_result = Dag::from_tickets(scan_result.tickets.clone());
 
@@ -16907,6 +17111,19 @@ owned\n\
         state.pending_completions.insert(
             "T-CDX-01".to_string(),
             PendingCompletion {
+                completion_key: CompletionGenerationId::new(
+                    CompletionId::new("T-CDX-01"),
+                    AttemptId::new(predecessor.attempt_id.to_string()),
+                    1,
+                ),
+                correlation: CorrelationId::new(
+                    CompletionGenerationId::new(
+                        CompletionId::new("T-CDX-01"),
+                        AttemptId::new(predecessor.attempt_id.to_string()),
+                        1,
+                    )
+                    .to_string(),
+                ),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Review,
                 source: CompletionSource::Artifact,
@@ -16931,6 +17148,19 @@ owned\n\
         state.pending_completions.insert(
             "T-CDX-01".to_string(),
             PendingCompletion {
+                completion_key: CompletionGenerationId::new(
+                    CompletionId::new("T-CDX-01"),
+                    AttemptId::new(replacement.attempt_id.to_string()),
+                    1,
+                ),
+                correlation: CorrelationId::new(
+                    CompletionGenerationId::new(
+                        CompletionId::new("T-CDX-01"),
+                        AttemptId::new(replacement.attempt_id.to_string()),
+                        1,
+                    )
+                    .to_string(),
+                ),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Review,
                 source: CompletionSource::Artifact,
@@ -17341,6 +17571,183 @@ owned\n\
         let ticket = state.dag.get_ticket(&"T-CDX-01".to_string()).unwrap();
         assert_eq!(ticket.phase, Phase::Done);
         assert_eq!(ticket.status, TicketStatus::Done);
+    }
+
+    #[test]
+    fn completion_journal_reconstructs_restart_states_before_authoritative_provenance() {
+        use lisa_core::provenance::ProvenanceLedgerRecord;
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        let journal = dir.path().join("completion-journal.jsonl");
+        state.completion_journal_path = journal.clone();
+        state.restore_completion_journal();
+        state.project_root = dir.path().to_path_buf();
+        state.git_root = dir.path().to_path_buf();
+        state.config.git_root = dir.path().to_path_buf();
+        state.config.lisa_bin = Some("/usr/local/bin/lisa".to_string());
+
+        let ticket_id = "T-CDX-01";
+        let ticket_path = state.config.ticket_dir.join(format!("{ticket_id}.md"));
+        fs::write(
+            &ticket_path,
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: review\npriority: high\nphase: review\nagent: codex\n---\n\nBody\n",
+        )
+        .unwrap();
+        state.dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap())
+                .unwrap();
+        let mut thread = Thread::new(ticket_id, 1);
+        thread.current_phase = Phase::Review;
+        thread.client = AgentClient::Codex;
+        state.threads.insert(ticket_id.to_string(), thread);
+        codex_slot(&mut state, 1, ticket_id);
+        let lease = install_current_attempt(&mut state, ticket_id);
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review\n").unwrap();
+        write_passing_review_disposition(&state, &lease);
+
+        state.check_artifact_advances();
+
+        let in_flight = state
+            .completion_aggregates
+            .get(ticket_id)
+            .cloned()
+            .expect("adapter must retain its durable aggregate");
+        let expected_key = CompletionGenerationId::new(
+            CompletionId::new(ticket_id),
+            AttemptId::new(lease.attempt_id.to_string()),
+            1,
+        );
+        assert_eq!(in_flight.completion_key(), &expected_key);
+        assert_eq!(in_flight.prior_phase(), Phase::Review);
+        assert_eq!(in_flight.prior_status(), TicketStatus::Review);
+        assert_eq!(
+            in_flight.state(),
+            &CompletionState::CommandInFlight {
+                correlation: CorrelationId::new(expected_key.to_string())
+            }
+        );
+        assert!(state.pending_completions.contains_key(ticket_id));
+        assert!(
+            !ledger.exists(),
+            "in-flight state cannot emit Done provenance"
+        );
+
+        let journal_body = fs::read_to_string(&journal).unwrap();
+        assert_eq!(journal_body.lines().count(), 2);
+        assert_eq!(
+            journal_body
+                .lines()
+                .filter(|line| line.contains("\"state\":\"requested\""))
+                .count(),
+            1
+        );
+        assert_eq!(
+            journal_body
+                .lines()
+                .filter(|line| line.contains("\"state\":\"command-in-flight\""))
+                .count(),
+            1
+        );
+
+        let mut restarted = State {
+            completion_journal_path: journal.clone(),
+            ..State::default()
+        };
+        restarted.restore_completion_journal();
+        assert!(restarted.completion_journal_healthy);
+        assert_eq!(
+            restarted.completion_aggregates.get(ticket_id),
+            Some(&in_flight),
+            "a fresh plugin state must reconstruct the exact in-flight aggregate"
+        );
+        assert_eq!(
+            restarted.reconciliation_state(ticket_id),
+            in_flight.state().clone()
+        );
+
+        lisa_core::ticket::update_ticket_done(&ticket_path).unwrap();
+        let mut restarted_scan = lisa_core::ticket::scan_tickets(&state.config.ticket_dir).unwrap();
+        let scanned = restarted_scan
+            .iter_mut()
+            .find(|ticket| ticket.id == ticket_id)
+            .unwrap();
+        assert_eq!(scanned.phase, Phase::Done);
+        restarted.mask_completion_transaction(scanned);
+        assert_eq!(scanned.phase, Phase::Review);
+        assert_eq!(scanned.status, TicketStatus::Review);
+
+        state.rebuild_dag();
+        assert_eq!(
+            state.dag.get_ticket(&ticket_id.to_string()).unwrap().phase,
+            Phase::Review,
+            "live journal/pending state must mask Done until confirmation"
+        );
+        let commit_id = "a".repeat(40);
+        state.handle_completion_result(
+            ticket_id,
+            Some(0),
+            commit_id.as_bytes().to_vec(),
+            Vec::new(),
+        );
+
+        assert!(!state.pending_completions.contains_key(ticket_id));
+        let confirmed = state.completion_aggregates.get(ticket_id).unwrap();
+        assert_eq!(confirmed.state(), &CompletionState::Confirmed);
+        assert_eq!(confirmed.confirmed_commit_id(), Some(commit_id.as_str()));
+
+        let mut confirmed_restart = State {
+            completion_journal_path: journal.clone(),
+            ..State::default()
+        };
+        confirmed_restart.restore_completion_journal();
+        assert_eq!(
+            confirmed_restart.completion_aggregates.get(ticket_id),
+            Some(confirmed)
+        );
+        assert_eq!(
+            confirmed_restart.reconciliation_state(ticket_id),
+            CompletionState::Confirmed
+        );
+
+        let journal_body = fs::read_to_string(&journal).unwrap();
+        assert_eq!(journal_body.lines().count(), 3);
+        assert_eq!(
+            journal_body
+                .lines()
+                .filter(|line| line.contains("\"state\":\"confirmed\""))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("journal.jsonl.tmp"))
+                .count(),
+            0,
+            "atomic publication must leave no sibling temporary"
+        );
+
+        let records = read_mixed_ledger(&ledger);
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            ProvenanceLedgerRecord::Execution(record) => {
+                assert_eq!(record.ticket_id, ticket_id);
+                assert_eq!(record.outcome, RunOutcome::Done);
+                assert!(record.authoritative);
+            }
+            other => {
+                panic!("completion must retain the legacy execution provenance shape: {other:?}")
+            }
+        }
     }
 
     #[test]
