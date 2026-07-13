@@ -3278,6 +3278,15 @@ impl State {
         let mut unscheduled = 0usize;
 
         for ticket_id in ready {
+            if self
+                .completion_aggregates
+                .get(&ticket_id)
+                .map(CompletionJournalAggregate::masks_durable_done)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             // Skip tickets that already have an active thread.
             // Defensive: if a stale Completed thread exists, remove it and proceed.
             let is_completed = self
@@ -18038,6 +18047,17 @@ owned\n\
         restarted.mask_completion_transaction(scanned);
         assert_eq!(scanned.phase, Phase::Review);
         assert_eq!(scanned.status, TicketStatus::Review);
+        restarted.dag = Dag::from_tickets(restarted_scan).unwrap();
+        restarted.config = state.config.clone();
+        restarted.permissions_granted = true;
+        restarted.slots_discovered = true;
+        codex_slot(&mut restarted, 7, ticket_id);
+        restarted.agent_slots[0].ticket_id = None;
+        restarted.schedule_ready_tickets();
+        assert!(
+            restarted.threads.is_empty(),
+            "an unresolved reconstructed completion must fence replacement scheduling"
+        );
 
         state.rebuild_dag();
         assert_eq!(
