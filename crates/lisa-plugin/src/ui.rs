@@ -284,6 +284,25 @@ pub enum ModalKind {
     QuitConfirm,
 }
 
+/// Visible lifecycle of one completion request submitted from MarkDone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorModalOutcome {
+    Pending {
+        ticket_id: String,
+        correlation_id: String,
+    },
+    Accepted {
+        ticket_id: String,
+        correlation_id: String,
+    },
+    Rejected {
+        ticket_id: String,
+        kind: CompletionRejectionKind,
+        correlation_id: String,
+        detail: String,
+    },
+}
+
 /// State for the modal overlay (UI representation).
 #[derive(Debug, Clone, Default)]
 pub struct ModalState {
@@ -297,6 +316,8 @@ pub struct ModalState {
     pub kind: ModalKind,
     /// (QuitConfirm only) New ticket IDs not in the current DAG.
     pub new_ticket_ids: Vec<String>,
+    /// (MarkDone only) Durable visible feedback for a submitted request.
+    pub operator_outcome: Option<OperatorModalOutcome>,
 }
 
 /// Which preset view is active on the dashboard.
@@ -1179,10 +1200,160 @@ fn render_activity_view(state: &PluginState, height: usize, output: &mut Vec<Str
     render_activity_log(state, max_entries, output);
 }
 
+fn wrap_modal_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+
+        let mut remainder = word;
+        while remainder.chars().count() > width {
+            let split = remainder
+                .char_indices()
+                .nth(width)
+                .map(|(index, _)| index)
+                .unwrap_or(remainder.len());
+            lines.push(remainder[..split].to_string());
+            remainder = &remainder[split..];
+        }
+        current.push_str(remainder);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn render_operator_outcome_modal(
+    outcome: &OperatorModalOutcome,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let box_w = width.min(50);
+    let inner_w = box_w.saturating_sub(4);
+    let (ticket_id, correlation_id, status, color, detail, pending) = match outcome {
+        OperatorModalOutcome::Pending {
+            ticket_id,
+            correlation_id,
+        } => (
+            ticket_id,
+            correlation_id,
+            "Completion pending".to_string(),
+            YELLOW,
+            None,
+            true,
+        ),
+        OperatorModalOutcome::Accepted {
+            ticket_id,
+            correlation_id,
+        } => (
+            ticket_id,
+            correlation_id,
+            "Completion accepted".to_string(),
+            BRIGHT_GREEN,
+            None,
+            false,
+        ),
+        OperatorModalOutcome::Rejected {
+            ticket_id,
+            kind,
+            correlation_id,
+            detail,
+        } => (
+            ticket_id,
+            correlation_id,
+            format!("Completion rejected: {kind}"),
+            RED,
+            Some(detail.as_str()),
+            false,
+        ),
+    };
+
+    let mut body = vec![format!("Ticket: {ticket_id}"), status.clone()];
+    body.extend(wrap_modal_text(
+        &format!("Correlation: {correlation_id}"),
+        inner_w,
+    ));
+    if let Some(detail) = detail {
+        body.extend(wrap_modal_text(&format!("Reason: {detail}"), inner_w));
+    }
+
+    let box_h = body.len() + 5;
+    let pad_top = height.saturating_sub(box_h) / 2;
+    let border_h = "─".repeat(box_w.saturating_sub(2));
+    let mut output = vec![String::new(); pad_top];
+    output.push(format!("┌{}┐", border_h));
+
+    let title = " Operator Completion ";
+    let title_pad = box_w.saturating_sub(2).saturating_sub(title.len());
+    let left_pad = title_pad / 2;
+    output.push(format!(
+        "│{}{}{}{}{}│",
+        " ".repeat(left_pad),
+        BOLD,
+        title,
+        RESET,
+        " ".repeat(title_pad - left_pad),
+    ));
+    output.push(format!("├{}┤", border_h));
+
+    for line in body {
+        let visible_len = line.chars().count();
+        let decorated = if line == status {
+            format!("{color}{BOLD}{line}{RESET}")
+        } else {
+            line
+        };
+        output.push(format!(
+            "│ {}{} │",
+            decorated,
+            " ".repeat(inner_w.saturating_sub(visible_len))
+        ));
+    }
+
+    output.push(format!("├{}┤", border_h));
+    let footer = if pending {
+        " Waiting for completion result "
+    } else {
+        " Enter/Esc=close "
+    };
+    let footer_pad = box_w.saturating_sub(2).saturating_sub(footer.len());
+    let footer_left = footer_pad / 2;
+    output.push(format!(
+        "│{}{}{}{}{}│",
+        " ".repeat(footer_left),
+        DIM,
+        footer,
+        RESET,
+        " ".repeat(footer_pad - footer_left),
+    ));
+    output.push(format!("└{}┘", border_h));
+    output
+}
+
 /// Render a modal overlay (mark-done, reset-ticket, or quit-confirm).
 fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> {
     if modal.kind == ModalKind::QuitConfirm {
         return render_quit_confirm_modal(modal, width, height);
+    }
+    if modal.kind == ModalKind::MarkDone {
+        if let Some(outcome) = modal.operator_outcome.as_ref() {
+            return render_operator_outcome_modal(outcome, width, height);
+        }
     }
 
     let mut output = Vec::new();
@@ -2668,6 +2839,7 @@ mod tests {
             cursor: 0,
             kind: ModalKind::ResetTicket,
             new_ticket_ids: Vec::new(),
+            operator_outcome: None,
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");
@@ -2685,6 +2857,7 @@ mod tests {
             cursor: 0,
             kind: ModalKind::MarkDone,
             new_ticket_ids: Vec::new(),
+            operator_outcome: None,
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");
@@ -2692,6 +2865,77 @@ mod tests {
             full.contains("Mark Ticket Done"),
             "Mark-done modal should have correct title"
         );
+    }
+
+    #[test]
+    fn operator_modal_outcomes_render_ticket_correlation_and_named_reason() {
+        assert_eq!(wrap_modal_text("éé", 1), vec!["é", "é"]);
+        let cases = [
+            OperatorModalOutcome::Pending {
+                ticket_id: "T-PENDING".to_string(),
+                correlation_id: "corr-pending".to_string(),
+            },
+            OperatorModalOutcome::Accepted {
+                ticket_id: "T-ACCEPTED".to_string(),
+                correlation_id: "corr-accepted".to_string(),
+            },
+            OperatorModalOutcome::Rejected {
+                ticket_id: "T-REJECTED".to_string(),
+                kind: CompletionRejectionKind::AlreadyPending,
+                correlation_id: "corr-rejected".to_string(),
+                detail: "another completion request owns this ticket".to_string(),
+            },
+        ];
+
+        for outcome in cases {
+            let modal = ModalState {
+                open: true,
+                ticket_ids: vec!["unused-after-submit".to_string()],
+                cursor: 0,
+                kind: ModalKind::MarkDone,
+                new_ticket_ids: Vec::new(),
+                operator_outcome: Some(outcome.clone()),
+            };
+            let rendered = render_modal(&modal, 50, 24).join("\n");
+
+            match outcome {
+                OperatorModalOutcome::Pending {
+                    ticket_id,
+                    correlation_id,
+                } => {
+                    assert!(rendered.contains("Completion pending"));
+                    assert!(rendered.contains(&ticket_id));
+                    assert!(rendered.contains(&correlation_id));
+                    assert!(rendered.contains("Waiting for completion result"));
+                }
+                OperatorModalOutcome::Accepted {
+                    ticket_id,
+                    correlation_id,
+                } => {
+                    assert!(rendered.contains("Completion accepted"));
+                    assert!(rendered.contains(&ticket_id));
+                    assert!(rendered.contains(&correlation_id));
+                    assert!(rendered.contains("Enter/Esc=close"));
+                }
+                OperatorModalOutcome::Rejected {
+                    ticket_id,
+                    kind,
+                    correlation_id,
+                    detail,
+                } => {
+                    assert!(rendered.contains(&format!("Completion rejected: {kind}")));
+                    assert!(rendered.contains(&ticket_id));
+                    assert!(rendered.contains(&correlation_id));
+                    assert!(
+                        detail
+                            .split_whitespace()
+                            .all(|word| rendered.contains(word)),
+                        "wrapped rejection detail lost content: {rendered}"
+                    );
+                    assert!(rendered.contains("Enter/Esc=close"));
+                }
+            }
+        }
     }
 
     #[test]

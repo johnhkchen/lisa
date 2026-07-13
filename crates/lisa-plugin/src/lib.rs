@@ -295,6 +295,39 @@ enum ModalMode {
     QuitConfirm,
 }
 
+/// Visible lifecycle of the completion request submitted from MarkDone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperatorModalOutcome {
+    Pending {
+        ticket_id: TicketId,
+        correlation_id: String,
+    },
+    Accepted {
+        ticket_id: TicketId,
+        correlation_id: String,
+    },
+    Rejected {
+        ticket_id: TicketId,
+        kind: CompletionRejectionKind,
+        correlation_id: String,
+        detail: String,
+    },
+}
+
+impl OperatorModalOutcome {
+    fn ticket_id(&self) -> &str {
+        match self {
+            Self::Pending { ticket_id, .. }
+            | Self::Accepted { ticket_id, .. }
+            | Self::Rejected { ticket_id, .. } => ticket_id,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+}
+
 /// Per-slot state machine for session transitions. Same-provider reset is gated
 /// by hook-generated `.stopped`/`.cleared` signals; cross-provider recycling
 /// uses a bounded `/exit` grace period before launching at the shell.
@@ -536,6 +569,8 @@ struct MarkDoneModal {
     mode: ModalMode,
     /// (QuitConfirm only) New ticket IDs found outside the current DAG.
     new_ticket_ids: Vec<TicketId>,
+    /// (MarkDone only) Visible feedback for the submitted completion request.
+    operator_outcome: Option<OperatorModalOutcome>,
 }
 
 /// Main plugin state
@@ -1274,6 +1309,49 @@ impl State {
         }
     }
 
+    fn operator_modal_targets(&self, ticket_id: &str) -> bool {
+        self.modal.open
+            && self.modal.mode == ModalMode::MarkDone
+            && self
+                .modal
+                .operator_outcome
+                .as_ref()
+                .map(OperatorModalOutcome::ticket_id)
+                .or_else(|| {
+                    self.modal
+                        .ticket_ids
+                        .get(self.modal.cursor)
+                        .map(String::as_str)
+                })
+                == Some(ticket_id)
+    }
+
+    fn show_operator_modal_rejection(
+        &mut self,
+        ticket_id: &str,
+        kind: CompletionRejectionKind,
+        correlation_id: String,
+        detail: String,
+    ) {
+        if self.operator_modal_targets(ticket_id) {
+            self.modal.operator_outcome = Some(OperatorModalOutcome::Rejected {
+                ticket_id: ticket_id.to_string(),
+                kind,
+                correlation_id,
+                detail,
+            });
+        }
+    }
+
+    fn show_operator_modal_accepted(&mut self, ticket_id: &str, correlation_id: String) {
+        if self.operator_modal_targets(ticket_id) {
+            self.modal.operator_outcome = Some(OperatorModalOutcome::Accepted {
+                ticket_id: ticket_id.to_string(),
+                correlation_id,
+            });
+        }
+    }
+
     fn log_completion_rejection(
         &mut self,
         ticket_id: &str,
@@ -1309,10 +1387,12 @@ impl State {
             }
         };
 
+        let correlation_id = correlation.to_string();
+        self.show_operator_modal_rejection(ticket_id, kind, correlation_id.clone(), detail.clone());
         self.log_activity(ActivityEvent::CompletionRejected {
             ticket_id: ticket_id.to_string(),
             kind,
-            correlation_id: correlation.to_string(),
+            correlation_id,
             detail,
         });
     }
@@ -2169,6 +2249,9 @@ impl State {
             return;
         }
 
+        let operator_modal_correlation =
+            matches!(pending.source, CompletionSource::OperatorRequested(_))
+                .then(|| completion_key.to_string());
         if let Err(error) =
             self.journal_completion_transition(CompletionJournalTransition::Confirmed {
                 key: completion_key,
@@ -2185,6 +2268,9 @@ impl State {
             return;
         }
 
+        if let Some(correlation_id) = operator_modal_correlation {
+            self.show_operator_modal_accepted(ticket_id, correlation_id);
+        }
         self.pending_completions.remove(ticket_id);
         self.rebuild_dag();
 
@@ -6045,6 +6131,21 @@ impl State {
                 return true;
             }
 
+            if self.modal.mode == ModalMode::MarkDone {
+                if let Some(outcome) = self.modal.operator_outcome.as_ref() {
+                    if outcome.is_pending() {
+                        return false;
+                    }
+                    return match key.bare_key {
+                        BareKey::Enter | BareKey::Esc | BareKey::Char('q') => {
+                            self.modal.open = false;
+                            true
+                        }
+                        _ => false,
+                    };
+                }
+            }
+
             match key.bare_key {
                 BareKey::Esc | BareKey::Char('q') => {
                     self.modal.open = false;
@@ -6060,14 +6161,21 @@ impl State {
                     }
                 }
                 BareKey::Enter => {
-                    if let Some(ticket_id) = self.modal.ticket_ids.get(self.modal.cursor).cloned() {
-                        match self.modal.mode {
-                            ModalMode::MarkDone => self.mark_ticket_done(&ticket_id),
-                            ModalMode::ResetTicket => self.reset_ticket(&ticket_id),
-                            ModalMode::QuitConfirm => {} // handled above
+                    let ticket_id = self.modal.ticket_ids.get(self.modal.cursor).cloned();
+                    match self.modal.mode {
+                        ModalMode::MarkDone => {
+                            if let Some(ticket_id) = ticket_id {
+                                self.mark_ticket_done(&ticket_id);
+                            }
                         }
+                        ModalMode::ResetTicket => {
+                            if let Some(ticket_id) = ticket_id {
+                                self.reset_ticket(&ticket_id);
+                            }
+                            self.modal.open = false;
+                        }
+                        ModalMode::QuitConfirm => {} // handled above
                     }
-                    self.modal.open = false;
                 }
                 _ => return false,
             }
@@ -6191,15 +6299,30 @@ impl State {
             cursor: 0,
             mode: ModalMode::MarkDone,
             new_ticket_ids: Vec::new(),
+            operator_outcome: None,
         };
     }
 
     /// Request manual completion through the same isolated transaction.
     fn mark_ticket_done(&mut self, ticket_id: &str) {
-        self.dispatch_completion(CompletionInput::OperatorRequested {
+        let dispatched = self.dispatch_completion(CompletionInput::OperatorRequested {
             ticket_id: ticket_id.to_string(),
             source: OperatorRequestSource::MarkDoneKey,
         });
+        if dispatched {
+            let correlation_id = self
+                .pending_completions
+                .get(ticket_id)
+                .map(|pending| pending.completion_key.to_string());
+            if let Some(correlation_id) = correlation_id {
+                if self.operator_modal_targets(ticket_id) {
+                    self.modal.operator_outcome = Some(OperatorModalOutcome::Pending {
+                        ticket_id: ticket_id.to_string(),
+                        correlation_id,
+                    });
+                }
+            }
+        }
     }
 
     /// Open the reset modal with tickets that are in non-ready, non-done phases.
@@ -6225,6 +6348,7 @@ impl State {
             cursor: 0,
             mode: ModalMode::ResetTicket,
             new_ticket_ids: Vec::new(),
+            operator_outcome: None,
         };
     }
 
@@ -6327,6 +6451,7 @@ impl State {
             cursor: 0,
             mode: ModalMode::QuitConfirm,
             new_ticket_ids: new_tickets,
+            operator_outcome: None,
         };
     }
 
@@ -6781,6 +6906,35 @@ impl State {
                     ModalMode::QuitConfirm => ui::ModalKind::QuitConfirm,
                 },
                 new_ticket_ids: self.modal.new_ticket_ids.clone(),
+                operator_outcome: self.modal.operator_outcome.as_ref().map(
+                    |outcome| match outcome {
+                        OperatorModalOutcome::Pending {
+                            ticket_id,
+                            correlation_id,
+                        } => ui::OperatorModalOutcome::Pending {
+                            ticket_id: ticket_id.clone(),
+                            correlation_id: correlation_id.clone(),
+                        },
+                        OperatorModalOutcome::Accepted {
+                            ticket_id,
+                            correlation_id,
+                        } => ui::OperatorModalOutcome::Accepted {
+                            ticket_id: ticket_id.clone(),
+                            correlation_id: correlation_id.clone(),
+                        },
+                        OperatorModalOutcome::Rejected {
+                            ticket_id,
+                            kind,
+                            correlation_id,
+                            detail,
+                        } => ui::OperatorModalOutcome::Rejected {
+                            ticket_id: ticket_id.clone(),
+                            kind: *kind,
+                            correlation_id: correlation_id.clone(),
+                            detail: detail.clone(),
+                        },
+                    },
+                ),
             },
             paused: self.paused,
             active_view: self.view_preset,
@@ -10079,6 +10233,38 @@ mod tests {
                 completion_id: CompletionId::new("T-001"),
             }]
         );
+        let correlation_id = pending.completion_key.to_string();
+        assert!(state.modal.open, "submission must not close the modal");
+        assert_eq!(
+            state.modal.operator_outcome,
+            Some(OperatorModalOutcome::Pending {
+                ticket_id: "T-001".to_string(),
+                correlation_id: correlation_id.clone(),
+            })
+        );
+        assert!(
+            !state.handle_key(KeyWithModifier {
+                bare_key: BareKey::Esc,
+                key_modifiers: Default::default(),
+            }),
+            "an unresolved request cannot be silently dismissed"
+        );
+
+        state.poll_tick();
+
+        assert!(state.modal.open, "the pending modal must survive a poll");
+        assert_eq!(
+            state.modal.operator_outcome,
+            Some(OperatorModalOutcome::Pending {
+                ticket_id: "T-001".to_string(),
+                correlation_id,
+            })
+        );
+        assert_eq!(
+            state.launched_completion_effects.len(),
+            1,
+            "polling must not duplicate the operator request"
+        );
         assert!(state.threads.contains_key("T-001"));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
@@ -10134,6 +10320,75 @@ mod tests {
         assert!(fs::read_to_string(tickets_dir.join("T-001.md"))
             .unwrap()
             .contains("phase: review"));
+    }
+
+    #[test]
+    fn test_mark_done_already_pending_keeps_named_correlated_rejection_visible() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: duplicate\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n",
+        )
+        .unwrap();
+        let dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&tickets_dir).unwrap()).unwrap();
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        write_canonical_review_disposition(
+            &state,
+            "T-001",
+            r#"{"disposition":"pass","reason":null}"#,
+        );
+
+        state.mark_ticket_done("T-001");
+        let correlation_id = state.pending_completions["T-001"]
+            .completion_key
+            .to_string();
+        assert_eq!(state.launched_completion_effects.len(), 1);
+
+        state.open_mark_done_modal();
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Enter,
+            key_modifiers: Default::default(),
+        }));
+
+        assert!(state.modal.open);
+        assert!(matches!(
+            state.modal.operator_outcome.as_ref(),
+            Some(OperatorModalOutcome::Rejected {
+                ticket_id,
+                kind: CompletionRejectionKind::AlreadyPending,
+                correlation_id: rejected_correlation,
+                detail,
+            }) if ticket_id == "T-001"
+                && rejected_correlation == &correlation_id
+                && detail.contains("already pending")
+        ));
+        assert_eq!(
+            state.launched_completion_effects.len(),
+            1,
+            "already-pending feedback must not launch a duplicate effect"
+        );
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Enter,
+            key_modifiers: Default::default(),
+        }));
+        assert!(
+            !state.modal.open,
+            "terminal feedback closes only on acknowledgement"
+        );
     }
 
     #[test]
@@ -18833,13 +19088,26 @@ owned\n\
             r#"{"disposition":"pass","reason":null}"#,
         );
 
-        state.mark_ticket_done("T-CDX-01");
+        state.open_mark_done_modal();
+        state.modal.cursor = state
+            .modal
+            .ticket_ids
+            .iter()
+            .position(|ticket_id| ticket_id == "T-CDX-01")
+            .unwrap();
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Enter,
+            key_modifiers: Default::default(),
+        }));
         assert!(matches!(
             state.pending_completions.get("T-CDX-01").map(|p| p.source),
             Some(CompletionSource::OperatorRequested(
                 OperatorRequestSource::MarkDoneKey
             ))
         ));
+        let first_correlation = state.pending_completions["T-CDX-01"]
+            .completion_key
+            .to_string();
         state.handle_completion_result(
             "T-CDX-01",
             Some(1),
@@ -18871,8 +19139,38 @@ owned\n\
                 && detail.contains("recoverable")
                 && !correlation_id.is_empty()
         )));
+        assert!(state.modal.open);
+        assert!(matches!(
+            state.modal.operator_outcome.as_ref(),
+            Some(OperatorModalOutcome::Rejected {
+                kind: CompletionRejectionKind::LaunchFailed,
+                correlation_id,
+                detail,
+                ..
+            }) if correlation_id == &first_correlation
+                && detail.contains("identity unavailable")
+                && detail.contains("recoverable")
+        ));
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Enter,
+            key_modifiers: Default::default(),
+        }));
+        assert!(!state.modal.open);
 
-        state.mark_ticket_done("T-CDX-01");
+        state.open_mark_done_modal();
+        state.modal.cursor = state
+            .modal
+            .ticket_ids
+            .iter()
+            .position(|ticket_id| ticket_id == "T-CDX-01")
+            .unwrap();
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Enter,
+            key_modifiers: Default::default(),
+        }));
+        let retry_correlation = state.pending_completions["T-CDX-01"]
+            .completion_key
+            .to_string();
         lisa_core::ticket::update_ticket_done(&ticket_path).unwrap();
         state.rebuild_dag();
         assert_eq!(
@@ -18896,6 +19194,19 @@ owned\n\
             .get_ready_tickets()
             .contains(&"T-CDX-02".to_string()));
         assert_eq!(read_ledger(&ledger).len(), 1);
+        assert!(state.modal.open);
+        assert_eq!(
+            state.modal.operator_outcome,
+            Some(OperatorModalOutcome::Accepted {
+                ticket_id: "T-CDX-01".to_string(),
+                correlation_id: retry_correlation,
+            })
+        );
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Esc,
+            key_modifiers: Default::default(),
+        }));
+        assert!(!state.modal.open);
 
         state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
         assert_eq!(read_ledger(&ledger).len(), 1);
