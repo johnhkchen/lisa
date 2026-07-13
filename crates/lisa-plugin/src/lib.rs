@@ -432,6 +432,12 @@ enum SeatAssignmentState {
     DeliveryFailed,
 }
 
+/// Human-facing surface that emitted an explicit operator completion request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorRequestSource {
+    MarkDoneKey,
+}
+
 /// Diagnostic origin for a request to durably complete a ticket. Every origin
 /// enters the same completion transaction and result publisher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,7 +446,7 @@ enum CompletionSource {
     Reconcile,
     Idle,
     Stopped(u32),
-    Manual,
+    OperatorRequested(OperatorRequestSource),
     ObservedDone,
 }
 
@@ -470,9 +476,9 @@ enum CompletionInput {
         ticket_id: TicketId,
         source_lease: Option<AttemptLease>,
     },
-    Manual {
+    OperatorRequested {
         ticket_id: TicketId,
-        authority: Option<CompletionAuthority>,
+        source: OperatorRequestSource,
     },
 }
 
@@ -1239,6 +1245,13 @@ impl State {
             }
         }
 
+        self.passing_review_disposition(ticket_id)
+    }
+
+    /// Evaluate the canonical E-040 Review verdict without claiming an
+    /// attempt's private artifact authority.
+    fn passing_review_disposition(&self, ticket_id: &str) -> Result<(), CompletionRejection> {
+        const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
         let disposition_path = self
             .config
             .work_dir
@@ -1561,10 +1574,12 @@ impl State {
                         source_lease.map(CompletionAuthority::Attempt),
                         None,
                     ),
-                    CompletionInput::Manual {
+                    CompletionInput::OperatorRequested { ticket_id, source } => (
                         ticket_id,
-                        authority,
-                    } => (ticket_id, CompletionSource::Manual, authority, None),
+                        CompletionSource::OperatorRequested(source),
+                        Some(CompletionAuthority::Operator),
+                        None,
+                    ),
                     CompletionInput::Reconcile { .. } => unreachable!("handled above"),
                 };
 
@@ -1581,6 +1596,13 @@ impl State {
                 let completion_id = CompletionId::new(ticket_id.clone());
                 let correlation =
                     Self::completion_correlation(completion_id.clone(), attempt_id.clone());
+
+                if matches!(source, CompletionSource::OperatorRequested(_)) {
+                    if let Err(rejection) = self.passing_review_disposition(&ticket_id) {
+                        self.log_completion_rejection(&ticket_id, &correlation, &rejection);
+                        return false;
+                    }
+                }
 
                 if let Some(review_lease) = review_lease.as_ref() {
                     if !self.admit_correlated_review(&ticket_id, review_lease, &correlation) {
@@ -1670,7 +1692,9 @@ impl State {
             {
                 CompletionAuthority::Attempt(lease)
             }
-            Some(CompletionAuthority::Operator) if source == CompletionSource::Manual => {
+            Some(CompletionAuthority::Operator)
+                if matches!(source, CompletionSource::OperatorRequested(_)) =>
+            {
                 CompletionAuthority::Operator
             }
             Some(CompletionAuthority::Attempt(lease)) => {
@@ -1840,7 +1864,9 @@ impl State {
             CompletionAuthority::Attempt(lease) => {
                 lease.is_current(self.current_leases.get(ticket_id))
             }
-            CompletionAuthority::Operator => pending.source == CompletionSource::Manual,
+            CompletionAuthority::Operator => {
+                matches!(pending.source, CompletionSource::OperatorRequested(_))
+            }
         };
         if !authority_is_current {
             let reason = format!(
@@ -5969,16 +5995,9 @@ impl State {
 
     /// Request manual completion through the same isolated transaction.
     fn mark_ticket_done(&mut self, ticket_id: &str) {
-        let authority = match self.threads.get(ticket_id) {
-            Some(thread) => thread
-                .attempt_lease
-                .clone()
-                .map(CompletionAuthority::Attempt),
-            None => Some(CompletionAuthority::Operator),
-        };
-        self.dispatch_completion(CompletionInput::Manual {
+        self.dispatch_completion(CompletionInput::OperatorRequested {
             ticket_id: ticket_id.to_string(),
-            authority,
+            source: OperatorRequestSource::MarkDoneKey,
         });
     }
 
@@ -6885,6 +6904,12 @@ mod tests {
             slot.attempt_lease = Some(lease.clone());
         }
         lease
+    }
+
+    fn write_canonical_review_disposition(state: &State, ticket_id: &str, disposition: &str) {
+        let canonical = state.config.work_dir.join(ticket_id);
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("review-disposition.json"), disposition).unwrap();
     }
 
     fn write_review_disposition(state: &State, lease: &AttemptLease, disposition: &str) {
@@ -9785,10 +9810,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: to-mark\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: to-mark\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n\nBody\n",
         ).unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -9798,6 +9824,7 @@ mod tests {
             dag,
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
+                work_dir,
                 ..PluginConfig::new()
             },
             ..State::default()
@@ -9817,22 +9844,44 @@ mod tests {
             last_activity_at: None,
             last_client: None,
         });
-        install_current_attempt(&mut state, "T-001");
+        let lease = install_current_attempt(&mut state, "T-001");
+        write_canonical_review_disposition(
+            &state,
+            "T-001",
+            r#"{"disposition":"pass","reason":null}"#,
+        );
 
-        state.mark_ticket_done("T-001");
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Char('d'),
+            key_modifiers: Default::default(),
+        }));
+        assert!(state.modal.open);
+        assert!(state.handle_key(KeyWithModifier {
+            bare_key: BareKey::Enter,
+            key_modifiers: Default::default(),
+        }));
 
-        assert!(state.pending_completions.contains_key("T-001"));
+        let pending = state.pending_completions.get("T-001").unwrap();
+        assert_eq!(pending.authority, CompletionAuthority::Operator);
+        assert_eq!(
+            pending.source,
+            CompletionSource::OperatorRequested(OperatorRequestSource::MarkDoneKey)
+        );
+        assert_ne!(
+            pending.completion_key.attempt_id().as_str(),
+            lease.attempt_id.to_string()
+        );
         assert_eq!(
             state.launched_completion_effects,
             vec![EffectCommand::LaunchCompletion {
-                attempt_id: AttemptId::new("1"),
+                attempt_id: AttemptId::new("operator"),
                 completion_id: CompletionId::new("T-001"),
             }]
         );
         assert!(state.threads.contains_key("T-001"));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(content.contains("phase: implement"));
+        assert!(content.contains("phase: review"));
     }
 
     #[test]
@@ -9841,6 +9890,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
@@ -9853,16 +9903,26 @@ mod tests {
             dag,
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
+                work_dir,
                 ..PluginConfig::new()
             },
             ..State::default()
         };
 
+        write_canonical_review_disposition(
+            &state,
+            "T-001",
+            r#"{"disposition":"pass","reason":null}"#,
+        );
+
         state.mark_ticket_done("T-001");
 
         let pending = state.pending_completions.get("T-001").unwrap();
         assert_eq!(pending.authority, CompletionAuthority::Operator);
-        assert_eq!(pending.source, CompletionSource::Manual);
+        assert_eq!(
+            pending.source,
+            CompletionSource::OperatorRequested(OperatorRequestSource::MarkDoneKey)
+        );
         assert_eq!(
             state.launched_completion_effects,
             vec![EffectCommand::LaunchCompletion {
@@ -9871,6 +9931,102 @@ mod tests {
             }]
         );
         assert!(fs::read_to_string(tickets_dir.join("T-001.md"))
+            .unwrap()
+            .contains("phase: review"));
+    }
+
+    #[test]
+    fn test_operator_requested_refuses_blocked_disposition_and_unmet_dependencies() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-BLOCKED.md"),
+            "---\nid: T-BLOCKED\ntitle: blocked review\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            tickets_dir.join("T-DEPENDENCY.md"),
+            "---\nid: T-DEPENDENCY\ntitle: unfinished dependency\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            tickets_dir.join("T-DEPENDENT.md"),
+            "---\nid: T-DEPENDENT\ntitle: dependent review\ntype: task\nstatus: review\npriority: high\nphase: review\ndepends_on: [T-DEPENDENCY]\n---\n",
+        )
+        .unwrap();
+
+        let dag =
+            Dag::from_tickets(lisa_core::ticket::scan_tickets(&tickets_dir).unwrap()).unwrap();
+        let mut state = State {
+            dag,
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let mut thread = Thread::new("T-BLOCKED", 1);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-BLOCKED".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-BLOCKED");
+        write_canonical_review_disposition(
+            &state,
+            "T-BLOCKED",
+            r#"{"disposition":"block","reason":"resolve the operator-blocking review"}"#,
+        );
+        write_canonical_review_disposition(
+            &state,
+            "T-DEPENDENT",
+            r#"{"disposition":"pass","reason":null}"#,
+        );
+
+        state.mark_ticket_done("T-BLOCKED");
+
+        assert!(state.pending_completions.is_empty());
+        assert!(state.launched_completion_effects.is_empty());
+        assert_eq!(
+            state.threads["T-BLOCKED"].attempt_lease.as_ref(),
+            Some(&lease),
+            "the operator request must not consume or replace attempt authority"
+        );
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::CompletionRejected {
+                ticket_id,
+                kind: CompletionRejectionKind::DispositionBlocked,
+                correlation_id,
+                detail,
+            } if ticket_id == "T-BLOCKED"
+                && correlation_id.contains("6f70657261746f72")
+                && detail.contains("resolve the operator-blocking review")
+        )));
+
+        state.mark_ticket_done("T-DEPENDENT");
+
+        assert!(state.pending_completions.is_empty());
+        assert!(state.launched_completion_effects.is_empty());
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::CompletionRejected {
+                ticket_id,
+                kind: CompletionRejectionKind::DependencyBlocked,
+                correlation_id,
+                detail,
+            } if ticket_id == "T-DEPENDENT"
+                && correlation_id.contains("6f70657261746f72")
+                && detail.contains("dependencies are not all done")
+        )));
+        assert!(fs::read_to_string(tickets_dir.join("T-BLOCKED.md"))
+            .unwrap()
+            .contains("phase: review"));
+        assert!(fs::read_to_string(tickets_dir.join("T-DEPENDENT.md"))
             .unwrap()
             .contains("phase: review"));
     }
@@ -18129,7 +18285,7 @@ owned\n\
     }
 
     #[test]
-    fn failed_manual_completion_retries_without_early_release_or_duplicate_provenance() {
+    fn failed_operator_completion_retries_without_early_release_or_duplicate_provenance() {
         use lisa_core::types::Thread;
         use std::fs;
 
@@ -18153,11 +18309,18 @@ owned\n\
             .last_pane_names
             .insert(1, "codex · T-CDX-01 · codex-a".to_string());
         install_current_attempt(&mut state, "T-CDX-01");
+        write_canonical_review_disposition(
+            &state,
+            "T-CDX-01",
+            r#"{"disposition":"pass","reason":null}"#,
+        );
 
         state.mark_ticket_done("T-CDX-01");
         assert!(matches!(
             state.pending_completions.get("T-CDX-01").map(|p| p.source),
-            Some(CompletionSource::Manual)
+            Some(CompletionSource::OperatorRequested(
+                OperatorRequestSource::MarkDoneKey
+            ))
         ));
         state.handle_completion_result(
             "T-CDX-01",
