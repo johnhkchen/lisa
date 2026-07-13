@@ -27,6 +27,10 @@ use deadline::{
 };
 
 use lisa_core::client::AgentClient;
+use lisa_core::completion::{
+    reduce as reduce_completion, AttemptId, CompletionEvent, CompletionId, CompletionState,
+    EffectCommand,
+};
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
 use lisa_core::disposition::{parse_review_disposition, ReviewDisposition};
@@ -403,6 +407,21 @@ enum CompletionSource {
     ObservedDone,
 }
 
+/// Scheduler evidence admitted by the typed completion adapter in this slice.
+/// Remaining completion origins migrate through the same seam in successor work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionInput {
+    Artifact {
+        ticket_id: TicketId,
+        source_lease: AttemptLease,
+    },
+    Stopped {
+        ticket_id: TicketId,
+        pane_id: u32,
+        source_lease: AttemptLease,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompletionAuthority {
     Attempt(AttemptLease),
@@ -605,6 +624,11 @@ pub struct State {
     /// result. While present, freshly scanned Done frontmatter is masked from
     /// the in-memory DAG so no scheduler consequence can publish early.
     pending_completions: HashMap<TicketId, PendingCompletion>,
+
+    /// Native-test effect executor: records the exact inert command accepted at
+    /// the production execution boundary before the Zellij host shim.
+    #[cfg(test)]
+    launched_completion_effects: Vec<EffectCommand>,
 
     /// When the loop started, used to compute `LISA_DURATION_SECS` on `complete`.
     loop_started_at: Option<std::time::SystemTime>,
@@ -1106,17 +1130,15 @@ impl State {
         Ok((argv, context))
     }
 
-    /// Admit and validate the current attempt's explicit Review outcome before
-    /// entering the completion transaction.
-    fn request_review_completion(
+    /// Admit and validate the current attempt's explicit Review outcome.
+    fn admit_passing_review(
         &mut self,
-        ticket_id: TicketId,
-        source: CompletionSource,
-        source_lease: Option<AttemptLease>,
+        ticket_id: &str,
+        source_lease: Option<&AttemptLease>,
     ) -> bool {
         const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
 
-        match self.admit_artifact(&ticket_id, source_lease.as_ref(), DISPOSITION_ARTIFACT) {
+        match self.admit_artifact(ticket_id, source_lease, DISPOSITION_ARTIFACT) {
             Ok(true) => {}
             Ok(false) => {
                 self.log_activity(ActivityEvent::Error {
@@ -1139,14 +1161,10 @@ impl State {
         let disposition_path = self
             .config
             .work_dir
-            .join(&ticket_id)
+            .join(ticket_id)
             .join(DISPOSITION_ARTIFACT);
         match parse_review_disposition(disposition_path) {
-            ReviewDisposition::Pass => self.request_completion(
-                ticket_id,
-                source,
-                source_lease.map(CompletionAuthority::Attempt),
-            ),
+            ReviewDisposition::Pass => true,
             ReviewDisposition::Block { reason } => {
                 self.log_activity(ActivityEvent::Warning {
                     message: format!("Completion blocked for {ticket_id}: {reason}"),
@@ -1164,13 +1182,127 @@ impl State {
         }
     }
 
-    /// Enter the single commit-gated completion state machine.
+    /// Convert admitted artifact/stopped scheduler evidence into a typed core
+    /// event and execute only the effect returned by the pure reducer.
+    fn dispatch_completion(&mut self, input: CompletionInput) -> bool {
+        let (ticket_id, source, source_lease) = match input {
+            CompletionInput::Artifact {
+                ticket_id,
+                source_lease,
+            } => (ticket_id, CompletionSource::Artifact, source_lease),
+            CompletionInput::Stopped {
+                ticket_id,
+                pane_id,
+                source_lease,
+            } => (ticket_id, CompletionSource::Stopped(pane_id), source_lease),
+        };
+
+        if !self.admit_passing_review(&ticket_id, Some(&source_lease)) {
+            return false;
+        }
+
+        let state = if self.pending_completions.contains_key(&ticket_id) {
+            CompletionState::Requested
+        } else {
+            CompletionState::Eligible
+        };
+        let event = CompletionEvent::Request {
+            attempt_id: AttemptId::new(source_lease.attempt_id.to_string()),
+            completion_id: CompletionId::new(ticket_id.clone()),
+        };
+        let transition = match reduce_completion(state, event) {
+            Ok(transition) => transition,
+            Err(rejection) => {
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!("Completion rejected for {ticket_id}: {rejection}"),
+                });
+                return false;
+            }
+        };
+
+        match transition.effect {
+            Some(effect) => self.execute_completion_effect(
+                effect,
+                ticket_id,
+                source,
+                Some(CompletionAuthority::Attempt(source_lease)),
+            ),
+            None => false,
+        }
+    }
+
+    /// Temporary bridge for completion origins migrated by successor tickets.
+    fn request_review_completion(
+        &mut self,
+        ticket_id: TicketId,
+        source: CompletionSource,
+        source_lease: Option<AttemptLease>,
+    ) -> bool {
+        if !self.admit_passing_review(&ticket_id, source_lease.as_ref()) {
+            return false;
+        }
+        self.request_completion(
+            ticket_id,
+            source,
+            source_lease.map(CompletionAuthority::Attempt),
+        )
+    }
+
+    /// Temporary bridge for non-adapter completion origins. It creates inert
+    /// command data but delegates all execution to the one effect executor.
     fn request_completion(
         &mut self,
         ticket_id: TicketId,
         source: CompletionSource,
         authority: Option<CompletionAuthority>,
     ) -> bool {
+        let attempt_id = match authority.as_ref() {
+            Some(CompletionAuthority::Attempt(lease)) => lease.attempt_id.to_string(),
+            Some(CompletionAuthority::Operator) | None => "operator".to_string(),
+        };
+        self.execute_completion_effect(
+            EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new(attempt_id),
+                completion_id: CompletionId::new(ticket_id.clone()),
+            },
+            ticket_id,
+            source,
+            authority,
+        )
+    }
+
+    /// Execute an inert core effect. This is the sole completion-command launch
+    /// boundary; callers may validate evidence, but cannot launch directly.
+    fn execute_completion_effect(
+        &mut self,
+        effect: EffectCommand,
+        ticket_id: TicketId,
+        source: CompletionSource,
+        authority: Option<CompletionAuthority>,
+    ) -> bool {
+        let (effect_attempt_id, effect_completion_id) = match &effect {
+            EffectCommand::LaunchCompletion {
+                attempt_id,
+                completion_id,
+            } => (attempt_id, completion_id),
+        };
+        let effect_matches_authority = effect_completion_id.as_str() == ticket_id
+            && match authority.as_ref() {
+                Some(CompletionAuthority::Attempt(lease)) => {
+                    effect_attempt_id.as_str() == lease.attempt_id.to_string()
+                }
+                Some(CompletionAuthority::Operator) => true,
+                None => false,
+            };
+        if !effect_matches_authority {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "Rejected completion effect for {ticket_id}: effect identity does not match source authority"
+                ),
+            });
+            return false;
+        }
+
         if self.pending_completions.contains_key(&ticket_id) {
             return false;
         }
@@ -1233,6 +1365,9 @@ impl State {
                 authority,
             },
         );
+
+        #[cfg(test)]
+        self.launched_completion_effects.push(effect);
 
         let (argv, context) = match self.build_completion_command(&ticket_id, &ticket_file) {
             Ok(command) => command,
@@ -3182,11 +3317,18 @@ impl State {
                 };
 
                 if next_phase == Phase::Done {
-                    self.request_review_completion(
-                        ticket_id.clone(),
-                        CompletionSource::Artifact,
-                        source_lease,
-                    );
+                    if let Some(source_lease) = source_lease {
+                        self.dispatch_completion(CompletionInput::Artifact {
+                            ticket_id: ticket_id.clone(),
+                            source_lease,
+                        });
+                    } else {
+                        self.log_activity(ActivityEvent::Warning {
+                            message: format!(
+                                "Rejected completion for {ticket_id} (Artifact): no attempt lease"
+                            ),
+                        });
+                    }
                     continue;
                 }
 
@@ -3754,7 +3896,19 @@ impl State {
                 slot.pane_id == pane_id && slot.ticket_id.as_deref() == Some(ticket_id.as_str())
             })
             .and_then(|slot| slot.attempt_lease.clone());
-        self.request_review_completion(ticket_id, CompletionSource::Stopped(pane_id), source_lease);
+        let Some(source_lease) = source_lease else {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "Rejected completion for {ticket_id} (Stopped({pane_id})): no attempt lease"
+                ),
+            });
+            return;
+        };
+        self.dispatch_completion(CompletionInput::Stopped {
+            ticket_id,
+            pane_id,
+            source_lease,
+        });
     }
 
     /// Append one attempt-scoped transition that failed before provider
@@ -7031,6 +7185,31 @@ mod tests {
         assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
         assert!(state.pending_completions.contains_key("T-001"));
+        assert_eq!(state.launched_completion_effects.len(), 1);
+        assert_eq!(
+            state.launched_completion_effects[0],
+            EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new(lease.attempt_id.to_string()),
+                completion_id: CompletionId::new("T-001"),
+            }
+        );
+
+        // The stopped source traverses the same reducer seam. Because the
+        // artifact request already made the aggregate pending, it cannot
+        // execute a second launch effect.
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            attempt_lease: Some(lease.clone()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+        state.auto_complete_review("T-001".to_string(), 1);
+        assert_eq!(state.launched_completion_effects.len(), 1);
 
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
         assert!(updated.contains("phase: review"));
