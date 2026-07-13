@@ -37,7 +37,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Set up a project to run with Lisa.
-    #[command(display_order = 0)]
+    #[command(
+        display_order = 0,
+        after_help = "Example: lisa init --path ./my-project"
+    )]
     Init {
         /// Show what would be done without making changes
         #[arg(long)]
@@ -48,7 +51,10 @@ enum Commands {
         path: PathBuf,
     },
     /// Check your tickets and project setup for problems before a run.
-    #[command(display_order = 1)]
+    #[command(
+        display_order = 1,
+        after_help = "Example: lisa validate --path ./my-project --check-tools"
+    )]
     Validate {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
@@ -59,7 +65,10 @@ enum Commands {
         check_tools: bool,
     },
     /// Show which tickets are ready to run and which are waiting, and why.
-    #[command(display_order = 2)]
+    #[command(
+        display_order = 2,
+        after_help = "Example: lisa status --path ./my-project"
+    )]
     Status {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
@@ -84,7 +93,10 @@ enum Commands {
     #[command(hide = true)]
     HooksGuide,
     /// Check that the tools Lisa needs are installed.
-    #[command(display_order = 3)]
+    #[command(
+        display_order = 3,
+        after_help = "Example: lisa doctor --path ./my-project"
+    )]
     Doctor {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
@@ -189,7 +201,10 @@ enum Commands {
         completion_generation: u64,
     },
     /// Start a run: work through the ready tickets, in parallel where they don't collide.
-    #[command(display_order = 4)]
+    #[command(
+        display_order = 4,
+        after_help = "Example: lisa loop --path ./my-project --max-threads 3"
+    )]
     Loop {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
