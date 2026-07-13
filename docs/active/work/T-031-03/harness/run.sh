@@ -198,6 +198,8 @@ run_ticket() {
   completion_commit="$("$LISA" complete-ticket \
     --path "$REPO" \
     --ticket-id "$id" \
+    --attempt-id "fixture-$id" \
+    --completion-generation 1 \
     --message "Complete $id" \
     --ticket-file "$ticket_path" \
     --work-dir "$work_path")"

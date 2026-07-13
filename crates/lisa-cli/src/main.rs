@@ -14,6 +14,7 @@ mod templates;
 use clap::{Parser, Subcommand};
 use lisa_cli::commit_transaction;
 use lisa_core::client::AgentClient;
+use lisa_core::completion::{AttemptId, CompletionGenerationId, CompletionId};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -172,6 +173,14 @@ enum Commands {
         /// Repository-relative path to this ticket's work artifact directory.
         #[arg(long)]
         work_dir: PathBuf,
+
+        /// Attempt identity authorized to complete this ticket.
+        #[arg(long)]
+        attempt_id: String,
+
+        /// Idempotency generation for this attempt's completion transaction.
+        #[arg(long)]
+        completion_generation: u64,
     },
     /// Start a run: work through the ready tickets, in parallel where they don't collide.
     #[command(display_order = 4)]
@@ -264,13 +273,21 @@ fn main() {
             message,
             ticket_file,
             work_dir,
+            attempt_id,
+            completion_generation,
         } => {
+            let completion_key = CompletionGenerationId::new(
+                CompletionId::new(ticket_id.clone()),
+                AttemptId::new(attempt_id),
+                completion_generation,
+            );
             let request = commit_transaction::CompleteTicketRequest {
                 repo_root: resolve_path(&path),
                 ticket_id,
                 message,
                 ticket_file,
                 work_dir,
+                completion_key,
             };
             match commit_transaction::complete_ticket(request) {
                 Ok(result) => println!("{}", result.commit_id),

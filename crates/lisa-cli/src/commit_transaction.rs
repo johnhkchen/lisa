@@ -5,6 +5,7 @@
 //! reconcile the exact committed paths to the new tree.
 
 use fs2::FileExt;
+use lisa_core::completion::CompletionGenerationId;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
@@ -31,6 +32,7 @@ pub struct CompleteTicketRequest {
     pub message: String,
     pub ticket_file: PathBuf,
     pub work_dir: PathBuf,
+    pub completion_key: CompletionGenerationId,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -240,25 +242,6 @@ fn completion_repo_relative_path(
                 repo.root.display()
             ))
         })
-}
-
-fn has_done_frontmatter(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    let Some(after_opening) = trimmed.strip_prefix("---") else {
-        return false;
-    };
-    let Some(closing) = after_opening.find("\n---") else {
-        return false;
-    };
-    let frontmatter = &after_opening[..closing];
-    let mut phase_done = false;
-    let mut status_done = false;
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        phase_done |= line == "phase: done";
-        status_done |= line == "status: done";
-    }
-    phase_done && status_done
 }
 
 struct TransactionLock {
@@ -629,8 +612,71 @@ fn rollback_after_ref_advance(
     }
 }
 
+const COMPLETION_KEY_PREFIX: &str = "Lisa-Completion-Key: ";
+
+fn completion_key_marker(key: &CompletionGenerationId) -> String {
+    format!("{COMPLETION_KEY_PREFIX}{key}")
+}
+
+fn completion_commit_message(message: &str, key: &CompletionGenerationId) -> String {
+    format!("{}\n\n{}", message.trim_end(), completion_key_marker(key))
+}
+
+fn discover_completion_commit(
+    repo: &Repository,
+    key: &CompletionGenerationId,
+) -> Result<Option<String>, CommitTransactionError> {
+    let marker = completion_key_marker(key);
+    let candidates = repo.git(
+        None,
+        "discover prior completion commit",
+        [
+            OsStr::new("log"),
+            OsStr::new("--format=%H"),
+            OsStr::new("--fixed-strings"),
+            OsStr::new("--grep"),
+            OsStr::new(&marker),
+        ],
+    )?;
+    let candidates = std::str::from_utf8(&candidates.stdout).map_err(|e| {
+        CommitTransactionError::new(format!(
+            "Git output for prior completion discovery was not UTF-8: {e}"
+        ))
+    })?;
+
+    for commit_id in candidates.lines().filter(|line| !line.is_empty()) {
+        let message = repo.git(
+            None,
+            "verify prior completion commit",
+            [
+                OsStr::new("show"),
+                OsStr::new("-s"),
+                OsStr::new("--format=%B"),
+                OsStr::new(commit_id),
+            ],
+        )?;
+        let message = std::str::from_utf8(&message.stdout).map_err(|e| {
+            CommitTransactionError::new(format!(
+                "Git output while verifying prior completion commit was not UTF-8: {e}"
+            ))
+        })?;
+        if message.lines().any(|line| line == marker) {
+            return Ok(Some(commit_id.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 pub fn commit_ticket(
     request: CommitTransactionRequest,
+) -> Result<CommitTransactionResult, CommitTransactionError> {
+    commit_ticket_with_key(request, None)
+}
+
+fn commit_ticket_with_key(
+    request: CommitTransactionRequest,
+    completion_key: Option<&CompletionGenerationId>,
 ) -> Result<CommitTransactionResult, CommitTransactionError> {
     if request.ticket_id.trim().is_empty() {
         return Err(CommitTransactionError::new("ticket ID must not be empty"));
@@ -643,6 +689,28 @@ pub fn commit_ticket(
     let includes = normalize_includes(request.includes.clone())?;
     let repo = Repository::discover(&request.repo_root)?;
     let mut lock = TransactionLock::acquire(&repo.root)?;
+    let discovered = match completion_key {
+        Some(key) => match discover_completion_commit(&repo, key) {
+            Ok(discovered) => discovered,
+            Err(primary) => {
+                return match lock.finish() {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(CommitTransactionError::new(format!(
+                        "{primary}; cleanup also failed: {cleanup}"
+                    ))),
+                };
+            }
+        },
+        None => None,
+    };
+    if let Some(commit_id) = discovered {
+        lock.finish()?;
+        return Ok(CommitTransactionResult {
+            previous_commit_id: commit_id.clone(),
+            commit_id,
+            committed_paths: Vec::new(),
+        });
+    }
     let mut alternate_index = match AlternateIndex::reserve(&repo.git_dir) {
         Ok(index) => index,
         Err(primary) => {
@@ -706,6 +774,13 @@ pub fn commit_ticket(
 pub fn complete_ticket(
     request: CompleteTicketRequest,
 ) -> Result<CommitTransactionResult, CommitTransactionError> {
+    if request.completion_key.completion_id().as_str() != request.ticket_id {
+        return Err(CommitTransactionError::new(format!(
+            "completion key ticket {} does not match request ticket {}",
+            request.completion_key.completion_id(),
+            request.ticket_id
+        )));
+    }
     let repo = Repository::discover(&request.repo_root)?;
     let ticket_file = completion_repo_relative_path(
         &repo,
@@ -738,35 +813,6 @@ pub fn complete_ticket(
         ))
     })?;
 
-    let already_done = std::str::from_utf8(&original).is_ok_and(has_done_frontmatter);
-    if already_done {
-        let mut status_args: Vec<&OsStr> = vec![
-            OsStr::new("status"),
-            OsStr::new("--porcelain"),
-            OsStr::new("-z"),
-            OsStr::new("--"),
-        ];
-        status_args.extend(includes.iter().map(|path| path.as_os_str()));
-        let status = repo.git(None, "verify already completed ticket paths", status_args)?;
-        if status.stdout.is_empty() {
-            let head = repo.git(
-                None,
-                "verify already completed ticket commit",
-                [
-                    OsStr::new("rev-parse"),
-                    OsStr::new("--verify"),
-                    OsStr::new("HEAD"),
-                ],
-            )?;
-            let commit_id = output_string("verify already completed ticket commit", &head)?;
-            return Ok(CommitTransactionResult {
-                previous_commit_id: commit_id.clone(),
-                commit_id,
-                committed_paths: Vec::new(),
-            });
-        }
-    }
-
     lisa_core::ticket::update_ticket_done(&ticket_path).map_err(|e| {
         CommitTransactionError::new(format!(
             "cannot prepare completion frontmatter for {}: {e}",
@@ -774,12 +820,16 @@ pub fn complete_ticket(
         ))
     })?;
 
-    let result = commit_ticket(CommitTransactionRequest {
-        repo_root: repo.root,
-        ticket_id: request.ticket_id,
-        message: request.message,
-        includes,
-    });
+    let message = completion_commit_message(&request.message, &request.completion_key);
+    let result = commit_ticket_with_key(
+        CommitTransactionRequest {
+            repo_root: repo.root,
+            ticket_id: request.ticket_id,
+            message,
+            includes,
+        },
+        Some(&request.completion_key),
+    );
 
     match result {
         Ok(result) => Ok(result),
@@ -868,6 +918,18 @@ mod tests {
                 includes: includes.iter().map(PathBuf::from).collect(),
             }
         }
+    }
+
+    fn completion_key(
+        ticket_id: &str,
+        attempt_id: &str,
+        generation: u64,
+    ) -> CompletionGenerationId {
+        CompletionGenerationId::new(
+            lisa_core::completion::CompletionId::new(ticket_id),
+            lisa_core::completion::AttemptId::new(attempt_id),
+            generation,
+        )
     }
 
     #[test]
@@ -1116,6 +1178,7 @@ mod tests {
             message: "Complete T-031-02".to_string(),
             ticket_file: PathBuf::from(ticket),
             work_dir: PathBuf::from(work),
+            completion_key: completion_key("T-031-02", "1", 1),
         })
         .unwrap();
 
@@ -1170,6 +1233,7 @@ mod tests {
             message: "Complete T-009-02-01".to_string(),
             ticket_file: PathBuf::from(project_ticket),
             work_dir: PathBuf::from(project_work),
+            completion_key: completion_key("T-009-02-01", "1", 1),
         })
         .unwrap();
 
@@ -1207,6 +1271,7 @@ mod tests {
             message: "Complete T-031-02".to_string(),
             ticket_file: PathBuf::from(ticket),
             work_dir: PathBuf::from("docs/active/work/T-031-02"),
+            completion_key: completion_key("T-031-02", "1", 1),
         })
         .unwrap_err()
         .to_string();
@@ -1215,6 +1280,35 @@ mod tests {
         assert_eq!(
             fs::read(repo.root().join(ticket)).unwrap(),
             original.as_bytes()
+        );
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn complete_ticket_rejects_a_key_bound_to_another_ticket() {
+        let repo = GitRepo::new();
+        let ticket = "docs/active/tickets/T-031-02.md";
+        let original = "---\nid: T-031-02\nstatus: open\nphase: review\n---\nBody\n";
+        repo.write(ticket, original);
+        repo.write("docs/active/work/T-031-02/review.md", "# Review\n");
+        repo.base_commit();
+        let head = repo.git_string(["rev-parse", "HEAD"]);
+
+        let error = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-031-02".to_string(),
+            message: "Complete T-031-02".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from("docs/active/work/T-031-02"),
+            completion_key: completion_key("T-OTHER", "1", 1),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not match request ticket"), "{error}");
+        assert_eq!(
+            fs::read_to_string(repo.root().join(ticket)).unwrap(),
+            original
         );
         assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
     }
@@ -1257,28 +1351,87 @@ mod tests {
     }
 
     #[test]
-    fn already_committed_done_ticket_returns_verified_head_without_new_commit() {
+    fn repeated_completion_key_discovers_prior_commit_and_different_key_is_independent() {
         let repo = GitRepo::new();
         let ticket = "docs/active/tickets/T-031-02.md";
         repo.write(
             ticket,
-            "---\nid: T-031-02\ntitle: done\ntype: task\nstatus: done\npriority: high\nphase: done\n---\nBody\n",
+            "---\nid: T-031-02\ntitle: done\ntype: task\nstatus: open\npriority: high\nphase: review\n---\nBody\n",
         );
-        repo.write("docs/active/work/T-031-02/review.md", "# Review\n");
+        let work_dir = "docs/active/work/T-031-02";
+        repo.write(&format!("{work_dir}/review.md"), "# Review\n");
         repo.base_commit();
-        let head = repo.git_string(["rev-parse", "HEAD"]);
+        let key_a = completion_key("T-031-02", "7", 1);
 
-        let result = complete_ticket(CompleteTicketRequest {
+        let first = complete_ticket(CompleteTicketRequest {
             repo_root: repo.root().to_path_buf(),
             ticket_id: "T-031-02".to_string(),
             message: "Complete T-031-02".to_string(),
             ticket_file: PathBuf::from(ticket),
-            work_dir: PathBuf::from("docs/active/work/T-031-02"),
+            work_dir: PathBuf::from(work_dir),
+            completion_key: key_a.clone(),
+        })
+        .unwrap();
+        assert!(repo
+            .git_string(["show", "-s", "--format=%B", &first.commit_id])
+            .lines()
+            .any(|line| line == completion_key_marker(&key_a)));
+
+        repo.write("foreign.txt", "unrelated\n");
+        repo.git(["add", "foreign.txt"]);
+        repo.git(["commit", "--quiet", "-m", "unrelated follow-up"]);
+        let head_after_unrelated = repo.git_string(["rev-parse", "HEAD"]);
+        let count_before_replay = repo.git_string(["rev-list", "--count", "HEAD"]);
+
+        let replay = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-031-02".to_string(),
+            message: "Complete T-031-02 again".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from(work_dir),
+            completion_key: key_a.clone(),
         })
         .unwrap();
 
-        assert_eq!(result.commit_id, head);
-        assert!(result.committed_paths.is_empty());
-        assert_eq!(repo.git_string(["rev-list", "--count", "HEAD"]), "1");
+        assert_eq!(replay.commit_id, first.commit_id);
+        assert_ne!(replay.commit_id, head_after_unrelated);
+        assert!(replay.committed_paths.is_empty());
+        assert_eq!(
+            repo.git_string(["rev-list", "--count", "HEAD"]),
+            count_before_replay
+        );
+
+        repo.write(&format!("{work_dir}/review.md"), "# Revised review\n");
+        let key_b = completion_key("T-031-02", "7", 2);
+        let different = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-031-02".to_string(),
+            message: "Complete T-031-02 generation 2".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from(work_dir),
+            completion_key: key_b.clone(),
+        })
+        .unwrap();
+
+        assert_ne!(different.commit_id, first.commit_id);
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), different.commit_id);
+        let different_message = repo.git_string(["show", "-s", "--format=%B", "HEAD"]);
+        assert!(different_message
+            .lines()
+            .any(|line| line == completion_key_marker(&key_b)));
+        assert!(!different_message
+            .lines()
+            .any(|line| line == completion_key_marker(&key_a)));
+
+        let replay_after_different = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-031-02".to_string(),
+            message: "ignored replay message".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from(work_dir),
+            completion_key: key_a,
+        })
+        .unwrap();
+        assert_eq!(replay_after_different.commit_id, first.commit_id);
     }
 }

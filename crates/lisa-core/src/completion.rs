@@ -62,6 +62,66 @@ string_id!(
     CorrelationId
 );
 
+/// Identifies one generation of a completion transaction for one ticket attempt.
+///
+/// The component fields remain typed so adapters cannot accidentally detach a
+/// generation from the completion aggregate or attempt that owns it. Its
+/// [`fmt::Display`] representation is stable ASCII suitable for durable commit
+/// metadata and journal records.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CompletionGenerationId {
+    completion_id: CompletionId,
+    attempt_id: AttemptId,
+    generation: u64,
+}
+
+impl CompletionGenerationId {
+    /// Bind a completion generation to its aggregate and authoritative attempt.
+    pub fn new(completion_id: CompletionId, attempt_id: AttemptId, generation: u64) -> Self {
+        Self {
+            completion_id,
+            attempt_id,
+            generation,
+        }
+    }
+
+    /// Borrow the completion aggregate identity, populated with the ticket ID.
+    pub fn completion_id(&self) -> &CompletionId {
+        &self.completion_id
+    }
+
+    /// Borrow the attempt identity authorized to complete the ticket.
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    /// Return this attempt's completion-command generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl fmt::Display for CompletionGenerationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("v1:")?;
+        write_hex(f, self.completion_id.as_str().as_bytes())?;
+        f.write_str(":")?;
+        write_hex(f, self.attempt_id.as_str().as_bytes())?;
+        write!(f, ":{}", self.generation)
+    }
+}
+
+fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        f.write_str(
+            std::str::from_utf8(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])
+                .expect("hexadecimal digits are UTF-8"),
+        )?;
+    }
+    Ok(())
+}
+
 /// A completion artifact admitted as belonging to the authoritative attempt.
 ///
 /// The adapter is responsible for checking the current lease before creating
@@ -564,6 +624,42 @@ mod tests {
         assert_eq!(attempt.as_str(), "attempt-7");
         assert_eq!(completion.to_string(), "completion-2");
         assert_eq!(correlation.as_str(), "command-9");
+    }
+
+    #[test]
+    fn completion_generation_binds_ticket_attempt_and_generation() {
+        let id = CompletionGenerationId::new(
+            CompletionId::new("T-042:ticket"),
+            AttemptId::new("attempt:7"),
+            3,
+        );
+
+        assert_eq!(id.completion_id().as_str(), "T-042:ticket");
+        assert_eq!(id.attempt_id().as_str(), "attempt:7");
+        assert_eq!(id.generation(), 3);
+        assert_eq!(
+            id.to_string(),
+            "v1:542d3034323a7469636b6574:617474656d70743a37:3"
+        );
+    }
+
+    #[test]
+    fn completion_generation_changes_with_each_identity_component() {
+        let key = CompletionGenerationId::new(CompletionId::new("T-042"), AttemptId::new("1"), 1);
+        let different_ticket =
+            CompletionGenerationId::new(CompletionId::new("T-043"), AttemptId::new("1"), 1);
+        let different_attempt =
+            CompletionGenerationId::new(CompletionId::new("T-042"), AttemptId::new("2"), 1);
+        let different_generation =
+            CompletionGenerationId::new(CompletionId::new("T-042"), AttemptId::new("1"), 2);
+
+        assert_ne!(key, different_ticket);
+        assert_ne!(key, different_attempt);
+        assert_ne!(key, different_generation);
+        assert_eq!(
+            CompletionGenerationId::new(CompletionId::new("T-042"), AttemptId::new("1"), 1,),
+            key
+        );
     }
 
     #[test]

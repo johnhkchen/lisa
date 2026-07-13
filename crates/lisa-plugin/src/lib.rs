@@ -28,8 +28,8 @@ use deadline::{
 
 use lisa_core::client::AgentClient;
 use lisa_core::completion::{
-    reduce as reduce_completion, AttemptId, CompletionEvent, CompletionId, CompletionState,
-    EffectCommand,
+    reduce as reduce_completion, AttemptId, CompletionEvent, CompletionGenerationId, CompletionId,
+    CompletionState, EffectCommand,
 };
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
@@ -1154,9 +1154,10 @@ impl State {
 
     fn build_completion_command(
         &self,
-        ticket_id: &str,
+        completion_key: &CompletionGenerationId,
         ticket_file: &Path,
     ) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+        let ticket_id = completion_key.completion_id().as_str();
         let lisa_bin = self
             .config
             .lisa_bin
@@ -1176,6 +1177,10 @@ impl State {
             self.git_root.display().to_string(),
             "--ticket-id".to_string(),
             ticket_id.to_string(),
+            "--attempt-id".to_string(),
+            completion_key.attempt_id().to_string(),
+            "--completion-generation".to_string(),
+            completion_key.generation().to_string(),
             "--message".to_string(),
             format!("Complete {ticket_id}"),
             "--ticket-file".to_string(),
@@ -1338,6 +1343,8 @@ impl State {
                 completion_id,
             } => (attempt_id, completion_id),
         };
+        let completion_key =
+            CompletionGenerationId::new(effect_completion_id.clone(), effect_attempt_id.clone(), 1);
         let effect_matches_authority = effect_completion_id.as_str() == ticket_id
             && match authority.as_ref() {
                 Some(CompletionAuthority::Attempt(lease)) => {
@@ -1421,7 +1428,7 @@ impl State {
         #[cfg(test)]
         self.launched_completion_effects.push(effect);
 
-        let (argv, context) = match self.build_completion_command(&ticket_id, &ticket_file) {
+        let (argv, context) = match self.build_completion_command(&completion_key, &ticket_file) {
             Ok(command) => command,
             Err(error) => {
                 #[cfg(test)]
@@ -7347,8 +7354,13 @@ mod tests {
             ..State::default()
         };
 
+        let completion_key =
+            CompletionGenerationId::new(CompletionId::new("T-001"), AttemptId::new("7"), 1);
         let (argv, context) = state
-            .build_completion_command("T-001", Path::new("/host/docs/active/tickets/T-001.md"))
+            .build_completion_command(
+                &completion_key,
+                Path::new("/host/docs/active/tickets/T-001.md"),
+            )
             .unwrap();
 
         assert_eq!(
@@ -7360,6 +7372,10 @@ mod tests {
                 "/repo",
                 "--ticket-id",
                 "T-001",
+                "--attempt-id",
+                "7",
+                "--completion-generation",
+                "1",
                 "--message",
                 "Complete T-001",
                 "--ticket-file",
@@ -7514,9 +7530,11 @@ mod tests {
             git_root: repo.root().to_path_buf(),
             ..State::default()
         };
+        let completion_key =
+            CompletionGenerationId::new(CompletionId::new(TICKET_ID), AttemptId::new("1"), 1);
         let (argv, context) = state
             .build_completion_command(
-                TICKET_ID,
+                &completion_key,
                 Path::new("/host/docs/active/tickets/T-009-02-01.md"),
             )
             .unwrap();
@@ -7529,10 +7547,13 @@ mod tests {
             message: option(&argv, "--message").unwrap(),
             ticket_file: PathBuf::from(option(&argv, "--ticket-file").unwrap()),
             work_dir: PathBuf::from(option(&argv, "--work-dir").unwrap()),
-            completion_key: lisa_core::completion::CompletionGenerationId::new(
-                CompletionId::new(TICKET_ID),
-                AttemptId::new("1"),
-                1,
+            completion_key: CompletionGenerationId::new(
+                CompletionId::new(option(&argv, "--ticket-id").unwrap()),
+                AttemptId::new(option(&argv, "--attempt-id").unwrap()),
+                option(&argv, "--completion-generation")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
             ),
         })
         .unwrap();
@@ -7580,8 +7601,10 @@ mod tests {
             ..State::default()
         };
 
+        let completion_key =
+            CompletionGenerationId::new(CompletionId::new("T-001"), AttemptId::new("1"), 1);
         let error = state
-            .build_completion_command("T-001", Path::new("/outside/T-001.md"))
+            .build_completion_command(&completion_key, Path::new("/outside/T-001.md"))
             .unwrap_err();
         assert!(error.contains("completion path outside Git root"));
         assert!(error.contains("/outside/T-001.md"));
