@@ -123,12 +123,14 @@ fn append_no_capture_marker(
     client_dir: &Path,
     pane_id: u32,
     session_id: &str,
+    captured_at: u64,
     reason: &'static str,
+    diagnostics: &mut impl Write,
 ) -> std::io::Result<()> {
     let marker = NoCaptureMarker {
         pane_id,
         session_id,
-        captured_at: system_time_to_epoch(SystemTime::now()),
+        captured_at,
         reason,
     };
     let mut line = serde_json::to_string(&marker)
@@ -142,41 +144,41 @@ fn append_no_capture_marker(
         .open(client_dir.join("no-captures.jsonl"))?;
     file.write_all(line.as_bytes())?;
 
-    eprintln!("lisa capture-usage: no capture for pane {pane_id} session {session_id}: {reason}");
+    writeln!(
+        diagnostics,
+        "lisa capture-usage: no capture for pane {pane_id} session {session_id}: {reason}"
+    )?;
     Ok(())
 }
 
-/// Read the Stop-hook payload from stdin, sum the transcript's usage, and write
-/// one append-only outcome row under `cwd`.
-///
-/// Successful observations go to `.lisa/<client>/captures.jsonl`; identified
-/// Stops without observable usage go to `.lisa/<client>/no-captures.jsonl`.
-/// Missing capture identity and persistence failures are returned to the caller.
-pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
+fn capture_usage_from(
+    cwd: &Path,
+    mut input: impl Read,
+    is_codex: bool,
+    pane_id: Option<&str>,
+    captured_at: u64,
+    diagnostics: &mut impl Write,
+) -> std::io::Result<()> {
     let mut stdin = String::new();
-    std::io::stdin()
-        .read_to_string(&mut stdin)
-        .map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("could not read Stop payload: {error}"),
-            )
-        })?;
+    input.read_to_string(&mut stdin).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("could not read Stop payload: {error}"),
+        )
+    })?;
     let payload: StopPayload = serde_json::from_str(&stdin).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid Stop payload: {error}"),
         )
     })?;
-    let is_codex = std::env::var("LISA_AGENT_CLIENT").is_ok_and(|v| v == "codex");
     let Some(session_id) = payload.session_id.filter(|value| !value.is_empty()) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Stop payload is missing session_id",
         ));
     };
-    let Some(pane_id) = std::env::var("LISA_PANE_ID")
-        .ok()
+    let Some(pane_id) = pane_id
         .filter(|value| !value.is_empty())
         .and_then(|value| value.parse::<u32>().ok())
     else {
@@ -193,7 +195,9 @@ pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
             &client_dir,
             pane_id,
             &session_id,
+            captured_at,
             MISSING_TRANSCRIPT_PATH,
+            diagnostics,
         );
     };
     let jsonl = match std::fs::read_to_string(&transcript_path) {
@@ -203,7 +207,9 @@ pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
                 &client_dir,
                 pane_id,
                 &session_id,
+                captured_at,
                 UNREADABLE_TRANSCRIPT,
+                diagnostics,
             );
         }
     };
@@ -215,17 +221,69 @@ pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
     // Nothing observed → record why no totals were written rather than
     // fabricating a measured zero or silently dropping the Stop.
     if usage == UsageTotals::default() {
-        return append_no_capture_marker(&client_dir, pane_id, &session_id, EMPTY_TRANSCRIPT);
+        return append_no_capture_marker(
+            &client_dir,
+            pane_id,
+            &session_id,
+            captured_at,
+            EMPTY_TRANSCRIPT,
+            diagnostics,
+        );
     }
     append_capture_record(
         &client_dir.join("captures.jsonl"),
         &CaptureRecord {
             pane_id,
             session_id,
-            captured_at: system_time_to_epoch(SystemTime::now()),
+            captured_at,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
         },
+    )
+}
+
+/// Read the Stop-hook payload from stdin, sum the transcript's usage, and write
+/// one append-only outcome row under `cwd`.
+///
+/// Successful observations go to `.lisa/<client>/captures.jsonl`; identified
+/// Stops without observable usage go to `.lisa/<client>/no-captures.jsonl`.
+/// Missing capture identity and persistence failures are returned to the caller.
+pub fn run_capture_usage(cwd: &Path) -> std::io::Result<()> {
+    let is_codex = std::env::var("LISA_AGENT_CLIENT").is_ok_and(|v| v == "codex");
+    let pane_id = std::env::var("LISA_PANE_ID").ok();
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    capture_usage_from(
+        cwd,
+        stdin.lock(),
+        is_codex,
+        pane_id.as_deref(),
+        system_time_to_epoch(SystemTime::now()),
+        &mut stderr.lock(),
+    )
+}
+
+/// Deterministic access to the native Stop processor for cross-crate regression
+/// tests. This is intentionally unavailable without the `test-support` feature.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn run_capture_usage_for_test(
+    cwd: &Path,
+    input: impl Read,
+    is_codex: bool,
+    pane_id: u32,
+    captured_at: u64,
+    diagnostics: &mut impl Write,
+) -> std::io::Result<()> {
+    let pane_id = pane_id.to_string();
+    capture_usage_from(
+        cwd,
+        input,
+        is_codex,
+        Some(&pane_id),
+        captured_at,
+        diagnostics,
     )
 }
 

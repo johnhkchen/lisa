@@ -11,6 +11,9 @@ keywords = ["task-scheduling", "dag", "zellij", "cli", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
 
+[features]
+test-support = []
+
 [[bin]]
 name = "lisa"
 path = "src/main.rs"
