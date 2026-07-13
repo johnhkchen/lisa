@@ -437,8 +437,9 @@ enum CompletionSource {
     ObservedDone,
 }
 
-/// Scheduler evidence admitted by the typed completion adapter in this slice.
-/// Remaining completion origins migrate through the same seam in successor work.
+/// Scheduler and operator evidence admitted by the sole typed completion
+/// adapter. Each production completion origin must enter through one of these
+/// variants before an effect can reach the executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompletionInput {
     Artifact {
@@ -449,6 +450,18 @@ enum CompletionInput {
         ticket_id: TicketId,
         pane_id: u32,
         source_lease: AttemptLease,
+    },
+    Idle {
+        ticket_id: TicketId,
+        source_lease: AttemptLease,
+    },
+    ObservedDone {
+        ticket_id: TicketId,
+        source_lease: Option<AttemptLease>,
+    },
+    Manual {
+        ticket_id: TicketId,
+        authority: Option<CompletionAuthority>,
     },
 }
 
@@ -1227,23 +1240,57 @@ impl State {
         }
     }
 
-    /// Convert admitted artifact/stopped scheduler evidence into a typed core
-    /// event and execute only the effect returned by the pure reducer.
+    /// Convert scheduler/operator evidence into a typed core event and execute
+    /// only the effect returned by the pure reducer.
     fn dispatch_completion(&mut self, input: CompletionInput) -> bool {
-        let (ticket_id, source, source_lease) = match input {
+        let (ticket_id, source, authority, review_lease) = match input {
             CompletionInput::Artifact {
                 ticket_id,
                 source_lease,
-            } => (ticket_id, CompletionSource::Artifact, source_lease),
+            } => (
+                ticket_id,
+                CompletionSource::Artifact,
+                Some(CompletionAuthority::Attempt(source_lease.clone())),
+                Some(source_lease),
+            ),
             CompletionInput::Stopped {
                 ticket_id,
                 pane_id,
                 source_lease,
-            } => (ticket_id, CompletionSource::Stopped(pane_id), source_lease),
+            } => (
+                ticket_id,
+                CompletionSource::Stopped(pane_id),
+                Some(CompletionAuthority::Attempt(source_lease.clone())),
+                Some(source_lease),
+            ),
+            CompletionInput::Idle {
+                ticket_id,
+                source_lease,
+            } => (
+                ticket_id,
+                CompletionSource::Idle,
+                Some(CompletionAuthority::Attempt(source_lease.clone())),
+                Some(source_lease),
+            ),
+            CompletionInput::ObservedDone {
+                ticket_id,
+                source_lease,
+            } => (
+                ticket_id,
+                CompletionSource::ObservedDone,
+                source_lease.map(CompletionAuthority::Attempt),
+                None,
+            ),
+            CompletionInput::Manual {
+                ticket_id,
+                authority,
+            } => (ticket_id, CompletionSource::Manual, authority, None),
         };
 
-        if !self.admit_passing_review(&ticket_id, Some(&source_lease)) {
-            return false;
+        if let Some(review_lease) = review_lease.as_ref() {
+            if !self.admit_passing_review(&ticket_id, Some(review_lease)) {
+                return false;
+            }
         }
 
         let state = if self.pending_completions.contains_key(&ticket_id) {
@@ -1251,8 +1298,13 @@ impl State {
         } else {
             CompletionState::Eligible
         };
+        let attempt_id = match authority.as_ref() {
+            Some(CompletionAuthority::Attempt(lease)) => lease.attempt_id.to_string(),
+            Some(CompletionAuthority::Operator) => "operator".to_string(),
+            None => "missing-authority".to_string(),
+        };
         let event = CompletionEvent::Request {
-            attempt_id: AttemptId::new(source_lease.attempt_id.to_string()),
+            attempt_id: AttemptId::new(attempt_id),
             completion_id: CompletionId::new(ticket_id.clone()),
         };
         let transition = match reduce_completion(state, event) {
@@ -1266,54 +1318,9 @@ impl State {
         };
 
         match transition.effect {
-            Some(effect) => self.execute_completion_effect(
-                effect,
-                ticket_id,
-                source,
-                Some(CompletionAuthority::Attempt(source_lease)),
-            ),
+            Some(effect) => self.execute_completion_effect(effect, ticket_id, source, authority),
             None => false,
         }
-    }
-
-    /// Temporary bridge for completion origins migrated by successor tickets.
-    fn request_review_completion(
-        &mut self,
-        ticket_id: TicketId,
-        source: CompletionSource,
-        source_lease: Option<AttemptLease>,
-    ) -> bool {
-        if !self.admit_passing_review(&ticket_id, source_lease.as_ref()) {
-            return false;
-        }
-        self.request_completion(
-            ticket_id,
-            source,
-            source_lease.map(CompletionAuthority::Attempt),
-        )
-    }
-
-    /// Temporary bridge for non-adapter completion origins. It creates inert
-    /// command data but delegates all execution to the one effect executor.
-    fn request_completion(
-        &mut self,
-        ticket_id: TicketId,
-        source: CompletionSource,
-        authority: Option<CompletionAuthority>,
-    ) -> bool {
-        let attempt_id = match authority.as_ref() {
-            Some(CompletionAuthority::Attempt(lease)) => lease.attempt_id.to_string(),
-            Some(CompletionAuthority::Operator) | None => "operator".to_string(),
-        };
-        self.execute_completion_effect(
-            EffectCommand::LaunchCompletion {
-                attempt_id: AttemptId::new(attempt_id),
-                completion_id: CompletionId::new(ticket_id.clone()),
-            },
-            ticket_id,
-            source,
-            authority,
-        )
     }
 
     /// Execute an inert core effect. This is the sole completion-command launch
@@ -3652,11 +3659,18 @@ impl State {
                         self.admit_artifact(&ticket_id, source_lease.as_ref(), "review.md"),
                         Ok(true)
                     ) {
-                        self.request_review_completion(
-                            ticket_id.clone(),
-                            CompletionSource::Idle,
-                            source_lease,
-                        );
+                        if let Some(source_lease) = source_lease {
+                            self.dispatch_completion(CompletionInput::Idle {
+                                ticket_id: ticket_id.clone(),
+                                source_lease,
+                            });
+                        } else {
+                            self.log_activity(ActivityEvent::Warning {
+                                message: format!(
+                                    "Rejected completion for {ticket_id} (Idle): no attempt lease"
+                                ),
+                            });
+                        }
                     }
                 }
 
@@ -3696,11 +3710,18 @@ impl State {
                                 .threads
                                 .get(&ticket_id)
                                 .and_then(|thread| thread.attempt_lease.clone());
-                            self.request_review_completion(
-                                ticket_id.clone(),
-                                CompletionSource::Idle,
-                                source_lease,
-                            );
+                            if let Some(source_lease) = source_lease {
+                                self.dispatch_completion(CompletionInput::Idle {
+                                    ticket_id: ticket_id.clone(),
+                                    source_lease,
+                                });
+                            } else {
+                                self.log_activity(ActivityEvent::Warning {
+                                    message: format!(
+                                        "Rejected completion for {ticket_id} (Idle): no attempt lease"
+                                    ),
+                                });
+                            }
                             continue;
                         }
 
@@ -4827,9 +4848,9 @@ impl State {
 
         self.rebuild_dag();
 
-        // Externally observed Done still enters the same commit transaction.
-        // The pending mask prevents this path from publishing while a command
-        // result is outstanding.
+        // Post-timeout/reload reconciliation routes externally observed Done
+        // through the typed adapter. The pending mask prevents this path from
+        // publishing while a command result is outstanding.
         let done_tickets: Vec<(TicketId, Option<AttemptLease>)> = self
             .threads
             .iter()
@@ -4844,11 +4865,10 @@ impl State {
             .collect();
 
         for (ticket_id, source_lease) in done_tickets {
-            self.request_completion(
+            self.dispatch_completion(CompletionInput::ObservedDone {
                 ticket_id,
-                CompletionSource::ObservedDone,
-                source_lease.map(CompletionAuthority::Attempt),
-            );
+                source_lease,
+            });
         }
 
         // Defensive reconciliation: catch phase changes from external edits or
@@ -5437,7 +5457,10 @@ impl State {
                 .map(CompletionAuthority::Attempt),
             None => Some(CompletionAuthority::Operator),
         };
-        self.request_completion(ticket_id.to_string(), CompletionSource::Manual, authority);
+        self.dispatch_completion(CompletionInput::Manual {
+            ticket_id: ticket_id.to_string(),
+            authority,
+        });
     }
 
     /// Open the reset modal with tickets that are in non-ready, non-done phases.
@@ -6192,6 +6215,48 @@ mod tests {
 
     mod signal_consumer_characterization;
     mod signal_ingestion_regression;
+
+    #[test]
+    fn completion_has_one_typed_request_gateway() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module marker remains available")
+            .0;
+
+        assert!(!production.contains("fn request_completion("));
+        assert!(!production.contains("fn request_review_completion("));
+
+        let dispatch_start = production
+            .find("fn dispatch_completion(")
+            .expect("typed completion dispatcher exists");
+        let executor_start = production
+            .find("fn execute_completion_effect(")
+            .expect("completion effect executor exists");
+        assert!(dispatch_start < executor_start);
+
+        let executor_call = "self.execute_completion_effect(";
+        assert_eq!(production.matches(executor_call).count(), 1);
+        assert_eq!(
+            production[dispatch_start..executor_start]
+                .matches(executor_call)
+                .count(),
+            1,
+            "the sole production effect-executor call must be inside typed dispatch"
+        );
+
+        let executor_end = production[executor_start..]
+            .find("fn is_commit_id(")
+            .map(|offset| executor_start + offset)
+            .expect("executor remains bounded by result validation");
+        assert_eq!(
+            production[executor_start..executor_end]
+                .matches("run_command_with_env_variables_and_cwd(")
+                .count(),
+            1,
+            "completion effects must have one host command launch boundary"
+        );
+    }
 
     /// Mirror production dispatch by installing one newly minted lease as the
     /// scheduler's high-water/current authority and stamping matching records.
@@ -7464,6 +7529,11 @@ mod tests {
             message: option(&argv, "--message").unwrap(),
             ticket_file: PathBuf::from(option(&argv, "--ticket-file").unwrap()),
             work_dir: PathBuf::from(option(&argv, "--work-dir").unwrap()),
+            completion_key: lisa_core::completion::CompletionGenerationId::new(
+                CompletionId::new(TICKET_ID),
+                AttemptId::new("1"),
+                1,
+            ),
         })
         .unwrap();
 
@@ -8888,6 +8958,13 @@ mod tests {
         state.mark_ticket_done("T-001");
 
         assert!(state.pending_completions.contains_key("T-001"));
+        assert_eq!(
+            state.launched_completion_effects,
+            vec![EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new("1"),
+                completion_id: CompletionId::new("T-001"),
+            }]
+        );
         assert!(state.threads.contains_key("T-001"));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
@@ -8921,6 +8998,14 @@ mod tests {
 
         let pending = state.pending_completions.get("T-001").unwrap();
         assert_eq!(pending.authority, CompletionAuthority::Operator);
+        assert_eq!(pending.source, CompletionSource::Manual);
+        assert_eq!(
+            state.launched_completion_effects,
+            vec![EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new("operator"),
+                completion_id: CompletionId::new("T-001"),
+            }]
+        );
         assert!(fs::read_to_string(tickets_dir.join("T-001.md"))
             .unwrap()
             .contains("phase: review"));
@@ -9511,6 +9596,15 @@ mod tests {
         assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
         assert!(state.pending_completions.contains_key("T-001"));
+        let pending = state.pending_completions.get("T-001").unwrap();
+        assert_eq!(pending.source, CompletionSource::Idle);
+        assert_eq!(
+            state.launched_completion_effects,
+            vec![EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new(lease.attempt_id.to_string()),
+                completion_id: CompletionId::new("T-001"),
+            }]
+        );
 
         // Verify: ticket file has not published Done.
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
@@ -16130,7 +16224,7 @@ owned\n\
     }
 
     #[test]
-    fn request_completion_rejects_stale_attempt_and_accepts_current_lease() {
+    fn typed_completion_rejects_stale_attempt_and_accepts_current_lease() {
         use lisa_core::types::Thread;
         use std::fs;
 
@@ -16154,11 +16248,10 @@ owned\n\
         assert!(!stale.is_current(state.current_leases.get("T-CDX-01")));
         assert!(current.is_current(state.current_leases.get("T-CDX-01")));
 
-        assert!(!state.request_completion(
-            "T-CDX-01".to_string(),
-            CompletionSource::Artifact,
-            Some(CompletionAuthority::Attempt(stale.clone())),
-        ));
+        assert!(!state.dispatch_completion(CompletionInput::ObservedDone {
+            ticket_id: "T-CDX-01".to_string(),
+            source_lease: Some(stale.clone()),
+        }));
         assert!(!state.pending_completions.contains_key("T-CDX-01"));
         assert!(state.threads.contains_key("T-CDX-01"));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-CDX-01"));
@@ -16169,14 +16262,23 @@ owned\n\
                     && message.contains("does not hold the current lease")
         )));
 
-        assert!(state.request_completion(
-            "T-CDX-01".to_string(),
-            CompletionSource::Artifact,
-            Some(CompletionAuthority::Attempt(current.clone())),
-        ));
+        assert!(state.dispatch_completion(CompletionInput::ObservedDone {
+            ticket_id: "T-CDX-01".to_string(),
+            source_lease: Some(current.clone()),
+        }));
         let pending = state.pending_completions.get("T-CDX-01").unwrap();
-        assert_eq!(pending.authority, CompletionAuthority::Attempt(current));
-        assert_eq!(pending.source, CompletionSource::Artifact);
+        assert_eq!(
+            pending.authority,
+            CompletionAuthority::Attempt(current.clone())
+        );
+        assert_eq!(pending.source, CompletionSource::ObservedDone);
+        assert_eq!(
+            state.launched_completion_effects,
+            vec![EffectCommand::LaunchCompletion {
+                attempt_id: AttemptId::new(current.attempt_id.to_string()),
+                completion_id: CompletionId::new("T-CDX-01"),
+            }]
+        );
         assert!(fs::read_to_string(ticket_path)
             .unwrap()
             .contains("phase: review"));
@@ -16275,11 +16377,10 @@ owned\n\
         assert!(replacement.is_current(state.current_leases.get("T-CDX-01")));
         state.pending_completions.remove("T-CDX-01");
 
-        assert!(state.request_completion(
-            "T-CDX-01".to_string(),
-            CompletionSource::Artifact,
-            Some(CompletionAuthority::Attempt(replacement.clone())),
-        ));
+        assert!(state.dispatch_completion(CompletionInput::ObservedDone {
+            ticket_id: "T-CDX-01".to_string(),
+            source_lease: Some(replacement.clone()),
+        }));
         lisa_core::ticket::update_ticket_done(&ticket_path).unwrap();
         state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
         state.handle_completion_result("T-CDX-01", Some(0), vec![b'b'; 40], Vec::new());
@@ -16523,11 +16624,10 @@ owned\n\
                 .is_err(),
             "a predecessor lease cannot publish its private artifact"
         );
-        assert!(!state.request_completion(
-            "T-SPLIT".to_string(),
-            CompletionSource::Artifact,
-            Some(CompletionAuthority::Attempt(predecessor.clone())),
-        ));
+        assert!(!state.dispatch_completion(CompletionInput::ObservedDone {
+            ticket_id: "T-SPLIT".to_string(),
+            source_lease: Some(predecessor.clone()),
+        }));
         assert!(!state.pending_completions.contains_key("T-SPLIT"));
         state.threads.get_mut("T-SPLIT").unwrap().attempt_lease = Some(predecessor.clone());
         assert!(
