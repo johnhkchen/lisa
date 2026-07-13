@@ -16,10 +16,9 @@ use std::process::{Command, Output};
 /// The five commands an operator runs, foregrounded in `--help`.
 const OPERATOR_COMMANDS: [&str; 5] = ["init", "validate", "status", "doctor", "loop"];
 
-/// The four machinery-invoked hook/contract commands: visible but set apart
-/// (banded below the operator block), never hidden — the loop launcher and
-/// Claude hooks call these by name.
-const HOOK_COMMANDS: [&str; 4] = [
+/// The four machinery-invoked commands: omitted from Clap's generated list but
+/// still shown in the curated plumbing footer and directly invokable by name.
+const PLUMBING_COMMANDS: [&str; 4] = [
     "agent-exec",
     "capture-usage",
     "commit-ticket",
@@ -176,14 +175,14 @@ fn plumbing_commands_are_separate_and_internal_hidden() {
         );
     }
 
-    for hook in HOOK_COMMANDS {
+    for plumbing in PLUMBING_COMMANDS {
         assert!(
-            listing_offset(operator_help, hook).is_none(),
-            "plumbing command `{hook}` leaked into the generated operator list",
+            listing_offset(operator_help, plumbing).is_none(),
+            "plumbing command `{plumbing}` leaked into the generated operator list",
         );
         assert!(
-            listing_offset(plumbing_help, hook).is_some(),
-            "plumbing command `{hook}` is missing from the plumbing section",
+            listing_offset(plumbing_help, plumbing).is_some(),
+            "plumbing command `{plumbing}` is missing from the plumbing section",
         );
     }
 
