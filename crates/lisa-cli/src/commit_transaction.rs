@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
-pub(crate) struct CommitTransactionRequest {
+pub struct CommitTransactionRequest {
     pub repo_root: PathBuf,
     pub ticket_id: String,
     pub message: String,
@@ -25,7 +25,7 @@ pub(crate) struct CommitTransactionRequest {
 }
 
 #[derive(Debug)]
-pub(crate) struct CompleteTicketRequest {
+pub struct CompleteTicketRequest {
     pub repo_root: PathBuf,
     pub ticket_id: String,
     pub message: String,
@@ -34,14 +34,14 @@ pub(crate) struct CompleteTicketRequest {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct CommitTransactionResult {
+pub struct CommitTransactionResult {
     pub commit_id: String,
     pub committed_paths: Vec<PathBuf>,
     previous_commit_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitTransactionError(String);
+pub struct CommitTransactionError(String);
 
 impl CommitTransactionError {
     fn new(message: impl Into<String>) -> Self {
@@ -629,7 +629,7 @@ fn rollback_after_ref_advance(
     }
 }
 
-pub(crate) fn commit_ticket(
+pub fn commit_ticket(
     request: CommitTransactionRequest,
 ) -> Result<CommitTransactionResult, CommitTransactionError> {
     if request.ticket_id.trim().is_empty() {
@@ -703,7 +703,7 @@ pub(crate) fn commit_ticket(
 ///
 /// If the transaction does not report success, the exact original ticket bytes
 /// are restored before the error is returned.
-pub(crate) fn complete_ticket(
+pub fn complete_ticket(
     request: CompleteTicketRequest,
 ) -> Result<CommitTransactionResult, CommitTransactionError> {
     let repo = Repository::discover(&request.repo_root)?;

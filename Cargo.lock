@@ -1612,6 +1612,7 @@ version = "0.4.0-rc.7"
 dependencies = [
  "ascii-dag",
  "libc",
+ "lisa-cli",
  "lisa-core",
  "serde",
  "serde_json",

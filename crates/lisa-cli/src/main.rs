@@ -1,6 +1,5 @@
 mod agent_exec;
 mod capture_usage;
-mod commit_transaction;
 mod config;
 mod detect;
 mod doctor;
@@ -13,6 +12,7 @@ mod status;
 mod templates;
 
 use clap::{Parser, Subcommand};
+use lisa_cli::commit_transaction;
 use lisa_core::client::AgentClient;
 use std::path::PathBuf;
 

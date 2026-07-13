@@ -6167,6 +6167,7 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
 }
 
 // Register the plugin with Zellij
+#[cfg(target_arch = "wasm32")]
 register_plugin!(State);
 
 // Provide a no-op stub for the Zellij host function on native targets so the
@@ -7303,6 +7304,197 @@ mod tests {
             ]
         );
         assert_eq!(context.get("lisa_completion"), Some(&"T-001".to_string()));
+    }
+
+    #[test]
+    fn nested_monorepo_completion_command_drives_real_transaction() {
+        use lisa_cli::commit_transaction::{complete_ticket, CompleteTicketRequest};
+        use std::ffi::OsStr;
+        use std::process::{Command, Output};
+
+        struct NestedRepo {
+            temp: tempfile::TempDir,
+        }
+
+        impl NestedRepo {
+            fn new() -> Self {
+                let repo = Self {
+                    temp: tempfile::tempdir().unwrap(),
+                };
+                repo.git(["init", "--quiet"]);
+                repo.git(["config", "user.name", "Lisa Test"]);
+                repo.git(["config", "user.email", "lisa@example.test"]);
+                repo
+            }
+
+            fn root(&self) -> &Path {
+                self.temp.path()
+            }
+
+            fn write(&self, path: &str, contents: &str) {
+                let path = self.root().join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, contents).unwrap();
+            }
+
+            fn git<I, S>(&self, args: I) -> Output
+            where
+                I: IntoIterator<Item = S>,
+                S: AsRef<OsStr>,
+            {
+                let output = Command::new("git")
+                    .arg("-C")
+                    .arg(self.root())
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "git failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output
+            }
+
+            fn git_string<I, S>(&self, args: I) -> String
+            where
+                I: IntoIterator<Item = S>,
+                S: AsRef<OsStr>,
+            {
+                String::from_utf8(self.git(args).stdout)
+                    .unwrap()
+                    .trim()
+                    .to_string()
+            }
+        }
+
+        fn option(argv: &[String], name: &str) -> Result<String, String> {
+            argv.windows(2)
+                .find(|pair| pair[0] == name)
+                .map(|pair| pair[1].clone())
+                .ok_or_else(|| format!("completion argv is missing {name}"))
+        }
+
+        fn assert_nested_contract(
+            argv: &[String],
+            git_root: &Path,
+            ticket_id: &str,
+        ) -> Result<(), String> {
+            let expected_ticket = format!("games/midsummer/docs/active/tickets/{ticket_id}.md");
+            let expected_work = format!("games/midsummer/docs/active/work/{ticket_id}");
+            let path = option(argv, "--path")?;
+            if Path::new(&path) != git_root {
+                return Err(format!(
+                    "--path must select Git root {}, got {path}",
+                    git_root.display()
+                ));
+            }
+            let ticket = option(argv, "--ticket-file")?;
+            if ticket != expected_ticket {
+                return Err(format!(
+                    "--ticket-file must select {expected_ticket}, got {ticket}"
+                ));
+            }
+            let work = option(argv, "--work-dir")?;
+            if work != expected_work {
+                return Err(format!(
+                    "--work-dir must select {expected_work}, got {work}"
+                ));
+            }
+            Ok(())
+        }
+
+        const TICKET_ID: &str = "T-009-02-01";
+        let repo = NestedRepo::new();
+        let nested_ticket = format!("games/midsummer/docs/active/tickets/{TICKET_ID}.md");
+        let nested_work = format!("games/midsummer/docs/active/work/{TICKET_ID}");
+        repo.write(
+            &nested_ticket,
+            &format!("---\nid: {TICKET_ID}\nstatus: open\nphase: review\n---\nArcade regression\n"),
+        );
+        repo.write("docs/root-sentinel.md", "root docs remain untouched\n");
+        repo.git(["add", "-A"]);
+        repo.git(["commit", "--quiet", "-m", "base"]);
+        repo.write(&format!("{nested_work}/review.md"), "# Passing review\n");
+        let old_head = repo.git_string(["rev-parse", "HEAD"]);
+
+        let legacy_argv = vec![
+            "lisa",
+            "complete-ticket",
+            "--path",
+            "games/midsummer",
+            "--ticket-id",
+            TICKET_ID,
+            "--message",
+            "Complete T-009-02-01",
+            "--ticket-file",
+            "docs/active/tickets/T-009-02-01.md",
+            "--work-dir",
+            "docs/active/work/T-009-02-01",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let legacy_error = assert_nested_contract(&legacy_argv, repo.root(), TICKET_ID)
+            .expect_err("the field-recorded pre-fix argv must fail the fixture contract");
+        assert!(legacy_error.contains("--path"), "{legacy_error}");
+
+        let state = State {
+            config: PluginConfig {
+                work_dir: PathBuf::from("/host/docs/active/work"),
+                lisa_bin: Some("lisa".to_string()),
+                ..PluginConfig::new()
+            },
+            project_root: repo.root().join("games/midsummer"),
+            git_root: repo.root().to_path_buf(),
+            ..State::default()
+        };
+        let (argv, context) = state
+            .build_completion_command(
+                TICKET_ID,
+                Path::new("/host/docs/active/tickets/T-009-02-01.md"),
+            )
+            .unwrap();
+        assert_nested_contract(&argv, repo.root(), TICKET_ID).unwrap();
+        assert_eq!(context.get("lisa_completion"), Some(&TICKET_ID.to_string()));
+
+        let result = complete_ticket(CompleteTicketRequest {
+            repo_root: PathBuf::from(option(&argv, "--path").unwrap()),
+            ticket_id: option(&argv, "--ticket-id").unwrap(),
+            message: option(&argv, "--message").unwrap(),
+            ticket_file: PathBuf::from(option(&argv, "--ticket-file").unwrap()),
+            work_dir: PathBuf::from(option(&argv, "--work-dir").unwrap()),
+        })
+        .unwrap();
+
+        assert_ne!(result.commit_id, old_head);
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), result.commit_id);
+        assert_eq!(repo.git_string(["rev-parse", "HEAD^"]), old_head);
+        assert_eq!(
+            result.committed_paths,
+            vec![
+                PathBuf::from(&nested_ticket),
+                PathBuf::from(format!("{nested_work}/review.md")),
+            ]
+        );
+        let committed_ticket = repo.git_string(["show", &format!("HEAD:{nested_ticket}")]);
+        assert!(committed_ticket.contains("status: done"));
+        assert!(committed_ticket.contains("phase: done"));
+        assert_eq!(
+            repo.git_string(["show", &format!("HEAD:{nested_work}/review.md")]),
+            "# Passing review"
+        );
+        assert_eq!(
+            repo.git_string(["show", "HEAD:docs/root-sentinel.md"]),
+            "root docs remain untouched"
+        );
+        let tree = repo.git_string(["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(!tree
+            .lines()
+            .any(|path| path == format!("docs/active/tickets/{TICKET_ID}.md")));
+        assert!(!tree
+            .lines()
+            .any(|path| path.starts_with(&format!("docs/active/work/{TICKET_ID}/"))));
     }
 
     #[test]
