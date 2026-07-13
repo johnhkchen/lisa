@@ -735,6 +735,29 @@ mod tests {
         assert!(RDSPI_WORKFLOW.contains("Structure"));
         assert!(RDSPI_WORKFLOW.contains("Plan"));
         assert!(RDSPI_WORKFLOW.contains("Implement"));
+        assert!(RDSPI_WORKFLOW.contains("Review"));
+    }
+
+    #[test]
+    fn test_review_disposition_contract_is_injected() {
+        let project = DetectedProject {
+            project_type: ProjectType::Rust,
+            name: "review-contract".to_string(),
+            build_command: "cargo build".to_string(),
+            test_command: "cargo test".to_string(),
+            lint_command: "cargo clippy".to_string(),
+            source_layout: "src:\n  main.rs".to_string(),
+        };
+
+        let claude_md = generate_claude_md(&project);
+        assert!(claude_md.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(claude_md.contains("injected into agent context"));
+        assert!(RDSPI_WORKFLOW.contains("review-disposition.json"));
+        assert!(RDSPI_WORKFLOW.contains(r#"{"disposition":"pass","reason":null}"#));
+        assert!(RDSPI_WORKFLOW
+            .contains(r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#));
+        assert!(RDSPI_WORKFLOW
+            .contains("A pass with a reason, or a block without a non-empty reason, is invalid."));
     }
 
     #[test]

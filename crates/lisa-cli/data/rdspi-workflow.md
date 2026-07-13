@@ -50,9 +50,14 @@ Self-assess the completed work. Produce `review.md` (~200 lines).
 
 Summarize what changed: files created, modified, or deleted. Evaluate test coverage and flag gaps. Surface open concerns, TODOs, or known limitations. Flag critical issues that need human attention. This is the handoff document — what a human reviewer needs to understand the work without reading every diff.
 
-After writing `review.md`, remain on the current ticket and wait. Do not edit phase/status, publish completion yourself, or start another ticket. Lisa prepares Done, commits the ticket and work artifacts through the isolated transaction, and confirms that completion commit before releasing the seat or scheduling dependents.
+Alongside `review.md`, write `review-disposition.json` with exactly one of these JSON shapes: `{"disposition":"pass","reason":null}` when the work is ready to complete, or `{"disposition":"block","reason":"<non-empty actionable reason>"}` when it is not. A pass with a reason, or a block without a non-empty reason, is invalid.
 
-Artifact: `docs/active/work/{ticket-id}/review.md`
+After writing both Review artifacts, remain on the current ticket and wait. Do not edit phase/status, publish completion yourself, or start another ticket. Lisa prepares Done, commits the ticket and work artifacts through the isolated transaction, and confirms that completion commit before releasing the seat or scheduling dependents.
+
+Artifacts:
+
+- `docs/active/work/{ticket-id}/review.md`
+- `docs/active/work/{ticket-id}/review-disposition.json`
 
 ---
 
