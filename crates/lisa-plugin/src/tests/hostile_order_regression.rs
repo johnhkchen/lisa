@@ -283,6 +283,265 @@ fn transaction_request(state: &State, key: &CompletionGenerationId) -> CompleteT
     }
 }
 
+struct LostResultFixture {
+    scenario: Scenario,
+    original_pending: PendingCompletion,
+    original_effect: EffectCommand,
+    prior_commit_id: String,
+}
+
+impl LostResultFixture {
+    fn new() -> Self {
+        let mut scenario = Scenario::new(r#"{"disposition":"pass","reason":null}"#);
+        scenario.state.check_artifact_advances();
+
+        assert_eq!(scenario.state.threads[PRIMARY].current_phase, Phase::Review);
+        assert_eq!(scenario.state.launched_completion_effects.len(), 1);
+        let original_effect = scenario.state.launched_completion_effects[0].clone();
+        let original_pending = scenario.state.pending_completions[PRIMARY].clone();
+        let aggregate = &scenario.state.completion_aggregates[PRIMARY];
+        assert_eq!(aggregate.completion_key(), &original_pending.completion_key);
+        assert_eq!(
+            aggregate.state(),
+            &CompletionState::CommandInFlight {
+                correlation: original_pending.correlation.clone(),
+                deadline: original_pending.deadline,
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(&scenario.state.completion_journal_path)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        let first = complete_ticket(transaction_request(
+            &scenario.state,
+            &original_pending.completion_key,
+        ))
+        .unwrap();
+        assert_eq!(scenario.repo.commit_count(), scenario.baseline_count + 1);
+        assert_eq!(
+            scenario.repo.git_string(["rev-parse", "HEAD^"]),
+            scenario.baseline_head
+        );
+        assert!(scenario
+            .repo
+            .git_string([
+                "show",
+                "HEAD:games/midsummer/docs/active/tickets/T-ARCADE-PRIMARY.md"
+            ])
+            .contains("phase: done"));
+        assert_eq!(
+            fs::read_to_string(&scenario.state.completion_journal_path)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "the fixture intentionally loses the first successful result"
+        );
+        assert!(!scenario.state.ledger_path.exists());
+
+        Self {
+            scenario,
+            original_pending,
+            original_effect,
+            prior_commit_id: first.commit_id,
+        }
+    }
+
+    fn restart_in_flight(&self) -> State {
+        let restarted = self.scenario.restart();
+        assert!(restarted.completion_journal_healthy);
+        assert!(!restarted.pending_completions.contains_key(PRIMARY));
+        let aggregate = &restarted.completion_aggregates[PRIMARY];
+        assert_eq!(
+            aggregate.completion_key(),
+            &self.original_pending.completion_key
+        );
+        assert_eq!(
+            aggregate.state(),
+            &CompletionState::CommandInFlight {
+                correlation: self.original_pending.correlation.clone(),
+                deadline: self.original_pending.deadline,
+            }
+        );
+        assert_eq!(
+            restarted.reconciliation_state(PRIMARY),
+            aggregate.state().clone()
+        );
+        let scanned = restarted.dag.get_ticket(&PRIMARY.to_string()).unwrap();
+        assert_eq!(scanned.phase, self.original_pending.prior_phase);
+        assert_eq!(scanned.status, self.original_pending.prior_status);
+        restarted
+    }
+
+    fn replay_time(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(
+                self.original_pending
+                    .deadline
+                    .unix_millis()
+                    .saturating_sub(1),
+            )
+    }
+
+    fn start_replay(&self, restarted: &mut State) {
+        assert!(restarted.dispatch_completion_at(
+            CompletionInput::Reconcile {
+                ticket_id: PRIMARY.to_string(),
+                source_lease: self.scenario.lease.clone(),
+            },
+            self.replay_time(),
+        ));
+        assert_eq!(
+            restarted.launched_completion_effects,
+            vec![self.original_effect.clone()]
+        );
+        let replay = &restarted.pending_completions[PRIMARY];
+        assert_eq!(replay.completion_key, self.original_pending.completion_key);
+        assert_eq!(replay.correlation, self.original_pending.correlation);
+        assert_eq!(replay.deadline, self.original_pending.deadline);
+        assert!(replay.is_reconciliation_replay);
+        assert_eq!(
+            fs::read_to_string(&restarted.completion_journal_path)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "reconstruction replay must retain the original journal intent"
+        );
+    }
+
+    fn converge(&self, restarted: &mut State) {
+        let replay = complete_ticket(transaction_request(
+            restarted,
+            &self.original_pending.completion_key,
+        ))
+        .unwrap();
+        assert_eq!(replay.commit_id, self.prior_commit_id);
+        assert!(replay.committed_paths.is_empty());
+        assert_eq!(
+            self.scenario.repo.commit_count(),
+            self.scenario.baseline_count + 1,
+            "same-generation replay must not create a second completion commit"
+        );
+
+        restarted.handle_completion_result(
+            PRIMARY,
+            Some(0),
+            replay.commit_id.as_bytes().to_vec(),
+            Vec::new(),
+        );
+        assert!(!restarted.pending_completions.contains_key(PRIMARY));
+        let aggregate = &restarted.completion_aggregates[PRIMARY];
+        assert_eq!(aggregate.state(), &CompletionState::Confirmed);
+        assert_eq!(
+            aggregate.confirmed_commit_id(),
+            Some(self.prior_commit_id.as_str())
+        );
+
+        let journal = fs::read_to_string(&restarted.completion_journal_path).unwrap();
+        assert_eq!(journal.lines().count(), 3);
+        assert_eq!(journal.matches("\"state\":\"requested\"").count(), 1);
+        assert_eq!(
+            journal.matches("\"state\":\"command-in-flight\"").count(),
+            1
+        );
+        assert_eq!(journal.matches("\"state\":\"confirmed\"").count(), 1);
+
+        let records = read_mixed_ledger(&restarted.ledger_path);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            &records[0],
+            ProvenanceLedgerRecord::Execution(record)
+                if record.ticket_id == PRIMARY
+                    && record.outcome == RunOutcome::Done
+                    && record.authoritative
+        ));
+        assert_eq!(
+            self.scenario.repo.commit_count(),
+            self.scenario.baseline_count + 1
+        );
+    }
+}
+
+#[test]
+fn plugin_restart_reconstruction_fixture_converges_on_single_prior_commit() {
+    let fixture = LostResultFixture::new();
+    let mut restarted = fixture.restart_in_flight();
+
+    fixture.start_replay(&mut restarted);
+    fixture.converge(&mut restarted);
+
+    let confirmed_restart = fixture.scenario.restart();
+    let aggregate = &confirmed_restart.completion_aggregates[PRIMARY];
+    assert_eq!(aggregate.state(), &CompletionState::Confirmed);
+    assert_eq!(
+        aggregate.confirmed_commit_id(),
+        Some(fixture.prior_commit_id.as_str())
+    );
+    assert_eq!(
+        confirmed_restart.reconciliation_state(PRIMARY),
+        CompletionState::Confirmed
+    );
+}
+
+#[test]
+fn lost_result_duplicate_stop_fixture_converges_on_single_prior_commit() {
+    let fixture = LostResultFixture::new();
+    let mut restarted = fixture.restart_in_flight();
+    let original_journal = fs::read_to_string(&restarted.completion_journal_path).unwrap();
+
+    restarted.handle_stopped_signal(PRIMARY_PANE);
+    restarted.handle_stopped_signal(PRIMARY_PANE);
+    assert!(restarted.pending_completions.is_empty());
+    assert!(restarted.launched_completion_effects.is_empty());
+    assert_eq!(
+        fs::read_to_string(&restarted.completion_journal_path).unwrap(),
+        original_journal
+    );
+
+    fixture.start_replay(&mut restarted);
+    restarted.handle_stopped_signal(PRIMARY_PANE);
+    restarted.handle_stopped_signal(PRIMARY_PANE);
+    assert!(!restarted.dispatch_completion_at(
+        CompletionInput::Reconcile {
+            ticket_id: PRIMARY.to_string(),
+            source_lease: fixture.scenario.lease.clone(),
+        },
+        fixture.replay_time(),
+    ));
+    assert_eq!(restarted.launched_completion_effects.len(), 1);
+    assert_eq!(
+        fs::read_to_string(&restarted.completion_journal_path).unwrap(),
+        original_journal
+    );
+
+    fixture.converge(&mut restarted);
+    let final_journal = fs::read_to_string(&restarted.completion_journal_path).unwrap();
+    let final_ledger = fs::read_to_string(&restarted.ledger_path).unwrap();
+    restarted.handle_completion_result(
+        PRIMARY,
+        Some(0),
+        fixture.prior_commit_id.as_bytes().to_vec(),
+        Vec::new(),
+    );
+    assert_eq!(
+        fs::read_to_string(&restarted.completion_journal_path).unwrap(),
+        final_journal
+    );
+    assert_eq!(
+        fs::read_to_string(&restarted.ledger_path).unwrap(),
+        final_ledger
+    );
+    assert_eq!(
+        fixture.scenario.repo.commit_count(),
+        fixture.scenario.baseline_count + 1
+    );
+}
+
 #[test]
 fn passing_review_hostile_order_converges_once_and_schedules_dependent() {
     let mut scenario = Scenario::new(r#"{"disposition":"pass","reason":null}"#);
