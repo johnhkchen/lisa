@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::process::Command;
 
 use crate::config::ResolvedConfig;
 use crate::templates::PLUGIN_WASM;
@@ -37,6 +38,8 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     if dry_run {
         return run_dry(root, config);
     }
+
+    let git_root = discover_git_root(root)?;
 
     let clients = configured_clients(root, config);
 
@@ -106,7 +109,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     let lisa_bin = std::env::current_exe().ok();
 
     // Generate KDL layout
-    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), config);
+    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), &git_root, config);
     let layout_path = root.join(".lisa-layout.kdl");
     std::fs::write(&layout_path, &layout)
         .map_err(|e| format!("Failed to write layout to {}: {}", layout_path.display(), e))?;
@@ -201,7 +204,10 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
     // Show generated layout (using a placeholder WASM path)
     let wasm_path = std::env::temp_dir().join("lisa-plugin.wasm");
     let lisa_bin = std::env::current_exe().ok();
-    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), config);
+    // Dry-run remains useful for a freshly initialized, not-yet-committed
+    // project, while real loops require a discoverable repository.
+    let git_root = discover_git_root(root).unwrap_or_else(|_| root.to_path_buf());
+    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), &git_root, config);
     println!();
     println!("Generated layout:");
     println!("{}", layout);
@@ -260,7 +266,40 @@ fn format_provider_caps(config: &ResolvedConfig) -> Option<String> {
     )
 }
 
-fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedConfig) -> String {
+fn discover_git_root(project_root: &Path) -> Result<std::path::PathBuf, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|error| format!("Failed to discover Git root: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to discover Git root from {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return Err("Failed to discover Git root: git returned an empty path".to_string());
+    }
+    std::path::PathBuf::from(root)
+        .canonicalize()
+        .map_err(|error| {
+            format!(
+                "Failed to resolve discovered Git root for {}: {error}",
+                project_root.display()
+            )
+        })
+}
+
+fn generate_layout(
+    wasm_path: &Path,
+    lisa_bin: Option<&Path>,
+    git_root: &Path,
+    config: &ResolvedConfig,
+) -> String {
     // Create 2x max_threads pane slots so transitions don't block scheduling.
     // Extra idle panes absorb new tickets while finishing panes wind down.
     let pane_count = config.max_threads * 2;
@@ -306,6 +345,7 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
 {agent_panes}        }}
         pane size="30%" {{
             plugin location="file://{wasm_path}" {{
+                git_root "{git_root}"
                 ticket_dir "{ticket_dir}"
                 story_dir  "{story_dir}"
                 work_dir   "{work_dir}"
@@ -323,6 +363,7 @@ fn generate_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedC
 "#,
         agent_panes = agent_panes,
         wasm_path = wasm_path.display(),
+        git_root = git_root.display(),
         lisa_bin_line = lisa_bin_line,
         provider_cap_lines = provider_cap_lines,
         ticket_dir = config.ticket_dir,
@@ -377,14 +418,19 @@ mod tests {
         ResolvedConfig::default()
     }
 
+    fn test_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedConfig) -> String {
+        generate_layout(wasm_path, lisa_bin, Path::new("/repo"), config)
+    }
+
     #[test]
     fn test_generate_layout() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let mut config = default_config();
         config.max_threads = 3;
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
 
         assert!(layout.contains("file:///tmp/lisa-plugin.wasm"));
+        assert!(layout.contains("git_root \"/repo\""));
         assert!(layout.contains("ticket_dir \"docs/active/tickets\""));
         assert!(layout.contains("story_dir  \"docs/active/stories\""));
         assert!(layout.contains("work_dir   \"docs/active/work\""));
@@ -406,7 +452,7 @@ mod tests {
     fn test_generate_layout_default_client_is_claude() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let config = default_config();
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
         assert!(layout.contains("client \"claude\""));
     }
 
@@ -417,7 +463,7 @@ mod tests {
             client: lisa_core::client::AgentClient::Codex,
             ..default_config()
         };
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
         assert!(layout.contains("client \"codex\""));
     }
 
@@ -451,7 +497,7 @@ mod tests {
         let mut config = default_config();
         config.provider_caps.insert("codex".to_string(), 8);
         config.provider_caps.insert("claude".to_string(), 4);
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
         assert!(layout.contains("provider_cap_codex \"8\""));
         assert!(layout.contains("provider_cap_claude \"4\""));
         // Sorted deterministically: claude before codex.
@@ -464,7 +510,7 @@ mod tests {
     fn test_generate_layout_omits_provider_caps_when_empty() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let config = default_config();
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
         // Byte-for-byte regression guard: uncapped loops emit no cap keys.
         assert!(!layout.contains("provider_cap_"));
     }
@@ -486,7 +532,7 @@ mod tests {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let config = default_config();
         let bin = PathBuf::from("/opt/bin/lisa");
-        let layout = generate_layout(&wasm_path, Some(&bin), &config);
+        let layout = test_layout(&wasm_path, Some(&bin), &config);
         assert!(layout.contains("lisa_bin \"/opt/bin/lisa\""));
     }
 
@@ -494,7 +540,7 @@ mod tests {
     fn test_generate_layout_omits_lisa_bin_when_absent() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let config = default_config();
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
         assert!(!layout.contains("lisa_bin"));
     }
 
@@ -502,7 +548,7 @@ mod tests {
     fn test_generate_layout_default_threads() {
         let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
         let config = default_config();
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
         assert!(layout.contains("max_threads \"2\""));
         // max_threads=2 should produce 4 pane lines (2x)
         let pane_count = layout.matches("            pane").count();
@@ -518,10 +564,28 @@ mod tests {
             work_dir: "custom/work".to_string(),
             ..default_config()
         };
-        let layout = generate_layout(&wasm_path, None, &config);
+        let layout = test_layout(&wasm_path, None, &config);
         assert!(layout.contains("ticket_dir \"custom/tickets\""));
         assert!(layout.contains("story_dir  \"custom/stories\""));
         assert!(layout.contains("work_dir   \"custom/work\""));
+    }
+
+    #[test]
+    fn test_discover_git_root_from_nested_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let project = dir.path().join("games/midsummer");
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert_eq!(
+            discover_git_root(&project).unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 
     #[test]

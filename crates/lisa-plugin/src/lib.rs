@@ -13,7 +13,7 @@ mod signal;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use zellij_tile::prelude::*;
 
@@ -205,6 +205,36 @@ const MAX_SAME_PANE_STARTUP_RELAUNCHES: u8 = 1;
 fn strip_host_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     PathBuf::from(s.strip_prefix("/host/").unwrap_or(&s).to_string())
+}
+
+/// Lexically normalize an absolute host path without requiring the enclosing
+/// host filesystem to be visible from WASI.
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "completion path is not absolute: {}",
+            path.display()
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "completion path escapes its filesystem root: {}",
+                        path.display()
+                    ));
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
 }
 
 /// Terminate a hard-silent attempt at the Zellij pane boundary. Native unit
@@ -606,6 +636,11 @@ pub struct State {
     /// notification host call is skipped while empty (e.g. in native tests).
     project_root: PathBuf,
 
+    /// Absolute host root of the enclosing Git repository. Unlike
+    /// `project_root`, this is discovered by the native launcher because the
+    /// WASI `/host` mount cannot reliably observe enclosing directories.
+    git_root: PathBuf,
+
     /// Panes already notified for `attention` (idle-without-artifact). Prevents
     /// a ~60s-repeating idle prompt from re-pinging. An entry is cleared when the
     /// pane emits a heartbeat (genuine progress), so a resumed-then-re-stalled
@@ -927,26 +962,35 @@ impl State {
         run_command_with_env_variables_and_cwd(&argv_refs, env, self.project_root.clone(), context);
     }
 
-    fn repository_relative_path(&self, path: &Path) -> Result<PathBuf, String> {
-        if let Ok(relative) = path.strip_prefix("/host") {
-            if !relative.as_os_str().is_empty() {
-                return Ok(relative.to_path_buf());
-            }
+    fn completion_repository_relative_path(&self, path: &Path) -> Result<PathBuf, String> {
+        if self.project_root.as_os_str().is_empty() {
+            return Err("Lisa project root is not available".to_string());
         }
-        if !self.project_root.as_os_str().is_empty() {
-            if let Ok(relative) = path.strip_prefix(&self.project_root) {
-                if !relative.as_os_str().is_empty() {
-                    return Ok(relative.to_path_buf());
-                }
-            }
+        if self.git_root.as_os_str().is_empty() {
+            return Err("Git root is not available".to_string());
         }
-        if path.is_relative() && !path.as_os_str().is_empty() {
-            return Ok(path.to_path_buf());
+
+        let host_path = match path.strip_prefix("/host") {
+            Ok(relative) => self.project_root.join(relative),
+            Err(_) if path.is_absolute() => path.to_path_buf(),
+            Err(_) => self.project_root.join(path),
+        };
+        let host_path = normalize_absolute_path(&host_path)?;
+        let git_root = normalize_absolute_path(&self.git_root)?;
+        let relative = host_path.strip_prefix(&git_root).map_err(|_| {
+            format!(
+                "completion path outside Git root: {} is not below {}",
+                host_path.display(),
+                git_root.display()
+            )
+        })?;
+        if relative.as_os_str().is_empty() {
+            return Err(format!(
+                "completion path outside Git root: {} selects the repository root",
+                host_path.display()
+            ));
         }
-        Err(format!(
-            "path {} is not relative to the Lisa project root",
-            path.display()
-        ))
+        Ok(relative.to_path_buf())
     }
 
     /// Private workflow directory for one execution attempt. Production uses
@@ -1109,13 +1153,14 @@ impl State {
         if self.project_root.as_os_str().is_empty() {
             return Err("project root is not available".to_string());
         }
-        let ticket_file = self.repository_relative_path(ticket_file)?;
-        let work_dir = self.repository_relative_path(&self.config.work_dir.join(ticket_id))?;
+        let ticket_file = self.completion_repository_relative_path(ticket_file)?;
+        let work_dir =
+            self.completion_repository_relative_path(&self.config.work_dir.join(ticket_id))?;
         let argv = vec![
             lisa_bin.to_string(),
             "complete-ticket".to_string(),
             "--path".to_string(),
-            self.project_root.display().to_string(),
+            self.git_root.display().to_string(),
             "--ticket-id".to_string(),
             ticket_id.to_string(),
             "--message".to_string(),
@@ -5544,6 +5589,7 @@ impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         // Parse configuration
         self.config = PluginConfig::from_config_map(&configuration);
+        self.git_root = self.config.git_root.clone();
 
         // Inside zellij's WASI sandbox, the host filesystem is mounted at /host.
         // Prefix relative config paths so std::fs can reach the project files.
@@ -7220,6 +7266,63 @@ mod tests {
             ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
             if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
         )));
+    }
+
+    #[test]
+    fn completion_command_uses_git_root_and_nested_repository_paths() {
+        let state = State {
+            config: PluginConfig {
+                work_dir: PathBuf::from("/host/docs/active/work"),
+                lisa_bin: Some("/usr/local/bin/lisa".to_string()),
+                ..PluginConfig::new()
+            },
+            project_root: PathBuf::from("/repo/games/midsummer"),
+            git_root: PathBuf::from("/repo"),
+            ..State::default()
+        };
+
+        let (argv, context) = state
+            .build_completion_command("T-001", Path::new("/host/docs/active/tickets/T-001.md"))
+            .unwrap();
+
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/local/bin/lisa",
+                "complete-ticket",
+                "--path",
+                "/repo",
+                "--ticket-id",
+                "T-001",
+                "--message",
+                "Complete T-001",
+                "--ticket-file",
+                "games/midsummer/docs/active/tickets/T-001.md",
+                "--work-dir",
+                "games/midsummer/docs/active/work/T-001",
+            ]
+        );
+        assert_eq!(context.get("lisa_completion"), Some(&"T-001".to_string()));
+    }
+
+    #[test]
+    fn completion_command_rejects_path_outside_git_root() {
+        let state = State {
+            config: PluginConfig {
+                work_dir: PathBuf::from("/host/docs/active/work"),
+                lisa_bin: Some("/usr/local/bin/lisa".to_string()),
+                ..PluginConfig::new()
+            },
+            project_root: PathBuf::from("/repo/games/midsummer"),
+            git_root: PathBuf::from("/repo"),
+            ..State::default()
+        };
+
+        let error = state
+            .build_completion_command("T-001", Path::new("/outside/T-001.md"))
+            .unwrap_err();
+        assert!(error.contains("completion path outside Git root"));
+        assert!(error.contains("/outside/T-001.md"));
     }
 
     #[test]

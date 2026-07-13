@@ -615,6 +615,12 @@ impl Thread {
 /// Parsed from the Zellij plugin configuration map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginConfig {
+    /// Absolute root of the enclosing Git repository, discovered by the native
+    /// launcher and passed through the Zellij layout. Empty only for legacy
+    /// layouts and directly constructed tests.
+    #[serde(default)]
+    pub git_root: PathBuf,
+
     /// Directory containing ticket files (default: "docs/active/tickets")
     pub ticket_dir: PathBuf,
 
@@ -722,6 +728,7 @@ impl PluginConfig {
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
         Self {
+            git_root: PathBuf::new(),
             ticket_dir: PathBuf::from(Self::DEFAULT_TICKET_DIR),
             story_dir: PathBuf::from(Self::DEFAULT_STORY_DIR),
             work_dir: PathBuf::from(Self::DEFAULT_WORK_DIR),
@@ -742,6 +749,10 @@ impl PluginConfig {
     /// Creates a PluginConfig from a Zellij configuration map.
     pub fn from_config_map(config: &BTreeMap<String, String>) -> Self {
         let mut result = Self::new();
+
+        if let Some(git_root) = config.get("git_root") {
+            result.git_root = PathBuf::from(git_root);
+        }
 
         if let Some(ticket_dir) = config.get("ticket_dir") {
             result.ticket_dir = PathBuf::from(ticket_dir);
@@ -1486,6 +1497,18 @@ mod tests {
         let mut empty = BTreeMap::new();
         empty.insert("lisa_bin".to_string(), String::new());
         assert_eq!(PluginConfig::from_config_map(&empty).lisa_bin, None);
+    }
+
+    #[test]
+    fn test_config_git_root_round_trip() {
+        assert!(PluginConfig::new().git_root.as_os_str().is_empty());
+
+        let mut map = BTreeMap::new();
+        map.insert("git_root".to_string(), "/repo".to_string());
+        assert_eq!(
+            PluginConfig::from_config_map(&map).git_root,
+            PathBuf::from("/repo")
+        );
     }
 
     #[test]
