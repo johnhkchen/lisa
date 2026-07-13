@@ -1,8 +1,8 @@
 use lisa_core::{
     completion::{
-        reconcile, reduce, AttemptId, CompletionEvent, CompletionId, CompletionState,
-        CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand,
-        Reconciliation, Transition,
+        reconcile, reduce, AttemptId, CompletionDeadline, CompletionEvent, CompletionId,
+        CompletionState, CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs,
+        EffectCommand, Reconciliation, Transition,
     },
     disposition::ReviewDisposition,
 };
@@ -11,6 +11,8 @@ const ATTEMPT: &str = "T-009-01-01/attempt-1";
 const COMPLETION: &str = "T-009-01-01/completion-1";
 const CORRELATION: &str = "T-009-01-01/manual-result";
 const RECORDED_REVIEW_TIMEOUT_SECS: u64 = 10 * 60;
+const RECONCILIATION_NOW_MILLIS: u64 = 100;
+const RECONCILIATION_DEADLINE_MILLIS: u64 = 200;
 
 #[derive(Debug, Clone, Copy)]
 enum RecordedEvent {
@@ -114,11 +116,22 @@ impl AggregateReplay {
             disposition: ReviewDisposition::Pass,
         };
 
-        match reconcile(&durable_inputs, &self.state) {
+        match reconcile(
+            &durable_inputs,
+            &self.state,
+            CompletionDeadline::from_unix_millis(RECONCILIATION_NOW_MILLIS),
+        ) {
             Reconciliation::Effect(effect) => self.apply_request(effect),
             Reconciliation::None => {}
-            Reconciliation::CommandInFlightActionRequired { correlation } => {
+            Reconciliation::ReplayCommandInFlight {
+                correlation,
+                deadline,
+            } => {
                 assert_eq!(correlation, CorrelationId::new(CORRELATION));
+                assert_eq!(deadline.unix_millis(), RECONCILIATION_DEADLINE_MILLIS);
+            }
+            Reconciliation::CommandInFlightDeadlineExceeded { .. } => {
+                panic!("recorded reconciliation time must remain before the deadline")
             }
         }
     }
@@ -140,12 +153,14 @@ impl AggregateReplay {
 
         let transition = self.reduce(CompletionEvent::CommandLaunched {
             correlation: CorrelationId::new(CORRELATION),
+            deadline: CompletionDeadline::from_unix_millis(RECONCILIATION_DEADLINE_MILLIS),
         });
         assert_eq!(transition.effect, None);
         assert_eq!(
             transition.state,
             CompletionState::CommandInFlight {
                 correlation: CorrelationId::new(CORRELATION),
+                deadline: CompletionDeadline::from_unix_millis(RECONCILIATION_DEADLINE_MILLIS,),
             }
         );
         self.state = transition.state;

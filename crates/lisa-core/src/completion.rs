@@ -62,6 +62,31 @@ string_id!(
     CorrelationId
 );
 
+/// Absolute wall-clock deadline for reconciling an unresolved command.
+///
+/// The opaque value is Unix epoch milliseconds so adapters can persist it
+/// across process restarts without coupling the domain model to a clock or
+/// serialization implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CompletionDeadline(u64);
+
+impl CompletionDeadline {
+    /// Reconstruct a deadline from its durable Unix epoch millisecond value.
+    pub fn from_unix_millis(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the durable Unix epoch millisecond value.
+    pub fn unix_millis(self) -> u64 {
+        self.0
+    }
+
+    /// Return whether this deadline has elapsed at `now`.
+    pub fn is_expired_at(self, now: Self) -> bool {
+        now >= self
+    }
+}
+
 /// Identifies one generation of a completion transaction for one ticket attempt.
 ///
 /// The component fields remain typed so adapters cannot accidentally detach a
@@ -240,6 +265,8 @@ pub enum CompletionState {
     CommandInFlight {
         /// Mandatory identity for matching the asynchronous result.
         correlation: CorrelationId,
+        /// Absolute bound shared by every reconciliation replay.
+        deadline: CompletionDeadline,
     },
     /// The request was refused or its command failed.
     Rejected {
@@ -266,6 +293,8 @@ pub enum CompletionEvent {
     CommandLaunched {
         /// Identity used to match the eventual result.
         correlation: CorrelationId,
+        /// Absolute bound for confirming this command and every replay.
+        deadline: CompletionDeadline,
     },
     /// The adapter failed before a command entered the in-flight state.
     CommandLaunchFailed {
@@ -316,10 +345,19 @@ pub enum Reconciliation {
     Effect(EffectCommand),
     /// No new action is required.
     None,
-    /// A launched command remains unresolved and needs bounded intervention.
-    CommandInFlightActionRequired {
+    /// Replay the exact unresolved command while its durable bound remains.
+    ReplayCommandInFlight {
         /// Identity of the exact unresolved command.
         correlation: CorrelationId,
+        /// Original absolute bound; a replay must not extend it.
+        deadline: CompletionDeadline,
+    },
+    /// The unresolved command exhausted its durable reconciliation window.
+    CommandInFlightDeadlineExceeded {
+        /// Identity of the exact unresolved command.
+        correlation: CorrelationId,
+        /// Original absolute bound that has elapsed.
+        deadline: CompletionDeadline,
     },
 }
 
@@ -338,9 +376,15 @@ pub fn reduce(
                 attempt_id,
                 completion_id,
             } => Ok(request_transition(attempt_id, completion_id)),
-            CompletionEvent::CommandLaunched { correlation } => Err(unexpected(
+            CompletionEvent::CommandLaunched {
+                correlation,
+                deadline,
+            } => Err(unexpected(
                 &CompletionState::Eligible,
-                &CompletionEvent::CommandLaunched { correlation },
+                &CompletionEvent::CommandLaunched {
+                    correlation,
+                    deadline,
+                },
             )),
             CompletionEvent::CommandLaunchFailed { source } => Err(unexpected(
                 &CompletionState::Eligible,
@@ -367,8 +411,14 @@ pub fn reduce(
             CompletionEvent::Request { completion_id, .. } => {
                 Err(CompletionRejection::AlreadyPending { completion_id })
             }
-            CompletionEvent::CommandLaunched { correlation } => Ok(Transition {
-                state: CompletionState::CommandInFlight { correlation },
+            CompletionEvent::CommandLaunched {
+                correlation,
+                deadline,
+            } => Ok(Transition {
+                state: CompletionState::CommandInFlight {
+                    correlation,
+                    deadline,
+                },
                 effect: None,
             }),
             CompletionEvent::CommandLaunchFailed { source } => {
@@ -391,20 +441,31 @@ pub fn reduce(
                 },
             )),
         },
-        CompletionState::CommandInFlight { correlation } => match event {
+        CompletionState::CommandInFlight {
+            correlation,
+            deadline,
+        } => match event {
             CompletionEvent::Request { completion_id, .. } => {
                 Err(CompletionRejection::AlreadyPending { completion_id })
             }
             CompletionEvent::CommandLaunched {
                 correlation: actual,
+                deadline: actual_deadline,
             } => Err(unexpected(
-                &CompletionState::CommandInFlight { correlation },
+                &CompletionState::CommandInFlight {
+                    correlation,
+                    deadline,
+                },
                 &CompletionEvent::CommandLaunched {
                     correlation: actual,
+                    deadline: actual_deadline,
                 },
             )),
             CompletionEvent::CommandLaunchFailed { source } => Err(unexpected(
-                &CompletionState::CommandInFlight { correlation },
+                &CompletionState::CommandInFlight {
+                    correlation,
+                    deadline,
+                },
                 &CompletionEvent::CommandLaunchFailed { source },
             )),
             CompletionEvent::CommandSucceeded {
@@ -448,12 +509,18 @@ pub fn reduce(
                 Retryability::Retryable => Ok(request_transition(attempt_id, completion_id)),
                 Retryability::ActionRequired => Err(reason),
             },
-            CompletionEvent::CommandLaunched { correlation } => Err(unexpected(
+            CompletionEvent::CommandLaunched {
+                correlation,
+                deadline,
+            } => Err(unexpected(
                 &CompletionState::Rejected {
                     reason,
                     retryability,
                 },
-                &CompletionEvent::CommandLaunched { correlation },
+                &CompletionEvent::CommandLaunched {
+                    correlation,
+                    deadline,
+                },
             )),
             CompletionEvent::CommandLaunchFailed { source } => Err(unexpected(
                 &CompletionState::Rejected {
@@ -489,9 +556,15 @@ pub fn reduce(
             CompletionEvent::Request { completion_id, .. } => {
                 Err(CompletionRejection::AlreadyPending { completion_id })
             }
-            CompletionEvent::CommandLaunched { correlation } => Err(unexpected(
+            CompletionEvent::CommandLaunched {
+                correlation,
+                deadline,
+            } => Err(unexpected(
                 &CompletionState::Confirmed,
-                &CompletionEvent::CommandLaunched { correlation },
+                &CompletionEvent::CommandLaunched {
+                    correlation,
+                    deadline,
+                },
             )),
             CompletionEvent::CommandLaunchFailed { source } => Err(unexpected(
                 &CompletionState::Confirmed,
@@ -525,11 +598,23 @@ pub fn reduce(
 pub fn reconcile(
     durable_inputs: &DurableCompletionInputs,
     state: &CompletionState,
+    now: CompletionDeadline,
 ) -> Reconciliation {
     match state {
-        CompletionState::CommandInFlight { correlation } => {
-            return Reconciliation::CommandInFlightActionRequired {
-                correlation: correlation.clone(),
+        CompletionState::CommandInFlight {
+            correlation,
+            deadline,
+        } => {
+            return if deadline.is_expired_at(now) {
+                Reconciliation::CommandInFlightDeadlineExceeded {
+                    correlation: correlation.clone(),
+                    deadline: *deadline,
+                }
+            } else {
+                Reconciliation::ReplayCommandInFlight {
+                    correlation: correlation.clone(),
+                    deadline: *deadline,
+                }
             };
         }
         CompletionState::Requested
@@ -615,6 +700,10 @@ mod tests {
 
     use super::*;
 
+    fn deadline(value: u64) -> CompletionDeadline {
+        CompletionDeadline::from_unix_millis(value)
+    }
+
     #[test]
     fn identity_newtypes_preserve_their_opaque_values() {
         let attempt = AttemptId::new("attempt-7");
@@ -663,15 +752,28 @@ mod tests {
     }
 
     #[test]
-    fn command_in_flight_always_contains_a_correlation_id() {
+    fn command_in_flight_contains_correlation_and_deadline() {
         let state = CompletionState::CommandInFlight {
             correlation: CorrelationId::new("command-1"),
+            deadline: deadline(42),
         };
 
-        let CompletionState::CommandInFlight { correlation } = state else {
+        let CompletionState::CommandInFlight {
+            correlation,
+            deadline: actual_deadline,
+        } = state
+        else {
             panic!("expected command-in-flight state");
         };
         assert_eq!(correlation.as_str(), "command-1");
+        assert_eq!(actual_deadline.unix_millis(), 42);
+    }
+
+    #[test]
+    fn completion_deadline_expires_inclusively() {
+        assert!(!deadline(42).is_expired_at(deadline(41)));
+        assert!(deadline(42).is_expired_at(deadline(42)));
+        assert!(deadline(42).is_expired_at(deadline(43)));
     }
 
     #[test]
@@ -724,7 +826,11 @@ mod tests {
     #[test]
     fn reconcile_eligible_durable_inputs_returns_the_request_effect() {
         assert_eq!(
-            reconcile(&eligible_durable_inputs(), &CompletionState::Eligible),
+            reconcile(
+                &eligible_durable_inputs(),
+                &CompletionState::Eligible,
+                deadline(0),
+            ),
             Reconciliation::Effect(EffectCommand::LaunchCompletion {
                 attempt_id: AttemptId::new("attempt-1"),
                 completion_id: CompletionId::new("completion-1"),
@@ -740,7 +846,7 @@ mod tests {
         };
 
         assert_eq!(
-            reconcile(&inputs, &CompletionState::Eligible),
+            reconcile(&inputs, &CompletionState::Eligible, deadline(0)),
             Reconciliation::None
         );
     }
@@ -761,7 +867,7 @@ mod tests {
             };
 
             assert_eq!(
-                reconcile(&inputs, &CompletionState::Eligible),
+                reconcile(&inputs, &CompletionState::Eligible, deadline(0)),
                 Reconciliation::None
             );
         }
@@ -771,7 +877,7 @@ mod tests {
     fn reconcile_pending_and_confirmed_transactions_return_none() {
         for state in [CompletionState::Requested, CompletionState::Confirmed] {
             assert_eq!(
-                reconcile(&eligible_durable_inputs(), &state),
+                reconcile(&eligible_durable_inputs(), &state, deadline(0)),
                 Reconciliation::None
             );
         }
@@ -790,6 +896,7 @@ mod tests {
                     reason: reason.clone(),
                     retryability: Retryability::Retryable,
                 },
+                deadline(0),
             ),
             Reconciliation::Effect(EffectCommand::LaunchCompletion {
                 attempt_id: AttemptId::new("attempt-1"),
@@ -803,15 +910,17 @@ mod tests {
                     reason,
                     retryability: Retryability::ActionRequired,
                 },
+                deadline(0),
             ),
             Reconciliation::None
         );
     }
 
     #[test]
-    fn reconcile_in_flight_is_bounded_and_correlation_tagged() {
+    fn reconcile_in_flight_replays_only_before_its_deadline() {
         let state = CompletionState::CommandInFlight {
             correlation: CorrelationId::new("command-17"),
+            deadline: deadline(200),
         };
         let inputs = DurableCompletionInputs {
             artifact_admission: None,
@@ -821,11 +930,22 @@ mod tests {
         };
 
         assert_eq!(
-            reconcile(&inputs, &state),
-            Reconciliation::CommandInFlightActionRequired {
+            reconcile(&inputs, &state, deadline(199)),
+            Reconciliation::ReplayCommandInFlight {
                 correlation: CorrelationId::new("command-17"),
+                deadline: deadline(200),
             }
         );
+
+        for now in [deadline(200), deadline(201)] {
+            assert_eq!(
+                reconcile(&inputs, &state, now),
+                Reconciliation::CommandInFlightDeadlineExceeded {
+                    correlation: CorrelationId::new("command-17"),
+                    deadline: deadline(200),
+                }
+            );
+        }
     }
 
     #[test]
@@ -854,16 +974,21 @@ mod tests {
     #[test]
     fn requested_launch_records_correlation_without_an_effect() {
         let correlation = CorrelationId::new("command-1");
+        let reconciliation_deadline = deadline(42);
 
         assert_eq!(
             reduce(
                 CompletionState::Requested,
                 CompletionEvent::CommandLaunched {
                     correlation: correlation.clone(),
+                    deadline: reconciliation_deadline,
                 },
             ),
             Ok(Transition {
-                state: CompletionState::CommandInFlight { correlation },
+                state: CompletionState::CommandInFlight {
+                    correlation,
+                    deadline: reconciliation_deadline,
+                },
                 effect: None,
             })
         );
@@ -898,6 +1023,7 @@ mod tests {
             reduce(
                 CompletionState::CommandInFlight {
                     correlation: correlation.clone(),
+                    deadline: deadline(42),
                 },
                 CompletionEvent::CommandSucceeded { correlation },
             ),
@@ -917,6 +1043,7 @@ mod tests {
             reduce(
                 CompletionState::CommandInFlight {
                     correlation: correlation.clone(),
+                    deadline: deadline(42),
                 },
                 CompletionEvent::CommandFailed {
                     correlation,
@@ -968,6 +1095,7 @@ mod tests {
             CompletionState::Requested,
             CompletionState::CommandInFlight {
                 correlation: CorrelationId::new("command-1"),
+                deadline: deadline(42),
             },
             CompletionState::Confirmed,
         ] {
@@ -1022,6 +1150,7 @@ mod tests {
                 reduce(
                     CompletionState::CommandInFlight {
                         correlation: CorrelationId::new("expected"),
+                        deadline: deadline(42),
                     },
                     event,
                 ),
@@ -1039,6 +1168,7 @@ mod tests {
             vec![
                 CompletionEvent::CommandLaunched {
                     correlation: CorrelationId::new("command-1"),
+                    deadline: deadline(42),
                 },
                 CompletionEvent::CommandLaunchFailed {
                     source: LaunchFailure::new("late failure"),
@@ -1073,11 +1203,13 @@ mod tests {
             (
                 CompletionState::CommandInFlight {
                     correlation: CorrelationId::new("command-1"),
+                    deadline: deadline(42),
                 },
                 "command-in-flight",
                 vec![
                     CompletionEvent::CommandLaunched {
                         correlation: CorrelationId::new("command-1"),
+                        deadline: deadline(42),
                     },
                     CompletionEvent::CommandLaunchFailed {
                         source: LaunchFailure::new("late failure"),

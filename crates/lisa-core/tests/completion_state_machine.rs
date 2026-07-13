@@ -1,6 +1,7 @@
 use lisa_core::completion::{
-    reconcile, reduce, AttemptId, CompletionEvent, CompletionId, CompletionState, CorrelationId,
-    CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand, Reconciliation,
+    reconcile, reduce, AttemptId, CompletionDeadline, CompletionEvent, CompletionId,
+    CompletionState, CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs,
+    EffectCommand, Reconciliation,
 };
 use lisa_core::disposition::ReviewDisposition;
 use proptest::prelude::*;
@@ -9,6 +10,8 @@ use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMac
 const ATTEMPT: &str = "generated-attempt";
 const COMPLETION: &str = "generated-completion";
 const CORRELATION: &str = "generated-command";
+const NOW_MILLIS: u64 = 100;
+const DEADLINE_MILLIS: u64 = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScenarioEvent {
@@ -172,7 +175,11 @@ impl CompletionHarness {
     }
 
     fn reconcile(&mut self) {
-        match reconcile(&self.durable_inputs(), &self.state) {
+        match reconcile(
+            &self.durable_inputs(),
+            &self.state,
+            CompletionDeadline::from_unix_millis(NOW_MILLIS),
+        ) {
             Reconciliation::Effect(effect) => {
                 assert_eq!(
                     effect,
@@ -198,15 +205,23 @@ impl CompletionHarness {
                     self.state.clone(),
                     CompletionEvent::CommandLaunched {
                         correlation: CorrelationId::new(CORRELATION),
+                        deadline: CompletionDeadline::from_unix_millis(DEADLINE_MILLIS),
                     },
                 )
                 .expect("new completion effect must accept its launch correlation");
                 assert_eq!(launched.effect, None);
                 self.state = launched.state;
             }
-            Reconciliation::CommandInFlightActionRequired { correlation } => {
+            Reconciliation::ReplayCommandInFlight {
+                correlation,
+                deadline,
+            } => {
                 assert_eq!(correlation, CorrelationId::new(CORRELATION));
+                assert_eq!(deadline.unix_millis(), DEADLINE_MILLIS);
                 assert_eq!(self.live_effects, 1);
+            }
+            Reconciliation::CommandInFlightDeadlineExceeded { .. } => {
+                panic!("generated reconciliation time must remain before the deadline")
             }
             Reconciliation::None => {}
         }
@@ -238,6 +253,7 @@ impl CompletionHarness {
         } else if self.live_effects == 1 {
             CompletionState::CommandInFlight {
                 correlation: CorrelationId::new(CORRELATION),
+                deadline: CompletionDeadline::from_unix_millis(DEADLINE_MILLIS),
             }
         } else {
             CompletionState::Eligible
