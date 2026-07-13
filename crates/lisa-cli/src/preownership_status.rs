@@ -85,6 +85,7 @@ pub fn write_preownership_status<W: Write>(
 
 fn assignment_state_name(state: AssignmentState) -> &'static str {
     match state {
+        AssignmentState::ClaimTimedOut => "claim-timed-out",
         AssignmentState::DeliveryFailed => "delivery-failed",
         AssignmentState::RecoveryFailed => "recovery-failed",
         AssignmentState::StartupFailed => "startup-failed",
@@ -102,6 +103,14 @@ mod tests {
         format!(
             r#"{{"schema_version":3,"record_type":"assignment-transition","ticket_id":"{ticket_id}","attempt_lease":{{"ticket_id":"{ticket_id}","attempt_id":{attempt_id}}},"pane_id":12,"provider":"openai","state":"{state}","reason":"provider did not acknowledge the bounded chat assignment","started_at":1752000000,"ended_at":1752000030,"wall_clock_secs":30}}"#
         )
+    }
+
+    #[test]
+    fn claim_timeout_has_distinct_status_name() {
+        assert_eq!(
+            assignment_state_name(AssignmentState::ClaimTimedOut),
+            "claim-timed-out"
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ pub enum ProvenanceRecordType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AssignmentState {
+    ClaimTimedOut,
     DeliveryFailed,
     RecoveryFailed,
     StartupFailed,

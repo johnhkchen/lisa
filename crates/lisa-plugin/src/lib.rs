@@ -392,6 +392,10 @@ enum FailureTransitionOutcome {
         pane_id: u32,
         ticket_id: Option<TicketId>,
     },
+    AssignmentClaimTimedOut {
+        pane_id: u32,
+        ticket_id: Option<TicketId>,
+    },
     AssignmentRecoveryFailed {
         pane_id: u32,
         ticket_id: Option<TicketId>,
@@ -466,6 +470,13 @@ enum SeatAssignmentState {
         ack_deadline: std::time::SystemTime,
         retries: u8,
     },
+    /// The assignment was delivered to a live Codex TUI, but no ownership
+    /// evidence arrived in the initial window. This state waits passively for
+    /// a claim or bounded fallback evidence and never re-injects the prompt.
+    DeliveredAwaitingClaim {
+        generation: u64,
+        claim_deadline: std::time::SystemTime,
+    },
     /// The seat is reserved for a ticket, but Codex has not acknowledged its
     /// current attempt lease.
     AssignedPendingAck {
@@ -493,6 +504,9 @@ enum SeatAssignmentState {
     /// A started provider did not acknowledge the bounded chat assignment after
     /// the single allowed retry. The retained reservation requires reset.
     DeliveryFailed,
+    /// A live Codex TUI retained its delivered assignment but produced no
+    /// admissible ownership evidence before the bounded passive deadline.
+    ClaimTimedOut,
 }
 
 /// Human-facing surface that emitted an explicit operator completion request.
@@ -2603,11 +2617,33 @@ impl State {
         match self.seat_assignment(pane_id) {
             Some(
                 SeatAssignmentState::Delivering { generation, .. }
+                | SeatAssignmentState::DeliveredAwaitingClaim { generation, .. }
                 | SeatAssignmentState::AssignedPendingAck { generation, .. }
                 | SeatAssignmentState::Recovering { generation, .. },
             ) => Some(generation),
             _ => None,
         }
+    }
+
+    /// Whether the addressed delivery still belongs to a live, current Codex
+    /// TUI. Only this path may replace an active retry with passive claim wait;
+    /// Claude and missing/stale sessions retain delivery-failure semantics.
+    fn is_live_codex_delivery(&self, pane_id: u32, generation: u64) -> bool {
+        self.agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id)
+            .is_some_and(|slot| {
+                let (Some(ticket_id), Some(lease)) =
+                    (slot.ticket_id.as_ref(), slot.attempt_lease.as_ref())
+                else {
+                    return false;
+                };
+                slot.has_session
+                    && slot.last_client == Some(AgentClient::Codex)
+                    && lease.ticket_id == *ticket_id
+                    && lease.attempt_id == generation
+                    && lease.is_current(self.current_leases.get(ticket_id))
+            })
     }
 
     /// Start the finite provider-acceptance clock after an actual fresh launch
@@ -2856,6 +2892,67 @@ impl State {
             ),
         });
         Some(FailureTransitionOutcome::AssignmentDeliveryFailed {
+            pane_id,
+            ticket_id: Some(ticket_id),
+        })
+    }
+
+    /// End a passive delivered-claim wait without misreporting successful
+    /// transport as delivery failure. Retain the reservation and current lease
+    /// for pane inspection and an explicit operator reset.
+    fn fail_assignment_claim_wait(
+        &mut self,
+        pane_id: u32,
+        reason: &str,
+    ) -> Option<FailureTransitionOutcome> {
+        if !matches!(
+            self.seat_assignment(pane_id),
+            Some(SeatAssignmentState::DeliveredAwaitingClaim { .. })
+        ) {
+            return None;
+        }
+        self.seat_assignments
+            .insert(pane_id, SeatAssignmentState::ClaimTimedOut);
+        let ticket_id = self
+            .agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id)
+            .and_then(|slot| slot.ticket_id.clone());
+        let Some(ticket_id) = ticket_id else {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Assignment claim timed out on pane {}: {}; reset after repairing the reservation",
+                    pane_id, reason
+                ),
+            });
+            return Some(FailureTransitionOutcome::AssignmentClaimTimedOut {
+                pane_id,
+                ticket_id: None,
+            });
+        };
+        if let Some(thread) = self.threads.get_mut(&ticket_id) {
+            thread.fail();
+        }
+        self.emit_assignment_transition(
+            pane_id,
+            &ticket_id,
+            AssignmentState::ClaimTimedOut,
+            reason,
+        );
+        if !self
+            .error_alerts
+            .iter()
+            .any(|(existing, existing_pane)| existing == &ticket_id && *existing_pane == pane_id)
+        {
+            self.error_alerts.push((ticket_id.clone(), pane_id));
+        }
+        self.log_activity(ActivityEvent::Error {
+            message: format!(
+                "{} delivered assignment was not claimed on pane {}: {}; inspect the pane and reset the ticket to retry",
+                ticket_id, pane_id, reason
+            ),
+        });
+        Some(FailureTransitionOutcome::AssignmentClaimTimedOut {
             pane_id,
             ticket_id: Some(ticket_id),
         })
@@ -3375,6 +3472,10 @@ impl State {
                     ack_deadline: deadline,
                     ..
                 }
+                | SeatAssignmentState::DeliveredAwaitingClaim {
+                    claim_deadline: deadline,
+                    ..
+                }
                 | SeatAssignmentState::AssignedPendingAck {
                     ack_deadline: Some(deadline),
                     ..
@@ -3447,6 +3548,29 @@ impl State {
                         outcomes.push(outcome);
                     }
                 }
+                SeatAssignmentState::Delivering { generation, .. }
+                    if self.is_live_codex_delivery(pane_id, generation) =>
+                {
+                    let ticket_id = self
+                        .agent_slots
+                        .iter()
+                        .find(|slot| slot.pane_id == pane_id)
+                        .and_then(|slot| slot.ticket_id.clone())
+                        .unwrap_or_else(|| "unknown ticket".to_string());
+                    self.seat_assignments.insert(
+                        pane_id,
+                        SeatAssignmentState::DeliveredAwaitingClaim {
+                            generation,
+                            claim_deadline: self.assignment_ack_deadline(now),
+                        },
+                    );
+                    self.log_activity(ActivityEvent::Warning {
+                        message: format!(
+                            "{} assignment is delivered on live Codex pane {}; awaiting claim without re-injecting the prompt",
+                            ticket_id, pane_id
+                        ),
+                    });
+                }
                 SeatAssignmentState::Delivering {
                     generation,
                     retries,
@@ -3464,6 +3588,14 @@ impl State {
                     if let Some(outcome) = self.fail_assignment_delivery(
                         pane_id,
                         "provider did not acknowledge the bounded chat assignment",
+                    ) {
+                        outcomes.push(outcome);
+                    }
+                }
+                SeatAssignmentState::DeliveredAwaitingClaim { .. } => {
+                    if let Some(outcome) = self.fail_assignment_claim_wait(
+                        pane_id,
+                        "delivered Codex assignment was not claimed before the bounded deadline",
                     ) {
                         outcomes.push(outcome);
                     }
@@ -7195,12 +7327,18 @@ impl State {
                         SeatAssignmentState::Delivering { .. } => {
                             ui::SeatAssignmentStatus::Delivering
                         }
+                        SeatAssignmentState::DeliveredAwaitingClaim { .. } => {
+                            ui::SeatAssignmentStatus::DeliveredAwaitingClaim
+                        }
                         SeatAssignmentState::AssignedPendingAck { .. } => {
                             ui::SeatAssignmentStatus::AssignedPendingAck
                         }
                         SeatAssignmentState::Owned => ui::SeatAssignmentStatus::Owned,
                         SeatAssignmentState::Recovering { .. } => {
                             ui::SeatAssignmentStatus::Recovering
+                        }
+                        SeatAssignmentState::ClaimTimedOut => {
+                            ui::SeatAssignmentStatus::ClaimTimedOut
                         }
                         SeatAssignmentState::RecoveryFailed => {
                             ui::SeatAssignmentStatus::RecoveryFailed
@@ -13115,10 +13253,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_prompt_miss_retries_then_recycles_to_delivery_failed_never_owned() {
-        // T-037-01-03 (prompt-miss regression): when the grace-paced send is
-        // never acknowledged, the seat resolves inside a finite, named state —
-        // one bounded retry, then DeliveryFailed — and never reaches Owned.
+    fn codex_prompt_miss_waits_for_claim_then_times_out_never_owned() {
+        // T-037-01-03 prompt-miss regression updated by T-045-03-03: when the
+        // grace-paced send is never acknowledged, a live Codex seat waits
+        // passively for ownership evidence, then reaches ClaimTimedOut.
         // Stale-attempt signals are rejected throughout, and even an exact-
         // generation ack arriving after the failure cannot resurrect ownership.
         let (mut codex, _codex_dir) = pane_name_schedule_state("codex", AgentClient::Codex, None);
@@ -13150,23 +13288,23 @@ mod tests {
         };
         assert!(!codex.seat_is_owned(10));
 
-        // The bounded retry: the acceptance clock elapses once with no ack.
+        // The old acceptance clock elapses once with no evidence. The live TUI
+        // enters passive claim wait without another delivery.
         codex.check_assignment_ack_timeouts_at(first_deadline);
-        let retry_deadline = match codex.seat_assignment(10) {
-            Some(SeatAssignmentState::Delivering {
+        let claim_deadline = match codex.seat_assignment(10) {
+            Some(SeatAssignmentState::DeliveredAwaitingClaim {
                 generation,
-                ack_deadline,
-                retries: 1,
+                claim_deadline,
             }) => {
                 assert_eq!(generation, lease.attempt_id);
-                ack_deadline
+                claim_deadline
             }
-            other => panic!("expected exactly one bounded chat retry, got {other:?}"),
+            other => panic!("expected passive delivered claim wait, got {other:?}"),
         };
         assert_eq!(
             delivery_log_count(&codex, "T-NAME"),
-            2,
-            "the paced send plus exactly one bounded retry"
+            1,
+            "passive claim wait must not re-inject the paced send"
         );
         assert!(!codex.seat_is_owned(10));
 
@@ -13177,16 +13315,16 @@ mod tests {
         );
         assert!(!codex.seat_is_owned(10));
 
-        // The miss resolves in the named, operator-visible DeliveryFailed state,
+        // The miss resolves in the named, operator-visible ClaimTimedOut state,
         // retaining the reservation and current lease for an explicit reset.
-        codex.check_assignment_ack_timeouts_at(retry_deadline);
+        codex.check_assignment_ack_timeouts_at(claim_deadline);
         assert_eq!(
             codex.seat_assignment(10),
-            Some(SeatAssignmentState::DeliveryFailed)
+            Some(SeatAssignmentState::ClaimTimedOut)
         );
         assert_eq!(
             codex.to_ui_state().seat_assignment_statuses.get(&1),
-            Some(&ui::SeatAssignmentStatus::DeliveryFailed),
+            Some(&ui::SeatAssignmentStatus::ClaimTimedOut),
             "the resolved miss is a named, operator-visible failure"
         );
         assert_eq!(
@@ -13200,11 +13338,11 @@ mod tests {
         // Terminal: an exact-generation ack arriving after the failure cannot own.
         assert!(
             !acknowledge_assignment(&mut codex, 10, "T-NAME", lease.attempt_id),
-            "DeliveryFailed is terminal; a late exact ack cannot publish Owned"
+            "ClaimTimedOut is terminal; a late exact ack cannot publish Owned"
         );
         assert_eq!(
             codex.seat_assignment(10),
-            Some(SeatAssignmentState::DeliveryFailed)
+            Some(SeatAssignmentState::ClaimTimedOut)
         );
         assert!(!codex.seat_is_owned(10));
     }
@@ -14136,6 +14274,18 @@ owned\n\
         assert!(!state.seat_is_owned(10));
         assert!(dashboard_thread_row(&state, "T-NAME").contains("delivering"));
 
+        let delivery_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Delivering { ack_deadline, .. }) => ack_deadline,
+            other => panic!("expected delivered assignment, got {other:?}"),
+        };
+        state.check_assignment_ack_timeouts_at(delivery_deadline);
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::DeliveredAwaitingClaim { generation, .. })
+                if generation == lease.attempt_id
+        ));
+        assert!(dashboard_thread_row(&state, "T-NAME").contains("delivered-awaiting-claim"));
+
         let exact = AssignmentClaim {
             nonce,
             ..wrong_nonce
@@ -14474,18 +14624,16 @@ owned\n\
         )));
 
         state.check_assignment_ack_timeouts_at(first_deadline);
-        let retry_deadline = match state.seat_assignment(10) {
-            Some(SeatAssignmentState::Delivering {
-                ack_deadline,
-                retries: 1,
-                ..
-            }) => ack_deadline,
-            other => panic!("expected one bounded chat retry, got {other:?}"),
+        let claim_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::DeliveredAwaitingClaim { claim_deadline, .. }) => {
+                claim_deadline
+            }
+            other => panic!("expected passive delivered claim wait, got {other:?}"),
         };
-        state.check_assignment_ack_timeouts_at(retry_deadline);
+        state.check_assignment_ack_timeouts_at(claim_deadline);
         assert_eq!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::DeliveryFailed)
+            Some(SeatAssignmentState::ClaimTimedOut)
         );
         assert!(!state.seat_is_owned(10));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
@@ -14497,48 +14645,84 @@ owned\n\
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
             ActivityEvent::Error { message }
-                if message.contains("assignment delivery failed") && message.contains("reset the ticket")
+                if message.contains("delivered assignment was not claimed") && message.contains("reset the ticket")
         )));
 
-        state.check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(60));
+        state.check_assignment_ack_timeouts_at(claim_deadline + std::time::Duration::from_secs(60));
         assert_eq!(
             state.current_leases.get("T-NAME"),
             Some(&original_lease),
-            "chat retries do not mint duplicate attempts or processes"
+            "passive claim wait does not mint duplicate attempts or processes"
         );
     }
 
     #[test]
-    fn test_bounded_fresh_delivery_retries_once_then_fails_actionably() {
-        let (mut state, _dir) =
+    fn live_codex_slow_claim_waits_without_reinjection_then_times_out_actionably() {
+        let (mut state, dir) =
             pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
         state.config.assignment_ack_timeout_secs = 1;
+        state.ledger_path = dir.path().join("provenance.jsonl");
 
         state.schedule_ready_tickets();
         let lease = state.current_leases["T-NAME"].clone();
         let first_deadline = exit_then_deliver_fresh_codex(&mut state, 10, &lease);
         assert!(!state.seat_is_owned(10));
+        assert!(state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
+        assert!(!state.signal_dir.join("pane-10.claim").exists());
+        assert!(!state.signal_dir.join("pane-10.ack").exists());
 
-        state.check_assignment_ack_timeouts_at(first_deadline);
-        let retry_deadline = match state.seat_assignment(10) {
-            Some(SeatAssignmentState::Delivering {
+        let delivery_logs = delivery_log_count(&state, "T-NAME");
+        let pending_enters = state.pending_enters.len();
+        let launches = state
+            .activity_log
+            .iter()
+            .filter(|event| matches!(event, ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"))
+            .count();
+
+        assert!(state
+            .check_assignment_ack_timeouts_at(first_deadline)
+            .is_empty());
+        let claim_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::DeliveredAwaitingClaim {
                 generation,
-                ack_deadline,
-                retries: 1,
-            }) if generation == lease.attempt_id => ack_deadline,
-            other => panic!("expected one chat retry on the fresh process, got {other:?}"),
+                claim_deadline,
+            }) if generation == lease.attempt_id => claim_deadline,
+            other => panic!("expected delivered-awaiting-claim, got {other:?}"),
         };
+        assert!(claim_deadline > first_deadline);
+        assert_eq!(delivery_log_count(&state, "T-NAME"), delivery_logs);
+        assert_eq!(state.pending_enters.len(), pending_enters);
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .filter(|event| matches!(event, ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"))
+                .count(),
+            launches
+        );
         assert_eq!(state.current_leases.get("T-NAME"), Some(&lease));
         assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(!state.seat_is_owned(10));
+        assert_eq!(
+            state.to_ui_state().seat_assignment_statuses.get(&1),
+            Some(&ui::SeatAssignmentStatus::DeliveredAwaitingClaim)
+        );
 
-        state.check_assignment_ack_timeouts_at(retry_deadline);
+        assert_eq!(
+            state.check_assignment_ack_timeouts_at(claim_deadline),
+            vec![FailureTransitionOutcome::AssignmentClaimTimedOut {
+                pane_id: 10,
+                ticket_id: Some("T-NAME".to_string()),
+            }]
+        );
         assert_eq!(
             state.seat_assignment(10),
-            Some(SeatAssignmentState::DeliveryFailed)
+            Some(SeatAssignmentState::ClaimTimedOut)
         );
         assert!(!state.seat_is_owned(10));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
+        assert_eq!(state.agent_slots[0].attempt_lease.as_ref(), Some(&lease));
         assert_eq!(
             state.threads["T-NAME"].status,
             lisa_core::types::ThreadStatus::Failed
@@ -14547,15 +14731,36 @@ owned\n\
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
             ActivityEvent::Error { message }
-                if message.contains("assignment delivery failed") && message.contains("reset the ticket")
+                if message.contains("delivered assignment was not claimed")
+                    && message.contains("inspect the pane")
+                    && message.contains("reset the ticket")
         )));
+        assert!(!state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message } if message.contains("assignment delivery failed")
+        )));
+        assert_eq!(delivery_log_count(&state, "T-NAME"), delivery_logs);
+        assert_eq!(state.pending_enters.len(), pending_enters);
 
-        state.check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(60));
+        let records = read_mixed_ledger(&state.ledger_path);
+        assert!(matches!(
+            records.as_slice(),
+            [lisa_core::provenance::ProvenanceLedgerRecord::AssignmentTransition(record)]
+                if record.ticket_id == "T-NAME"
+                    && record.attempt_lease == lease
+                    && record.state == AssignmentState::ClaimTimedOut
+                    && record.reason == "delivered Codex assignment was not claimed before the bounded deadline"
+        ));
+
+        assert!(state
+            .check_assignment_ack_timeouts_at(claim_deadline + std::time::Duration::from_secs(60),)
+            .is_empty());
         assert_eq!(state.current_leases.get("T-NAME"), Some(&lease));
+        assert_eq!(read_mixed_ledger(&state.ledger_path).len(), 1);
     }
 
     #[test]
-    fn test_retry_ack_promotes_only_the_current_fresh_generation() {
+    fn passive_claim_wait_promotes_only_the_current_fresh_generation() {
         let (mut state, _dir) =
             pane_name_schedule_state("codex", AgentClient::Claude, Some(AgentClient::Codex));
         state.config.assignment_ack_timeout_secs = 1;
@@ -14563,13 +14768,12 @@ owned\n\
         let lease = state.current_leases["T-NAME"].clone();
         let first_deadline = exit_then_deliver_fresh_codex(&mut state, 10, &lease);
         state.check_assignment_ack_timeouts_at(first_deadline);
-        let retry_deadline = match state.seat_assignment(10) {
-            Some(SeatAssignmentState::Delivering {
+        let claim_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::DeliveredAwaitingClaim {
                 generation: 1,
-                ack_deadline,
-                retries: 1,
-            }) => ack_deadline,
-            other => panic!("expected current-generation retry, got {other:?}"),
+                claim_deadline,
+            }) => claim_deadline,
+            other => panic!("expected current-generation claim wait, got {other:?}"),
         };
 
         let stale = serde_json::json!({
@@ -14598,7 +14802,7 @@ owned\n\
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
         assert!(state.seat_is_owned(10));
 
-        state.check_assignment_ack_timeouts_at(retry_deadline + std::time::Duration::from_secs(1));
+        state.check_assignment_ack_timeouts_at(claim_deadline + std::time::Duration::from_secs(1));
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
         assert!(state.error_alerts.is_empty());
     }
@@ -14626,7 +14830,7 @@ owned\n\
         let mut codex_tickets = std::collections::HashSet::new();
         let mut codex_panes = std::collections::HashSet::new();
         let mut ack_then_owned = 0usize;
-        let mut timeout_then_retry = 0usize;
+        let mut timeout_then_claim = 0usize;
 
         for _round in 0..5 {
             codex.schedule_ready_tickets();
@@ -14658,17 +14862,16 @@ owned\n\
 
                 let (outcome, fallback_launches) = if sequence == 6 {
                     // Deterministically lose the first submitted acceptance. The
-                    // exact finite deadline permits one chat retry in the same
-                    // fresh process, never another process or attempt.
+                    // exact finite deadline enters passive claim wait in the
+                    // same fresh process, never another send, process, or attempt.
                     codex.check_assignment_ack_timeouts_at(original_deadline);
-                    let retry_deadline = match codex.seat_assignment(*pane_id) {
-                        Some(SeatAssignmentState::Delivering {
+                    let claim_deadline = match codex.seat_assignment(*pane_id) {
+                        Some(SeatAssignmentState::DeliveredAwaitingClaim {
                             generation,
-                            ack_deadline,
-                            retries: 1,
-                        }) if generation == original_generation => ack_deadline,
+                            claim_deadline,
+                        }) if generation == original_generation => claim_deadline,
                         other => {
-                            panic!("{ticket_id} must enter one bounded chat retry, got {other:?}")
+                            panic!("{ticket_id} must enter passive claim wait, got {other:?}")
                         }
                     };
                     assert!(!codex.seat_is_owned(*pane_id));
@@ -14678,9 +14881,9 @@ owned\n\
                         ticket_id,
                         original_generation,
                     ));
-                    codex.check_assignment_ack_timeouts_at(retry_deadline);
-                    timeout_then_retry += 1;
-                    ("timeout-then-retry", 0)
+                    codex.check_assignment_ack_timeouts_at(claim_deadline);
+                    timeout_then_claim += 1;
+                    ("timeout-then-claim", 0)
                 } else {
                     assert!(acknowledge_assignment(
                         &mut codex,
@@ -14725,7 +14928,7 @@ owned\n\
         assert_eq!(codex_tickets.len(), 10);
         assert_eq!(codex_panes, std::collections::HashSet::from([10, 11]));
         assert_eq!(ack_then_owned, 9);
-        assert_eq!(timeout_then_retry, 1);
+        assert_eq!(timeout_then_claim, 1);
         assert!(codex.error_alerts.is_empty());
 
         let (mut claude, _claude_dir) =
@@ -14799,7 +15002,7 @@ owned\n\
         assert_eq!(claude_panes, std::collections::HashSet::from([20, 21]));
         assert!(claude.error_alerts.is_empty());
         println!(
-            "T0330302|summary|codex=10|ack_then_owned={ack_then_owned}|timeout_then_retry={timeout_then_retry}|claude=10|silent_stalls=0"
+            "T0330302|summary|codex=10|ack_then_owned={ack_then_owned}|timeout_then_claim={timeout_then_claim}|claude=10|silent_stalls=0"
         );
     }
 

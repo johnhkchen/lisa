@@ -189,9 +189,11 @@ pub enum SeatAssignmentStatus {
     Starting,
     ReadyForAssignment,
     Delivering,
+    DeliveredAwaitingClaim,
     AssignedPendingAck,
     Owned,
     Recovering,
+    ClaimTimedOut,
     RecoveryFailed,
     StartupFailed,
     DeliveryFailed,
@@ -203,9 +205,11 @@ impl SeatAssignmentStatus {
             Self::Starting => "starting",
             Self::ReadyForAssignment => "ready-for-assignment",
             Self::Delivering => "delivering",
+            Self::DeliveredAwaitingClaim => "delivered-awaiting-claim",
             Self::AssignedPendingAck => "assigned-pending-ack",
             Self::Owned => "owned",
             Self::Recovering => "recovering",
+            Self::ClaimTimedOut => "claim-timed-out",
             Self::RecoveryFailed => "recovery-failed",
             Self::StartupFailed => "startup-failed",
             Self::DeliveryFailed => "delivery-failed",
@@ -217,10 +221,14 @@ impl SeatAssignmentStatus {
             Self::Starting
             | Self::ReadyForAssignment
             | Self::Delivering
+            | Self::DeliveredAwaitingClaim
             | Self::AssignedPendingAck => YELLOW,
             Self::Owned => GREEN,
             Self::Recovering => BRIGHT_YELLOW,
-            Self::RecoveryFailed | Self::StartupFailed | Self::DeliveryFailed => RED,
+            Self::ClaimTimedOut
+            | Self::RecoveryFailed
+            | Self::StartupFailed
+            | Self::DeliveryFailed => RED,
         }
     }
 }
