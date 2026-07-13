@@ -5,6 +5,7 @@
 //! tracks phase progress, and provides a live dashboard.
 
 mod adapter;
+mod assignment;
 mod codex_ack;
 mod completion_journal;
 mod deadline;
@@ -24,6 +25,7 @@ use adapter::{
     resolve_adapter_or_native, FollowUp, FollowUpContext, ReadinessMode, ResetStrategy,
     SpawnContext,
 };
+use assignment::{write_assignment, AssignmentRef};
 use completion_journal::{CompletionJournalAggregate, CompletionJournalTransition};
 use deadline::{
     AcknowledgementInput, DeadlineEvaluator, HealthInput, ReviewInput, SessionAction, SessionInput,
@@ -53,7 +55,8 @@ use lisa_core::types::{
 };
 use pane_name::{format_pane_name, PaneName};
 use publication::{
-    PublicationErrors, PublicationPath, RustPublication, ShellPublication, TemporaryName,
+    publication_nonce, PublicationErrors, PublicationPath, RustPublication, ShellPublication,
+    TemporaryName,
 };
 use signal::{IdleTarget, SignalRecord, SignalRequest};
 
@@ -214,9 +217,6 @@ pub(crate) fn finish_up_prompt(
 /// A 2-second gap is imperceptible to human operators but gives the TUI
 /// plenty of time to process the characters.
 const ENTER_DELAY_SECS: f64 = 2.0;
-
-/// Complete instructions are stored beside attempt-private workflow artifacts.
-const ASSIGNMENT_FILE_NAME: &str = "assignment.md";
 
 /// One same-attempt chat redelivery is allowed before operator-visible failure.
 const MAX_ASSIGNMENT_DELIVERY_RETRIES: u8 = 1;
@@ -636,6 +636,11 @@ pub struct State {
     /// Missing means the seat has no current assignment.
     seat_assignments: HashMap<u32, SeatAssignmentState>,
 
+    /// Exact successfully published assignment for each ticket's current
+    /// attempt. Lease authority remains in `current_leases`; this map retains
+    /// the nonce-bearing path that later delivery and claim evidence must use.
+    assignment_refs: HashMap<TicketId, AssignmentRef>,
+
     /// Provider bootstrap-readiness classification per pane, recorded at launch
     /// dispatch (T-037-01-01). Observational only in this ticket; T-037-01-02
     /// keys the Codex startup-grace transition on it. Deliberately disjoint from
@@ -909,32 +914,23 @@ impl State {
         Ok(format!("sh {}", shell_quote(&shell_path.to_string_lossy())))
     }
 
-    /// Atomically publish the complete instructions for one exact attempt.
-    /// Fresh provider launch scripts never contain these bytes; after a matching
-    /// SessionStart the scheduler submits only a bounded reference to this file.
-    fn prepare_assignment(artifact_dir: &Path, assignment: &str) -> Result<PathBuf, String> {
-        std::fs::create_dir_all(artifact_dir).map_err(|error| {
-            format!(
-                "cannot create assignment directory {}: {error}",
-                artifact_dir.display()
-            )
-        })?;
-
-        let destination = artifact_dir.join(ASSIGNMENT_FILE_NAME);
-        RustPublication {
-            path: PublicationPath {
-                destination,
-                temporary_name: TemporaryName::Nonce {
-                    prefix: format!(".{ASSIGNMENT_FILE_NAME}.tmp."),
-                },
-            },
-            body: assignment.as_bytes(),
-            errors: PublicationErrors {
-                write: "cannot write assignment payload",
-                publish: "cannot publish assignment payload",
-            },
-        }
-        .publish()
+    /// Atomically publish and retain the complete instructions for one exact
+    /// ticket attempt. A reference becomes scheduler-visible only after rename.
+    fn prepare_assignment(
+        &mut self,
+        artifact_dir: &Path,
+        lease: &AttemptLease,
+        assignment: &str,
+    ) -> Result<AssignmentRef, String> {
+        let assignment = write_assignment(
+            artifact_dir,
+            lease,
+            publication_nonce(),
+            assignment.as_bytes(),
+        )?;
+        self.assignment_refs
+            .insert(lease.ticket_id.clone(), assignment.clone());
+        Ok(assignment)
     }
 
     /// Construct a bounded shell command whose successful execution positively
@@ -2518,7 +2514,17 @@ impl State {
         {
             return Err("current attempt lease is missing or stale".to_string());
         }
-        let assignment_path = self.attempt_work_dir(&lease).join(ASSIGNMENT_FILE_NAME);
+        let assignment = self
+            .assignment_refs
+            .get(&ticket_id)
+            .cloned()
+            .ok_or_else(|| format!("assignment reference for {ticket_id} is missing"))?;
+        if assignment.lease != lease {
+            return Err(format!(
+                "assignment reference for {ticket_id} belongs to a stale attempt"
+            ));
+        }
+        let assignment_path = assignment.path;
         if !assignment_path.is_file() {
             return Err(format!(
                 "assignment file {} is missing",
@@ -2969,7 +2975,7 @@ impl State {
             assignment_generation: None,
         };
         let assignment = adapter.assignment_text(&ctx);
-        if let Err(error) = Self::prepare_assignment(&attempt_artifact_dir, &assignment) {
+        if let Err(error) = self.prepare_assignment(&attempt_artifact_dir, candidate, &assignment) {
             self.fail_startup_recovery(pane_id, &error);
             return false;
         }
@@ -3779,7 +3785,9 @@ impl State {
             // input. Fresh launch scripts are deliberately bare; exact
             // SessionStart later unlocks only a bounded reference to this file.
             let assignment_text = adapter.assignment_text(&ctx);
-            if let Err(error) = Self::prepare_assignment(&attempt_artifact_dir, &assignment_text) {
+            if let Err(error) =
+                self.prepare_assignment(&attempt_artifact_dir, &attempt_lease, &assignment_text)
+            {
                 self.revoke_current_lease(&ticket_id);
                 self.log_activity(ActivityEvent::Error {
                     message: format!(
@@ -5228,19 +5236,32 @@ impl State {
                 continue;
             }
             let launch_artifact_dir = artifact_dir;
+            let Some(launch_lease) = self.pane_attempt_lease(pane_id) else {
+                if recovering {
+                    self.fail_assignment_recovery(pane_id, "current attempt lease is missing");
+                } else {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "Cannot prepare assignment for {} on pane {} after exit: current attempt lease is missing",
+                            ticket_id, pane_id
+                        ),
+                    });
+                }
+                continue;
+            };
             let artifact_dir = strip_host_prefix(&launch_artifact_dir);
             let ctx = SpawnContext {
                 ticket_dir: &host_ticket_dir,
                 ticket_id: &ticket_id,
                 pane_id,
-                attempt_id: self
-                    .pane_attempt_lease(pane_id)
-                    .map_or(0, |lease| lease.attempt_id),
+                attempt_id: launch_lease.attempt_id,
                 artifact_dir: &artifact_dir,
                 assignment_generation: self.active_assignment_generation(pane_id),
             };
             let assignment_text = adapter.assignment_text(&ctx);
-            if let Err(error) = Self::prepare_assignment(&launch_artifact_dir, &assignment_text) {
+            if let Err(error) =
+                self.prepare_assignment(&launch_artifact_dir, &launch_lease, &assignment_text)
+            {
                 if recovering {
                     self.fail_assignment_recovery(pane_id, &error);
                 } else {
@@ -7795,12 +7816,15 @@ mod tests {
 
         let assignment_dir = hostile_root.join("assignment");
         fs::create_dir_all(&assignment_dir).unwrap();
-        let assignment_destination = assignment_dir.join(ASSIGNMENT_FILE_NAME);
+        let lease = AttemptLease::mint("T-PUB-'-$()", None).unwrap();
+        let assignment_destination = assignment_dir.join("assignment-1-17.md");
         fs::write(&assignment_destination, "old assignment").unwrap();
         let assignment = "raw assignment\nquote:' dollar:$() backtick:`x`\n";
         assert_eq!(
-            State::prepare_assignment(&assignment_dir, assignment).unwrap(),
-            assignment_destination
+            write_assignment(&assignment_dir, &lease, 17, assignment.as_bytes())
+                .unwrap()
+                .path,
+            assignment_destination,
         );
         assert_eq!(
             fs::read_to_string(&assignment_destination).unwrap(),
@@ -7809,7 +7833,6 @@ mod tests {
 
         let signal_dir = hostile_root.join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
-        let lease = AttemptLease::mint("T-PUB-'-$()", None).unwrap();
         let lease_destination = signal_dir.join("pane-19.lease");
         fs::write(&lease_destination, "old lease").unwrap();
         let lease_state = State {
@@ -7939,12 +7962,12 @@ mod tests {
         assert!(error.contains(&long_dir.to_string_lossy().into_owned()));
         assert_nonce_temp_in_error(&error, "/.lisa-launch-7.sh.tmp.");
 
-        let error = State::prepare_assignment(&long_dir, "assignment").unwrap_err();
+        let lease = AttemptLease::mint("T-PUB", None).unwrap();
+        let error = write_assignment(&long_dir, &lease, 17, b"assignment").unwrap_err();
         assert!(error.starts_with("cannot write assignment payload "));
         assert!(error.contains(&long_dir.to_string_lossy().into_owned()));
-        assert_nonce_temp_in_error(&error, "/.assignment.md.tmp.");
+        assert_nonce_temp_in_error(&error, "/.assignment-1-17.md.tmp.");
 
-        let lease = AttemptLease::mint("T-PUB", None).unwrap();
         let state = State {
             signal_dir: long_dir.clone(),
             ..State::default()
@@ -7965,9 +7988,9 @@ mod tests {
 
         let assignment_dir = hostile_root.join("failed-assignment");
         fs::create_dir_all(&assignment_dir).unwrap();
-        let assignment_destination = assignment_dir.join(ASSIGNMENT_FILE_NAME);
+        let assignment_destination = assignment_dir.join("assignment-1-19.md");
         fs::create_dir(&assignment_destination).unwrap();
-        let error = State::prepare_assignment(&assignment_dir, "assignment").unwrap_err();
+        let error = write_assignment(&assignment_dir, &lease, 19, b"assignment").unwrap_err();
         assert!(error.starts_with("cannot publish assignment payload "));
         assert!(error.contains(&assignment_destination.to_string_lossy().into_owned()));
         assert_only_destination_directory(&assignment_dir, &assignment_destination);
@@ -8095,15 +8118,16 @@ mod tests {
     fn test_prepare_assignment_atomically_preserves_complete_hostile_payload() {
         let temp = tempfile::tempdir().unwrap();
         let artifact_dir = temp.path().join("attempt path with ' quote");
+        let lease = AttemptLease::mint("T-ASSIGNMENT", None).unwrap();
         let payload = format!(
             "Read everything exactly.\n{}",
             "quote:' double:\" dollar:$() backtick:`x` slash:\\\n\t\r\u{1b}".repeat(8_192)
         );
 
-        let path = State::prepare_assignment(&artifact_dir, &payload).unwrap();
+        let assignment = write_assignment(&artifact_dir, &lease, 23, payload.as_bytes()).unwrap();
 
-        assert_eq!(path, artifact_dir.join(ASSIGNMENT_FILE_NAME));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), payload);
+        assert_eq!(assignment.path, artifact_dir.join("assignment-1-23.md"));
+        assert_eq!(std::fs::read_to_string(assignment.path).unwrap(), payload);
         assert!(std::fs::read_dir(&artifact_dir).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
@@ -13078,8 +13102,10 @@ mod tests {
             assert!(dashboard_thread_row(&state, "T-NAME").contains("starting"));
 
             let attempt_dir = state.attempt_work_dir(&lease);
-            let assignment =
-                std::fs::read_to_string(attempt_dir.join(ASSIGNMENT_FILE_NAME)).unwrap();
+            let assignment_ref = state.assignment_refs.get("T-NAME").unwrap();
+            assert_eq!(assignment_ref.lease, lease);
+            assert_eq!(assignment_ref.path.parent(), Some(attempt_dir.as_path()));
+            let assignment = std::fs::read_to_string(&assignment_ref.path).unwrap();
             assert!(assignment.contains("Read the ticket"));
             let launch = std::fs::read_to_string(attempt_dir.join(".lisa-launch-10.sh")).unwrap();
             assert!(!launch.contains("Read the ticket"));
@@ -13394,10 +13420,9 @@ mod tests {
         assert!(replacement_deadline > first_deadline);
         assert_eq!(state.agent_slots[0].pane_id, 10);
         assert_eq!(state.agent_slots.len(), 1);
-        assert!(state
-            .attempt_work_dir(&successor)
-            .join(ASSIGNMENT_FILE_NAME)
-            .is_file());
+        let assignment = state.assignment_refs.get(&successor.ticket_id).unwrap();
+        assert_eq!(assignment.lease, successor);
+        assert!(assignment.path.is_file());
         let launch = std::fs::read_to_string(
             state
                 .attempt_work_dir(&successor)
@@ -15211,6 +15236,7 @@ owned\n\
     #[test]
     fn test_recycle_exit_grace_launches_fresh_incoming_client() {
         let dir = tempfile::tempdir().unwrap();
+        let lease = AttemptLease::mint("T-RECYCLE", None).unwrap();
         let mut state = State {
             config: PluginConfig {
                 client: AgentClient::Codex,
@@ -15220,10 +15246,13 @@ owned\n\
             },
             ..State::default()
         };
+        state
+            .current_leases
+            .insert(lease.ticket_id.clone(), lease.clone());
         state.agent_slots.push(AgentSlot {
             pane_id: 1,
             ticket_id: Some("T-RECYCLE".to_string()),
-            attempt_lease: None,
+            attempt_lease: Some(lease),
             has_session: false,
             transition_state: TransitionState::WaitingForExit,
             transition_started_at: Some(
