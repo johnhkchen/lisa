@@ -1116,11 +1116,7 @@ impl State {
     ) -> bool {
         const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
 
-        match self.admit_artifact(
-            &ticket_id,
-            source_lease.as_ref(),
-            DISPOSITION_ARTIFACT,
-        ) {
+        match self.admit_artifact(&ticket_id, source_lease.as_ref(), DISPOSITION_ARTIFACT) {
             Ok(true) => {}
             Ok(false) => {
                 self.log_activity(ActivityEvent::Error {
@@ -3758,11 +3754,7 @@ impl State {
                 slot.pane_id == pane_id && slot.ticket_id.as_deref() == Some(ticket_id.as_str())
             })
             .and_then(|slot| slot.attempt_lease.clone());
-        self.request_review_completion(
-            ticket_id,
-            CompletionSource::Stopped(pane_id),
-            source_lease,
-        );
+        self.request_review_completion(ticket_id, CompletionSource::Stopped(pane_id), source_lease);
     }
 
     /// Append one attempt-scoped transition that failed before provider
@@ -6017,6 +6009,16 @@ mod tests {
         lease
     }
 
+    fn write_review_disposition(state: &State, lease: &AttemptLease, disposition: &str) {
+        let staged = state.attempt_work_dir(lease);
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("review-disposition.json"), disposition).unwrap();
+    }
+
+    fn write_passing_review_disposition(state: &State, lease: &AttemptLease) {
+        write_review_disposition(state, lease, r#"{"disposition":"pass","reason":null}"#);
+    }
+
     #[test]
     fn test_phase_to_ui_phase() {
         assert_eq!(phase_to_ui_phase(Phase::Ready), ui::Phase::Ready);
@@ -6857,6 +6859,7 @@ mod tests {
         let staged = state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("review.md"), "# Review\nAll good.").unwrap();
+        write_passing_review_disposition(&state, &lease);
 
         state.check_artifact_advances();
 
@@ -6914,6 +6917,7 @@ mod tests {
         fs::write(staged.join("structure.md"), "# Structure").unwrap();
         fs::write(staged.join("plan.md"), "# Plan").unwrap();
         fs::write(staged.join("review.md"), "# Review").unwrap();
+        write_passing_review_disposition(&state, &lease);
 
         state.check_artifact_advances();
 
@@ -7010,6 +7014,7 @@ mod tests {
         let staged = state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("review.md"), "# Review summary").unwrap();
+        write_passing_review_disposition(&state, &lease);
 
         state.check_artifact_advances();
 
@@ -7028,6 +7033,122 @@ mod tests {
             ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
             if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
         )));
+    }
+
+    #[test]
+    fn review_disposition_gates_artifact_completion_and_dependents() {
+        use lisa_core::types::{Thread, ThreadStatus};
+        use std::fs;
+
+        let cases = [
+            (
+                "block",
+                r#"{"disposition":"block","reason":"resolve the failing release test"}"#,
+                false,
+                "resolve the failing release test",
+            ),
+            ("pass", r#"{"disposition":"pass","reason":null}"#, true, ""),
+            (
+                "invalid",
+                r#"{"disposition":"pass","reason":"contradictory"}"#,
+                false,
+                "invalid review disposition",
+            ),
+        ];
+
+        for (case, disposition, should_request, visible_reason) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let tickets_dir = dir.path().join("tickets");
+            let work_dir = dir.path().join("work");
+            fs::create_dir_all(&tickets_dir).unwrap();
+            fs::write(
+                tickets_dir.join("T-REVIEW.md"),
+                "---\nid: T-REVIEW\ntitle: review gate\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n",
+            )
+            .unwrap();
+            fs::write(
+                tickets_dir.join("T-DEPENDENT.md"),
+                "---\nid: T-DEPENDENT\ntitle: downstream\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [T-REVIEW]\n---\n",
+            )
+            .unwrap();
+
+            let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+            let mut state = State {
+                dag: Dag::from_tickets(tickets).unwrap(),
+                config: PluginConfig {
+                    ticket_dir: tickets_dir.clone(),
+                    work_dir: work_dir.clone(),
+                    ..PluginConfig::new()
+                },
+                ..State::default()
+            };
+            state.agent_slots.push(AgentSlot {
+                pane_id: 7,
+                ticket_id: Some("T-REVIEW".to_string()),
+                attempt_lease: None,
+                has_session: true,
+                transition_state: TransitionState::Idle,
+                transition_started_at: None,
+                cooldown_until: None,
+                last_activity_at: None,
+                last_client: None,
+            });
+            let mut thread = Thread::new("T-REVIEW", 7);
+            thread.current_phase = Phase::Review;
+            state.threads.insert("T-REVIEW".to_string(), thread);
+            let lease = install_current_attempt(&mut state, "T-REVIEW");
+            let staged = state.attempt_work_dir(&lease);
+            fs::create_dir_all(&staged).unwrap();
+            fs::write(staged.join("review.md"), "# Review\n").unwrap();
+            write_review_disposition(&state, &lease, disposition);
+
+            state.check_artifact_advances();
+
+            assert_eq!(
+                state.pending_completions.contains_key("T-REVIEW"),
+                should_request,
+                "{case}: only Pass may request completion"
+            );
+            let thread = state.threads.get("T-REVIEW").unwrap();
+            assert_eq!(thread.current_phase, Phase::Review, "{case}");
+            assert_eq!(thread.status, ThreadStatus::Running, "{case}");
+            assert_eq!(
+                state.agent_slots[0].ticket_id.as_deref(),
+                Some("T-REVIEW"),
+                "{case}: assignment must remain until commit success"
+            );
+            assert_eq!(
+                state.current_leases.get("T-REVIEW"),
+                Some(&lease),
+                "{case}: current attempt must remain authoritative"
+            );
+            assert!(
+                fs::read_to_string(tickets_dir.join("T-REVIEW.md"))
+                    .unwrap()
+                    .contains("phase: review"),
+                "{case}: Done must not publish before a successful transaction"
+            );
+            assert!(
+                !state.dag.all_dependencies_done(&"T-DEPENDENT".to_string()),
+                "{case}: the dependent must remain blocked before committed Done"
+            );
+            assert_eq!(
+                fs::read_to_string(work_dir.join("T-REVIEW").join("review-disposition.json"))
+                    .unwrap(),
+                disposition,
+                "{case}: admitted evidence must match the current attempt"
+            );
+            if !visible_reason.is_empty() {
+                assert!(
+                    state.activity_log.iter().any(|event| match event {
+                        ActivityEvent::Warning { message } | ActivityEvent::Error { message } =>
+                            message.contains(visible_reason),
+                        _ => false,
+                    }),
+                    "{case}: refusal reason must be operator-visible"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8800,6 +8921,7 @@ mod tests {
         let staged = state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("review.md"), "# Review\nAll good.").unwrap();
+        write_passing_review_disposition(&state, &lease);
 
         // Run idle signal check
         state.check_idle_signals();
@@ -9492,6 +9614,7 @@ mod tests {
         let staged = state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("review.md"), "# Review summary").unwrap();
+        write_passing_review_disposition(&state, &lease);
 
         state.check_idle_signals();
 
@@ -12888,6 +13011,7 @@ owned\n\
             dag,
             config: PluginConfig {
                 ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
                 ..PluginConfig::new()
             },
             ..State::default()
@@ -12910,7 +13034,8 @@ owned\n\
         let mut thread = Thread::new("T-001", 1);
         thread.current_phase = Phase::Review;
         state.threads.insert("T-001".to_string(), thread);
-        install_current_attempt(&mut state, "T-001");
+        let lease = install_current_attempt(&mut state, "T-001");
+        write_passing_review_disposition(&state, &lease);
 
         // Directly call auto_complete_review
         state.auto_complete_review("T-001".to_string(), 1);
@@ -12927,6 +13052,66 @@ owned\n\
         let content = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
         assert!(content.contains("phase: review"), "{content}");
         assert!(content.contains("status: review"), "{content}");
+    }
+
+    #[test]
+    fn test_auto_complete_review_block_retains_assignment_with_visible_reason() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: review\npriority: high\nphase: review\n---\n",
+        )
+        .unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-001".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-001");
+        write_review_disposition(
+            &state,
+            &lease,
+            r#"{"disposition":"block","reason":"rerun the release suite"}"#,
+        );
+
+        state.auto_complete_review("T-001".to_string(), 1);
+
+        assert!(!state.pending_completions.contains_key("T-001"));
+        assert!(state.threads.contains_key("T-001"));
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
+        assert!(fs::read_to_string(tickets_dir.join("T-001.md"))
+            .unwrap()
+            .contains("phase: review"));
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message }
+                if message.contains("Completion blocked")
+                    && message.contains("rerun the release suite")
+        )));
     }
 
     #[test]
@@ -14567,6 +14752,7 @@ owned\n\
 
         // review.md reaches Review and starts commit-gated completion.
         fs::write(ticket_work.join("review.md"), "x").unwrap();
+        write_passing_review_disposition(&state, &lease);
         state.check_artifact_advances();
         assert_eq!(
             state.threads.get("T-CDX-01").unwrap().current_phase,
@@ -14614,8 +14800,10 @@ owned\n\
         let mut th2 = Thread::new("T-CDX-02", 2);
         th2.current_phase = Phase::Review;
         state.threads.insert("T-CDX-02".to_string(), th2);
-        install_current_attempt(&mut state, "T-CDX-01");
-        install_current_attempt(&mut state, "T-CDX-02");
+        let lease1 = install_current_attempt(&mut state, "T-CDX-01");
+        let lease2 = install_current_attempt(&mut state, "T-CDX-02");
+        write_passing_review_disposition(&state, &lease1);
+        write_passing_review_disposition(&state, &lease2);
 
         // Negative first: T-CDX-02's dep (T-CDX-01) is not Done → guard blocks.
         state.auto_complete_review("T-CDX-02".to_string(), 2);
@@ -15720,6 +15908,7 @@ owned\n\
             "replacement review is authoritative\n",
         )
         .unwrap();
+        write_passing_review_disposition(&state, &replacement);
         state.check_artifact_advances();
 
         assert_eq!(
@@ -15799,6 +15988,7 @@ owned\n\
         let staged = state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("review.md"), "# Review\n").unwrap();
+        write_passing_review_disposition(&state, &lease);
 
         state.check_artifact_advances();
 
