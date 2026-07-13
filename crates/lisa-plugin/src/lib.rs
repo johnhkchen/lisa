@@ -95,16 +95,25 @@ pub(crate) fn ticket_prompt(
     context_file: &str,
     artifact_dir: &Path,
 ) -> String {
-    let ticket_path = lisa_core::ticket::scan_tickets(ticket_dir)
+    let ticket = lisa_core::ticket::scan_tickets(ticket_dir)
         .ok()
-        .and_then(|tickets| {
-            tickets
-                .into_iter()
-                .find(|ticket| ticket.id == ticket_id)
-                .map(|ticket| ticket.file_path)
-        })
+        .and_then(|tickets| tickets.into_iter().find(|ticket| ticket.id == ticket_id));
+    let ticket_path = ticket
+        .as_ref()
+        .map(|ticket| ticket.file_path.clone())
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| ticket_dir.join(format!("{}.md", ticket_id)));
+    let review_recovery = if ticket.as_ref().map(|ticket| ticket.phase) == Some(Phase::Review) {
+        format!(
+            " Recovery case: this ticket already starts in Review. Inspect any existing \
+             docs/active/work/{ticket_id}/review.md and the committed ticket-owned changes, then immediately \
+             write a current-attempt review.md and review-disposition.json under {}/. Do not wait for a timeout, \
+             redo earlier phases, or change source unless that Review finds a real defect.",
+            artifact_dir.display(),
+        )
+    } else {
+        String::new()
+    };
     format!(
         "Read the ticket at {path}, {context}, and docs/knowledge/rdspi-workflow.md. \
          Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
@@ -122,13 +131,14 @@ pub(crate) fn ticket_prompt(
          or {block_json} with a non-empty actionable reason when it is blocked. Both Review artifacts are required. \
          After Review is complete, \
          remain on this ticket and stop. Do not start another ticket until Lisa confirms the completion commit; \
-         Lisa handles Done publication and seat release.",
+         Lisa handles Done publication and seat release.{review_recovery}",
         path = ticket_path.display(),
         context = context_file,
         id = ticket_id,
         artifact_dir = artifact_dir.display(),
         pass_json = r#"{"disposition":"pass","reason":null}"#,
         block_json = r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#,
+        review_recovery = review_recovery,
     )
 }
 
@@ -8246,6 +8256,29 @@ mod tests {
 
         assert!(prompt.contains("T-024-03-descriptive-title.md"));
         assert!(!prompt.contains("tickets/T-024-03.md"));
+        assert!(!prompt.contains("Recovery case:"));
+    }
+
+    #[test]
+    fn review_startup_prompt_recovers_missing_disposition_without_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("tickets");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        std::fs::write(
+            ticket_dir.join("T-RECOVER.md"),
+            "---\nid: T-RECOVER\ntitle: recover-review\ntype: bug\nstatus: open\npriority: critical\nphase: review\n---\n",
+        )
+        .unwrap();
+        let artifact_dir = Path::new(".lisa/attempts/T-RECOVER/2/work");
+
+        let prompt = ticket_prompt(&ticket_dir, "T-RECOVER", "AGENTS.md", artifact_dir);
+
+        assert!(prompt.contains("Recovery case: this ticket already starts in Review"));
+        assert!(prompt.contains("docs/active/work/T-RECOVER/review.md"));
+        assert!(prompt.contains("immediately write a current-attempt review.md"));
+        assert!(prompt.contains("review-disposition.json"));
+        assert!(prompt.contains("Do not wait for a timeout"));
+        assert!(prompt.contains(".lisa/attempts/T-RECOVER/2/work/"));
     }
 
     #[test]
