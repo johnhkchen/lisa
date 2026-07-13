@@ -37,13 +37,31 @@ pub(crate) const LEGACY_ON_IDLE_HOOKS: &[&str] = &[];
 ///
 /// Beyond writing the `.stopped` signal it forwards the Stop payload (piped on
 /// stdin, carrying `transcript_path`) to `lisa capture-usage`, which sums the
-/// session's token usage into the provider-specific usage artifact for the
-/// provenance ledger (T-027-02). Stop fires per *turn*, not per tool call, so the
-/// heartbeat hook stays trivial; the artifact is overwritten each turn with the
-/// cumulative total and read by the plugin only write-after. Capture is
-/// best-effort — `${LISA_BIN:-lisa}` degrades to a PATH lookup and any failure is
-/// swallowed, leaving tokens null (never fabricated).
+/// session's token usage into the provider-specific append-only capture ledger.
+/// Stop fires per *turn*, not per tool call, so the heartbeat hook stays trivial.
+/// Stops without observable transcript usage append a no-capture marker, while
+/// malformed identity or persistence errors remain visible to the operator.
 pub const ON_STOP_HOOK: &str = r#"#!/bin/sh
+# Lisa stop signal hook — called when the native agent finishes responding.
+# Writes a signal file so the plugin knows the pane is ready for input, and
+# captures session token usage for the provenance ledger (T-027-02).
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
+fi
+
+# Forward the Stop payload (stdin: includes transcript_path) to the usage
+# capturer. No-capture markers and capture errors remain visible to operators.
+in=$(cat)
+printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage
+"#;
+
+/// Exact prior Stop-hook generations eligible for safe `lisa init` upgrades.
+pub(crate) const LEGACY_ON_STOP_HOOKS: &[&str] = &[
+    r#"#!/bin/sh
 # Lisa stop signal hook — called when the native agent finishes responding.
 # Writes a signal file so the plugin knows the pane is ready for input, and
 # captures session token usage for the provenance ledger (T-027-02).
@@ -59,10 +77,8 @@ fi
 # capturer. Best-effort: never fail the session if lisa is absent.
 in=$(cat)
 printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage 2>/dev/null || true
-"#;
-
-/// Stop hook shipped by Lisa v0.3 before token-usage capture was added.
-pub(crate) const LEGACY_ON_STOP_HOOKS: &[&str] = &[r#"#!/bin/sh
+"#,
+    r#"#!/bin/sh
 # Lisa stop signal hook — called by Claude Code when it finishes responding.
 # Writes a signal file so the plugin knows the pane is ready for input.
 
@@ -72,7 +88,8 @@ mkdir -p "$SIGNAL_DIR"
 if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
 fi
-"#];
+"#,
+];
 
 /// The on-clear hook script, called by the native client's SessionStart[clear] event.
 /// Fires after /clear is processed (context cleared).
@@ -1298,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_hook_still_writes_stopped_and_captures_usage() {
+    fn stop_hook_writes_stopped_and_keeps_capture_outcomes_visible() {
         // T-027-02: the Stop hook keeps writing the `.stopped` signal and now
         // forwards its stdin payload to `lisa capture-usage`.
         assert!(ON_STOP_HOOK.contains("pane-$LISA_PANE_ID.stopped"));
@@ -1306,6 +1323,14 @@ mod tests {
         assert!(ON_STOP_HOOK.contains("${LISA_BIN:-lisa}"));
         // Reads stdin once (the Stop payload carries transcript_path).
         assert!(ON_STOP_HOOK.contains("in=$(cat)"));
+        assert!(!ON_STOP_HOOK.contains("2>/dev/null"));
+        assert!(!ON_STOP_HOOK.contains("|| true"));
+
+        let live_hook = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.lisa/hooks/on-stop.sh"),
+        )
+        .unwrap();
+        assert_eq!(live_hook, ON_STOP_HOOK);
     }
 
     #[test]

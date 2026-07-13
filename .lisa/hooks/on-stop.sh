@@ -11,6 +11,6 @@ if [ -n "$LISA_PANE_ID" ]; then
 fi
 
 # Forward the Stop payload (stdin: includes transcript_path) to the usage
-# capturer. Best-effort: never fail the session if lisa is absent.
+# capturer. No-capture markers and capture errors remain visible to operators.
 in=$(cat)
-printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage 2>/dev/null || true
+printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage

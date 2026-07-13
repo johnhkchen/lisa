@@ -18,6 +18,13 @@ The flow is one-directional: **shell hooks write signals, the plugin consumes th
 The plugin never writes signal files. Signal files are ephemeral — `.lisa/signals/` is
 gitignored.
 
+The Stop hook also forwards its lifecycle payload to `lisa capture-usage`. Successful
+transcript observations append to `.lisa/<client>/captures.jsonl`. If an identified
+Stop has a missing, unreadable, or empty transcript, Lisa instead appends a durable row
+to `.lisa/<client>/no-captures.jsonl` carrying the pane, provider session, capture time,
+and reason. The hook leaves Lisa's stderr and exit status visible, so malformed identity
+or a failure to persist either outcome is not silently discarded.
+
 ## The five lifecycle hooks
 
 `lisa init` scaffolds these five executable scripts into `.lisa/hooks/`. Claude
