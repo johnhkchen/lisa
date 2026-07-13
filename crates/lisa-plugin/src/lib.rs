@@ -11,6 +11,7 @@ mod deadline;
 mod ownership;
 mod pane_name;
 mod publication;
+mod quarantine;
 mod signal;
 mod ui;
 
