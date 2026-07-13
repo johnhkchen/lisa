@@ -29,7 +29,11 @@ use deadline::{
 use lisa_core::client::AgentClient;
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
-use lisa_core::provenance::{self, ProvenanceRecord, Route, RunOutcome};
+use lisa_core::disposition::{parse_review_disposition, ReviewDisposition};
+use lisa_core::provenance::{
+    self, AssignmentState, AssignmentTransitionRecord, ProvenanceRecord, ProvenanceRecordType,
+    Route, RunOutcome,
+};
 use lisa_core::ticket;
 use lisa_core::types::{
     ActivityEvent, AttemptLease, Phase, PluginConfig, Thread, TicketId, TicketStatus,
@@ -1102,6 +1106,68 @@ impl State {
         Ok((argv, context))
     }
 
+    /// Admit and validate the current attempt's explicit Review outcome before
+    /// entering the completion transaction.
+    fn request_review_completion(
+        &mut self,
+        ticket_id: TicketId,
+        source: CompletionSource,
+        source_lease: Option<AttemptLease>,
+    ) -> bool {
+        const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
+
+        match self.admit_artifact(
+            &ticket_id,
+            source_lease.as_ref(),
+            DISPOSITION_ARTIFACT,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Completion refused for {ticket_id}: missing required {DISPOSITION_ARTIFACT}"
+                    ),
+                });
+                return false;
+            }
+            Err(reason) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Completion refused for {ticket_id}: could not admit {DISPOSITION_ARTIFACT}: {reason}"
+                    ),
+                });
+                return false;
+            }
+        }
+
+        let disposition_path = self
+            .config
+            .work_dir
+            .join(&ticket_id)
+            .join(DISPOSITION_ARTIFACT);
+        match parse_review_disposition(disposition_path) {
+            ReviewDisposition::Pass => self.request_completion(
+                ticket_id,
+                source,
+                source_lease.map(CompletionAuthority::Attempt),
+            ),
+            ReviewDisposition::Block { reason } => {
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!("Completion blocked for {ticket_id}: {reason}"),
+                });
+                false
+            }
+            ReviewDisposition::Invalid { reason } => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Completion refused for {ticket_id}: invalid review disposition: {reason}"
+                    ),
+                });
+                false
+            }
+        }
+    }
+
     /// Enter the single commit-gated completion state machine.
     fn request_completion(
         &mut self,
@@ -1721,6 +1787,12 @@ impl State {
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
             thread.fail();
         }
+        self.emit_assignment_transition(
+            pane_id,
+            &ticket_id,
+            AssignmentState::DeliveryFailed,
+            reason,
+        );
         if !self
             .error_alerts
             .iter()
@@ -1778,6 +1850,12 @@ impl State {
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
             thread.fail();
         }
+        self.emit_assignment_transition(
+            pane_id,
+            &ticket_id,
+            AssignmentState::RecoveryFailed,
+            reason,
+        );
         if !self
             .error_alerts
             .iter()
@@ -2099,6 +2177,12 @@ impl State {
         if let Some(thread) = self.threads.get_mut(&ticket_id) {
             thread.fail();
         }
+        self.emit_assignment_transition(
+            pane_id,
+            &ticket_id,
+            AssignmentState::StartupFailed,
+            reason,
+        );
         if !self
             .error_alerts
             .iter()
@@ -3102,10 +3186,10 @@ impl State {
                 };
 
                 if next_phase == Phase::Done {
-                    self.request_completion(
+                    self.request_review_completion(
                         ticket_id.clone(),
                         CompletionSource::Artifact,
-                        source_lease.map(CompletionAuthority::Attempt),
+                        source_lease,
                     );
                     continue;
                 }
@@ -3385,10 +3469,10 @@ impl State {
                         self.admit_artifact(&ticket_id, source_lease.as_ref(), "review.md"),
                         Ok(true)
                     ) {
-                        self.request_completion(
+                        self.request_review_completion(
                             ticket_id.clone(),
                             CompletionSource::Idle,
-                            source_lease.map(CompletionAuthority::Attempt),
+                            source_lease,
                         );
                     }
                 }
@@ -3429,10 +3513,10 @@ impl State {
                                 .threads
                                 .get(&ticket_id)
                                 .and_then(|thread| thread.attempt_lease.clone());
-                            self.request_completion(
+                            self.request_review_completion(
                                 ticket_id.clone(),
                                 CompletionSource::Idle,
-                                source_lease.map(CompletionAuthority::Attempt),
+                                source_lease,
                             );
                             continue;
                         }
@@ -3674,11 +3758,75 @@ impl State {
                 slot.pane_id == pane_id && slot.ticket_id.as_deref() == Some(ticket_id.as_str())
             })
             .and_then(|slot| slot.attempt_lease.clone());
-        self.request_completion(
+        self.request_review_completion(
             ticket_id,
             CompletionSource::Stopped(pane_id),
-            source_lease.map(CompletionAuthority::Attempt),
+            source_lease,
         );
+    }
+
+    /// Append one attempt-scoped transition that failed before provider
+    /// ownership. The terminal assignment-state guard at each caller is the
+    /// exact-once boundary; this method only validates and persists evidence.
+    fn emit_assignment_transition(
+        &mut self,
+        pane_id: u32,
+        ticket_id: &str,
+        state: AssignmentState,
+        reason: &str,
+    ) -> bool {
+        if self.ledger_path.as_os_str().is_empty() {
+            return false;
+        }
+        let evidence = self
+            .agent_slots
+            .iter()
+            .find(|slot| slot.pane_id == pane_id && slot.ticket_id.as_deref() == Some(ticket_id))
+            .and_then(|slot| slot.attempt_lease.clone())
+            .and_then(|attempt_lease| {
+                let thread = self.threads.get(ticket_id)?;
+                (attempt_lease.ticket_id == ticket_id
+                    && thread.pane_id == pane_id
+                    && thread.attempt_lease.as_ref() == Some(&attempt_lease))
+                .then_some((attempt_lease, thread.client, thread.started_at))
+            });
+        let Some((attempt_lease, client, started_at)) = evidence else {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "assignment-transition provenance rejected for {} on pane {}: matching attempt evidence is missing or inconsistent",
+                    ticket_id, pane_id
+                ),
+            });
+            return false;
+        };
+
+        let started = provenance::system_time_to_epoch(started_at);
+        let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
+        let record = AssignmentTransitionRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            record_type: ProvenanceRecordType::AssignmentTransition,
+            ticket_id: ticket_id.to_string(),
+            attempt_lease,
+            pane_id,
+            provider: Route::from_client(client).provider,
+            state,
+            reason: reason.to_string(),
+            started_at: started,
+            ended_at: ended,
+            wall_clock_secs: ended.saturating_sub(started),
+        };
+        if let Err(error) =
+            provenance::append_assignment_transition_record(&self.ledger_path, &record)
+        {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "assignment-transition provenance write failed for {}: {}",
+                    ticket_id, error
+                ),
+            });
+            return false;
+        }
+        true
     }
 
     /// Append one provenance record for a finishing ticket-run (T-027-01).
@@ -11095,10 +11243,18 @@ mod tests {
         );
         assert!(!state.agent_slots[0].has_session);
         assert!(state.threads.contains_key("T-NAME"));
-        assert!(
-            !state.ledger_path.exists(),
-            "retained failures emit no provenance"
-        );
+        let records = read_mixed_ledger(&state.ledger_path);
+        assert_eq!(records.len(), 1, "one retained recovery failure row");
+        assert!(matches!(
+            &records[0],
+            lisa_core::provenance::ProvenanceLedgerRecord::AssignmentTransition(record)
+                if record.ticket_id == "T-NAME"
+                    && record.attempt_lease == successor
+                    && record.pane_id == 10
+                    && record.provider == "openai"
+                    && record.state == lisa_core::provenance::AssignmentState::RecoveryFailed
+                    && record.reason == "fresh Codex session did not acknowledge before the deadline"
+        ));
         assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
 
         assert!(state
@@ -11113,6 +11269,11 @@ mod tests {
         );
         assert_eq!(state.current_leases.get("T-NAME"), Some(&successor));
         assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
+        assert_eq!(
+            read_mixed_ledger(&state.ledger_path).len(),
+            1,
+            "terminal recovery state cannot append duplicate evidence"
+        );
     }
 
     #[test]
@@ -14711,6 +14872,185 @@ owned\n\
             .lines()
             .map(|l| serde_json::from_str(l).expect("ledger line parses"))
             .collect()
+    }
+
+    fn read_mixed_ledger(
+        path: &std::path::Path,
+    ) -> Vec<lisa_core::provenance::ProvenanceLedgerRecord> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("mixed ledger line parses"))
+            .collect()
+    }
+
+    fn preownership_failure_state(
+        seat: SeatAssignmentState,
+        client: AgentClient,
+    ) -> (State, tempfile::TempDir, AttemptLease, std::path::PathBuf) {
+        use lisa_core::types::Thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 10,
+            ticket_id: Some("T-NAME".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(client),
+        });
+        let mut thread = Thread::new("T-NAME", 10);
+        thread.client = client;
+        thread.started_at = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(3))
+            .unwrap();
+        state.threads.insert("T-NAME".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-NAME");
+        state.seat_assignments.insert(10, seat);
+        let ledger = with_ledger(&mut state, &dir);
+        (state, dir, lease, ledger)
+    }
+
+    #[test]
+    fn preownership_terminal_transitions_append_once_and_coexist_with_later_done() {
+        use lisa_core::provenance::{
+            AssignmentState, ProvenanceLedgerRecord, ProvenanceRecordType,
+        };
+
+        let deadline = std::time::SystemTime::now();
+
+        let (mut delivery, _delivery_dir, delivery_lease, delivery_ledger) =
+            preownership_failure_state(
+                SeatAssignmentState::Delivering {
+                    generation: 1,
+                    ack_deadline: deadline,
+                    retries: MAX_ASSIGNMENT_DELIVERY_RETRIES,
+                },
+                AgentClient::Claude,
+            );
+        assert!(delivery
+            .fail_assignment_delivery(10, "delivery evidence")
+            .is_some());
+        assert_eq!(
+            delivery.fail_assignment_delivery(10, "duplicate delivery"),
+            None
+        );
+        assert!(
+            delivery_ledger.exists(),
+            "delivery ledger missing: {:?}",
+            delivery.activity_log
+        );
+
+        let (mut recovery, _recovery_dir, recovery_lease, recovery_ledger) =
+            preownership_failure_state(
+                SeatAssignmentState::Recovering {
+                    generation: 1,
+                    ack_deadline: Some(deadline),
+                },
+                AgentClient::Codex,
+            );
+        assert!(recovery
+            .fail_assignment_recovery(10, "recovery evidence")
+            .is_some());
+        assert_eq!(
+            recovery.fail_assignment_recovery(10, "duplicate recovery"),
+            None
+        );
+        assert!(
+            recovery_ledger.exists(),
+            "recovery ledger missing: {:?}",
+            recovery.activity_log
+        );
+
+        let (mut startup, _startup_dir, startup_lease, startup_ledger) = preownership_failure_state(
+            SeatAssignmentState::Starting {
+                generation: 1,
+                start_deadline: Some(deadline),
+                relaunches: 0,
+            },
+            AgentClient::Codex,
+        );
+        assert!(startup.fail_startup(10, "startup evidence").is_some());
+        assert_eq!(startup.fail_startup(10, "duplicate startup"), None);
+        assert!(
+            startup_ledger.exists(),
+            "startup ledger missing: {:?}",
+            startup.activity_log
+        );
+
+        let cases = [
+            (
+                &delivery_ledger,
+                delivery_lease.clone(),
+                "anthropic",
+                AssignmentState::DeliveryFailed,
+                "delivery evidence",
+            ),
+            (
+                &recovery_ledger,
+                recovery_lease,
+                "openai",
+                AssignmentState::RecoveryFailed,
+                "recovery evidence",
+            ),
+            (
+                &startup_ledger,
+                startup_lease,
+                "openai",
+                AssignmentState::StartupFailed,
+                "startup evidence",
+            ),
+        ];
+        for (ledger, lease, provider, expected_state, reason) in cases {
+            let raw = std::fs::read_to_string(ledger).unwrap();
+            assert_eq!(raw.lines().count(), 1, "terminal edge appends exactly once");
+            let value: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+            assert!(value.get("authoritative").is_none());
+            assert!(value.get("outcome").is_none());
+
+            let records = read_mixed_ledger(ledger);
+            let ProvenanceLedgerRecord::AssignmentTransition(record) = &records[0] else {
+                panic!("pre-ownership failure must use the assignment row shape");
+            };
+            assert_eq!(record.schema_version, lisa_core::provenance::SCHEMA_VERSION);
+            assert_eq!(
+                record.record_type,
+                ProvenanceRecordType::AssignmentTransition
+            );
+            assert_eq!(record.ticket_id, "T-NAME");
+            assert_eq!(record.attempt_lease, lease);
+            assert_eq!(record.pane_id, 10);
+            assert_eq!(record.provider, provider);
+            assert_eq!(record.state, expected_state);
+            assert_eq!(record.reason, reason);
+            assert!(record.ended_at >= record.started_at);
+            assert_eq!(
+                record.wall_clock_secs,
+                record.ended_at.saturating_sub(record.started_at)
+            );
+        }
+
+        let later_lease = install_current_attempt(&mut delivery, "T-NAME");
+        assert!(delivery.emit_provenance("T-NAME", RunOutcome::Done, false));
+        let records = read_mixed_ledger(&delivery_ledger);
+        assert_eq!(records.len(), 2, "later terminal evidence appends");
+        assert!(matches!(
+            &records[0],
+            ProvenanceLedgerRecord::AssignmentTransition(record)
+                if record.attempt_lease == delivery_lease
+                    && record.state == AssignmentState::DeliveryFailed
+        ));
+        assert!(matches!(
+            &records[1],
+            ProvenanceLedgerRecord::Execution(record)
+                if record.attempt_lease == later_lease
+                    && record.outcome == RunOutcome::Done
+                    && record.authoritative
+        ));
     }
 
     /// AC: a record is emitted on terminal failure (`.error` reclaim), driven
