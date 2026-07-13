@@ -145,8 +145,9 @@ pub(crate) enum ReadinessMode {
 /// and ACP fit this shape without redesign, and for the WASM constraint that
 /// makes every method return a description rather than perform I/O.
 pub(crate) trait AgentAdapter {
-    /// Bare command to launch a fresh session in an empty pane.
-    fn launch_command(&self, ctx: &SpawnContext) -> String;
+    /// Bare command to launch a fresh session in an empty pane against an
+    /// already-published, pane-addressable assignment file.
+    fn launch_command(&self, ctx: &SpawnContext, assignment_path: &Path) -> String;
 
     /// Complete attempt-specific instructions, persisted before a fresh launch
     /// and typed directly only when reusing an established session.
@@ -242,7 +243,7 @@ impl ClaudeCodeAdapter {
 }
 
 impl AgentAdapter for ClaudeCodeAdapter {
-    fn launch_command(&self, ctx: &SpawnContext) -> String {
+    fn launch_command(&self, ctx: &SpawnContext, _assignment_path: &Path) -> String {
         build_claude_command(
             ctx.ticket_id,
             ctx.pane_id,
@@ -287,9 +288,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
 /// Lisa-generated Codex hooks provide liveness, stop, startup, and exact prompt
 /// acknowledgment signals. A completed Codex TUI is exited and freshly
 /// launched for the next ticket: this avoids making unattended delivery depend
-/// on the version-sensitive interactive `/clear` hook. The new process still
-/// receives its assignment only after the provider-aware startup grace and
-/// becomes owned only after the tagged `UserPromptSubmit` acknowledgment.
+/// on the version-sensitive interactive `/clear` hook. The new process receives
+/// only the exact immutable assignment path through Lisa's native launcher; the
+/// full body never crosses Zellij's pane-input boundary. Delivery and ownership
+/// remain distinct scheduler facts.
 /// `--dangerously-bypass-hook-trust` is scoped to this invocation because lisa
 /// generated the hook definitions. Agent command execution uses Codex's
 /// full-access/no-approval mode, matching the existing Claude
@@ -317,8 +319,8 @@ impl CodexAdapter {
         }
     }
 
-    /// The ` --model <m>` fragment for the interactive Codex line, or empty when
-    /// no model is routed.
+    /// The ` --model <m>` fragment for the native Lisa launcher line, or empty
+    /// when no model is routed.
     fn model_flag(&self) -> String {
         match &self.model {
             Some(m) => format!(" --model {}", shell_quote(m)),
@@ -342,15 +344,15 @@ impl CodexAdapter {
         }
     }
 
-    /// The full interactive shell line for a fresh Codex TUI. The env prefix
-    /// gives lifecycle hooks pane/ticket attribution and tells `capture-usage`
-    /// to parse the Codex transcript into `.lisa/codex/`. Assignment text is
-    /// deliberately absent and arrives through chat only after SessionStart.
-    fn interactive_line(&self, ctx: &SpawnContext) -> String {
+    /// The full native launcher line for a fresh Codex TUI. The env prefix gives
+    /// lifecycle hooks pane/ticket attribution and tells `capture-usage` to
+    /// parse the Codex transcript into `.lisa/codex/`. Only the exact immutable
+    /// assignment path crosses this shell boundary; the native launcher builds
+    /// Codex argv without a shell and the assignment body never enters the pane.
+    fn interactive_line(&self, ctx: &SpawnContext, assignment_path: &Path) -> String {
         format!(
             "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} LISA_ATTEMPT_ID={attempt} \
-             codex --dangerously-bypass-approvals-and-sandbox \
-             --dangerously-bypass-hook-trust{model} || \
+             {bin} launch-codex{model} -- {assignment} || \
              {{ mkdir -p .lisa/signals; date -u +%Y-%m-%dT%H:%M:%SZ > \
              .lisa/signals/pane-{pane}.error; }}",
             bin = shell_quote(&self.lisa_bin),
@@ -358,13 +360,14 @@ impl CodexAdapter {
             ticket = shell_quote(ctx.ticket_id),
             attempt = ctx.attempt_id,
             model = self.model_flag(),
+            assignment = shell_quote(&assignment_path.to_string_lossy()),
         )
     }
 }
 
 impl AgentAdapter for CodexAdapter {
-    fn launch_command(&self, ctx: &SpawnContext) -> String {
-        self.interactive_line(ctx)
+    fn launch_command(&self, ctx: &SpawnContext, assignment_path: &Path) -> String {
+        self.interactive_line(ctx, assignment_path)
     }
 
     fn assignment_text(&self, ctx: &SpawnContext) -> String {
@@ -463,6 +466,8 @@ pub(crate) fn resolve_adapter_or_native(
 mod tests {
     use super::*;
 
+    const ASSIGNMENT_PATH: &str = ".lisa/attempts/T-042-01/1/work/assignment-1-8675309.md";
+
     fn spawn_ctx<'a>(dir: &'a Path, id: &'a str, pane: u32) -> SpawnContext<'a> {
         SpawnContext {
             ticket_dir: dir,
@@ -479,7 +484,7 @@ mod tests {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
-            ClaudeCodeAdapter::default().launch_command(&ctx),
+            ClaudeCodeAdapter::default().launch_command(&ctx, Path::new(ASSIGNMENT_PATH)),
             build_claude_command("T-042-01", 7, 1, None, None)
         );
     }
@@ -488,7 +493,8 @@ mod tests {
     fn native_launch_with_model_maps_flag() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
-        let cmd = ClaudeCodeAdapter::new(Some("opus"), None).launch_command(&ctx);
+        let cmd = ClaudeCodeAdapter::new(Some("opus"), None)
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(cmd.contains("--model 'opus'"), "got: {cmd}");
         assert_eq!(
             cmd,
@@ -502,12 +508,14 @@ mod tests {
         // capture-usage is reachable; without one the launch line is unchanged.
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
-        let with_bin = ClaudeCodeAdapter::new(None, Some("/abs/lisa")).launch_command(&ctx);
+        let with_bin = ClaudeCodeAdapter::new(None, Some("/abs/lisa"))
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(
             with_bin.starts_with("LISA_BIN='/abs/lisa' LISA_PANE_ID=7"),
             "got: {with_bin}"
         );
-        let without = ClaudeCodeAdapter::new(None, None).launch_command(&ctx);
+        let without =
+            ClaudeCodeAdapter::new(None, None).launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(!without.contains("LISA_BIN="), "got: {without}");
         assert!(without.starts_with("LISA_PANE_ID=7"), "got: {without}");
     }
@@ -615,8 +623,11 @@ mod tests {
         let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, Some("/abs/lisa"));
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert!(adapter
-            .launch_command(&spawn_ctx(Path::new("docs/active/tickets"), "T-003", 1))
-            .contains(" codex "));
+            .launch_command(
+                &spawn_ctx(Path::new("docs/active/tickets"), "T-003", 1),
+                Path::new(ASSIGNMENT_PATH),
+            )
+            .contains(" launch-codex "));
         assert_eq!(route.agent, AgentClient::Codex);
         assert!(!route.substituted);
     }
@@ -653,7 +664,8 @@ mod tests {
 
         // The model flows into the launched command for the Codex pane.
         let dir = Path::new("docs/active/tickets");
-        let cmd_a = adapter_a.launch_command(&spawn_ctx(dir, "T-005", 1));
+        let cmd_a =
+            adapter_a.launch_command(&spawn_ctx(dir, "T-005", 1), Path::new(ASSIGNMENT_PATH));
         assert!(cmd_a.contains("--model 'gpt-5'"), "got: {cmd_a}");
     }
 
@@ -663,12 +675,13 @@ mod tests {
     fn codex_launch_command_shape() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
-        let cmd = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
+        let cmd = CodexAdapter::new(Some("/abs/lisa"), None)
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(cmd.starts_with(
-            "LISA_BIN='/abs/lisa' LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 codex "
+            "LISA_BIN='/abs/lisa' LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 '/abs/lisa' launch-codex -- "
         ));
-        assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(cmd.contains("--dangerously-bypass-hook-trust"));
+        assert!(cmd.contains(&shell_quote(ASSIGNMENT_PATH)));
+        assert!(!cmd.contains("codex --dangerously-bypass"));
         assert!(cmd.contains(".lisa/signals/pane-7.error"));
         assert!(!cmd.contains("Read the ticket"));
         assert!(!cmd.contains("AGENTS.md"));
@@ -676,19 +689,23 @@ mod tests {
     }
 
     #[test]
-    fn provider_assignment_text_uses_its_context_file_while_launch_is_bare() {
+    fn provider_assignment_text_uses_its_context_file_while_launch_is_path_only() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 1);
 
         let codex = CodexAdapter::new(Some("/abs/lisa"), None);
         assert!(codex.assignment_text(&ctx).contains("AGENTS.md"));
         assert!(!codex.assignment_text(&ctx).contains("CLAUDE.md"));
-        assert!(!codex.launch_command(&ctx).contains("AGENTS.md"));
+        assert!(!codex
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH))
+            .contains("AGENTS.md"));
 
         let claude = ClaudeCodeAdapter::default();
         assert!(claude.assignment_text(&ctx).contains("CLAUDE.md"));
         assert!(!claude.assignment_text(&ctx).contains("AGENTS.md"));
-        assert!(!claude.launch_command(&ctx).contains("CLAUDE.md"));
+        assert!(!claude
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH))
+            .contains("CLAUDE.md"));
     }
 
     #[test]
@@ -696,10 +713,18 @@ mod tests {
         // A routed model (T-026-01) is forwarded to the interactive CLI.
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
-        let cmd = CodexAdapter::new(Some("/abs/lisa"), Some("gpt-5")).launch_command(&ctx);
-        assert!(cmd.contains("--model 'gpt-5' ||"), "got: {cmd}");
+        let cmd = CodexAdapter::new(Some("/abs/lisa"), Some("gpt-5"))
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
+        assert!(
+            cmd.contains(&format!(
+                "--model 'gpt-5' -- {} ||",
+                shell_quote(ASSIGNMENT_PATH)
+            )),
+            "got: {cmd}"
+        );
         // No model → no flag (pre-routing wrapper line).
-        let bare = CodexAdapter::new(Some("/abs/lisa"), None).launch_command(&ctx);
+        let bare = CodexAdapter::new(Some("/abs/lisa"), None)
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(!bare.contains("--model"), "got: {bare}");
     }
 
@@ -730,7 +755,7 @@ mod tests {
         let reuse = adapter.reuse_prompt(&ctx);
         assert!(reuse.contains(r#"LISA_ASSIGNMENT {"ticket_id":"T-042-01","generation":17}"#));
 
-        let launch = adapter.launch_command(&ctx);
+        let launch = adapter.launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(!launch.contains("LISA_ASSIGNMENT"));
         let reference = adapter.assignment_reference(
             &ctx,
@@ -801,8 +826,9 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-001", 1);
         // None and empty both degrade to a PATH-resolved `lisa` for hooks.
         for bin in [None, Some("")] {
-            let cmd = CodexAdapter::new(bin, None).launch_command(&ctx);
+            let cmd = CodexAdapter::new(bin, None).launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
             assert!(cmd.starts_with("LISA_BIN='lisa' "), "cmd: {cmd}");
+            assert!(cmd.contains(" 'lisa' launch-codex -- "), "cmd: {cmd}");
         }
     }
 }

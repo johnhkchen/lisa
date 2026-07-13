@@ -3827,8 +3827,8 @@ impl State {
             };
 
             // Persist the complete instructions before any provider lifecycle
-            // input. Fresh launch scripts are deliberately bare; exact
-            // SessionStart later unlocks only a bounded reference to this file.
+            // input. A fresh Codex script receives only this file's exact path;
+            // Claude remains bare and waits for its established delivery path.
             let assignment_text = adapter.assignment_text(&ctx);
             let assignment_ref = match self.prepare_assignment(
                 &attempt_artifact_dir,
@@ -5375,9 +5375,9 @@ impl State {
                 slot.last_activity_at = Some(now);
             }
             if let Some(generation) = recovery_generation {
-                // The one fresh fallback is also a bare provider launch. It must
-                // prove process readiness and receive the bounded chat reference
-                // before its successor attempt can become owned.
+                // The one fresh fallback carries the successor's exact assignment
+                // path through the same launcher. Process readiness and ownership
+                // evidence remain independently gated.
                 self.seat_assignments.insert(
                     pane_id,
                     SeatAssignmentState::Starting {
@@ -12570,6 +12570,103 @@ mod tests {
             .collect();
         active.sort();
         active
+    }
+
+    #[test]
+    fn codex_stub_panes_receive_only_fresh_per_ticket_launcher_lines() {
+        let (mut state, _dir) = consecutive_reuse_state(AgentClient::Codex, "T-LAUNCH", &[10, 11]);
+        state.config.lisa_bin = Some("/fixture path/lisa'bin".to_string());
+        for slot in &mut state.agent_slots {
+            slot.has_session = false;
+            slot.last_client = None;
+        }
+
+        // Native tests link no-op Zellij host calls. Scheduling still crosses
+        // the production send_line_to_pane boundary and queues each deferred
+        // Enter, making these two empty slots deterministic stub panes.
+        state.schedule_ready_tickets();
+
+        let active = active_ticket_panes(&state);
+        assert_eq!(active.len(), 2, "both empty stub panes receive a ticket");
+        assert_eq!(
+            state.pending_enters.len(),
+            2,
+            "one actual pane submission is queued per fresh TUI"
+        );
+
+        let mut assignment_paths = std::collections::HashSet::new();
+        let mut launch_paths = std::collections::HashSet::new();
+        for (ticket_id, pane_id) in active {
+            let lease = state.current_leases[&ticket_id].clone();
+            let assignment_ref = &state.assignment_refs[&ticket_id];
+            assert_eq!(assignment_ref.lease, lease);
+            assert!(assignment_paths.insert(assignment_ref.path.clone()));
+
+            let assignment_body = std::fs::read_to_string(&assignment_ref.path).unwrap();
+            assert!(assignment_body.contains("Read the ticket"));
+            assert!(assignment_body.contains("AGENTS.md"));
+
+            let launch_path = state
+                .attempt_work_dir(&lease)
+                .join(format!(".lisa-launch-{pane_id}.sh"));
+            assert!(launch_paths.insert(launch_path.clone()));
+            let launch_script = std::fs::read_to_string(&launch_path).unwrap();
+            let pane_assignment_path = strip_host_prefix(&assignment_ref.path);
+
+            assert!(
+                launch_script.contains("'/fixture path/lisa'\"'\"'bin' launch-codex"),
+                "script invokes the resolved Lisa launcher: {launch_script}"
+            );
+            assert!(launch_script.contains(&format!(
+                " -- {} ||",
+                shell_quote(&pane_assignment_path.to_string_lossy())
+            )));
+            assert!(!launch_script.contains("Read the ticket"));
+            assert!(!launch_script.contains("AGENTS.md"));
+            assert!(!launch_script.contains(" codex --dangerously"));
+
+            let pane_line = state
+                .activity_log
+                .iter()
+                .find_map(|event| match event {
+                    ActivityEvent::SessionLaunch {
+                        ticket_id: launched_ticket,
+                        pane_id: launched_pane,
+                        command,
+                    } if launched_ticket == &ticket_id && launched_pane == &pane_id => {
+                        Some(command)
+                    }
+                    _ => None,
+                })
+                .expect("fresh dispatch records its exact pane line");
+            assert_eq!(
+                pane_line,
+                &format!(
+                    "sh {}",
+                    shell_quote(&strip_host_prefix(&launch_path).to_string_lossy())
+                )
+            );
+            assert!(!pane_line.contains("Read the ticket"));
+            assert!(!pane_line.contains("AGENTS.md"));
+            assert!(!pane_line.contains("launch-codex"));
+
+            let slot = state
+                .agent_slots
+                .iter()
+                .find(|slot| slot.pane_id == pane_id)
+                .unwrap();
+            assert!(slot.has_session, "launcher starts a fresh resident TUI");
+            assert_eq!(slot.last_client, Some(AgentClient::Codex));
+            assert_eq!(slot.transition_state, TransitionState::Idle);
+            assert!(matches!(
+                state.seat_assignment(pane_id),
+                Some(SeatAssignmentState::Starting { generation, .. })
+                    if generation == lease.attempt_id
+            ));
+        }
+
+        assert_eq!(assignment_paths.len(), 2);
+        assert_eq!(launch_paths.len(), 2);
     }
 
     fn acknowledge_assignment(
