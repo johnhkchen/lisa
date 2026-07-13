@@ -8,6 +8,7 @@ mod adapter;
 mod codex_ack;
 mod completion_journal;
 mod deadline;
+mod ownership;
 mod pane_name;
 mod publication;
 mod signal;
