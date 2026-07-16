@@ -51,13 +51,28 @@ jobs:
           git tag --annotate "$TAG" --message "Release $TAG"
           git push origin "$TAG"
 
-      - name: Start the tagged cargo-dist release
+      - name: Start the tagged cargo-dist release when idle
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "$TAG already has a GitHub release; not dispatching a duplicate."
+            exit 0
+          fi
+
+          tag_commit="$(git rev-list -n 1 "$TAG")"
+          active_run="$(
+            gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow release.yml \
+              --commit "$tag_commit" \
+              --limit 20 \
+              --json databaseId,status,url \
+              --jq 'map(select(.status != "completed")) | first // empty'
+          )"
+          if [[ -n "$active_run" ]]; then
+            echo "$TAG already has an active release run; not dispatching a duplicate: $active_run"
             exit 0
           fi
 
