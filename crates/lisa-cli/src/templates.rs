@@ -225,10 +225,17 @@ pub const LISA_GITIGNORE: &str = "signals/\nattempts/\nclaude/\ncodex/\n";
 ///
 /// Codex auto-loads `AGENTS.md`; Claude Code auto-loads `CLAUDE.md` (codex-client
 /// doc 06 §AGENTS.md). To make the two impossible to drift, `AGENTS.md` carries
-/// no project body of its own — it points at `CLAUDE.md` as the single source of
-/// truth and repeats only the RDSPI workflow reference. A Codex session, told by
-/// its ticket prompt to read `AGENTS.md`, follows the pointer to `CLAUDE.md`.
+/// no project body of its own — it carries Lisa's stable purpose and agent
+/// contract, points at `CLAUDE.md` as the single source of truth, and repeats the
+/// RDSPI workflow reference. A Codex session, told by its ticket prompt to read
+/// `AGENTS.md`, follows the pointer to `CLAUDE.md`.
 pub const AGENTS_MD: &str = "# AGENTS.md\n\
+\n\
+Lisa runs coding agents like Claude Code and Codex through your ticket board, so \
+you don't have to approve every step by hand.\n\
+\n\
+Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable \
+record, and wait for Lisa to confirm completion.\n\
 \n\
 This project's agent context lives in [CLAUDE.md](CLAUDE.md) — the single source \
 of truth for every agent client (Claude Code reads `CLAUDE.md`; Codex reads this \
@@ -712,6 +719,10 @@ pub fn generate_claude_md(project: &DetectedProject) -> String {
     format!(
         r#"# CLAUDE.md
 
+Lisa runs coding agents like Claude Code and Codex through your ticket board, so you don't have to approve every step by hand.
+
+Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable record, and wait for Lisa to confirm completion.
+
 ## Project
 
 {name} ({type_label}) — TODO: add a one-line project description here.
@@ -803,6 +814,35 @@ mod tests {
         assert!(result.contains("lib.rs"));
         assert!(result.contains("docs/active/tickets/"));
         assert!(result.contains("docs/knowledge/rdspi-workflow.md"));
+    }
+
+    #[test]
+    fn test_generated_agent_context_opens_with_purpose_and_contract() {
+        let project = DetectedProject {
+            project_type: ProjectType::Rust,
+            name: "purpose-first".to_string(),
+            build_command: "cargo build".to_string(),
+            test_command: "cargo test".to_string(),
+            lint_command: "cargo clippy".to_string(),
+            source_layout: "src:\n  main.rs".to_string(),
+        };
+        let purpose = "Lisa runs coding agents like Claude Code and Codex through your ticket board, so you don't have to approve every step by hand.";
+        let contract = "Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable record, and wait for Lisa to confirm completion.";
+        let claude_md = generate_claude_md(&project);
+
+        for (context, heading, later_section) in [
+            (claude_md.as_str(), "# CLAUDE.md", "## Project"),
+            (AGENTS_MD, "# AGENTS.md", "This project's agent context"),
+        ] {
+            let heading_position = context.find(heading).unwrap();
+            let purpose_position = context.find(purpose).unwrap();
+            let contract_position = context.find(contract).unwrap();
+            let later_section_position = context.find(later_section).unwrap();
+
+            assert!(heading_position < purpose_position);
+            assert!(purpose_position < contract_position);
+            assert!(contract_position < later_section_position);
+        }
     }
 
     #[test]
