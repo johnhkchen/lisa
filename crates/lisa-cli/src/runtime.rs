@@ -27,6 +27,9 @@ use sha2::{Digest, Sha256};
 /// SDK family. Managed mode installs this release at [`managed_zellij_path`].
 pub const MANAGED_ZELLIJ_VERSION: ZellijVersion = ZellijVersion::release(0, 43, 1);
 
+/// Companion-package Zellij installed outside PATH by native system packages.
+const PACKAGED_ZELLIJ_PATH: &str = "/usr/libexec/lisa/zellij";
+
 /// Release-pinned archive checksums for Lisa's managed Zellij runtime.
 ///
 /// T-046-02-02 consumes this compile-time manifest while fetching and atomically
@@ -106,6 +109,7 @@ pub enum ZellijRuntimeRequest {
 /// The selected source of a resolved Zellij executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZellijRuntimeMode {
+    Packaged,
     Managed,
     System,
     Pinned,
@@ -114,6 +118,7 @@ pub enum ZellijRuntimeMode {
 impl fmt::Display for ZellijRuntimeMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Packaged => "packaged",
             Self::Managed => "managed",
             Self::System => "system",
             Self::Pinned => "pinned",
@@ -134,6 +139,7 @@ struct RuntimeEnvironment {
     path: Option<OsString>,
     xdg_data_home: Option<OsString>,
     home: Option<OsString>,
+    packaged_zellij: PathBuf,
 }
 
 impl RuntimeEnvironment {
@@ -142,6 +148,7 @@ impl RuntimeEnvironment {
             path: std::env::var_os("PATH"),
             xdg_data_home: std::env::var_os("XDG_DATA_HOME"),
             home: std::env::var_os("HOME"),
+            packaged_zellij: PathBuf::from(PACKAGED_ZELLIJ_PATH),
         }
     }
 }
@@ -549,11 +556,18 @@ fn resolve_zellij_runtime_in(
 ) -> Result<ResolvedZellijRuntime, String> {
     let (mode, path) = match request {
         ZellijRuntimeRequest::Managed => {
-            let path = managed_zellij_path(environment)?;
-            if !is_executable(&path) {
-                ensure_managed_zellij(&path, managed_release()?)?;
+            if is_executable(&environment.packaged_zellij) {
+                (
+                    ZellijRuntimeMode::Packaged,
+                    environment.packaged_zellij.clone(),
+                )
+            } else {
+                let path = managed_zellij_path(environment)?;
+                if !is_executable(&path) {
+                    ensure_managed_zellij(&path, managed_release()?)?;
+                }
+                (ZellijRuntimeMode::Managed, path)
             }
-            (ZellijRuntimeMode::Managed, path)
         }
         ZellijRuntimeRequest::System => {
             (ZellijRuntimeMode::System, find_system_zellij(environment)?)
@@ -742,6 +756,7 @@ mod tests {
             path: path.map(|value| value.as_os_str().to_os_string()),
             xdg_data_home: xdg_data_home.map(|value| value.as_os_str().to_os_string()),
             home: Some(home.as_os_str().to_os_string()),
+            packaged_zellij: home.join("missing-packaged-zellij"),
         }
     }
 
@@ -834,6 +849,27 @@ mod tests {
         assert_eq!(resolved.mode, ZellijRuntimeMode::Managed);
         assert_eq!(resolved.version.to_string(), "0.43.1");
         assert_eq!(resolved.path, managed.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_mode_prefers_packaged_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let packaged = dir.path().join("usr/libexec/lisa/zellij");
+        let data_home = dir.path().join("data");
+        let managed = data_home.join("lisa/runtime/zellij-0.43.1/zellij");
+        let system_dir = dir.path().join("system");
+        write_stub(&packaged, "zellij 0.44.2", 0);
+        write_stub(&managed, "zellij 0.43.1", 0);
+        write_stub(&system_dir.join("zellij"), "zellij 0.43.7", 0);
+        let mut env = environment(dir.path(), Some(&data_home), Some(&system_dir));
+        env.packaged_zellij = packaged.clone();
+
+        let resolved = resolve_zellij_runtime_in(&ZellijRuntimeRequest::Managed, &env).unwrap();
+
+        assert_eq!(resolved.mode, ZellijRuntimeMode::Packaged);
+        assert_eq!(resolved.version.to_string(), "0.44.2");
+        assert_eq!(resolved.path, packaged.canonicalize().unwrap());
     }
 
     #[cfg(unix)]

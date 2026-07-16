@@ -806,6 +806,11 @@ mod tests {
     fn test_runtime_report_names_mode_version_and_path_for_every_mode() {
         for (mode, label, path) in [
             (
+                crate::runtime::ZellijRuntimeMode::Packaged,
+                "packaged",
+                "/usr/libexec/lisa/zellij",
+            ),
+            (
                 crate::runtime::ZellijRuntimeMode::Managed,
                 "managed",
                 "/data/lisa/runtime/zellij-0.43.1/zellij",
