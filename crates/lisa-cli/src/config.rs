@@ -5,6 +5,8 @@ use serde::Deserialize;
 use lisa_core::client::AgentClient;
 use lisa_core::types::PluginConfig;
 
+use crate::runtime::ZellijRuntimeRequest;
+
 /// Top-level .lisa.toml structure.
 #[derive(Debug, Default, Deserialize)]
 pub struct LisaConfig {
@@ -15,6 +17,15 @@ pub struct LisaConfig {
     pub scheduling: SchedulingConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+}
+
+/// Zellij runtime selection (`[runtime]`).
+#[derive(Debug, Default, Deserialize)]
+pub struct RuntimeConfig {
+    /// `managed` (default), `system`, or an absolute executable path.
+    pub zellij: Option<String>,
 }
 
 /// Agent client selection section (`[agent]`).
@@ -69,6 +80,7 @@ pub struct ResolvedConfig {
     pub assignment_ack_timeout_secs: u64,
     pub phase_timeouts: std::collections::HashMap<String, u64>,
     pub client: AgentClient,
+    pub zellij_runtime: ZellijRuntimeRequest,
     /// Resolved per-provider concurrency sub-caps, keyed by raw client name.
     /// Empty when none configured (T-026-02).
     pub provider_caps: std::collections::HashMap<String, usize>,
@@ -89,6 +101,7 @@ impl Default for ResolvedConfig {
             assignment_ack_timeout_secs: PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
+            zellij_runtime: ZellijRuntimeRequest::Managed,
             provider_caps: std::collections::HashMap::new(),
         }
     }
@@ -143,6 +156,11 @@ pub fn resolve_config(
             .clone()
             .unwrap_or_else(|| defaults.project_version.clone()),
         client,
+        zellij_runtime: match config.runtime.zellij.as_deref() {
+            None | Some("managed") => ZellijRuntimeRequest::Managed,
+            Some("system") => ZellijRuntimeRequest::System,
+            Some(path) => ZellijRuntimeRequest::Pinned(path.into()),
+        },
         ticket_dir: config.dirs.tickets.clone().unwrap_or(defaults.ticket_dir),
         story_dir: config.dirs.stories.clone().unwrap_or(defaults.story_dir),
         work_dir: config.dirs.work.clone().unwrap_or(defaults.work_dir),
@@ -186,9 +204,10 @@ pub struct ConfigValidation {
 /// Returns the parsed config plus any warnings about unknown keys.
 /// Returns `Err` for parse failures or invalid values (e.g. max_threads = 0).
 pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
-    let known_top = &["version", "dirs", "scheduling", "agent"];
+    let known_top = &["version", "dirs", "scheduling", "agent", "runtime"];
     let known_dirs = &["tickets", "stories", "work"];
     let known_agent = &["client"];
+    let known_runtime = &["zellij"];
     let known_scheduling = &[
         "max_threads",
         "auto_advance",
@@ -226,6 +245,14 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
             for key in agent.keys() {
                 if !known_agent.contains(&key.as_str()) {
                     warnings.push(format!("Unknown key in [agent]: {}", key));
+                }
+            }
+        }
+
+        if let Some(toml::Value::Table(runtime)) = table.get("runtime") {
+            for key in runtime.keys() {
+                if !known_runtime.contains(&key.as_str()) {
+                    warnings.push(format!("Unknown key in [runtime]: {}", key));
                 }
             }
         }
@@ -284,6 +311,13 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     }
     if let Some(client) = &config.agent.client {
         AgentClient::parse(client)?;
+    }
+    if let Some(zellij) = config.runtime.zellij.as_deref() {
+        if !matches!(zellij, "managed" | "system") && !Path::new(zellij).is_absolute() {
+            return Err(format!(
+                "[runtime].zellij must be `managed`, `system`, or an absolute path (got {zellij:?})"
+            ));
+        }
     }
     // A per-provider cap of 0 would starve that provider forever; reject it with
     // the same "at least 1" contract as max_threads (T-026-02).
@@ -380,6 +414,12 @@ version = "{}"
 tickets = "docs/active/tickets"
 stories = "docs/active/stories"
 work = "docs/active/work"
+
+[runtime]
+# Zellij runtime: "managed" (default), "system" (PATH), or an absolute path.
+# zellij = "managed"
+# zellij = "system"
+# zellij = "/opt/zellij/bin/zellij"
 
 [agent]
 # Which agent client the loop drives (default: claude). Set to "codex" to run
@@ -529,6 +569,52 @@ max_threads = 6
         let config: LisaConfig = toml::from_str(&content).unwrap();
         assert_eq!(config.dirs.tickets, Some("docs/active/tickets".to_string()));
         assert_eq!(config.scheduling.max_threads, Some(2));
+        assert_eq!(
+            resolve_config(&config, None, None).zellij_runtime,
+            ZellijRuntimeRequest::Managed
+        );
+    }
+
+    #[test]
+    fn test_resolve_zellij_runtime_modes_and_precedence() {
+        let default = resolve_config(&LisaConfig::default(), None, None);
+        assert_eq!(default.zellij_runtime, ZellijRuntimeRequest::Managed);
+
+        let managed: LisaConfig = toml::from_str("[runtime]\nzellij = \"managed\"\n").unwrap();
+        assert_eq!(
+            resolve_config(&managed, None, None).zellij_runtime,
+            ZellijRuntimeRequest::Managed
+        );
+
+        let system: LisaConfig = toml::from_str("[runtime]\nzellij = \"system\"\n").unwrap();
+        assert_eq!(
+            resolve_config(&system, None, None).zellij_runtime,
+            ZellijRuntimeRequest::System
+        );
+
+        let pinned: LisaConfig =
+            toml::from_str("[runtime]\nzellij = \"/opt/lisa/zellij\"\n").unwrap();
+        assert_eq!(
+            resolve_config(&pinned, None, None).zellij_runtime,
+            ZellijRuntimeRequest::Pinned("/opt/lisa/zellij".into())
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_unknown_keys_warn_without_failing() {
+        let result =
+            validate_config("[runtime]\nzellij = \"managed\"\nchannel = \"beta\"\n").unwrap();
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("channel"));
+        assert!(result.warnings[0].contains("[runtime]"));
+    }
+
+    #[test]
+    fn test_validate_runtime_rejects_relative_pin() {
+        let error = validate_config("[runtime]\nzellij = \"bin/zellij\"\n").unwrap_err();
+        assert!(error.contains("[runtime].zellij"));
+        assert!(error.contains("absolute path"));
+        assert!(error.contains("bin/zellij"));
     }
 
     #[test]

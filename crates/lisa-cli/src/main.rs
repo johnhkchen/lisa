@@ -9,6 +9,7 @@ mod hooks_guide;
 mod init;
 mod loop_cmd;
 mod preownership_status;
+mod runtime;
 mod setup_guide;
 mod status;
 mod templates;
