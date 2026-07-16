@@ -4,13 +4,20 @@ use std::process::Command;
 
 use directories::ProjectDirs;
 use lisa_core::client::AgentClient;
+use lisa_core::version::{
+    classify_zellij_version_output, ZellijVersionVerdict, SUPPORTED_ZELLIJ_RANGE,
+};
 
 use crate::config;
+
+const ZELLIJ_INSTALL_REMEDY: &str =
+    "Use Zellij's prebuilt static binaries: https://github.com/zellij-org/zellij/releases";
 
 /// Result of checking a single dependency.
 enum CheckResult {
     Found { version: String },
     NotFound { install_hint: String },
+    Unsupported { description: String, remedy: String },
     Skipped { reason: String },
 }
 
@@ -39,6 +46,16 @@ impl fmt::Display for CheckReport {
                     f,
                     "  {:<12} not found\n    Install: {}",
                     self.name, install_hint
+                )
+            }
+            CheckResult::Unsupported {
+                description,
+                remedy,
+            } => {
+                write!(
+                    f,
+                    "  {:<12} unsupported\n    {}\n    Remedy: {}",
+                    self.name, description, remedy
                 )
             }
             CheckResult::Skipped { reason } => {
@@ -75,13 +92,34 @@ pub(crate) fn which(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn check_zellij_version_output(output: &str) -> CheckResult {
+    match classify_zellij_version_output(output) {
+        ZellijVersionVerdict::InRange(version) => CheckResult::Found {
+            version: format!("detected {version}, supported {SUPPORTED_ZELLIJ_RANGE}"),
+        },
+        ZellijVersionVerdict::BelowFloor(version) => CheckResult::Unsupported {
+            description: format!(
+                "detected Zellij {version}; supported range {SUPPORTED_ZELLIJ_RANGE}"
+            ),
+            remedy: ZELLIJ_INSTALL_REMEDY.to_string(),
+        },
+        ZellijVersionVerdict::Unparseable => CheckResult::Unsupported {
+            description: format!(
+                "unparseable Zellij version output {:?}; supported range {SUPPORTED_ZELLIJ_RANGE}",
+                output.trim()
+            ),
+            remedy: ZELLIJ_INSTALL_REMEDY.to_string(),
+        },
+    }
+}
+
 fn check_zellij() -> CheckResult {
-    match get_command_version("zellij", &["--version"]) {
-        Some(version) => CheckResult::Found { version },
-        None => CheckResult::NotFound {
-            install_hint:
-                "cargo install zellij\n    Or visit: https://zellij.dev/documentation/installation"
-                    .to_string(),
+    match Command::new("zellij").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            check_zellij_version_output(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => CheckResult::NotFound {
+            install_hint: ZELLIJ_INSTALL_REMEDY.to_string(),
         },
     }
 }
@@ -188,7 +226,9 @@ fn format_report(reports: &[CheckReport]) -> String {
     out.push('\n');
 
     if has_failures(reports) {
-        out.push_str("Some dependencies are missing. Lisa requires all of the above to run.");
+        out.push_str(
+            "Some required dependencies are unavailable or unsupported. Lisa requires supported versions of all required tools to run.",
+        );
     } else {
         out.push_str("All dependencies satisfied.");
     }
@@ -196,30 +236,41 @@ fn format_report(reports: &[CheckReport]) -> String {
     out
 }
 
-/// Check if any required dependency is missing.
+/// Check if any required dependency is unavailable or unsupported.
 fn has_failures(reports: &[CheckReport]) -> bool {
-    reports
-        .iter()
-        .any(|r| r.required && matches!(r.result, CheckResult::NotFound { .. }))
+    reports.iter().any(|r| {
+        r.required
+            && matches!(
+                r.result,
+                CheckResult::NotFound { .. } | CheckResult::Unsupported { .. }
+            )
+    })
 }
 
 /// Check that all required runtime dependencies are present.
-/// Returns Ok(()) if all found, Err with list of missing dep names otherwise.
+/// Returns Ok(()) if all are found and supported, or rendered failure details
+/// for unavailable and unsupported dependencies otherwise.
 pub(crate) fn check_required_deps(client: AgentClient) -> Result<(), Vec<String>> {
     check_required_deps_inner(build_checks(client))
 }
 
 fn check_required_deps_inner(checks: Vec<DependencyCheck>) -> Result<(), Vec<String>> {
     let reports = run_checks(checks);
-    let missing: Vec<String> = reports
+    let failures: Vec<String> = reports
         .iter()
-        .filter(|r| r.required && matches!(r.result, CheckResult::NotFound { .. }))
-        .map(|r| r.name.to_string())
+        .filter(|r| {
+            r.required
+                && matches!(
+                    r.result,
+                    CheckResult::NotFound { .. } | CheckResult::Unsupported { .. }
+                )
+        })
+        .map(ToString::to_string)
         .collect();
-    if missing.is_empty() {
+    if failures.is_empty() {
         Ok(())
     } else {
-        Err(missing)
+        Err(failures)
     }
 }
 
@@ -521,7 +572,7 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     println!("{}", output);
 
     if has_failures(&reports) {
-        Err("Some dependencies are missing.".to_string())
+        Err("Some required dependencies are unavailable or unsupported.".to_string())
     } else {
         Ok(())
     }
@@ -633,6 +684,19 @@ mod tests {
         }
     }
 
+    fn mock_unsupported(name: &'static str, description: &str, remedy: &str) -> DependencyCheck {
+        let description = description.to_string();
+        let remedy = remedy.to_string();
+        DependencyCheck {
+            name,
+            required: true,
+            check: Box::new(move || CheckResult::Unsupported {
+                description: description.clone(),
+                remedy: remedy.clone(),
+            }),
+        }
+    }
+
     fn mock_skipped(name: &'static str, reason: &str) -> DependencyCheck {
         let reason = reason.to_string();
         DependencyCheck {
@@ -642,6 +706,55 @@ mod tests {
                 reason: reason.clone(),
             }),
         }
+    }
+
+    fn format_zellij_report(output: &str) -> String {
+        CheckReport {
+            name: "zellij",
+            required: true,
+            result: check_zellij_version_output(output),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn test_zellij_043_reports_detected_version_and_supported_range() {
+        let report = format_zellij_report("zellij 0.43.7\n");
+
+        assert!(report.contains("detected 0.43.7"));
+        assert!(report.contains(&format!("supported {SUPPORTED_ZELLIJ_RANGE}")));
+        assert!(report.contains("OK"));
+    }
+
+    #[test]
+    fn test_zellij_044_reports_detected_version_and_supported_range() {
+        let report = format_zellij_report("zellij 0.44.2");
+
+        assert!(report.contains("detected 0.44.2"));
+        assert!(report.contains(&format!("supported {SUPPORTED_ZELLIJ_RANGE}")));
+        assert!(report.contains("OK"));
+    }
+
+    #[test]
+    fn test_zellij_below_floor_is_unsupported_with_static_binary_remedy() {
+        let report = format_zellij_report("zellij 0.40.1");
+
+        assert!(report.contains("unsupported"));
+        assert!(report.contains("detected Zellij 0.40.1"));
+        assert!(report.contains(&format!("supported range {SUPPORTED_ZELLIJ_RANGE}")));
+        assert!(report.contains("prebuilt static binaries"));
+        assert!(report.contains("https://github.com/zellij-org/zellij/releases"));
+    }
+
+    #[test]
+    fn test_unparseable_zellij_output_is_named_unsupported() {
+        let report = format_zellij_report("zellij definitely-not-a-version");
+
+        assert!(report.contains("unsupported"));
+        assert!(report
+            .contains("unparseable Zellij version output \"zellij definitely-not-a-version\""));
+        assert!(report.contains(&format!("supported range {SUPPORTED_ZELLIJ_RANGE}")));
+        assert!(report.contains("prebuilt static binaries"));
     }
 
     #[test]
@@ -697,7 +810,25 @@ mod tests {
 
         assert!(output.contains("not found"));
         assert!(output.contains("Install: cargo install zellij"));
-        assert!(output.contains("Some dependencies are missing."));
+        assert!(output.contains("Some required dependencies are unavailable or unsupported."));
+    }
+
+    #[test]
+    fn test_format_report_with_unsupported_dependency() {
+        let checks = vec![
+            mock_unsupported(
+                "zellij",
+                "detected Zellij 0.40.1; supported range >= 0.43.0",
+                ZELLIJ_INSTALL_REMEDY,
+            ),
+            mock_found("claude", "claude 1.2.3"),
+        ];
+        let reports = run_checks(checks);
+        let output = format_report(&reports);
+
+        assert!(output.contains("unsupported"));
+        assert!(output.contains("detected Zellij 0.40.1"));
+        assert!(output.contains("Some required dependencies are unavailable or unsupported."));
     }
 
     #[test]
@@ -730,6 +861,17 @@ mod tests {
             mock_not_found("zellij", "install it"),
             mock_found("claude", "v1.2.3"),
         ];
+        let reports = run_checks(checks);
+        assert!(has_failures(&reports));
+    }
+
+    #[test]
+    fn test_has_failures_required_unsupported() {
+        let checks = vec![mock_unsupported(
+            "zellij",
+            "detected Zellij 0.40.1; supported range >= 0.43.0",
+            ZELLIJ_INSTALL_REMEDY,
+        )];
         let reports = run_checks(checks);
         assert!(has_failures(&reports));
     }
@@ -775,6 +917,25 @@ mod tests {
     }
 
     #[test]
+    fn test_report_display_unsupported() {
+        let report = CheckReport {
+            name: "zellij",
+            required: true,
+            result: CheckResult::Unsupported {
+                description: "detected Zellij 0.40.1; supported range >= 0.43.0".to_string(),
+                remedy: ZELLIJ_INSTALL_REMEDY.to_string(),
+            },
+        };
+        let output = report.to_string();
+
+        assert!(output.contains("zellij"));
+        assert!(output.contains("unsupported"));
+        assert!(output.contains("detected Zellij 0.40.1"));
+        assert!(output.contains("Remedy:"));
+        assert!(output.contains("prebuilt static binaries"));
+    }
+
+    #[test]
     fn test_report_display_skipped() {
         let report = CheckReport {
             name: "wasm target",
@@ -806,7 +967,10 @@ mod tests {
         let result = check_required_deps_inner(checks);
         assert!(result.is_err());
         let missing = result.unwrap_err();
-        assert_eq!(missing, vec!["zellij"]);
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("zellij"));
+        assert!(missing[0].contains("not found"));
+        assert!(missing[0].contains("cargo install zellij"));
     }
 
     #[test]
@@ -818,7 +982,30 @@ mod tests {
         let result = check_required_deps_inner(checks);
         assert!(result.is_err());
         let missing = result.unwrap_err();
-        assert_eq!(missing, vec!["zellij", "claude"]);
+        assert_eq!(missing.len(), 2);
+        assert!(missing[0].contains("zellij"));
+        assert!(missing[0].contains("cargo install zellij"));
+        assert!(missing[1].contains("claude"));
+        assert!(missing[1].contains("install claude"));
+    }
+
+    #[test]
+    fn test_check_required_deps_preserves_unsupported_details() {
+        let checks = vec![
+            mock_unsupported(
+                "zellij",
+                "detected Zellij 0.40.1; supported range >= 0.43.0",
+                ZELLIJ_INSTALL_REMEDY,
+            ),
+            mock_found("claude", "claude 1.2.3"),
+        ];
+        let failures = check_required_deps_inner(checks).unwrap_err();
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("zellij"));
+        assert!(failures[0].contains("detected Zellij 0.40.1"));
+        assert!(failures[0].contains("supported range >= 0.43.0"));
+        assert!(failures[0].contains("prebuilt static binaries"));
     }
 
     #[test]
