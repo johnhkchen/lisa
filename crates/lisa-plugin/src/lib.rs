@@ -5291,7 +5291,8 @@ impl State {
                     .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
                     .filter_map(|record| match record {
                         ProvenanceLedgerRecord::Execution(record) => Some(record),
-                        ProvenanceLedgerRecord::AssignmentTransition(_) => None,
+                        ProvenanceLedgerRecord::AssignmentTransition(_)
+                        | ProvenanceLedgerRecord::ParkingTransition(_) => None,
                     })
                     .collect()
             })

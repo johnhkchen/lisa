@@ -28,12 +28,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::AgentClient;
+use crate::disposition::RemedyOwner;
 use crate::types::AttemptLease;
 
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -83,6 +84,14 @@ pub enum RunOutcome {
 #[serde(rename_all = "kebab-case")]
 pub enum ProvenanceRecordType {
     AssignmentTransition,
+}
+
+/// Explicit JSON-level kind for a transition into or out of parked state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParkingTransitionType {
+    Park,
+    Unpark,
 }
 
 /// Stable, operator-visible assignment state retained in provenance.
@@ -156,6 +165,22 @@ pub struct AssignmentTransitionRecord {
     pub wall_clock_secs: u64,
 }
 
+/// One attempt-scoped transition into or out of parked state.
+///
+/// Timestamps are UTC epoch seconds. The interval fields let an unpark row
+/// carry queryable stranded time without joining separate point events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkingTransitionRecord {
+    pub schema_version: u32,
+    pub record_type: ParkingTransitionType,
+    pub ticket_id: String,
+    pub attempt_lease: AttemptLease,
+    pub remedy_owner: RemedyOwner,
+    pub started_at: u64,
+    pub ended_at: u64,
+    pub wall_clock_secs: u64,
+}
+
 /// A row read from a potentially mixed-version, mixed-shape provenance ledger.
 ///
 /// Untagged representation preserves the exact schema-v2 execution JSON shape,
@@ -166,6 +191,7 @@ pub struct AssignmentTransitionRecord {
 #[serde(untagged)]
 pub enum ProvenanceLedgerRecord {
     AssignmentTransition(AssignmentTransitionRecord),
+    ParkingTransition(ParkingTransitionRecord),
     Execution(ProvenanceRecord),
 }
 
@@ -210,6 +236,14 @@ pub fn append_record(path: &Path, record: &ProvenanceRecord) -> std::io::Result<
 pub fn append_assignment_transition_record(
     path: &Path,
     record: &AssignmentTransitionRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+/// Append one park or unpark transition as a single JSONL row.
+pub fn append_parking_transition_record(
+    path: &Path,
+    record: &ParkingTransitionRecord,
 ) -> std::io::Result<()> {
     append_serialized(path, record)
 }
@@ -274,6 +308,22 @@ mod tests {
         }
     }
 
+    fn sample_parking_transition(record_type: ParkingTransitionType) -> ParkingTransitionRecord {
+        ParkingTransitionRecord {
+            schema_version: SCHEMA_VERSION,
+            record_type,
+            ticket_id: "T-048-01-02".to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: "T-048-01-02".to_string(),
+                attempt_id: 4,
+            },
+            remedy_owner: RemedyOwner::Operator,
+            started_at: 1_752_700_000,
+            ended_at: 1_752_700_125,
+            wall_clock_secs: 125,
+        }
+    }
+
     const SCHEMA_V2_EXECUTION_JSON: &str = r#"{"schema_version":2,"ticket_id":"T-027-01","attempt_lease":{"ticket_id":"T-027-01","attempt_id":2},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}"#;
 
     #[test]
@@ -307,7 +357,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":3"));
+        assert!(json.contains("\"schema_version\":4"));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
         assert!(json.contains("\"authoritative\":true"));
@@ -324,7 +374,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":3"));
+        assert!(json.contains("\"schema_version\":4"));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
         assert!(json.contains("\"pane_id\":12"));
@@ -357,25 +407,84 @@ mod tests {
     }
 
     #[test]
-    fn mixed_ledger_reads_schema_v2_execution_and_schema_v3_assignment_transition() {
+    fn parking_transitions_serialize_and_round_trip_as_compact_rows() {
+        for record_type in [ParkingTransitionType::Park, ParkingTransitionType::Unpark] {
+            let record = sample_parking_transition(record_type);
+            let json = serde_json::to_string(&record).unwrap();
+
+            assert!(!json.contains('\n'), "record must be single-line: {json}");
+            assert!(json.contains("\"schema_version\":4"));
+            assert!(json.contains(&format!(
+                "\"record_type\":{}",
+                serde_json::to_string(&record_type).unwrap()
+            )));
+            assert!(
+                json.contains("\"attempt_lease\":{\"ticket_id\":\"T-048-01-02\",\"attempt_id\":4}")
+            );
+            assert!(json.contains("\"remedy_owner\":\"operator\""));
+            assert!(json.contains("\"started_at\":1752700000"));
+            assert!(json.contains("\"ended_at\":1752700125"));
+            assert!(json.contains("\"wall_clock_secs\":125"));
+
+            let back: ParkingTransitionRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, record);
+        }
+    }
+
+    #[test]
+    fn parking_transitions_append_and_replay_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/provenance.jsonl");
+        let park = sample_parking_transition(ParkingTransitionType::Park);
+        let mut unpark = sample_parking_transition(ParkingTransitionType::Unpark);
+        unpark.remedy_owner = RemedyOwner::World;
+
+        append_parking_transition_record(&path, &park).unwrap();
+        append_parking_transition_record(&path, &unpark).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        let records: Vec<ProvenanceLedgerRecord> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(
+            records,
+            vec![
+                ProvenanceLedgerRecord::ParkingTransition(park),
+                ProvenanceLedgerRecord::ParkingTransition(unpark),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_ledger_replays_execution_assignment_park_and_unpark_rows() {
         let legacy: ProvenanceRecord = serde_json::from_str(SCHEMA_V2_EXECUTION_JSON).unwrap();
         assert_eq!(legacy.schema_version, 2);
         assert_eq!(legacy.attempt_lease.attempt_id, 2);
         assert_eq!(legacy.outcome, RunOutcome::Done);
         assert!(legacy.authoritative);
 
-        let transition = sample_assignment_transition();
+        let mut transition = sample_assignment_transition();
+        transition.schema_version = 3;
+        let park = sample_parking_transition(ParkingTransitionType::Park);
+        let mut unpark = sample_parking_transition(ParkingTransitionType::Unpark);
+        unpark.remedy_owner = RemedyOwner::World;
         let ledger = format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
             SCHEMA_V2_EXECUTION_JSON,
-            serde_json::to_string(&transition).unwrap()
+            serde_json::to_string(&transition).unwrap(),
+            serde_json::to_string(&park).unwrap(),
+            serde_json::to_string(&unpark).unwrap(),
         );
         let rows: Vec<ProvenanceLedgerRecord> = ledger
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 4);
         assert_eq!(
             rows[0],
             ProvenanceLedgerRecord::Execution(legacy),
@@ -386,6 +495,24 @@ mod tests {
             ProvenanceLedgerRecord::AssignmentTransition(transition),
             "the schema-v3 line is recognized as pre-ownership evidence"
         );
+        assert_eq!(
+            rows[2],
+            ProvenanceLedgerRecord::ParkingTransition(park),
+            "the schema-v4 park line is recognized as parking evidence"
+        );
+        assert_eq!(
+            rows[3],
+            ProvenanceLedgerRecord::ParkingTransition(unpark.clone()),
+            "the schema-v4 unpark line is recognized as parking evidence"
+        );
+        let ProvenanceLedgerRecord::ParkingTransition(replayed) = &rows[3] else {
+            panic!("expected an unpark transition")
+        };
+        assert_eq!(replayed.attempt_lease.attempt_id, 4);
+        assert_eq!(replayed.remedy_owner, RemedyOwner::World);
+        assert_eq!(replayed.started_at, 1_752_700_000);
+        assert_eq!(replayed.ended_at, 1_752_700_125);
+        assert_eq!(replayed.wall_clock_secs, 125);
     }
 
     #[test]
