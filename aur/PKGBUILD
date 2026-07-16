@@ -8,12 +8,12 @@ pkgdesc='DAG-driven concurrent task scheduling CLI for the RDSPI workflow'
 arch=('x86_64' 'aarch64')
 url='https://github.com/johnhkchen/lisa'
 license=('MIT')
-depends=('zellij' 'gcc-libs')
+depends=('zellij')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 
-source_x86_64=("${_pkgname}-${pkgver}-x86_64.tar.xz::${url}/releases/download/v${pkgver}/lisa-cli-x86_64-unknown-linux-gnu.tar.xz")
-source_aarch64=("${_pkgname}-${pkgver}-aarch64.tar.xz::${url}/releases/download/v${pkgver}/lisa-cli-aarch64-unknown-linux-gnu.tar.xz")
+source_x86_64=("${_pkgname}-${pkgver}-x86_64.tar.xz::${url}/releases/download/v${pkgver}/lisa-cli-x86_64-unknown-linux-musl.tar.xz")
+source_aarch64=("${_pkgname}-${pkgver}-aarch64.tar.xz::${url}/releases/download/v${pkgver}/lisa-cli-aarch64-unknown-linux-musl.tar.xz")
 
 # TODO: Replace with real checksums after first release (T-014-03)
 # Generate with: updpkgsums (from pacman-contrib)

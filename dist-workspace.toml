@@ -11,12 +11,13 @@ installers = ["shell", "homebrew"]
 targets = [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
 ]
 packages = ["lisa-cli"]
 github-build-setup = "../build-setup.yml"
-install-path = "CARGO_HOME"
+install-path = "~/.local/bin"
+install-success-msg = "Lisa is ready in ~/.local/bin. Open a new shell, then run lisa doctor."
 tap = "johnhkchen/homebrew-lisa"
 formula = "lisa"
 publish-jobs = ["homebrew"]
