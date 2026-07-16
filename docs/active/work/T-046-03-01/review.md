@@ -1,0 +1,228 @@
+# T-046-03-01 Review
+
+## Disposition
+
+Pass. The requested musl release migration, Rust-free install location, embedded
+WASM enforcement, managed-runtime checksum baking, and portability verification
+are implemented and tested. Both acceptance criteria are satisfied.
+
+## Scope reviewed
+
+The review covers these ticket-owned source changes:
+
+- `dist-workspace.toml`
+- `aur/PKGBUILD`
+- `.github/build-setup.yml`
+- `.github/workflows/release.yml`
+- `crates/lisa-cli/build.rs`
+- `scripts/verify-musl-release.sh`
+- `crates/lisa-cli/data/managed-runtime-sha256.json`
+- `crates/lisa-cli/src/runtime.rs`
+- `crates/lisa-cli/src/main.rs`
+
+The implementation was committed in four meaningful, exact-path units using
+`lisa commit-ticket`:
+
+- `e4886c6 Ship static musl Linux artifacts`
+- `fcdd293 Verify portable Linux release artifacts`
+- `f213b3f Bake managed runtime checksums`
+- `5457d06 Retain runtime manifest across release targets`
+
+## Acceptance criterion 1
+
+> `dist plan` lists both musl targets; a built musl `lisa` runs on a Debian
+> bullseye (glibc 2.31) container and is verified statically linked; fat-LTO
+> link behavior on CI runners confirmed, not assumed.
+
+Result: satisfied.
+
+### Release graph
+
+The cargo-dist target list now contains:
+
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+
+The previous GNU Linux targets were replaced rather than retained alongside
+musl. This matters because cargo-dist 0.30.4 classifies GNU as the native Linux
+shell-installer option and musl as fallback when both are present. Replacing the
+targets ensures the shell installer actually serves musl on Linux.
+
+The official cargo-dist 0.30.4 executable was used for planning and global
+artifact generation. The final JSON plan contains exactly the two musl Linux
+archives, contains no GNU Linux archive, and retains both Darwin archives, the
+shell installer, and the Homebrew formula. Its Linux jobs use the native
+`ubuntu-22.04` and `ubuntu-22.04-arm` runners and install `musl-tools`.
+
+Generated Homebrew formula inspection also shows musl URLs for both Linux
+architectures. The AUR source URLs name the same musl archives, and the package
+no longer declares the unnecessary direct `gcc-libs` dependency.
+
+### Static linkage and fat LTO
+
+The existing release profile has `lto = true`, and the dist profile inherits it;
+this is Rust's fat-LTO mode. The review did not infer success from configuration.
+It completed optimized dist-profile links for both Linux musl targets in Ubuntu
+22.04 environments with the release WASM requirement enabled:
+
+- Native arm64: `aarch64-unknown-linux-musl`, fat-LTO link completed.
+- amd64 environment: `x86_64-unknown-linux-musl`, fat-LTO link completed.
+
+For each resulting binary:
+
+- `file` identifies a static or static-PIE ELF for the expected architecture.
+- `readelf -l` contains no `INTERP` program header.
+- `ldd` reports that the binary is not dynamic/statically linked.
+- Binary inspection finds the WebAssembly module header.
+- Binary inspection finds the target's managed-runtime archive checksum.
+- `lisa --version` prints `lisa 0.4.0-rc.8`.
+
+Each binary was then mounted read-only into `debian:bullseye-slim`. The image
+reports glibc 2.31, yet both executables run successfully because they carry no
+glibc runtime dependency. The image resolved to:
+
+`debian@sha256:cba95a21c96c1f5fc2470081829363eed57706634f7dc26e8c6712934303d57a`
+
+This directly exercises the compatibility boundary named by the ticket.
+
+### Release-time automated verification
+
+`scripts/verify-musl-release.sh` repeats the important release assertions in CI.
+For each musl cargo-dist job it:
+
+1. Accepts only the two supported musl triples.
+2. Locates and extracts the matching cargo-dist archive.
+3. Verifies the expected ELF architecture and static classification.
+4. Rejects an ELF with a dynamic interpreter segment.
+5. Rejects a dynamically linked result according to `ldd`.
+6. Confirms the embedded WASM magic/version bytes.
+7. Reads the baked manifest and confirms the target checksum is in the binary.
+8. Executes the binary inside `debian:bullseye-slim`.
+
+The release workflow invokes this after cargo-dist builds the artifacts and
+before artifact upload, so a portability regression cannot be published by the
+normal release job. Shell syntax validation and the unsupported-target negative
+case both pass.
+
+## Acceptance criterion 2
+
+> The installer places the binary in `~/.local/bin` and prints a brand-voice
+> PATH note; CI verifies the embedded WASM is non-empty in musl artifacts.
+
+Result: satisfied.
+
+### Installer behavior
+
+The cargo-dist install path is now `~/.local/bin`, avoiding creation of a Rust
+toolchain-shaped `~/.cargo` directory on machines that only install Lisa. A
+Lisa-specific success message tells the user where Lisa was placed, asks them to
+open a new shell, and points them to `lisa doctor`.
+
+Inspection of the installer generated by cargo-dist 0.30.4 confirms:
+
+- The destination resolves to `$HOME/.local/bin`.
+- The Lisa success message is present.
+- cargo-dist's plain restart/source guidance is emitted when PATH needs updating.
+
+### Embedded WASM enforcement
+
+The shared build setup builds `lisa-plugin` for `wasm32-wasip1` in release mode,
+then checks that the output is a non-empty file with exact WebAssembly header
+bytes `0061736d01000000`. Only after this succeeds does it export
+`LISA_REQUIRE_EMBEDDED_WASM=1` for the cargo-dist build.
+
+The CLI build script independently validates an existing WASM file before
+embedding it. With the release environment flag set, a missing module is a hard
+error. Without the flag, ordinary developer builds retain the prior placeholder
+behavior so commands such as an initial host-only `cargo check` remain usable.
+
+The final artifact verifier checks the bytes again in each musl executable. The
+WASM therefore has validation at production, embedding, and packaged-artifact
+boundaries rather than relying on build command success alone.
+
+## Managed-runtime manifest
+
+The release now bakes a typed JSON manifest for Zellij 0.43.1 archives. It covers
+the two Darwin and two musl Linux targets with target triple, archive filename,
+immutable versioned URL, and SHA-256 of the compressed archive.
+
+Archive hashes were calculated from the four official release archives. Archive
+hashes, rather than the upstream unpacked-binary checksum files, match the
+consumer's security boundary: the concurrent managed-runtime implementation
+verifies the downloaded compressed bytes before extraction and atomic install.
+
+The production Linux managed-runtime lookup consumes the embedded manifest,
+eliminating duplicated URL and checksum constants. The manifest test enforces:
+
+- The manifest version matches the pinned managed-runtime version.
+- Exactly the four intended target triples exist.
+- Targets and archive names are unique.
+- Target triples correspond to archive names.
+- URLs derive from the pinned version and archive.
+- Hashes are exactly 64 lowercase hexadecimal digits.
+- Production lookup returns the manifest's Linux entries.
+
+During review, Darwin release-binary inspection exposed a real fat-LTO behavior:
+because managed acquisition is currently Linux-only, the optimizer could remove
+that entire code path and its manifest bytes from a Darwin binary. The existing
+hidden `version` command now passes the public embedded manifest constant to
+`std::hint::black_box`. This retains the manifest in every release target without
+changing output or adding a public command. A rebuilt Darwin fat-LTO binary
+contains all four hashes and the WASM header, while `lisa version` remains exactly
+`lisa 0.4.0-rc.8`.
+
+## Verification summary
+
+The following checks pass on the final implementation:
+
+- `cargo fmt --all -- --check`
+- `cargo test --workspace`
+- `cargo build -p lisa-plugin --target wasm32-wasip1 --release`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test -p lisa-cli` after the final retention change
+- `cargo clippy -p lisa-cli --all-targets -- -D warnings` after that change
+- `LISA_REQUIRE_EMBEDDED_WASM=1 cargo check -p lisa-cli`
+- `dist plan --output-format=json`
+- `dist build --artifacts=global --output-format=json`
+- `bash -n scripts/verify-musl-release.sh`
+- Ruby/Psych parsing of both changed YAML files
+- `git diff --check`
+- Darwin fat-LTO artifact content and unchanged version output
+- Native arm64 musl fat-LTO build, static checks, and Bullseye execution
+- x86_64 musl fat-LTO build, static checks, and Bullseye execution
+
+The workspace test suite passed across CLI, core, plugin, integration, and doc
+tests. One integration that requires a live external Zellij process remains
+explicitly ignored; it predates and is unrelated to this release change.
+
+## Concurrency and ownership review
+
+T-046-02-02 concurrently modified `runtime.rs` and `Cargo.lock` after this
+ticket's clean ownership baseline. This ticket removed only its own temporary
+overlap, waited for the other ticket's isolated commit, then integrated the
+manifest consumer as its own exact-path commit. No foreign uncommitted work was
+staged or included. All source commits used `lisa commit-ticket`; ordinary
+`git add` and `git commit` were not used.
+
+## Open concerns
+
+- The next pull-request or tag workflow remains the authoritative execution on
+  GitHub-hosted `ubuntu-22.04` and `ubuntu-22.04-arm` runners. Local verification
+  used matching Ubuntu 22.04 userspace/tooling, native arm64, and an amd64 Docker
+  environment on the arm64 host. The checked-in CI verifier makes runner-level
+  success a release gate.
+- Debian Bullseye in Docker is a reproducible stand-in for the ticket's old
+  Debian/Chromebook compatibility boundary, not a physical Chromebook test.
+- Release publication itself is intentionally out of scope; this ticket verifies
+  cargo-dist's generated graph and artifacts without creating a release.
+- The verifier depends on `docker`, `file`, `readelf`, `ldd`, and Python, all
+  available or installed in the configured Ubuntu release jobs. Future runner
+  image changes should preserve those prerequisites.
+- Darwin entries are deliberately baked now, but managed-runtime acquisition
+  remains Linux-only under T-046-02-02's current platform boundary.
+
+None of these concerns blocks completion. The implementation and automated
+release gates cover the acceptance criteria, including both architectures and
+the requested old-glibc execution boundary.
