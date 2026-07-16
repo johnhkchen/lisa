@@ -1585,6 +1585,7 @@ name = "lisa-cli"
 version = "0.4.0-rc.8"
 dependencies = [
  "clap 4.5.57",
+ "directories",
  "fs2",
  "lisa-core",
  "serde",
@@ -1599,6 +1600,7 @@ version = "0.4.0-rc.8"
 dependencies = [
  "proptest",
  "proptest-state-machine",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml_ng",

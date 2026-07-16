@@ -12,6 +12,7 @@ categories = ["development-tools"]
 readme = "../../README.md"
 
 [dependencies]
+semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.9"
 serde_json = "1.0"
