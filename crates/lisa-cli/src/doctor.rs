@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use directories::ProjectDirs;
 use lisa_core::client::AgentClient;
 
 use crate::config;
@@ -282,17 +283,10 @@ fn check_project_version(root: &Path) -> CheckReport {
     }
 }
 
-/// Return the platform-specific Zellij plugin cache directory.
-fn zellij_cache_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let home = std::path::Path::new(&home);
-
-    if cfg!(target_os = "macos") {
-        Some(home.join("Library/Caches/org.Zellij-Contributors.Zellij"))
-    } else {
-        // Linux / other Unix
-        Some(home.join(".cache/zellij"))
-    }
+/// Return the Zellij plugin cache directory using Zellij 0.43's project identity.
+fn zellij_cache_dir() -> Option<PathBuf> {
+    ProjectDirs::from("org", "Zellij Contributors", "Zellij")
+        .map(|project_dirs| project_dirs.cache_dir().to_path_buf())
 }
 
 /// Recursively walk `cache_dir` and remove any directory or file whose name
@@ -536,6 +530,86 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::ffi::OsString;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::sync::Mutex;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static ZELLIJ_CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct ScopedZellijCacheEnv {
+        home: Option<OsString>,
+        xdg_cache_home: Option<OsString>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl ScopedZellijCacheEnv {
+        fn set(home: &Path, xdg_cache_home: Option<&Path>) -> Self {
+            let previous = Self {
+                home: std::env::var_os("HOME"),
+                xdg_cache_home: std::env::var_os("XDG_CACHE_HOME"),
+            };
+            std::env::set_var("HOME", home);
+            match xdg_cache_home {
+                Some(path) => std::env::set_var("XDG_CACHE_HOME", path),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            previous
+        }
+
+        fn restore(name: &str, value: Option<&OsString>) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for ScopedZellijCacheEnv {
+        fn drop(&mut self) {
+            Self::restore("HOME", self.home.as_ref());
+            Self::restore("XDG_CACHE_HOME", self.xdg_cache_home.as_ref());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expected_zellij_cache_dir(home: &Path, xdg_cache_home: Option<&Path>) -> PathBuf {
+        xdg_cache_home
+            .map(|path| path.join("zellij"))
+            .unwrap_or_else(|| home.join(".cache/zellij"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn expected_zellij_cache_dir(home: &Path, _xdg_cache_home: Option<&Path>) -> PathBuf {
+        home.join("Library/Caches/org.Zellij-Contributors.Zellij")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_zellij_cache_routing(expected: &Path) {
+        assert_eq!(zellij_cache_dir().as_deref(), Some(expected));
+
+        let cached_plugin = expected
+            .join("session-abc/file:/tmp")
+            .join("lisa-plugin-deadbeef.wasm");
+        std::fs::create_dir_all(&cached_plugin).unwrap();
+        clean_zellij_plugin_cache();
+        assert!(!cached_plugin.exists());
+
+        let wasm = Path::new("/tmp/lisa-plugin-deadbeef.wasm");
+        pregrant_plugin_permissions(wasm);
+        let content = std::fs::read_to_string(expected.join("permissions.kdl")).unwrap();
+        assert!(content.contains("\"/tmp/lisa-plugin-deadbeef.wasm\" {"));
+        for permission in PLUGIN_PERMISSIONS {
+            assert!(
+                content.contains(permission),
+                "missing permission {permission}"
+            );
+        }
+    }
 
     fn mock_found(name: &'static str, version: &str) -> DependencyCheck {
         let version = version.to_string();
@@ -935,6 +1009,41 @@ mod tests {
         let nonexistent = dir.path().join("does-not-exist");
         let removed = clean_zellij_plugin_cache_in(&nonexistent);
         assert_eq!(removed, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_zellij_cache_wrappers_honor_configured_environment() {
+        let _lock = ZELLIJ_CACHE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg_cache_home = dir.path().join("xdg-cache");
+        let _env = ScopedZellijCacheEnv::set(&home, Some(&xdg_cache_home));
+        let expected = expected_zellij_cache_dir(&home, Some(&xdg_cache_home));
+
+        assert_zellij_cache_routing(&expected);
+
+        #[cfg(target_os = "linux")]
+        let non_selected = home.join(".cache/zellij");
+        #[cfg(target_os = "macos")]
+        let non_selected = xdg_cache_home.join("zellij");
+        assert!(!non_selected.join("permissions.kdl").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_zellij_cache_wrappers_honor_unconfigured_environment() {
+        let _lock = ZELLIJ_CACHE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let _env = ScopedZellijCacheEnv::set(&home, None);
+        let expected = expected_zellij_cache_dir(&home, None);
+
+        assert_zellij_cache_routing(&expected);
     }
 
     #[test]
