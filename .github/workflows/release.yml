@@ -219,6 +219,10 @@ jobs:
         shell: bash
         run: scripts/verify-deb-release.sh
 
+      - name: Verify signed apt install and upgrade on Debian bookworm
+        shell: bash
+        run: scripts/verify-apt-repository.sh
+
       - id: cargo-dist
         name: Post-build
         shell: bash
@@ -304,6 +308,119 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
+  publish-apt-repository:
+    needs:
+      - plan
+      - host
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: publish-lisa-apt-repository
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - name: Collect Debian packages from stable releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          input="$RUNNER_TEMP/apt-input"
+          mkdir -p "$input"
+          # shellcheck disable=SC2016 # $assets belongs to jq, not the shell.
+          mapfile -t tags < <(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '
+              .[]
+              | select(.draft == false and .prerelease == false)
+              | ([.assets[].name]) as $assets
+              | select(
+                  ($assets | index("lisa-amd64.deb")) != null and
+                  ($assets | index("lisa-arm64.deb")) != null and
+                  ($assets | index("lisa-runtime-zellij-amd64.deb")) != null and
+                  ($assets | index("lisa-runtime-zellij-arm64.deb")) != null
+                )
+              | .tag_name
+            '
+          )
+          if [[ ${#tags[@]} -eq 0 ]]; then
+            echo "No stable release contains the complete Debian package set" >&2
+            exit 1
+          fi
+          for tag in "${tags[@]}"; do
+            destination="$input/$tag"
+            mkdir -p "$destination"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+              --dir "$destination" \
+              --pattern lisa-amd64.deb \
+              --pattern lisa-arm64.deb \
+              --pattern lisa-runtime-zellij-amd64.deb \
+              --pattern lisa-runtime-zellij-arm64.deb
+          done
+          echo "LISA_APT_INPUT=$input" >> "$GITHUB_ENV"
+
+      - name: Install apt repository tools
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y -qq apt-utils gnupg
+
+      - name: Build signed apt repository
+        shell: bash
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z $APT_SIGNING_KEY ]]; then
+            echo "APT_SIGNING_KEY is not configured" >&2
+            exit 1
+          fi
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/lisa-apt-gnupg.XXXXXX")
+          chmod 0700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --quiet --import
+          secret_count=$(gpg --batch --with-colons --list-secret-keys |
+            awk -F: '$1 == "sec" { count++ } END { print count + 0 }')
+          if [[ $secret_count -ne 1 ]]; then
+            echo "APT_SIGNING_KEY must contain exactly one primary secret key" >&2
+            exit 1
+          fi
+          fingerprint=$(gpg --batch --with-colons --list-secret-keys |
+            awk -F: '$1 == "fpr" { print toupper($10); exit }')
+          public_fingerprint=$(gpg --batch --with-colons --show-keys \
+            packaging/apt/lisa-archive-keyring.asc |
+            awk -F: '$1 == "fpr" { print toupper($10); exit }')
+          if [[ $fingerprint != "$public_fingerprint" ]]; then
+            echo "APT_SIGNING_KEY does not match the checked-in public key" >&2
+            exit 1
+          fi
+          scripts/build-apt-repository.sh \
+            "$LISA_APT_INPUT" "$RUNNER_TEMP/apt-site" "$fingerprint" \
+            packaging/apt/lisa-archive-keyring.asc
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload apt repository Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/apt-site
+          include-hidden-files: true
+
+      - name: Deploy apt repository to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
   publish-homebrew-formula:
     needs:
       - plan
@@ -354,11 +471,12 @@ jobs:
     needs:
       - plan
       - host
+      - publish-apt-repository
       - publish-homebrew-formula
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-apt-repository.result == 'skipped' || needs.publish-apt-repository.result == 'success') && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
