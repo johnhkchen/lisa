@@ -11,12 +11,14 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use lisa_core::version::{
     classify_zellij_version_output, ZellijVersion, ZellijVersionVerdict, SUPPORTED_ZELLIJ_RANGE,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Exact Zellij release used by Lisa's managed-runtime directory contract.
@@ -25,12 +27,38 @@ use sha2::{Digest, Sha256};
 /// SDK family. Managed mode installs this release at [`managed_zellij_path`].
 pub const MANAGED_ZELLIJ_VERSION: ZellijVersion = ZellijVersion::release(0, 43, 1);
 
-const MANAGED_ZELLIJ_X86_64_URL: &str = "https://github.com/zellij-org/zellij/releases/download/v0.43.1/zellij-no-web-x86_64-unknown-linux-musl.tar.gz";
-const MANAGED_ZELLIJ_X86_64_SHA256: &str =
-    "bac0728945e8f5a28f2647e2b9b0cfe4591d71abfe227336b1318937241f071d";
-const MANAGED_ZELLIJ_AARCH64_URL: &str = "https://github.com/zellij-org/zellij/releases/download/v0.43.1/zellij-no-web-aarch64-unknown-linux-musl.tar.gz";
-const MANAGED_ZELLIJ_AARCH64_SHA256: &str =
-    "8ced877df27a8fe9112607dd3d772442aefa5e42359cda1baba53e78c4ae46aa";
+/// Release-pinned archive checksums for Lisa's managed Zellij runtime.
+///
+/// T-046-02-02 consumes this compile-time manifest while fetching and atomically
+/// installing the managed runtime. The checksums cover the downloaded archives,
+/// so verification completes before any archive entry is unpacked.
+pub const MANAGED_RUNTIME_SHA256_MANIFEST: &str =
+    include_str!("../data/managed-runtime-sha256.json");
+
+#[derive(Debug, Deserialize)]
+struct ManagedRuntimeManifest {
+    version: String,
+    artifacts: Vec<ManagedRuntimeArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedRuntimeArtifact {
+    target: String,
+    url: String,
+    sha256: String,
+}
+
+static MANAGED_RUNTIME_MANIFEST: LazyLock<ManagedRuntimeManifest> = LazyLock::new(|| {
+    let manifest: ManagedRuntimeManifest = serde_json::from_str(MANAGED_RUNTIME_SHA256_MANIFEST)
+        .expect("managed-runtime sha256 manifest must be valid JSON");
+    assert_eq!(
+        manifest.version,
+        MANAGED_ZELLIJ_VERSION.to_string(),
+        "managed-runtime manifest version must match MANAGED_ZELLIJ_VERSION"
+    );
+    manifest
+});
+
 const INSTALL_TEMP_ATTEMPTS: u64 = 32;
 static INSTALL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -51,17 +79,20 @@ fn managed_release() -> Result<ManagedRelease<'static>, String> {
 }
 
 fn managed_release_for(os: &str, architecture: &str) -> Option<ManagedRelease<'static>> {
-    match (os, architecture) {
-        ("linux", "x86_64") => Some(ManagedRelease {
-            url: MANAGED_ZELLIJ_X86_64_URL,
-            sha256: MANAGED_ZELLIJ_X86_64_SHA256,
-        }),
-        ("linux", "aarch64") => Some(ManagedRelease {
-            url: MANAGED_ZELLIJ_AARCH64_URL,
-            sha256: MANAGED_ZELLIJ_AARCH64_SHA256,
-        }),
-        _ => None,
-    }
+    let target = match (os, architecture) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        _ => return None,
+    };
+    let manifest: &'static ManagedRuntimeManifest = &MANAGED_RUNTIME_MANIFEST;
+    manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.target == target)
+        .map(|artifact| ManagedRelease {
+            url: &artifact.url,
+            sha256: &artifact.sha256,
+        })
 }
 
 /// Runtime intent after `.lisa.toml` defaults have been applied.
@@ -850,24 +881,61 @@ mod tests {
 
     #[test]
     fn production_release_metadata_is_pinned_to_managed_version() {
-        for (architecture, url, sha256) in [
-            (
-                "x86_64",
-                MANAGED_ZELLIJ_X86_64_URL,
-                MANAGED_ZELLIJ_X86_64_SHA256,
-            ),
-            (
-                "aarch64",
-                MANAGED_ZELLIJ_AARCH64_URL,
-                MANAGED_ZELLIJ_AARCH64_SHA256,
-            ),
-        ] {
-            assert_eq!(managed_release_for("linux", architecture).unwrap().url, url);
-            assert!(url.contains(&format!("/v{MANAGED_ZELLIJ_VERSION}/")));
-            assert!(url.contains("zellij-no-web-"));
-            assert!(url.ends_with("-unknown-linux-musl.tar.gz"));
+        let manifest: serde_json::Value =
+            serde_json::from_str(MANAGED_RUNTIME_SHA256_MANIFEST).unwrap();
+        assert_eq!(
+            manifest["version"].as_str().unwrap(),
+            MANAGED_ZELLIJ_VERSION.to_string()
+        );
+
+        let artifacts = manifest["artifacts"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 4);
+        let expected_targets = std::collections::BTreeSet::from([
+            "aarch64-apple-darwin",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+        ]);
+        let mut observed_targets = std::collections::BTreeSet::new();
+
+        for artifact in artifacts {
+            let object = artifact.as_object().unwrap();
+            assert_eq!(object.len(), 4);
+            let target = object["target"].as_str().unwrap();
+            assert!(observed_targets.insert(target), "duplicate target {target}");
+
+            let archive = object["archive"].as_str().unwrap();
+            let url = object["url"].as_str().unwrap();
+            let sha256 = object["sha256"].as_str().unwrap();
+            assert!(archive.starts_with("zellij-no-web-"));
+            assert!(archive.contains(target));
+            assert!(archive.ends_with(".tar.gz"));
+            assert_eq!(
+                url,
+                format!(
+                    "https://github.com/zellij-org/zellij/releases/download/v{}/{archive}",
+                    MANAGED_ZELLIJ_VERSION
+                )
+            );
             assert_eq!(sha256.len(), 64);
-            assert!(sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
+
+        assert_eq!(observed_targets, expected_targets);
+
+        for (architecture, target) in [
+            ("x86_64", "x86_64-unknown-linux-musl"),
+            ("aarch64", "aarch64-unknown-linux-musl"),
+        ] {
+            let release = managed_release_for("linux", architecture).unwrap();
+            let artifact = artifacts
+                .iter()
+                .find(|artifact| artifact["target"] == target)
+                .unwrap();
+            assert_eq!(release.url, artifact["url"].as_str().unwrap());
+            assert_eq!(release.sha256, artifact["sha256"].as_str().unwrap());
         }
     }
 
