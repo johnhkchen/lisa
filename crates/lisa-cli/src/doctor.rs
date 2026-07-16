@@ -4,12 +4,14 @@ use std::process::Command;
 
 use directories::ProjectDirs;
 use lisa_core::client::AgentClient;
-use lisa_core::version::{
-    classify_zellij_version_output, ZellijVersionVerdict, SUPPORTED_ZELLIJ_RANGE,
-};
+use lisa_core::version::SUPPORTED_ZELLIJ_RANGE;
+#[cfg(test)]
+use lisa_core::version::{classify_zellij_version_output, ZellijVersionVerdict};
 
 use crate::config;
+use crate::runtime::{ResolvedZellijRuntime, ZellijRuntimeRequest};
 
+#[cfg(test)]
 const ZELLIJ_INSTALL_REMEDY: &str =
     "Use Zellij's prebuilt static binaries: https://github.com/zellij-org/zellij/releases";
 
@@ -92,6 +94,7 @@ pub(crate) fn which(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn check_zellij_version_output(output: &str) -> CheckResult {
     match classify_zellij_version_output(output) {
         ZellijVersionVerdict::InRange(version) => CheckResult::Found {
@@ -113,13 +116,24 @@ fn check_zellij_version_output(output: &str) -> CheckResult {
     }
 }
 
-fn check_zellij() -> CheckResult {
-    match Command::new("zellij").arg("--version").output() {
-        Ok(output) if output.status.success() => {
-            check_zellij_version_output(&String::from_utf8_lossy(&output.stdout))
-        }
-        _ => CheckResult::NotFound {
-            install_hint: ZELLIJ_INSTALL_REMEDY.to_string(),
+fn resolved_zellij_check(runtime: &ResolvedZellijRuntime) -> CheckResult {
+    CheckResult::Found {
+        version: format!(
+            "mode {}, version {}, supported {}, path {}",
+            runtime.mode,
+            runtime.version,
+            SUPPORTED_ZELLIJ_RANGE,
+            runtime.path.display()
+        ),
+    }
+}
+
+fn check_zellij_runtime(request: &ZellijRuntimeRequest) -> CheckResult {
+    match crate::runtime::resolve_zellij_runtime(request) {
+        Ok(runtime) => resolved_zellij_check(&runtime),
+        Err(description) => CheckResult::Unsupported {
+            description,
+            remedy: "Set `[runtime] zellij = \"managed\"` to use Lisa's managed runtime, or configure a compatible absolute path.".to_string(),
         },
     }
 }
@@ -175,20 +189,15 @@ fn check_wasm_target() -> CheckResult {
 
 /// Build the list of dependency checks for the *selected* client.
 ///
-/// zellij and the wasm target are client-independent; the agent binary checked
-/// is exactly the one the loop will drive (`claude --version` or
-/// `codex --version`), never both.
+/// The Zellij runtime is resolved independently so its configured mode and path
+/// are preserved. The agent binary checked is exactly the one the loop drives
+/// (`claude --version` or `codex --version`), never both.
 fn build_checks(client: AgentClient) -> Vec<DependencyCheck> {
     let (agent_name, agent_check): (&'static str, Box<dyn Fn() -> CheckResult>) = match client {
         AgentClient::Claude => ("claude", Box::new(check_claude)),
         AgentClient::Codex => ("codex", Box::new(check_codex)),
     };
     vec![
-        DependencyCheck {
-            name: "zellij",
-            required: true,
-            check: Box::new(check_zellij),
-        },
         DependencyCheck {
             name: agent_name,
             required: true,
@@ -247,7 +256,7 @@ fn has_failures(reports: &[CheckReport]) -> bool {
     })
 }
 
-/// Check that all required runtime dependencies are present.
+/// Check that all non-Zellij runtime dependencies are present.
 /// Returns Ok(()) if all are found and supported, or rendered failure details
 /// for unavailable and unsupported dependencies otherwise.
 pub(crate) fn check_required_deps(client: AgentClient) -> Result<(), Vec<String>> {
@@ -504,14 +513,17 @@ pub(crate) fn pregrant_codex_trust(work_tree: &Path) -> Option<PathBuf> {
 
 /// Run the doctor command: check all dependencies and report.
 pub fn run_doctor(root: &Path) -> Result<(), String> {
-    // Determine the selected client from .lisa.toml (defaults to Claude, so a
-    // project with no opt-in produces exactly today's output).
-    let client = config::load_config(root)
-        .map(|v| config::resolve_config(&v.config, None, None).client)
-        .unwrap_or_default();
+    let validation = config::load_config(root)?;
+    let resolved_config = config::resolve_config(&validation.config, None, None);
+    let client = resolved_config.client;
 
     let checks = build_checks(client);
-    let mut reports = run_checks(checks);
+    let mut reports = vec![CheckReport {
+        name: "zellij",
+        required: true,
+        result: check_zellij_runtime(&resolved_config.zellij_runtime),
+    }];
+    reports.extend(run_checks(checks));
 
     // Add project version check
     let project_report = check_project_version(root);
@@ -715,6 +727,55 @@ mod tests {
             result: check_zellij_version_output(output),
         }
         .to_string()
+    }
+
+    fn format_resolved_runtime_report(
+        mode: crate::runtime::ZellijRuntimeMode,
+        version: &str,
+        path: &str,
+    ) -> String {
+        let runtime = ResolvedZellijRuntime {
+            mode,
+            version: lisa_core::version::ZellijVersion::parse_command_output(&format!(
+                "zellij {version}"
+            ))
+            .unwrap(),
+            path: PathBuf::from(path),
+        };
+        CheckReport {
+            name: "zellij",
+            required: true,
+            result: resolved_zellij_check(&runtime),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn test_runtime_report_names_mode_version_and_path_for_every_mode() {
+        for (mode, label, path) in [
+            (
+                crate::runtime::ZellijRuntimeMode::Managed,
+                "managed",
+                "/data/lisa/runtime/zellij-0.43.1/zellij",
+            ),
+            (
+                crate::runtime::ZellijRuntimeMode::System,
+                "system",
+                "/usr/local/bin/zellij",
+            ),
+            (
+                crate::runtime::ZellijRuntimeMode::Pinned,
+                "pinned",
+                "/opt/zellij/bin/zellij",
+            ),
+        ] {
+            let report = format_resolved_runtime_report(mode, "0.43.1", path);
+            assert!(report.contains(&format!("mode {label}")));
+            assert!(report.contains("version 0.43.1"));
+            assert!(report.contains("supported >= 0.43.0"));
+            assert!(report.contains(&format!("path {path}")));
+            assert!(report.contains("OK"));
+        }
     }
 
     #[test]
@@ -1026,7 +1087,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"claude"));
         assert!(!names.contains(&"codex"));
-        assert!(names.contains(&"zellij"));
+        assert!(!names.contains(&"zellij"));
     }
 
     #[test]
@@ -1037,7 +1098,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"codex"));
         assert!(!names.contains(&"claude"));
-        assert!(names.contains(&"zellij"));
+        assert!(!names.contains(&"zellij"));
     }
 
     #[test]

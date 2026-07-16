@@ -65,6 +65,11 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
 
     let git_root = discover_git_root(root)?;
 
+    // Freeze one configured runtime decision before any launch side effects.
+    // The resulting path is the exact executable reported by doctor and exec'd
+    // below; managed and pinned modes never fall back to PATH.
+    let zellij_runtime = crate::runtime::resolve_zellij_runtime(&config.zellij_runtime)?;
+
     let clients = configured_clients(root, config);
 
     // Validate every provider the DAG can route to (skip in dry-run — user may
@@ -137,6 +142,9 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     println!("Lisa loop starting...");
     println!("  WASM plugin: {}", wasm_path.display());
     println!("  Layout: {}", layout_path.display());
+    println!("  Zellij mode: {}", zellij_runtime.mode);
+    println!("  Zellij version: {}", zellij_runtime.version);
+    println!("  Zellij path: {}", zellij_runtime.path.display());
     println!(
         "  Max threads: {} (panes: {})",
         config.max_threads,
@@ -148,7 +156,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     println!();
 
     // Exec zellij (replaces this process)
-    exec_zellij(root, &layout_path)
+    exec_zellij(&zellij_runtime.path, root, &layout_path)
 }
 
 /// Dry-run mode: scan tickets, build DAG, print summary.
@@ -400,33 +408,36 @@ fn generate_layout(
 }
 
 #[cfg(unix)]
-fn exec_zellij(root: &Path, layout_path: &Path) -> Result<(), String> {
+fn exec_zellij(zellij_path: &Path, root: &Path, layout_path: &Path) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
 
-    let err = std::process::Command::new("zellij")
-        .arg("--layout")
-        .arg(layout_path)
-        .current_dir(root)
-        .exec();
+    let err = zellij_command(zellij_path, root, layout_path).exec();
 
     // exec() only returns on error
-    Err(format!("Failed to exec zellij: {}", err))
+    Err(format!(
+        "Failed to exec Zellij at {}: {}",
+        zellij_path.display(),
+        err
+    ))
 }
 
 #[cfg(not(unix))]
-fn exec_zellij(root: &Path, layout_path: &Path) -> Result<(), String> {
-    let status = std::process::Command::new("zellij")
-        .arg("--layout")
-        .arg(layout_path)
-        .current_dir(root)
+fn exec_zellij(zellij_path: &Path, root: &Path, layout_path: &Path) -> Result<(), String> {
+    let status = zellij_command(zellij_path, root, layout_path)
         .status()
-        .map_err(|e| format!("Failed to run zellij: {}", e))?;
+        .map_err(|e| format!("Failed to run Zellij at {}: {}", zellij_path.display(), e))?;
 
     if status.success() {
         Ok(())
     } else {
         Err(format!("zellij exited with status: {}", status))
     }
+}
+
+fn zellij_command(zellij_path: &Path, root: &Path, layout_path: &Path) -> Command {
+    let mut command = Command::new(zellij_path);
+    command.arg("--layout").arg(layout_path).current_dir(root);
+    command
 }
 
 #[cfg(test)]
@@ -466,6 +477,26 @@ mod tests {
         // max_threads=3 should produce 6 pane lines (2x)
         let pane_count = layout.matches("            pane").count();
         assert_eq!(pane_count, 6, "Expected 6 panes (2 * max_threads=3)");
+    }
+
+    #[test]
+    fn test_zellij_command_uses_resolved_absolute_path() {
+        for zellij_path in [
+            Path::new("/data/lisa/runtime/zellij-0.43.1/zellij"),
+            Path::new("/opt/pinned/zellij"),
+        ] {
+            let command = zellij_command(
+                zellij_path,
+                Path::new("/repo"),
+                Path::new("/repo/.lisa-layout.kdl"),
+            );
+            assert_eq!(command.get_program(), zellij_path.as_os_str());
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                vec!["--layout", "/repo/.lisa-layout.kdl"]
+            );
+            assert_eq!(command.get_current_dir(), Some(Path::new("/repo")));
+        }
     }
 
     #[test]
