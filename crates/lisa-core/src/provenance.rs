@@ -1,9 +1,10 @@
 //! Execution-provenance ledger: append-only JSONL learning data.
 //!
-//! The ledger contains terminal execution [`ProvenanceRecord`] rows and
-//! pre-ownership [`AssignmentTransitionRecord`] rows. Use
-//! [`ProvenanceLedgerRecord`] to read a ledger containing both shapes. Terminal
-//! execution rows are written by the plugin *after* the attempt ends
+//! The ledger contains terminal execution [`ProvenanceRecord`] rows,
+//! pre-ownership [`AssignmentTransitionRecord`] rows, and park/unpark
+//! [`ParkingTransitionRecord`] rows. Use [`ProvenanceLedgerRecord`] to read a
+//! ledger containing all three shapes. Terminal execution rows are written by
+//! the plugin *after* the attempt ends
 //! (write-after; they never race the agent and never touch the agent-owned
 //! ticket frontmatter — epic E-001 Decision 2). `.lisa/` gitignores only
 //! `signals/`, so the ledger is committable, queryable-across-runs data.
@@ -184,9 +185,10 @@ pub struct ParkingTransitionRecord {
 /// A row read from a potentially mixed-version, mixed-shape provenance ledger.
 ///
 /// Untagged representation preserves the exact schema-v2 execution JSON shape,
-/// which predates an explicit record discriminator. The new assignment shape
-/// has a required `record_type`, `state`, and `reason`, so the variants remain
-/// distinguishable without rewriting old ledger lines.
+/// which predates an explicit record discriminator. Assignment and parking
+/// shapes have required, disjoint `record_type` enums and their own required
+/// fields, so the variants remain distinguishable without rewriting old ledger
+/// lines.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProvenanceLedgerRecord {
