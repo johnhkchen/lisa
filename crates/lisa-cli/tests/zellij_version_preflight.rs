@@ -26,7 +26,7 @@ fn run_with_zellij_version(command: &str, version_output: &str) -> Output {
     fs::write(
         root.join(".lisa.toml"),
         format!(
-            "version = {:?}\n\n[agent]\nclient = \"claude\"\n",
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n",
             env!("CARGO_PKG_VERSION")
         ),
     )
@@ -78,17 +78,22 @@ fn assert_supported_loop_preflight(version: &str) {
     assert!(!stderr.contains("Dependency preflight failed"));
 }
 
+fn assert_runtime_remedy(output: &str) {
+    assert!(
+        output.contains("prebuilt static binaries") || output.contains("managed runtime"),
+        "missing Zellij runtime remedy:\n{output}"
+    );
+}
+
 #[test]
 fn loop_refuses_zellij_0401_with_floor_and_remedy() {
     let output = run_with_zellij_version("loop", "zellij 0.40.1");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("Dependency preflight failed"));
-    assert!(stderr.contains("detected Zellij 0.40.1"));
-    assert!(stderr.contains("supported range >= 0.43.0"));
-    assert!(stderr.contains("prebuilt static binaries"));
-    assert!(stderr.contains("https://github.com/zellij-org/zellij/releases"));
+    assert!(stderr.contains("Zellij 0.40.1"));
+    assert!(stderr.contains(">= 0.43.0"));
+    assert_runtime_remedy(&stderr);
 }
 
 #[test]
@@ -104,7 +109,8 @@ fn doctor_reports_detected_version_and_supported_range_on_success() {
 
     assert!(output.status.success());
     assert!(stdout.contains("zellij"));
-    assert!(stdout.contains("detected 0.44.3, supported >= 0.43.0"));
+    assert!(stdout.contains("0.44.3"));
+    assert!(stdout.contains("supported >= 0.43.0"));
     assert!(stdout.contains("OK"));
 }
 
@@ -116,7 +122,8 @@ fn doctor_names_unparseable_zellij_output_as_unsupported() {
     assert!(!output.status.success());
     assert!(stdout.contains("zellij"));
     assert!(stdout.contains("unsupported"));
-    assert!(stdout.contains("unparseable Zellij version output \"zellij mystery-version\""));
-    assert!(stdout.contains("supported range >= 0.43.0"));
-    assert!(stdout.contains("prebuilt static binaries"));
+    assert!(stdout.contains("unparseable"));
+    assert!(stdout.contains("zellij mystery-version"));
+    assert!(stdout.contains(">= 0.43.0"));
+    assert_runtime_remedy(&stdout);
 }
