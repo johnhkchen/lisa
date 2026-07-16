@@ -42,6 +42,7 @@ use lisa_core::completion::{
     CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand,
     Reconciliation, Retryability,
 };
+use lisa_core::context::PURPOSE_PARAGRAPH;
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
 use lisa_core::disposition::{parse_review_disposition, ReviewDisposition};
@@ -119,7 +120,7 @@ pub(crate) fn ticket_prompt(
         String::new()
     };
     format!(
-        "Read the ticket at {path}, {context}, and docs/knowledge/rdspi-workflow.md. \
+        "{purpose}\n\nRead the ticket at {path}, {context}, and docs/knowledge/rdspi-workflow.md. \
          Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
          (Research, Design, Structure, Plan, Implement, Review) without stopping between phases. \
          For each phase, write the artifact to {artifact_dir}/ then immediately continue to the next phase. \
@@ -137,6 +138,7 @@ pub(crate) fn ticket_prompt(
          remain on this ticket and stop. Do not start another ticket until Lisa confirms the completion commit; \
          Lisa handles Done publication and seat release.{review_recovery}",
         path = ticket_path.display(),
+        purpose = PURPOSE_PARAGRAPH,
         context = context_file,
         id = ticket_id,
         artifact_dir = artifact_dir.display(),
@@ -1337,7 +1339,7 @@ impl State {
             .join(DISPOSITION_ARTIFACT);
         match parse_review_disposition(disposition_path) {
             ReviewDisposition::Pass => Ok(()),
-            ReviewDisposition::Block { reason } => {
+            ReviewDisposition::Block { reason, .. } => {
                 Err(CompletionRejection::DispositionBlocked { reason })
             }
             ReviewDisposition::Invalid { reason } => Err(CompletionRejection::DispositionBlocked {
@@ -5783,7 +5785,7 @@ impl State {
 
         match parse_review_disposition(&disposition_path) {
             ReviewDisposition::Pass => None,
-            ReviewDisposition::Block { reason } => Some((
+            ReviewDisposition::Block { reason, .. } => Some((
                 format!("Review blocked: {reason}"),
                 vec![
                     "Resolve review blocker".to_string(),
@@ -8587,6 +8589,28 @@ mod tests {
         );
         assert!(prompt.contains("Both Review artifacts are required"));
         assert!(prompt.contains("Do not start another ticket until Lisa confirms"));
+    }
+
+    #[test]
+    fn test_ticket_prompt_opens_with_canonical_purpose_before_mechanics() {
+        let prompt = ticket_prompt(
+            Path::new("docs/active/tickets"),
+            "T-024-03",
+            AgentClient::Claude.context_file(),
+            Path::new(".lisa/attempts/T-024-03/1/work"),
+        );
+        assert!(prompt.starts_with(PURPOSE_PARAGRAPH));
+
+        let lower = prompt.to_lowercase();
+        let purpose_position = lower.find(&PURPOSE_PARAGRAPH.to_lowercase()).unwrap();
+        for mechanism in ["dag", "phase", "scheduling", "zellij"] {
+            if let Some(position) = lower.find(mechanism) {
+                assert!(
+                    purpose_position < position,
+                    "purpose must precede {mechanism}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -334,7 +334,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     } else {
         actions.push(InitAction::CreateFile {
             path: agents_md_path,
-            content: templates::AGENTS_MD.to_string(),
+            content: templates::generate_agents_md(),
         });
     }
 
@@ -1555,7 +1555,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
-        fs::write(dir.path().join("AGENTS.md"), templates::AGENTS_MD).unwrap();
+        fs::write(
+            dir.path().join("AGENTS.md"),
+            templates::generate_agents_md(),
+        )
+        .unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();

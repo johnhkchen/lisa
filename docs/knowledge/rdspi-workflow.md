@@ -1,3 +1,5 @@
+Lisa runs coding agents like Claude Code and Codex through your ticket board, so you don't have to approve every step by hand.
+
 ## RDSPI Workflow
 
 Every ticket passes through six phases in order. No phases are skipped regardless of ticket size. Complete all phases in a single continuous pass — do not stop between phases.

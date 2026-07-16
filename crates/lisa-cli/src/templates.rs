@@ -1,4 +1,5 @@
 use crate::detect::DetectedProject;
+use lisa_core::context::PURPOSE_PARAGRAPH;
 
 /// The RDSPI workflow document, embedded at compile time
 pub const RDSPI_WORKFLOW: &str = include_str!("../data/rdspi-workflow.md");
@@ -229,20 +230,18 @@ pub const LISA_GITIGNORE: &str = "signals/\nattempts/\nclaude/\ncodex/\n";
 /// contract, points at `CLAUDE.md` as the single source of truth, and repeats the
 /// RDSPI workflow reference. A Codex session, told by its ticket prompt to read
 /// `AGENTS.md`, follows the pointer to `CLAUDE.md`.
-pub const AGENTS_MD: &str = "# AGENTS.md\n\
-\n\
-Lisa runs coding agents like Claude Code and Codex through your ticket board, so \
-you don't have to approve every step by hand.\n\
-\n\
+pub fn generate_agents_md() -> String {
+    format!(
+        "# AGENTS.md\n\n{PURPOSE_PARAGRAPH}\n\n\
 Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable \
-record, and wait for Lisa to confirm completion.\n\
-\n\
+record, and wait for Lisa to confirm completion.\n\n\
 This project's agent context lives in [CLAUDE.md](CLAUDE.md) — the single source \
 of truth for every agent client (Claude Code reads `CLAUDE.md`; Codex reads this \
-`AGENTS.md`). Read `CLAUDE.md` first.\n\
-\n\
+`AGENTS.md`). Read `CLAUDE.md` first.\n\n\
 The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is \
-injected into agent context by lisa automatically.\n";
+injected into agent context by lisa automatically.\n"
+    )
+}
 
 /// The on-notify hook SAMPLE, scaffolded as `.lisa/hooks/on-notify.sample`.
 /// User-owned attention/completion notification hook. It is deliberately a
@@ -719,7 +718,7 @@ pub fn generate_claude_md(project: &DetectedProject) -> String {
     format!(
         r#"# CLAUDE.md
 
-Lisa runs coding agents like Claude Code and Codex through your ticket board, so you don't have to approve every step by hand.
+{purpose}
 
 Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable record, and wait for Lisa to confirm completion.
 
@@ -742,6 +741,7 @@ docs/active/work/       # Work artifacts, one subdirectory per ticket ID
 The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is injected into agent context by lisa automatically.
 "#,
         name = project.name,
+        purpose = PURPOSE_PARAGRAPH,
         type_label = type_label,
         build_section = build_section,
         source_layout_section = source_layout_section,
@@ -826,16 +826,20 @@ mod tests {
             lint_command: "cargo clippy".to_string(),
             source_layout: "src:\n  main.rs".to_string(),
         };
-        let purpose = "Lisa runs coding agents like Claude Code and Codex through your ticket board, so you don't have to approve every step by hand.";
         let contract = "Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable record, and wait for Lisa to confirm completion.";
         let claude_md = generate_claude_md(&project);
+        let agents_md = generate_agents_md();
 
         for (context, heading, later_section) in [
             (claude_md.as_str(), "# CLAUDE.md", "## Project"),
-            (AGENTS_MD, "# AGENTS.md", "This project's agent context"),
+            (
+                agents_md.as_str(),
+                "# AGENTS.md",
+                "This project's agent context",
+            ),
         ] {
             let heading_position = context.find(heading).unwrap();
-            let purpose_position = context.find(purpose).unwrap();
+            let purpose_position = context.find(PURPOSE_PARAGRAPH).unwrap();
             let contract_position = context.find(contract).unwrap();
             let later_section_position = context.find(later_section).unwrap();
 
@@ -843,6 +847,56 @@ mod tests {
             assert!(purpose_position < contract_position);
             assert!(contract_position < later_section_position);
         }
+    }
+
+    #[test]
+    fn test_injected_context_is_purpose_first_and_copy_is_single_sourced() {
+        let project = DetectedProject {
+            project_type: ProjectType::Unknown,
+            name: "purpose-order".to_string(),
+            build_command: String::new(),
+            test_command: String::new(),
+            lint_command: String::new(),
+            source_layout: String::new(),
+        };
+        let claude_md = generate_claude_md(&project);
+        let agents_md = generate_agents_md();
+
+        for (name, context) in [
+            ("CLAUDE.md", claude_md.as_str()),
+            ("AGENTS.md", agents_md.as_str()),
+            ("RDSPI workflow", RDSPI_WORKFLOW),
+        ] {
+            assert_eq!(
+                context.matches(PURPOSE_PARAGRAPH).count(),
+                1,
+                "{name} should contain one canonical purpose paragraph"
+            );
+            let lower = context.to_lowercase();
+            let purpose_position = lower.find(&PURPOSE_PARAGRAPH.to_lowercase()).unwrap();
+            for mechanism in ["dag", "phase", "scheduling", "zellij"] {
+                if let Some(position) = lower.find(mechanism) {
+                    assert!(
+                        purpose_position < position,
+                        "{name}: purpose must precede {mechanism}"
+                    );
+                }
+            }
+        }
+
+        let rust_template_sources = [
+            include_str!("../../lisa-core/src/context.rs"),
+            include_str!("../../lisa-plugin/src/lib.rs"),
+            include_str!("templates.rs"),
+        ];
+        assert_eq!(
+            rust_template_sources
+                .iter()
+                .map(|source| source.matches(PURPOSE_PARAGRAPH).count())
+                .sum::<usize>(),
+            1,
+            "canonical prose must have exactly one Rust template source"
+        );
     }
 
     #[test]
@@ -1112,12 +1166,13 @@ mod tests {
     fn test_agents_md_points_to_claude() {
         // The pointer names CLAUDE.md as the source of truth and keeps the RDSPI
         // reference, but carries no duplicated project body (so it cannot drift).
-        assert!(AGENTS_MD.contains("# AGENTS.md"));
-        assert!(AGENTS_MD.contains("CLAUDE.md"));
-        assert!(AGENTS_MD.contains("docs/knowledge/rdspi-workflow.md"));
+        let agents_md = generate_agents_md();
+        assert!(agents_md.contains("# AGENTS.md"));
+        assert!(agents_md.contains("CLAUDE.md"));
+        assert!(agents_md.contains("docs/knowledge/rdspi-workflow.md"));
         // No build/source-layout sections copied from CLAUDE.md.
-        assert!(!AGENTS_MD.contains("Build and Test"));
-        assert!(!AGENTS_MD.contains("Source Layout"));
+        assert!(!agents_md.contains("Build and Test"));
+        assert!(!agents_md.contains("Source Layout"));
     }
 
     #[test]

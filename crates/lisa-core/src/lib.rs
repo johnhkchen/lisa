@@ -2,6 +2,7 @@ pub mod capture;
 pub mod claim;
 pub mod client;
 pub mod completion;
+pub mod context;
 pub mod dag;
 pub mod diagnostics;
 pub mod disposition;
