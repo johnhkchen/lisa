@@ -99,6 +99,44 @@ init PATH:
 validate PATH=".":
     cargo run -p lisa-cli -- validate --path {{PATH}}
 
+# Enter the Chromebook-test fixture (E-046): builds the image, verifies the
+# fixture invariants in a disposable container, then opens an interactive
+# capped shell as `tester`. The container is KEPT after exit — it is evidence
+# until its run record is complete; remove it with `docker rm <name>`.
+# Optional LEG labels the container: `just emulate-debian claude-a`.
+emulate-debian LEG="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker build -t lisa-chromebook-test docker/chromebook-test/
+    docker image inspect lisa-chromebook-test \
+        --format 'image id={{{{.Id}} architecture={{{{.Architecture}}'
+    echo ">>> preflight: fixture invariants (disposable container, no tokens spent)"
+    docker run --rm --memory=4g --cpus=2 lisa-chromebook-test bash -c '
+        set -eu
+        test "$(id -un)" = tester
+        test "$HOME" = /home/tester
+        sudo -n true
+        command -v claude >/dev/null
+        command -v codex >/dev/null
+        for b in git rustc cargo rustup xz gcc cc g++ make; do
+            if command -v "$b" >/dev/null 2>&1; then
+                echo "fixture invariant failed: $b present" >&2
+                exit 1
+            fi
+        done
+        test ! -e "$HOME/.claude"
+        test ! -e "$HOME/.codex"
+        echo "preflight OK: node=$(node --version) claude=$(claude --version) codex=$(codex --version)"
+    '
+    name="cbt-$(date +%m%d-%H%M%S)"
+    if [ -n "{{LEG}}" ]; then name="$name-{{LEG}}"; fi
+    echo ""
+    echo ">>> entering fixture: $name   (memory=4g, cpus=2, kept after exit)"
+    echo ">>> record this container name in the run record"
+    echo ">>> runbook: docs/knowledge/chromebook-install-test.md"
+    echo ">>> auth inside:  claude auth login   |   codex login --device-auth"
+    exec docker run -it --memory=4g --cpus=2 --name "$name" lisa-chromebook-test bash
+
 # S-020 interactive-gate dry run (T-020-05): set up an instrumented throwaway
 # project, run lisa loop against it, then print the block/resume evidence on exit.
 gate-test DEST="/tmp/lisa-gate-dryrun":

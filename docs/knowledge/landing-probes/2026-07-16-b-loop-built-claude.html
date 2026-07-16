@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lisa — DAG-driven concurrent task scheduling</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --bg-alt: #10141d;
+    --panel: #141924;
+    --edge: #1c2333;
+    --text: #d8dee9;
+    --text-dim: #8b95aa;
+    --accent: #7dd3a8;
+    --accent-dim: #4f8f6f;
+    --warn-bg: #241a12;
+    --warn-edge: #4a3418;
+    --warn-text: #e8b877;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+  }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 0 24px; }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  .hero {
+    padding: 88px 0 56px;
+    border-bottom: 1px solid var(--edge);
+    background: linear-gradient(180deg, var(--bg-alt), var(--bg));
+  }
+  .badge {
+    display: inline-block;
+    font-size: 12px;
+    color: var(--accent);
+    border: 1px solid var(--accent-dim);
+    border-radius: 999px;
+    padding: 4px 12px;
+    margin-bottom: 18px;
+    letter-spacing: 0.02em;
+  }
+  h1 {
+    font-size: 40px;
+    line-height: 1.15;
+    margin: 0 0 16px;
+    letter-spacing: -0.01em;
+  }
+  .hero p.tagline {
+    font-size: 18px;
+    color: var(--text-dim);
+    max-width: 60ch;
+    margin: 0;
+  }
+
+  section { padding: 48px 0; border-bottom: 1px solid var(--edge); }
+  h2 {
+    font-size: 22px;
+    margin: 0 0 20px;
+  }
+  h2 .mono { color: var(--accent); font-size: 15px; display: block; margin-bottom: 6px; }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    padding: 18px;
+  }
+  .card .cmd {
+    color: var(--accent);
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+  .card p { margin: 0; color: var(--text-dim); font-size: 14px; }
+
+  .term {
+    background: var(--panel);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 14px;
+  }
+  .term .bar {
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--edge);
+    padding: 8px 14px;
+    font-size: 13px;
+    color: var(--accent);
+  }
+  .term pre {
+    margin: 0;
+    padding: 14px 16px;
+    font-size: 13px;
+    overflow-x: auto;
+    color: var(--text);
+    white-space: pre;
+  }
+  .callout {
+    font-size: 13px;
+    color: var(--warn-text);
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-edge);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin: -4px 0 18px;
+  }
+
+  .rough-edges {
+    background: var(--warn-bg);
+    border-top: 1px solid var(--warn-edge);
+    border-bottom: 1px solid var(--warn-edge);
+  }
+  .rough-edges h2 { color: var(--warn-text); }
+  .rough-edges ol { margin: 0; padding-left: 20px; color: var(--text); }
+  .rough-edges li { margin-bottom: 12px; }
+  .rough-edges li:last-child { margin-bottom: 0; }
+
+  footer {
+    padding: 32px 0 64px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="badge mono">lisa 0.3.0 · captured from a real session</span>
+    <h1>Lisa schedules your ticket DAG so Claude Code agents can work concurrently, in order.</h1>
+    <p class="tagline">
+      Lisa turns a directory of markdown tickets into a dependency graph,
+      then drives Claude Code agents through a fixed six-phase workflow
+      (Research → Design → Structure → Plan → Implement → Review) for each
+      ticket — scheduling multiple threads at once wherever the DAG allows.
+    </p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>What Lisa does</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="cmd">lisa init</div>
+        <p>Scaffolds a project: ticket/story/work directories, CLAUDE.md,
+        the RDSPI workflow doc, hooks, and Lisa's own config file.</p>
+      </div>
+      <div class="card">
+        <div class="cmd">lisa validate</div>
+        <p>Checks the ticket DAG before anything runs — catches missing
+        tickets, bad dependency edges, and cycles up front.</p>
+      </div>
+      <div class="card">
+        <div class="cmd">lisa status</div>
+        <p>Shows the DAG as execution waves: what's done, in progress,
+        ready, or blocked, and who blocks whom.</p>
+      </div>
+      <div class="card">
+        <div class="cmd">lisa loop</div>
+        <p>Launches a Zellij session running Lisa's scheduling plugin,
+        which spawns concurrent agent threads for ready tickets.</p>
+      </div>
+      <div class="card">
+        <div class="cmd">lisa doctor</div>
+        <p>Checks that runtime dependencies (Zellij, Claude Code, the wasm
+        build target) are installed before you rely on them.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>See it run</h2>
+
+    <div class="term">
+      <div class="bar mono">$ lisa doctor</div>
+      <pre class="mono">Checking dependencies...
+
+  zellij       zellij 0.44.3  OK
+  claude       2.1.211 (Claude Code) OK
+  wasm target  skipped (rustup not found)
+
+All dependencies satisfied.
+
+Checking Zellij plugin cache...
+
+  Cleaned 2 cached lisa-plugin entries</pre>
+    </div>
+    <div class="callout">
+      Note the summary still says "All dependencies satisfied" even though
+      the wasm target was skipped, not checked — see Rough edges below.
+    </div>
+
+    <div class="term">
+      <div class="bar mono">$ lisa validate — before any tickets exist</div>
+      <pre class="mono">docs/active/tickets/: readiness: no tickets found. Create at least one ticket file.
+
+1 error(s) found. Fix and re-run `lisa validate`.
+Error: 1 error(s) found. Fix and re-run `lisa validate`.</pre>
+    </div>
+
+    <div class="term">
+      <div class="bar mono">$ lisa validate — after adding tickets</div>
+      <pre class="mono">All checks passed. 3 tickets, 1 ready, DAG valid. Run `lisa loop` to start.
+Config: max_threads=2, session_timeout=3600s</pre>
+    </div>
+
+    <div class="term">
+      <div class="bar mono">$ lisa status</div>
+      <pre class="mono">DAG: 3 tickets, 3 edges, no cycles
+Critical path: 3 tickets
+Status: 0 done, 1 in progress, 1 ready, 1 blocked
+Config: max_threads=2, session_timeout=3600s
+
+Wave 0 (no dependencies):
+  T-001-01      research  open  capture-lisa-basics  blocks: T-001-02, T-001-03
+
+Wave 1 (depends on wave 0):
+  T-001-02      ready  open  build-lisa-landing-page  deps: T-001-01  blocks: T-001-03
+
+Wave 2 (depends on wave 1):
+  T-001-03      ready  open  synthesize-work-docs  deps: T-001-01, T-001-02
+
+Ready to schedule: T-001-01</pre>
+    </div>
+  </div>
+</section>
+
+<section class="rough-edges">
+  <div class="wrap">
+    <h2>Rough edges</h2>
+    <ol>
+      <li>
+        <strong>The wasm target is silently skipped, not failed.</strong>
+        <code class="mono">lisa doctor</code> reports "skipped (rustup not
+        found)" rather than erroring, and the overall summary still reads
+        "All dependencies satisfied." It's easy to miss that a dependency
+        is incomplete — check for <code class="mono">rustup</code>
+        explicitly if you'll need the Zellij plugin built from source.
+      </li>
+      <li>
+        <strong><code class="mono">lisa validate</code> fails hard on an
+        empty project.</strong> Running <code class="mono">lisa init</code>
+        alone doesn't get you to a working state — <code class="mono">validate</code>
+        immediately errors with "no tickets found" until at least one
+        ticket file exists. The error message is precise and actionable,
+        but the two-step ("init, then oh — I also need a ticket") is a
+        small surprise on a first run.
+      </li>
+    </ol>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Every command block above is real output captured from an installed
+    <code class="mono">lisa 0.3.0</code> session — nothing on this page is
+    fabricated. Full transcripts:
+    <a href="docs/active/work/T-001-01/lisa-output.md">docs/active/work/T-001-01/lisa-output.md</a>.
+  </div>
+</footer>
+
+</body>
+</html>
