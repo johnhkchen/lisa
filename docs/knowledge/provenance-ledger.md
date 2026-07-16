@@ -1,19 +1,16 @@
 # Provenance Ledger
 
-The **execution-provenance ledger** is an append-only JSONL file at
-`.lisa/provenance.jsonl`. lisa's plugin appends **one record per terminal
-execution attempt** the
-moment a run reaches a terminal state (completed or failed), *after* the ticket's
-frontmatter is already updated — it never races the agent and never touches
-agent-owned fields. `.lisa/` gitignores only `signals/`, so the ledger is
-**committable learning data**: check it in and query it across runs to evaluate
-routing policies (which `(method, provider, model)` yields the best results, is
-most cost-effective, and survives high concurrency).
+The **provenance ledger** is an append-only JSONL file at
+`.lisa/provenance.jsonl`. It contains terminal execution attempts,
+pre-ownership assignment failures, and ticket parking transitions. Terminal
+execution rows are appended after the attempt reaches its terminal state and
+never race agent-owned ticket fields. `.lisa/` gitignores only `signals/`, so
+the ledger is **committable learning data** that can be queried across runs.
 
 Schema owner: `crates/lisa-core/src/provenance.rs`. Current
-`schema_version`: **2**.
+`schema_version`: **4**.
 
-## Record shape
+## Execution record shape
 
 One JSON object per line. Example:
 
@@ -98,6 +95,70 @@ Missing values are always `null`, never guessed. A run that produced no
 observable usage (no artifact, empty/unreadable transcript) records `null`
 tokens — not a fabricated `0`.
 
+## Assignment-transition record shape
+
+Schema 3 added pre-ownership evidence for bounded assignment transitions that
+end before an agent provider owns the attempt.
+
+Example:
+
+```json
+{"schema_version":3,"record_type":"assignment-transition","ticket_id":"T-040-02-01","attempt_lease":{"ticket_id":"T-040-02-01","attempt_id":7},"pane_id":12,"provider":"openai","state":"delivery-failed","reason":"provider did not acknowledge the bounded chat assignment","started_at":1752000000,"ended_at":1752000030,"wall_clock_secs":30}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema_version` | int | `3` for the generation that introduced this shape; current writers stamp `4`. |
+| `record_type` | enum | Always `assignment-transition`. |
+| `ticket_id` | string | Ticket whose assignment was attempted. |
+| `attempt_lease` | object | Exact `{ticket_id, attempt_id}` assignment lease. |
+| `pane_id` | int | Zellij pane involved in the transition. |
+| `provider` | string | Provider serving the assignment. |
+| `state` | enum | `claim-timed-out`, `delivery-failed`, `recovery-failed`, or `startup-failed`. |
+| `reason` | string | Stable operator-visible explanation. |
+| `started_at` | int | Transition start, UTC epoch seconds. |
+| `ended_at` | int | Terminal observation, UTC epoch seconds. |
+| `wall_clock_secs` | int | Saturating `ended_at - started_at`. |
+
+These rows are evidence, not scheduler authority. Their state vocabulary does
+not replace the plugin's private assignment state machine.
+
+## Parking-transition record shape
+
+Schema 4 adds park and unpark rows so parked duration and remedy ownership are
+queryable. T-048-01-01 defines and validates this storage contract; scheduler
+emission is implemented by its dependent ticket.
+
+Example:
+
+```json
+{"schema_version":4,"record_type":"unpark","ticket_id":"T-048-01-02","attempt_lease":{"ticket_id":"T-048-01-02","attempt_id":4},"remedy_owner":"world","started_at":1752700000,"ended_at":1752700125,"wall_clock_secs":125}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema_version` | int | `4` for parking-transition rows. |
+| `record_type` | enum | `park` or `unpark`. |
+| `ticket_id` | string | Ticket entering or leaving parked state. |
+| `attempt_lease` | object | Exact attempt associated with the transition. |
+| `remedy_owner` | enum | `agent`, `operator`, or `world`. |
+| `started_at` | int | Interval start, UTC epoch seconds. |
+| `ended_at` | int | Interval end, UTC epoch seconds. |
+| `wall_clock_secs` | int | Saturating interval duration. |
+
+The interval fields let an unpark row carry stranded time directly. Producers
+own the precise mapping from scheduler observations to those timestamps.
+
+## Mixed-ledger reading
+
+Historical execution rows have no `record_type`. Assignment and parking rows
+have distinct required discriminators and fields. Core exposes the untagged
+`ProvenanceLedgerRecord` enum to replay all three shapes without rewriting old
+lines.
+
+Readers interested in execution metrics must filter for execution fields (for
+example, `outcome`) rather than assuming every JSONL row is an execution.
+
 ## Querying
 
 **jq** — average wall-clock of successful Codex runs:
@@ -145,9 +206,11 @@ ORDER BY 1, 2;
 ## Versioning
 
 `schema_version` lets readers branch as the schema grows. Version 2 added the
-required `attempt_lease`, `authoritative`, and `fenced` fields. Version-1 rows
-remain valid append-only history but predate attempt attribution; readers of a
-mixed ledger must branch on `schema_version` rather than inventing leases.
+required execution `attempt_lease`, `authoritative`, and `fenced` fields.
+Version 3 added assignment-transition rows. Version 4 added park/unpark rows
+and the shared remedy-owner classification. Version-1 rows remain valid
+append-only history but predate attempt attribution; readers of a mixed ledger
+must branch on version and shape rather than inventing leases.
 
 Populating Claude
 tokens (T-027-02) did **not** bump the version — the record *shape* is unchanged;
