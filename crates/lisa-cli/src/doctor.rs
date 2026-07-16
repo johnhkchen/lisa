@@ -10,6 +10,9 @@ use lisa_core::version::{classify_zellij_version_output, ZellijVersionVerdict};
 
 use crate::config;
 use crate::runtime::{ResolvedZellijRuntime, ZellijRuntimeRequest};
+use crate::templates::PLUGIN_WASM;
+
+pub(crate) const LISA_SHELL_INSTALL_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh";
 
 #[cfg(test)]
 const ZELLIJ_INSTALL_REMEDY: &str =
@@ -138,6 +141,15 @@ fn check_zellij_runtime(request: &ZellijRuntimeRequest) -> CheckResult {
     }
 }
 
+fn check_git() -> CheckResult {
+    match get_command_version("git", &["--version"]) {
+        Some(version) => CheckResult::Found { version },
+        None => CheckResult::NotFound {
+            install_hint: "sudo apt install git".to_string(),
+        },
+    }
+}
+
 fn check_claude() -> CheckResult {
     match get_command_version("claude", &["--version"]) {
         Some(version) => CheckResult::Found { version },
@@ -156,6 +168,26 @@ fn check_codex() -> CheckResult {
                     .to_string(),
         },
     }
+}
+
+fn check_embedded_wasm_bytes(wasm: &[u8]) -> CheckResult {
+    if wasm.is_empty() {
+        CheckResult::Unsupported {
+            description: "this Lisa binary contains an empty embedded WASM plugin placeholder"
+                .to_string(),
+            remedy: format!(
+                "Reinstall Lisa with the shell installer:\n    {LISA_SHELL_INSTALL_COMMAND}"
+            ),
+        }
+    } else {
+        CheckResult::Found {
+            version: "plugin embedded".to_string(),
+        }
+    }
+}
+
+fn check_embedded_wasm() -> CheckResult {
+    check_embedded_wasm_bytes(PLUGIN_WASM)
 }
 
 fn check_wasm_target() -> CheckResult {
@@ -187,28 +219,48 @@ fn check_wasm_target() -> CheckResult {
     }
 }
 
-/// Build the list of dependency checks for the *selected* client.
+/// Build the external dependency checks shared by doctor and loop preflight.
 ///
 /// The Zellij runtime is resolved independently so its configured mode and path
 /// are preserved. The agent binary checked is exactly the one the loop drives
 /// (`claude --version` or `codex --version`), never both.
-fn build_checks(client: AgentClient) -> Vec<DependencyCheck> {
+fn build_required_deps_checks(client: AgentClient) -> Vec<DependencyCheck> {
     let (agent_name, agent_check): (&'static str, Box<dyn Fn() -> CheckResult>) = match client {
         AgentClient::Claude => ("claude", Box::new(check_claude)),
         AgentClient::Codex => ("codex", Box::new(check_codex)),
     };
     vec![
         DependencyCheck {
+            name: "git",
+            required: true,
+            check: Box::new(check_git),
+        },
+        DependencyCheck {
             name: agent_name,
             required: true,
             check: agent_check,
+        },
+    ]
+}
+
+fn build_checks(client: AgentClient) -> Vec<DependencyCheck> {
+    // Doctor also diagnoses packaging and optional developer-tool state. Loop
+    // retains its adjacent empty-WASM guard so that failure has loop-specific
+    // shell-installer guidance at the point before the bytes are consumed.
+    let mut checks = build_required_deps_checks(client);
+    checks.extend([
+        DependencyCheck {
+            name: "embedded WASM",
+            required: true,
+            check: Box::new(check_embedded_wasm),
         },
         DependencyCheck {
             name: "wasm target",
             required: false,
             check: Box::new(check_wasm_target),
         },
-    ]
+    ]);
+    checks
 }
 
 /// Execute all checks and collect reports.
@@ -260,7 +312,7 @@ fn has_failures(reports: &[CheckReport]) -> bool {
 /// Returns Ok(()) if all are found and supported, or rendered failure details
 /// for unavailable and unsupported dependencies otherwise.
 pub(crate) fn check_required_deps(client: AgentClient) -> Result<(), Vec<String>> {
-    check_required_deps_inner(build_checks(client))
+    check_required_deps_inner(build_required_deps_checks(client))
 }
 
 fn check_required_deps_inner(checks: Vec<DependencyCheck>) -> Result<(), Vec<String>> {
@@ -819,6 +871,48 @@ mod tests {
     }
 
     #[test]
+    fn test_zellij_runtime_failure_names_managed_runtime_remedy() {
+        let report = CheckReport {
+            name: "zellij",
+            required: true,
+            result: check_zellij_runtime(&ZellijRuntimeRequest::Pinned(PathBuf::from(
+                "/definitely/missing/zellij",
+            ))),
+        }
+        .to_string();
+
+        assert!(report.contains("unsupported"));
+        assert!(report.contains("managed runtime"));
+        assert!(report.contains("[runtime] zellij = \"managed\""));
+    }
+
+    #[test]
+    fn test_embedded_wasm_check_accepts_nonempty_plugin() {
+        assert!(matches!(
+            check_embedded_wasm_bytes(b"not-empty"),
+            CheckResult::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn test_embedded_wasm_check_names_placeholder_and_shell_installer() {
+        let report = CheckReport {
+            name: "embedded WASM",
+            required: true,
+            result: check_embedded_wasm_bytes(b""),
+        }
+        .to_string();
+
+        assert!(report.contains("embedded WASM"));
+        assert!(report.contains("unsupported"));
+        assert!(report.contains("empty embedded WASM plugin placeholder"));
+        assert!(report.contains("lisa-cli-installer.sh"));
+        assert!(report.contains(LISA_SHELL_INSTALL_COMMAND));
+        assert!(!report.contains("git clone"));
+        assert!(!report.contains("just release"));
+    }
+
+    #[test]
     fn test_run_checks_found() {
         let checks = vec![mock_found("zellij", "zellij 0.43.0")];
         let reports = run_checks(checks);
@@ -828,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_run_checks_not_found() {
-        let checks = vec![mock_not_found("zellij", "cargo install zellij")];
+        let checks = vec![mock_not_found("git", "sudo apt install git")];
         let reports = run_checks(checks);
         assert_eq!(reports.len(), 1);
         assert!(matches!(reports[0].result, CheckResult::NotFound { .. }));
@@ -863,14 +957,14 @@ mod tests {
     #[test]
     fn test_format_report_with_failure() {
         let checks = vec![
-            mock_not_found("zellij", "cargo install zellij"),
+            mock_not_found("git", "sudo apt install git"),
             mock_found("claude", "claude 1.2.3"),
         ];
         let reports = run_checks(checks);
         let output = format_report(&reports);
 
         assert!(output.contains("not found"));
-        assert!(output.contains("Install: cargo install zellij"));
+        assert!(output.contains("Install: sudo apt install git"));
         assert!(output.contains("Some required dependencies are unavailable or unsupported."));
     }
 
@@ -966,15 +1060,15 @@ mod tests {
     #[test]
     fn test_report_display_not_found() {
         let report = CheckReport {
-            name: "zellij",
+            name: "git",
             required: true,
             result: CheckResult::NotFound {
-                install_hint: "cargo install zellij".to_string(),
+                install_hint: "sudo apt install git".to_string(),
             },
         };
         let s = format!("{}", report);
         assert!(s.contains("not found"));
-        assert!(s.contains("Install: cargo install zellij"));
+        assert!(s.contains("Install: sudo apt install git"));
     }
 
     #[test]
@@ -1022,30 +1116,30 @@ mod tests {
     #[test]
     fn test_check_required_deps_one_missing() {
         let checks = vec![
-            mock_not_found("zellij", "cargo install zellij"),
+            mock_not_found("git", "sudo apt install git"),
             mock_found("claude", "claude 1.2.3"),
         ];
         let result = check_required_deps_inner(checks);
         assert!(result.is_err());
         let missing = result.unwrap_err();
         assert_eq!(missing.len(), 1);
-        assert!(missing[0].contains("zellij"));
+        assert!(missing[0].contains("git"));
         assert!(missing[0].contains("not found"));
-        assert!(missing[0].contains("cargo install zellij"));
+        assert!(missing[0].contains("sudo apt install git"));
     }
 
     #[test]
     fn test_check_required_deps_all_missing() {
         let checks = vec![
-            mock_not_found("zellij", "cargo install zellij"),
+            mock_not_found("git", "sudo apt install git"),
             mock_not_found("claude", "install claude"),
         ];
         let result = check_required_deps_inner(checks);
         assert!(result.is_err());
         let missing = result.unwrap_err();
         assert_eq!(missing.len(), 2);
-        assert!(missing[0].contains("zellij"));
-        assert!(missing[0].contains("cargo install zellij"));
+        assert!(missing[0].contains("git"));
+        assert!(missing[0].contains("sudo apt install git"));
         assert!(missing[1].contains("claude"));
         assert!(missing[1].contains("install claude"));
     }
@@ -1086,6 +1180,8 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert!(names.contains(&"claude"));
+        assert!(names.contains(&"git"));
+        assert!(names.contains(&"embedded WASM"));
         assert!(!names.contains(&"codex"));
         assert!(!names.contains(&"zellij"));
     }
@@ -1097,8 +1193,23 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert!(names.contains(&"codex"));
+        assert!(names.contains(&"git"));
+        assert!(names.contains(&"embedded WASM"));
         assert!(!names.contains(&"claude"));
         assert!(!names.contains(&"zellij"));
+    }
+
+    #[test]
+    fn test_loop_required_deps_include_git_but_leave_wasm_to_loop_guard() {
+        let names: Vec<&str> = build_required_deps_checks(AgentClient::Claude)
+            .iter()
+            .map(|c| c.name)
+            .collect();
+
+        assert!(names.contains(&"git"));
+        assert!(names.contains(&"claude"));
+        assert!(!names.contains(&"embedded WASM"));
+        assert!(!names.contains(&"wasm target"));
     }
 
     #[test]

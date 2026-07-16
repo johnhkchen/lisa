@@ -14,6 +14,14 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 fn run_with_zellij_version(command: &str, version_output: &str) -> Output {
+    run_with_zellij_version_and_path(command, version_output, true)
+}
+
+fn run_with_zellij_version_and_path(
+    command: &str,
+    version_output: &str,
+    include_host_path: bool,
+) -> Output {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     let bin = temp.path().join("bin");
@@ -51,9 +59,12 @@ fn run_with_zellij_version(command: &str, version_output: &str) -> Output {
         "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf '%s\\n' 'claude 1.0.0'\nfi\nexit 0\n",
     );
 
-    let original_path = env::var_os("PATH").unwrap_or_default();
-    let path =
-        env::join_paths(std::iter::once(bin).chain(env::split_paths(&original_path))).unwrap();
+    let mut paths = vec![bin];
+    if include_host_path {
+        let original_path = env::var_os("PATH").unwrap_or_default();
+        paths.extend(env::split_paths(&original_path));
+    }
+    let path = env::join_paths(paths).unwrap();
 
     Command::new(env!("CARGO_BIN_EXE_lisa"))
         .arg(command)
@@ -62,6 +73,30 @@ fn run_with_zellij_version(command: &str, version_output: &str) -> Output {
         .env("HOME", home)
         .output()
         .unwrap()
+}
+
+#[test]
+fn doctor_names_missing_git_and_apt_remedy() {
+    let output = run_with_zellij_version_and_path("doctor", "zellij 0.44.3", false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!output.status.success());
+    assert!(stdout.contains("git"));
+    assert!(stdout.contains("not found"));
+    assert!(stdout.contains("sudo apt install git"));
+}
+
+#[test]
+fn loop_names_missing_git_before_git_root_discovery() {
+    let output = run_with_zellij_version_and_path("loop", "zellij 0.44.3", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Dependency preflight failed"));
+    assert!(stderr.contains("git"));
+    assert!(stderr.contains("not found"));
+    assert!(stderr.contains("sudo apt install git"));
+    assert!(!stderr.contains("Failed to discover Git root"));
 }
 
 fn assert_supported_loop_preflight(version: &str) {

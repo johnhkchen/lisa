@@ -41,6 +41,13 @@ fn format_dependency_preflight_error(client: AgentClient, failures: &[String]) -
     )
 }
 
+fn embedded_wasm_error() -> String {
+    format!(
+        "WASM plugin not embedded in this binary; it contains the empty development placeholder.\n\n  Reinstall Lisa with the shell installer:\n    {}",
+        crate::doctor::LISA_SHELL_INSTALL_COMMAND
+    )
+}
+
 /// Run the lisa loop: write embedded WASM, generate layout, exec zellij.
 ///
 /// In dry-run mode, scans tickets, builds the DAG, and prints what would happen
@@ -63,8 +70,6 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         return run_dry(root, config);
     }
 
-    let git_root = discover_git_root(root)?;
-
     // Freeze one configured runtime decision before any launch side effects.
     // The resulting path is the exact executable reported by doctor and exec'd
     // below; managed and pinned modes never fall back to PATH.
@@ -79,6 +84,11 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         crate::doctor::check_required_deps(*client)
             .map_err(|failures| format_dependency_preflight_error(*client, &failures))?;
     }
+
+    // Dependency preflight checks Git explicitly and provides an actionable
+    // install remedy. Discover the root only after that check so a missing Git
+    // executable never escapes as a raw command-spawn error.
+    let git_root = discover_git_root(root)?;
 
     // The native Codex TUI can stop at its directory-trust prompt before Lisa's
     // injected ticket is handled, so pre-seed trust for every loop that may route
@@ -96,11 +106,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
 
     // Check the WASM plugin is actually embedded (not a dev placeholder)
     if PLUGIN_WASM.is_empty() {
-        return Err("WASM plugin not embedded in this binary.\n\n  \
-             If installed via `cargo install`, the WASM plugin is not included.\n  \
-             Build from source for full functionality:\n    \
-             git clone https://github.com/johnhkchen/lisa && cd lisa && just release"
-            .to_string());
+        return Err(embedded_wasm_error());
     }
 
     // Write WASM to a content-hashed temp path so Zellij's plugin cache is
@@ -581,17 +587,28 @@ mod tests {
     #[test]
     fn test_format_dependency_preflight_error_preserves_zellij_details() {
         let failures = vec![
-            "  zellij       unsupported\n    detected Zellij 0.40.1; supported range >= 0.43.0\n    Remedy: Use Zellij's prebuilt static binaries: https://github.com/zellij-org/zellij/releases"
+            "  zellij       unsupported\n    configured system Zellij was not found\n    Remedy: Set `[runtime] zellij = \"managed\"` to use Lisa's managed runtime"
                 .to_string(),
         ];
 
         let error = format_dependency_preflight_error(AgentClient::Claude, &failures);
 
         assert!(error.contains("Dependency preflight failed for claude"));
-        assert!(error.contains("detected Zellij 0.40.1"));
-        assert!(error.contains("supported range >= 0.43.0"));
-        assert!(error.contains("prebuilt static binaries"));
+        assert!(error.contains("configured system Zellij was not found"));
+        assert!(error.contains("managed runtime"));
         assert!(error.contains("lisa doctor"));
+    }
+
+    #[test]
+    fn test_embedded_wasm_error_names_shell_installer_not_source_build() {
+        let error = embedded_wasm_error();
+
+        assert!(error.contains("WASM plugin not embedded"));
+        assert!(error.contains("empty development placeholder"));
+        assert!(error.contains(crate::doctor::LISA_SHELL_INSTALL_COMMAND));
+        assert!(error.contains("lisa-cli-installer.sh"));
+        assert!(!error.contains("git clone"));
+        assert!(!error.contains("just release"));
     }
 
     #[test]
