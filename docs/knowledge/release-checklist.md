@@ -152,14 +152,14 @@ Assert the four platform archives and their adjacent checksums:
 
 ```bash
 for artifact in \
-  lisa-cli-aarch64-apple-darwin.tar.xz \
-  lisa-cli-aarch64-apple-darwin.tar.xz.sha256 \
-  lisa-cli-x86_64-apple-darwin.tar.xz \
-  lisa-cli-x86_64-apple-darwin.tar.xz.sha256 \
-  lisa-cli-aarch64-unknown-linux-musl.tar.xz \
-  lisa-cli-aarch64-unknown-linux-musl.tar.xz.sha256 \
-  lisa-cli-x86_64-unknown-linux-musl.tar.xz \
-  lisa-cli-x86_64-unknown-linux-musl.tar.xz.sha256 \
+  lisa-cli-aarch64-apple-darwin.tar.gz \
+  lisa-cli-aarch64-apple-darwin.tar.gz.sha256 \
+  lisa-cli-x86_64-apple-darwin.tar.gz \
+  lisa-cli-x86_64-apple-darwin.tar.gz.sha256 \
+  lisa-cli-aarch64-unknown-linux-musl.tar.gz \
+  lisa-cli-aarch64-unknown-linux-musl.tar.gz.sha256 \
+  lisa-cli-x86_64-unknown-linux-musl.tar.gz \
+  lisa-cli-x86_64-unknown-linux-musl.tar.gz.sha256 \
   lisa-cli-installer.sh \
   lisa.rb
 do
@@ -307,14 +307,14 @@ jq -e '
   [.assets[].name] as $assets
   | all([
       "dist-manifest.json",
-      "lisa-cli-aarch64-apple-darwin.tar.xz",
-      "lisa-cli-aarch64-apple-darwin.tar.xz.sha256",
-      "lisa-cli-x86_64-apple-darwin.tar.xz",
-      "lisa-cli-x86_64-apple-darwin.tar.xz.sha256",
-      "lisa-cli-aarch64-unknown-linux-musl.tar.xz",
-      "lisa-cli-aarch64-unknown-linux-musl.tar.xz.sha256",
-      "lisa-cli-x86_64-unknown-linux-musl.tar.xz",
-      "lisa-cli-x86_64-unknown-linux-musl.tar.xz.sha256",
+      "lisa-cli-aarch64-apple-darwin.tar.gz",
+      "lisa-cli-aarch64-apple-darwin.tar.gz.sha256",
+      "lisa-cli-x86_64-apple-darwin.tar.gz",
+      "lisa-cli-x86_64-apple-darwin.tar.gz.sha256",
+      "lisa-cli-aarch64-unknown-linux-musl.tar.gz",
+      "lisa-cli-aarch64-unknown-linux-musl.tar.gz.sha256",
+      "lisa-cli-x86_64-unknown-linux-musl.tar.gz",
+      "lisa-cli-x86_64-unknown-linux-musl.tar.gz.sha256",
       "lisa-cli-installer.sh",
       "lisa.rb",
       "sha256.sum",
@@ -388,8 +388,8 @@ gh api repos/johnhkchen/homebrew-lisa/contents/Formula/lisa.rb \
   > "$EVIDENCE/lisa.rb"
 
 grep -F 'version "0.4.0"' "$EVIDENCE/lisa.rb"
-grep -F 'lisa-cli-aarch64-unknown-linux-musl.tar.xz' "$EVIDENCE/lisa.rb"
-grep -F 'lisa-cli-x86_64-unknown-linux-musl.tar.xz' "$EVIDENCE/lisa.rb"
+grep -F 'lisa-cli-aarch64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa.rb"
+grep -F 'lisa-cli-x86_64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa.rb"
 ```
 
 Compare all stable-facing versions in one record:

@@ -63,7 +63,7 @@ fi
 package_architecture() {
     local rust_target=$1
     local deb_arch=$2
-    local lisa_archive="$distrib_dir/lisa-cli-${rust_target}.tar.xz"
+    local lisa_archive="$distrib_dir/lisa-cli-${rust_target}.tar.gz"
     local stage="$work_dir/$deb_arch"
     local lisa_binary
     local lisa_count
@@ -80,7 +80,7 @@ package_architecture() {
     fi
 
     mkdir -p "$stage/lisa"
-    tar -xJf "$lisa_archive" -C "$stage/lisa"
+    tar -xzf "$lisa_archive" -C "$stage/lisa"
     lisa_count=$(find "$stage/lisa" -type f -name lisa | wc -l | tr -d ' ')
     if [[ $lisa_count != 1 ]]; then
         echo "Expected exactly one lisa binary in $lisa_archive, found $lisa_count" >&2
