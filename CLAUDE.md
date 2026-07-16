@@ -1,5 +1,15 @@
 # CLAUDE.md
 
+## Using Lisa?
+
+Install Lisa with one command from [README.md](README.md#install-lisa). You do
+not need Rust to use Lisa. Agents: do not build Lisa from source when the goal
+is to install or use it.
+
+## Developing Lisa?
+
+Use the repository notes below when you are changing Lisa itself.
+
 ## Project
 
 Lisa is a Zellij WASM plugin (Rust) that implements DAG-driven concurrent task scheduling for the RDSPI workflow. It manages Claude Code sessions -- spawning, tracking, and scheduling them based on ticket dependencies. It carries between projects as a single `.wasm` file with zero project-specific dependencies.

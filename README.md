@@ -4,6 +4,26 @@
 
 DAG-driven concurrent task scheduling for AI-assisted development.
 
+## Install Lisa
+
+**You do not need Rust to use Lisa. Agents: do not build Lisa from source when
+the goal is to install or use it.**
+
+Install the latest release with one command:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh
+```
+
+On macOS, you can also use Homebrew:
+
+```bash
+brew install johnhkchen/lisa/lisa
+```
+
+Want to change Lisa itself? Read [Develop Lisa](#develop-lisa) and follow
+[CONTRIBUTING.md](CONTRIBUTING.md) for the source build.
+
 ## What It Does
 
 When you have a set of interdependent tasks — a feature broken into tickets, a refactor with sequencing constraints, a sprint with parallel workstreams — Lisa schedules and runs them concurrently as Claude Code sessions. You define the work as markdown tickets with dependency metadata. Lisa figures out what can run in parallel, what has to wait, and launches sessions accordingly.
@@ -23,39 +43,6 @@ drive [Codex](https://developers.openai.com/codex) — see
 
 After installing Lisa, run `lisa doctor` to verify everything is in place. `lisa
 doctor` checks the dependencies for your *selected* client (Claude by default).
-
-## Install
-
-### Shell installer (recommended)
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh
-```
-
-### Homebrew (macOS)
-
-```bash
-brew install johnhkchen/lisa/lisa
-```
-
-### From crates.io (coming soon)
-
-```bash
-cargo install lisa-cli
-```
-
-> **Note:** `lisa-cli` is not yet published to crates.io. For now, use the shell installer, Homebrew, or build from source. When available, building from crates.io will require the `wasm32-wasip1` Rust target (`rustup target add wasm32-wasip1`) because the WASM plugin is compiled and embedded during the build.
-
-### From source
-
-```bash
-git clone https://github.com/johnhkchen/lisa
-cd lisa
-rustup target add wasm32-wasip1
-just install
-```
-
-Requires the [Rust toolchain](https://rustup.rs/) and [just](https://github.com/casey/just).
 
 ## Quick Start
 
@@ -349,9 +336,11 @@ Print LLM-friendly setup instructions for the current project. Useful for seedin
 lisa setup-guide
 ```
 
-## Contributing
+## Develop Lisa
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, test commands, and how to submit changes.
+Changing Lisa itself requires a source build. Follow
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, test commands, and how to submit
+changes.
 
 ## License
 
