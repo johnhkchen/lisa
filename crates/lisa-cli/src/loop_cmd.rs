@@ -34,6 +34,13 @@ fn validate_project_protocol(config: &ResolvedConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn format_dependency_preflight_error(client: AgentClient, failures: &[String]) -> String {
+    format!(
+        "Dependency preflight failed for {client}:\n{}\n\nRun `lisa doctor` for the complete dependency report and install guidance.",
+        failures.join("\n")
+    )
+}
+
 /// Run the lisa loop: write embedded WASM, generate layout, exec zellij.
 ///
 /// In dry-run mode, scans tickets, builds the DAG, and prints what would happen
@@ -64,12 +71,8 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     // not have them installed). This matters for mixed Claude+Codex loops whose
     // loop default names only one of the two binaries.
     for client in &clients {
-        crate::doctor::check_required_deps(*client).map_err(|missing| {
-            format!(
-                "Missing dependencies for {client}: {}\n\nRun `lisa doctor` for details and install instructions.",
-                missing.join(", ")
-            )
-        })?;
+        crate::doctor::check_required_deps(*client)
+            .map_err(|failures| format_dependency_preflight_error(*client, &failures))?;
     }
 
     // The native Codex TUI can stop at its directory-trust prompt before Lisa's
@@ -542,6 +545,22 @@ mod tests {
             format_provider_caps(&config).as_deref(),
             Some("claude=4, codex=8")
         );
+    }
+
+    #[test]
+    fn test_format_dependency_preflight_error_preserves_zellij_details() {
+        let failures = vec![
+            "  zellij       unsupported\n    detected Zellij 0.40.1; supported range >= 0.43.0\n    Remedy: Use Zellij's prebuilt static binaries: https://github.com/zellij-org/zellij/releases"
+                .to_string(),
+        ];
+
+        let error = format_dependency_preflight_error(AgentClient::Claude, &failures);
+
+        assert!(error.contains("Dependency preflight failed for claude"));
+        assert!(error.contains("detected Zellij 0.40.1"));
+        assert!(error.contains("supported range >= 0.43.0"));
+        assert!(error.contains("prebuilt static binaries"));
+        assert!(error.contains("lisa doctor"));
     }
 
     #[test]
