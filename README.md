@@ -319,10 +319,9 @@ lisa status
 
 ### `lisa doctor`
 
-Verify that all runtime dependencies are installed. Checks the *selected* client's
-binary (`claude` or `codex`, per `.lisa.toml`) and reports its version, plus
-Zellij and the wasm32-wasip1 target. When Codex is selected it also pre-seeds
-directory trust for unattended `codex exec`.
+Check the selected agent (`claude` or `codex`, per `.lisa.toml`) and the Zellij
+runtime Lisa will use. When Codex is selected, this also prepares directory
+trust for unattended `codex exec`.
 
 ```bash
 lisa doctor
