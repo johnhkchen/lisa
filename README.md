@@ -2,7 +2,8 @@
 
 [![Release](https://img.shields.io/github/v/release/johnhkchen/lisa)](https://github.com/johnhkchen/lisa/releases/latest)
 
-DAG-driven concurrent task scheduling for AI-assisted development.
+Lisa runs coding agents like Claude Code and Codex through your ticket board, so
+you don't have to approve every step by hand.
 
 ## Install Lisa
 
@@ -70,6 +71,10 @@ When you have a set of interdependent tasks — a feature broken into tickets, a
 Lisa runs as a [Zellij](https://zellij.dev/) plugin. It reads your tickets, computes a dependency graph, and spawns Claude Code sessions for every ticket whose dependencies are satisfied. A dashboard shows what's running, what's queued, and what's done. When a ticket finishes, Lisa checks what it unblocked and schedules the next wave.
 
 Each ticket goes through six phases: Research, Design, Structure, Plan, Implement, Review. Every phase produces a short artifact (~200 lines) that serves as both a review checkpoint and crash recovery. If a session dies mid-work, the latest artifact plus the ticket is enough to seed a new session at the right phase.
+
+Lisa keeps the trail reviewable: an append-only attempt ledger records each run,
+the completion journal ties finished tickets to commits, and each ticket keeps
+its work documents.
 
 ## Prerequisites
 
