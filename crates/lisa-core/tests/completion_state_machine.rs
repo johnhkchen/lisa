@@ -3,7 +3,7 @@ use lisa_core::completion::{
     CompletionState, CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs,
     EffectCommand, Reconciliation,
 };
-use lisa_core::disposition::ReviewDisposition;
+use lisa_core::disposition::{RemedyOwner, ReviewDisposition};
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
 
@@ -166,6 +166,11 @@ impl CompletionHarness {
                 Some(ModelDisposition::Pass) => ReviewDisposition::Pass,
                 Some(ModelDisposition::Block) => ReviewDisposition::Block {
                     reason: "generated blocked Review".into(),
+                    remedy_owner: RemedyOwner::Operator,
+                    ask: "generated blocked Review".into(),
+                    steps: None,
+                    check: None,
+                    unstructured: true,
                 },
                 None => ReviewDisposition::Invalid {
                     reason: "Review not observed".into(),

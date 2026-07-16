@@ -856,6 +856,11 @@ mod tests {
         for disposition in [
             ReviewDisposition::Block {
                 reason: "fix the failing test".into(),
+                remedy_owner: crate::disposition::RemedyOwner::Operator,
+                ask: "fix the failing test".into(),
+                steps: None,
+                check: None,
+                unstructured: true,
             },
             ReviewDisposition::Invalid {
                 reason: "missing reason field".into(),

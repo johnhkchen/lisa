@@ -8,7 +8,18 @@
 use std::fs;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// The party whose durable reality must change before a blocked ticket can
+/// make progress again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemedyOwner {
+    Agent,
+    Operator,
+    World,
+}
 
 /// The validated outcome of a Review disposition file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,7 +27,16 @@ pub enum ReviewDisposition {
     /// The agent explicitly declared that Review passed.
     Pass,
     /// The agent blocked completion with an actionable reason.
-    Block { reason: String },
+    Block {
+        reason: String,
+        remedy_owner: RemedyOwner,
+        ask: String,
+        steps: Option<Vec<String>>,
+        check: Option<String>,
+        /// True when missing or malformed remedy structure was replaced with
+        /// the safe operator-owned legacy fallback.
+        unstructured: bool,
+    },
     /// The file could not be trusted as either valid disposition.
     Invalid { reason: String },
 }
@@ -71,7 +91,7 @@ fn validate_document(document: Value) -> ReviewDisposition {
         ("pass", Value::Null) => ReviewDisposition::Pass,
         ("pass", _) => invalid("a passing review disposition must have a null reason"),
         ("block", Value::String(reason)) if !reason.trim().is_empty() => {
-            ReviewDisposition::Block { reason }
+            validate_block_structure(reason, &mut object)
         }
         ("block", _) => {
             invalid("a blocking review disposition must have a non-empty string reason")
@@ -79,6 +99,66 @@ fn validate_document(document: Value) -> ReviewDisposition {
         (unknown, _) => invalid(format!(
             "unknown review disposition {unknown:?}; expected \"pass\" or \"block\""
         )),
+    }
+}
+
+fn validate_block_structure(
+    reason: String,
+    object: &mut serde_json::Map<String, Value>,
+) -> ReviewDisposition {
+    let structure = (|| {
+        let remedy_owner = match object.remove("remedy_owner")? {
+            Value::String(owner) if owner == "agent" => RemedyOwner::Agent,
+            Value::String(owner) if owner == "operator" => RemedyOwner::Operator,
+            Value::String(owner) if owner == "world" => RemedyOwner::World,
+            _ => return None,
+        };
+        let ask = non_empty_string(object.remove("ask")?)?;
+        let steps = match object.remove("steps") {
+            None => None,
+            Some(Value::Array(values)) => Some(
+                values
+                    .into_iter()
+                    .map(non_empty_string)
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Some(_) => return None,
+        };
+        let check = match object.remove("check") {
+            None => None,
+            Some(value) => Some(non_empty_string(value)?),
+        };
+        Some((remedy_owner, ask, steps, check))
+    })();
+
+    match structure {
+        Some((remedy_owner, ask, steps, check)) => ReviewDisposition::Block {
+            reason,
+            remedy_owner,
+            ask,
+            steps,
+            check,
+            unstructured: false,
+        },
+        None => unstructured_block(reason),
+    }
+}
+
+fn non_empty_string(value: Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+fn unstructured_block(reason: String) -> ReviewDisposition {
+    ReviewDisposition::Block {
+        ask: reason.clone(),
+        reason,
+        remedy_owner: RemedyOwner::Operator,
+        steps: None,
+        check: None,
+        unstructured: true,
     }
 }
 
@@ -120,7 +200,137 @@ mod tests {
             parse_document(r#"{"disposition":"block","reason":"tests are failing"}"#),
             ReviewDisposition::Block {
                 reason: "tests are failing".to_string(),
+                remedy_owner: RemedyOwner::Operator,
+                ask: "tests are failing".to_string(),
+                steps: None,
+                check: None,
+                unstructured: true,
             }
+        );
+    }
+
+    #[test]
+    fn parses_all_remedy_owners() {
+        for (owner, expected) in [
+            ("agent", RemedyOwner::Agent),
+            ("operator", RemedyOwner::Operator),
+            ("world", RemedyOwner::World),
+        ] {
+            assert_eq!(
+                parse_document(&format!(
+                    r#"{{"disposition":"block","reason":"blocked","remedy_owner":"{owner}","ask":"Apply the remedy."}}"#
+                )),
+                ReviewDisposition::Block {
+                    reason: "blocked".to_string(),
+                    remedy_owner: expected,
+                    ask: "Apply the remedy.".to_string(),
+                    steps: None,
+                    check: None,
+                    unstructured: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parses_optional_steps_and_check_without_normalizing_content() {
+        assert_eq!(
+            parse_document(
+                r#"{"disposition":"block","reason":"release missing","remedy_owner":"world","ask":"Publish the release.","steps":["Run just release","  Verify the URL  "],"check":"curl -fsS https://example.test/release"}"#,
+            ),
+            ReviewDisposition::Block {
+                reason: "release missing".to_string(),
+                remedy_owner: RemedyOwner::World,
+                ask: "Publish the release.".to_string(),
+                steps: Some(vec![
+                    "Run just release".to_string(),
+                    "  Verify the URL  ".to_string(),
+                ]),
+                check: Some("curl -fsS https://example.test/release".to_string()),
+                unstructured: false,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_block_preserves_reason_bytes_in_reason_and_fallback_ask() {
+        let reason = "  retain these bytes  ";
+        assert_eq!(
+            parse_document(&format!(
+                r#"{{"disposition":"block","reason":{}}}"#,
+                serde_json::to_string(reason).unwrap()
+            )),
+            ReviewDisposition::Block {
+                reason: reason.to_string(),
+                remedy_owner: RemedyOwner::Operator,
+                ask: reason.to_string(),
+                steps: None,
+                check: None,
+                unstructured: true,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_structure_uses_complete_operator_fallback() {
+        let documents = [
+            r#"{"disposition":"block","reason":"raw reason","ask":"Do it."}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"agent"}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"nobody","ask":"Do it."}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":7,"ask":"Do it."}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"agent","ask":"  "}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"agent","ask":7}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"agent","ask":"Do it.","steps":"one"}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"agent","ask":"Do it.","steps":["valid",7]}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"agent","ask":"Do it.","steps":["  "]}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"world","ask":"Do it.","check":7}"#,
+            r#"{"disposition":"block","reason":"raw reason","remedy_owner":"world","ask":"Do it.","check":"  ","steps":["discard me"]}"#,
+        ];
+
+        for document in documents {
+            assert_eq!(
+                parse_document(document),
+                ReviewDisposition::Block {
+                    reason: "raw reason".to_string(),
+                    remedy_owner: RemedyOwner::Operator,
+                    ask: "raw reason".to_string(),
+                    steps: None,
+                    check: None,
+                    unstructured: true,
+                },
+                "unexpected parse result for {document}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_content_is_never_executed_during_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("parser-must-not-create-this");
+        let check = format!("touch {}", sentinel.display());
+        let document = serde_json::json!({
+            "disposition": "block",
+            "reason": "wait for external state",
+            "remedy_owner": "world",
+            "ask": "Wait for the external state.",
+            "check": check,
+        });
+        let path = dir.path().join("review-disposition.json");
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let parsed = parse_review_disposition(&path);
+
+        assert!(matches!(
+            parsed,
+            ReviewDisposition::Block {
+                remedy_owner: RemedyOwner::World,
+                unstructured: false,
+                ..
+            }
+        ));
+        assert!(
+            !sentinel.exists(),
+            "parsing must store check content without executing it"
         );
     }
 
