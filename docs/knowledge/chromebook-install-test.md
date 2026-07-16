@@ -465,6 +465,29 @@ Append one section per run to this file or the driving ticket's private work dir
 - findings → tickets:
 ```
 
+### Auth check record — 2026-07-16 (T-046-06-01 evidence)
+
+- Container: `cbt-0716-144625` (fixture image, arm64; no host config mounts —
+  verified 0 matches in the container mount table; the image build asserts
+  `~/.claude` and `~/.codex` absent, so all auth state was created by fresh
+  interactive login inside the container).
+- Claude: `claude auth login` (subscription / Claude Max method), then
+  `claude auth status --text` → **exit 0**. Verified again read-only on
+  2026-07-16 by the operator's session.
+- Codex: `codex login --device-auth` (ChatGPT device method), then
+  `codex login status` → `Logged in using ChatGPT`, **exit 0**. Verified again
+  read-only on 2026-07-16.
+- Functional proof beyond the status checks: the Codex CLI completed a full
+  measured baseline leg in this container, and the Claude CLI drove a 3-ticket
+  `lisa loop` run to completion — both flows work end-to-end post-auth.
+- **Recorded deviation:** both CLIs were authenticated in ONE shared container,
+  not the separate containers the prior Review requested. Operator (John)
+  accepted this: the auth-flow question ("do the runbook's fresh-login flows
+  work in the fixture, no host mounts?") is answered identically either way.
+  Container separation remains mandatory for *measured legs* and is unaffected
+  by this deviation; this container is the codex-leg + tour evidence box and
+  will not host further measured legs.
+
 ## Baseline expectation — 2026-07-16, before fixes
 
 Run the baseline against today's README early; its value is capturing the pre-fix
