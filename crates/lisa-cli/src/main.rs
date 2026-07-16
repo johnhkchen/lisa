@@ -274,6 +274,10 @@ fn main() {
             }
         }
         Commands::Version => {
+            // Keep the release-pinned runtime manifest in every platform build.
+            // Without this OS-neutral reference, fat LTO can remove the Linux-only
+            // managed acquisition path (and its manifest) from Darwin artifacts.
+            std::hint::black_box(runtime::MANAGED_RUNTIME_SHA256_MANIFEST);
             println!("lisa {}", env!("CARGO_PKG_VERSION"));
         }
         Commands::AgentExec {
