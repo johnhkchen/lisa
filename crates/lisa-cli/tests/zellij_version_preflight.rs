@@ -98,6 +98,17 @@ fn loop_preflight_accepts_zellij_043_and_044() {
 }
 
 #[test]
+fn doctor_reports_detected_version_and_supported_range_on_success() {
+    let output = run_with_zellij_version("doctor", "zellij 0.44.3");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("zellij"));
+    assert!(stdout.contains("detected 0.44.3, supported >= 0.43.0"));
+    assert!(stdout.contains("OK"));
+}
+
+#[test]
 fn doctor_names_unparseable_zellij_output_as_unsupported() {
     let output = run_with_zellij_version("doctor", "zellij mystery-version");
     let stdout = String::from_utf8_lossy(&output.stdout);
