@@ -1585,7 +1585,6 @@ name = "lisa-cli"
 version = "0.4.0-rc.8"
 dependencies = [
  "clap 4.5.57",
- "directories",
  "fs2",
  "lisa-core",
  "serde",
