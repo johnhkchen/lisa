@@ -512,10 +512,27 @@ fn find_system_zellij(environment: &RuntimeEnvironment) -> Result<PathBuf, Strin
     Err("Cannot resolve system Zellij: `zellij` was not found on PATH".to_string())
 }
 
+// ETXTBSY (os error 26 on Linux and macOS): exec of a freshly written binary
+// can transiently fail while a concurrently forked process still holds a copy
+// of the writer's file descriptor — the fd table is cloned at fork and
+// CLOEXEC only clears at that process's own exec. The window is milliseconds;
+// retry bounded rather than surfacing a scary one-off failure on first run.
+fn run_version_probe(path: &Path) -> io::Result<std::process::Output> {
+    let mut delay = Duration::from_millis(10);
+    for _ in 0..6 {
+        match Command::new(path).arg("--version").output() {
+            Err(error) if error.raw_os_error() == Some(26) => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            other => return other,
+        }
+    }
+    Command::new(path).arg("--version").output()
+}
+
 fn inspect_zellij(path: &Path, mode: ZellijRuntimeMode) -> Result<ZellijVersion, String> {
-    let output = Command::new(path)
-        .arg("--version")
-        .output()
+    let output = run_version_probe(path)
         .map_err(|error| format!("Cannot run {mode} Zellij at {}: {error}", path.display()))?;
 
     if !output.status.success() {
