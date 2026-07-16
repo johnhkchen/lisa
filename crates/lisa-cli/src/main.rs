@@ -24,7 +24,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "lisa",
-    about = "Runs your coding agents through a project's tickets.",
+    about = "Runs coding agents through your ticket board, so you don't have to approve every step by hand.",
     before_help = "Everyday path: init → validate → status → loop",
     after_help = "Plumbing commands (called by Lisa and agent hooks):
   agent-exec       Run Codex and turn its output into Lisa's pane signals

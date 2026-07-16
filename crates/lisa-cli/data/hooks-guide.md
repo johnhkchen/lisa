@@ -1,5 +1,7 @@
 # Lisa Hooks Guide
 
+Lisa runs coding agents through your ticket board, so you don't have to approve every step by hand.
+
 You are setting up (or repairing) Claude Code or Codex hooks for a project that uses Lisa.
 The fastest path is `lisa init`, which scaffolds everything below automatically and is
 safe to re-run. If you cannot run `lisa init`, the **Manual setup** section gives you

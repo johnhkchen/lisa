@@ -34,7 +34,7 @@ const PLUMBING_HEADING: &str = "Plumbing commands (called by Lisa and agent hook
 
 const TOP_LEVEL_HELP_SNAPSHOT: &str = r#"Everyday path: init → validate → status → loop
 
-Runs your coding agents through a project's tickets.
+Runs coding agents through your ticket board, so you don't have to approve every step by hand.
 
 Usage: lisa <COMMAND>
 
@@ -171,6 +171,11 @@ const BANNED_JARGON: [&str; 9] = [
     "research release",
 ];
 
+const PURPOSE_SENTENCE: &str =
+    "runs coding agents through your ticket board, so you don't have to approve every step by hand.";
+
+const MECHANISM_TERMS: [&str; 4] = ["dag", "wasm", "zellij", "scheduling"];
+
 /// Invoke the real `lisa` binary with `args` and capture its output.
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lisa"))
@@ -217,6 +222,21 @@ fn listing_offset(help: &str, command: &str) -> Option<usize> {
     help.find(&format!("\n  {command} "))
 }
 
+fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
+    let lower = output.to_lowercase();
+    let purpose_offset = lower.find(PURPOSE_SENTENCE).unwrap_or_else(|| {
+        panic!("{surface} output is missing the purpose sentence: {PURPOSE_SENTENCE:?}")
+    });
+    for mechanism in MECHANISM_TERMS {
+        if let Some(mechanism_offset) = lower.find(mechanism) {
+            assert!(
+                purpose_offset < mechanism_offset,
+                "{surface} output introduces mechanism term {mechanism:?} at byte {mechanism_offset} before the purpose sentence at byte {purpose_offset}",
+            );
+        }
+    }
+}
+
 /// (a) Every one of the 13 own subcommands resolves — including the hidden
 /// three, which `--help` reaches even though they are absent from the listing.
 #[test]
@@ -241,6 +261,17 @@ fn all_thirteen_subcommands_resolve() {
 #[test]
 fn top_level_help_matches_snapshot() {
     assert_eq!(help_stdout(&["--help"]), TOP_LEVEL_HELP_SNAPSHOT);
+}
+
+#[test]
+fn cli_and_guides_put_purpose_before_mechanism() {
+    for (surface, args) in [
+        ("lisa --help", &["--help"][..]),
+        ("lisa setup-guide", &["setup-guide"][..]),
+        ("lisa hooks-guide", &["hooks-guide"][..]),
+    ] {
+        assert_purpose_precedes_mechanism(surface, &help_stdout(args));
+    }
 }
 
 /// (c) Every operator command's complete help is a deliberate, reviewable

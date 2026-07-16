@@ -252,6 +252,7 @@ fn build_guide(root: &Path) -> Result<String, String> {
 
     let header = format!(
         "# Lisa Setup Guide for {} ({})\n\n\
+         Lisa runs coding agents through your ticket board, so you don't have to approve every step by hand.\n\n\
          Follow these steps to set up this project for lisa-loop. \
          Each step is self-contained — complete them in order.",
         project.name, type_label
