@@ -1,0 +1,18 @@
+name: lisa-runtime-zellij
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${LISA_VERSION}
+version_schema: semver
+release: "1"
+section: utils
+priority: optional
+maintainer: John Chen <john.hk.chen@gmail.com>
+description: Pinned Zellij ${ZELLIJ_VERSION} runtime for Lisa
+homepage: https://github.com/johnhkchen/lisa
+license: MIT
+contents:
+  - src: ${ZELLIJ_BINARY}
+    dst: /usr/libexec/lisa/zellij
+    expand: true
+    file_info:
+      mode: 0755

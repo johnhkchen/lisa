@@ -1,0 +1,22 @@
+name: lisa
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${LISA_VERSION}
+version_schema: semver
+release: "1"
+section: utils
+priority: optional
+maintainer: John Chen <john.hk.chen@gmail.com>
+description: CLI for Lisa DAG-driven concurrent task scheduling
+homepage: https://github.com/johnhkchen/lisa
+license: MIT
+depends:
+  - git
+recommends:
+  - lisa-runtime-zellij
+contents:
+  - src: ${LISA_BINARY}
+    dst: /usr/bin/lisa
+    expand: true
+    file_info:
+      mode: 0755

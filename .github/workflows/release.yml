@@ -209,12 +209,20 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
-      - id: cargo-dist
+      - name: Build global artifacts
         shell: bash
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
+      - name: Verify Debian packages on Debian bookworm
+        shell: bash
+        run: scripts/verify-deb-release.sh
+
+      - id: cargo-dist
+        name: Post-build
+        shell: bash
+        run: |
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"

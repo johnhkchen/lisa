@@ -25,3 +25,12 @@ publish-jobs = ["homebrew"]
 # main, so publish them deliberately instead of leaving the tap on an older
 # stable version.
 publish-prereleases = true
+
+[[dist.extra-artifacts]]
+artifacts = [
+    "lisa-amd64.deb",
+    "lisa-arm64.deb",
+    "lisa-runtime-zellij-amd64.deb",
+    "lisa-runtime-zellij-arm64.deb",
+]
+build = ["bash", "scripts/package-debs.sh"]
