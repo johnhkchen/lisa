@@ -14,6 +14,10 @@ targets = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
 ]
+# The Chromebook fixture's decompressor floor is tar+gzip (Debian
+# Priority: required). xz is deliberately absent there, so .tar.xz archives
+# break the README one-command install at extraction time (T-046-03-03).
+unix-archive = ".tar.gz"
 packages = ["lisa-cli"]
 github-build-setup = "../build-setup.yml"
 install-path = "~/.local/bin"
