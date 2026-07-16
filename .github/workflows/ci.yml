@@ -43,8 +43,11 @@ jobs:
       - name: Clippy (lisa-plugin, WASM)
         run: cargo clippy -p lisa-plugin --target wasm32-wasip1 -- -D warnings
 
+      # Tests exercise the lisa binary via CARGO_BIN_EXE_lisa, and doctor
+      # fails a binary whose embedded plugin is the empty build.rs placeholder
+      # — so the real WASM must exist before the test build embeds it.
+      - name: Build WASM plugin for embedding
+        run: cargo build -p lisa-plugin --target wasm32-wasip1 --release
+
       - name: Run tests
         run: cargo test --workspace
-
-      - name: Check WASM plugin builds
-        run: cargo check -p lisa-plugin --target wasm32-wasip1
