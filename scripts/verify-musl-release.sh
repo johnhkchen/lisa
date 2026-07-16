@@ -16,15 +16,30 @@ case "$target" in
 esac
 
 distrib_dir=${LISA_DISTRIB_DIR:-target/distrib}
-archive="$distrib_dir/lisa-cli-$target.tar.xz"
+archive="$distrib_dir/lisa-cli-$target.tar.gz"
 if [[ ! -f "$archive" ]]; then
     echo "missing musl release archive: $archive" >&2
     exit 1
 fi
+archive=$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")
 
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
-tar -xJf "$archive" -C "$work_dir"
+
+# Extract inside a container matching the Chromebook fixture's decompressor
+# floor (tar+gzip, no xz) so "unpacking needs no extra host packages" is a
+# checked release property, not an accident of runner tooling (T-046-03-03).
+docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    --mount "type=bind,source=$archive,target=/archive.tar.gz,readonly" \
+    --mount "type=bind,source=$work_dir,target=/extract" \
+    debian:bookworm-slim sh -eu -c '
+        if command -v xz >/dev/null 2>&1; then
+            echo "no-xz extraction proof is vacuous: container image ships xz" >&2
+            exit 1
+        fi
+        tar -xzf /archive.tar.gz -C /extract
+    '
 
 mapfile -d '' binaries < <(find "$work_dir" -type f -name lisa -print0)
 if [[ ${#binaries[@]} -ne 1 ]]; then
@@ -69,4 +84,4 @@ if [[ ! "$version_output" =~ ^lisa\  ]]; then
     exit 1
 fi
 
-echo "verified $target: static ELF, embedded assets, bullseye execution ($version_output)"
+echo "verified $target: no-xz gzip extraction, static ELF, embedded assets, bullseye execution ($version_output)"

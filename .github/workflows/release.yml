@@ -215,6 +215,10 @@ jobs:
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
+      - name: Verify shell installer on no-xz Debian bookworm
+        shell: bash
+        run: scripts/verify-shell-installer.sh
+
       - name: Verify Debian packages on Debian bookworm
         shell: bash
         run: scripts/verify-deb-release.sh
