@@ -2,3 +2,12 @@
   run: rustup target add wasm32-wasip1
 - name: Build WASM plugin
   run: cargo build -p lisa-plugin --target wasm32-wasip1 --release
+- name: Verify release WASM embedding input
+  shell: bash
+  run: |
+    set -euo pipefail
+    wasm=target/wasm32-wasip1/release/lisa.wasm
+    test -s "$wasm"
+    header=$(od -An -tx1 -N8 "$wasm" | tr -d ' \n')
+    test "$header" = "0061736d01000000"
+    echo "LISA_REQUIRE_EMBEDDED_WASM=1" >> "$GITHUB_ENV"
