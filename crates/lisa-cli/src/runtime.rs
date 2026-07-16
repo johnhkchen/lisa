@@ -6,18 +6,63 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use flate2::read::GzDecoder;
 use lisa_core::version::{
     classify_zellij_version_output, ZellijVersion, ZellijVersionVerdict, SUPPORTED_ZELLIJ_RANGE,
 };
+use sha2::{Digest, Sha256};
 
 /// Exact Zellij release used by Lisa's managed-runtime directory contract.
 ///
 /// This is the patch release resolved for the plugin's `zellij-tile = "0.43"`
-/// SDK family. T-046-02-02 installs this release at [`managed_zellij_path`].
+/// SDK family. Managed mode installs this release at [`managed_zellij_path`].
 pub const MANAGED_ZELLIJ_VERSION: ZellijVersion = ZellijVersion::release(0, 43, 1);
+
+const MANAGED_ZELLIJ_X86_64_URL: &str = "https://github.com/zellij-org/zellij/releases/download/v0.43.1/zellij-no-web-x86_64-unknown-linux-musl.tar.gz";
+const MANAGED_ZELLIJ_X86_64_SHA256: &str =
+    "bac0728945e8f5a28f2647e2b9b0cfe4591d71abfe227336b1318937241f071d";
+const MANAGED_ZELLIJ_AARCH64_URL: &str = "https://github.com/zellij-org/zellij/releases/download/v0.43.1/zellij-no-web-aarch64-unknown-linux-musl.tar.gz";
+const MANAGED_ZELLIJ_AARCH64_SHA256: &str =
+    "8ced877df27a8fe9112607dd3d772442aefa5e42359cda1baba53e78c4ae46aa";
+const INSTALL_TEMP_ATTEMPTS: u64 = 32;
+static INSTALL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedRelease<'a> {
+    url: &'a str,
+    sha256: &'a str,
+}
+
+fn managed_release() -> Result<ManagedRelease<'static>, String> {
+    managed_release_for(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
+        format!(
+            "Managed Zellij is not available for {} {}; use `[runtime] zellij = \"system\"` or an absolute pinned path",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    })
+}
+
+fn managed_release_for(os: &str, architecture: &str) -> Option<ManagedRelease<'static>> {
+    match (os, architecture) {
+        ("linux", "x86_64") => Some(ManagedRelease {
+            url: MANAGED_ZELLIJ_X86_64_URL,
+            sha256: MANAGED_ZELLIJ_X86_64_SHA256,
+        }),
+        ("linux", "aarch64") => Some(ManagedRelease {
+            url: MANAGED_ZELLIJ_AARCH64_URL,
+            sha256: MANAGED_ZELLIJ_AARCH64_SHA256,
+        }),
+        _ => None,
+    }
+}
 
 /// Runtime intent after `.lisa.toml` defaults have been applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +165,290 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+fn acquisition_error(
+    category: &str,
+    detail: impl fmt::Display,
+    release: ManagedRelease<'_>,
+) -> String {
+    format!(
+        "{category}: {detail}; URL: {}; expected sha256: {}",
+        release.url, release.sha256
+    )
+}
+
+struct TempInstall {
+    path: PathBuf,
+    published: bool,
+}
+
+impl TempInstall {
+    fn create(runtime_root: &Path, version_dir_name: &str) -> io::Result<Self> {
+        std::fs::create_dir_all(runtime_root)?;
+
+        for _ in 0..INSTALL_TEMP_ATTEMPTS {
+            let sequence = INSTALL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = runtime_root.join(format!(
+                ".{version_dir_name}.install-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        published: false,
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "could not allocate a temporary directory after {INSTALL_TEMP_ATTEMPTS} attempts"
+            ),
+        ))
+    }
+
+    fn disarm(&mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for TempInstall {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn download_archive(release: ManagedRelease<'_>, destination: &Path) -> Result<(), String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(10))
+        .redirects(5)
+        .build();
+    let response = agent
+        .get(release.url)
+        .set("User-Agent", concat!("lisa/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|error| acquisition_error("Managed Zellij download failed", error, release))?;
+
+    let file = File::create(destination).map_err(|error| {
+        acquisition_error(
+            "Managed Zellij download failed",
+            format!("cannot create {}: {error}", destination.display()),
+            release,
+        )
+    })?;
+    let mut writer = BufWriter::new(file);
+    io::copy(&mut response.into_reader(), &mut writer).map_err(|error| {
+        acquisition_error(
+            "Managed Zellij download failed",
+            format!("response body was incomplete or could not be stored: {error}"),
+            release,
+        )
+    })?;
+    writer.flush().map_err(|error| {
+        acquisition_error(
+            "Managed Zellij download failed",
+            format!("cannot flush {}: {error}", destination.display()),
+            release,
+        )
+    })?;
+    writer.get_ref().sync_all().map_err(|error| {
+        acquisition_error(
+            "Managed Zellij download failed",
+            format!("cannot sync {}: {error}", destination.display()),
+            release,
+        )
+    })
+}
+
+fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    sha256_reader(BufReader::new(File::open(path)?))
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn extract_zellij(
+    archive_path: &Path,
+    executable_path: &Path,
+    release: ManagedRelease<'_>,
+) -> Result<(), String> {
+    let operation = || -> io::Result<()> {
+        let file = File::open(archive_path)?;
+        let decoder = GzDecoder::new(BufReader::new(file));
+        let mut archive = tar::Archive::new(decoder);
+        let mut found = false;
+
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let entry_path = entry.path()?;
+            if entry_path.as_ref() != Path::new(executable_name())
+                || !entry.header().entry_type().is_file()
+                || found
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("archive contains unexpected entry {}", entry_path.display()),
+                ));
+            }
+
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(executable_path)?;
+            let mut writer = BufWriter::new(file);
+            io::copy(&mut entry, &mut writer)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            found = true;
+        }
+
+        if !found {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("archive does not contain {}", executable_name()),
+            ));
+        }
+
+        make_executable(executable_path)
+    };
+
+    operation().map_err(|error| {
+        acquisition_error(
+            "Managed Zellij install failed",
+            format!("cannot unpack verified archive: {error}"),
+            release,
+        )
+    })
+}
+
+fn ensure_managed_zellij(
+    executable_path: &Path,
+    release: ManagedRelease<'_>,
+) -> Result<(), String> {
+    if is_executable(executable_path) {
+        return Ok(());
+    }
+
+    let version_dir = executable_path.parent().ok_or_else(|| {
+        acquisition_error(
+            "Managed Zellij install failed",
+            format!("invalid executable path {}", executable_path.display()),
+            release,
+        )
+    })?;
+    if version_dir.exists() {
+        return Err(acquisition_error(
+            "Managed Zellij cache is invalid",
+            format!(
+                "{} exists without an executable {}",
+                version_dir.display(),
+                executable_name()
+            ),
+            release,
+        ));
+    }
+
+    let runtime_root = version_dir.parent().ok_or_else(|| {
+        acquisition_error(
+            "Managed Zellij install failed",
+            format!("invalid runtime directory {}", version_dir.display()),
+            release,
+        )
+    })?;
+    let version_dir_name = version_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            acquisition_error(
+                "Managed Zellij install failed",
+                format!("invalid runtime directory {}", version_dir.display()),
+                release,
+            )
+        })?;
+    let mut temporary = TempInstall::create(runtime_root, version_dir_name).map_err(|error| {
+        acquisition_error(
+            "Managed Zellij install failed",
+            format!("cannot create a temporary install directory: {error}"),
+            release,
+        )
+    })?;
+
+    let archive_path = temporary.path.join("download.tar.gz");
+    download_archive(release, &archive_path)?;
+    let actual_sha256 = sha256_file(&archive_path).map_err(|error| {
+        acquisition_error(
+            "Managed Zellij checksum failed",
+            format!("cannot hash {}: {error}", archive_path.display()),
+            release,
+        )
+    })?;
+    if actual_sha256 != release.sha256 {
+        return Err(acquisition_error(
+            "Managed Zellij checksum mismatch",
+            format!("actual sha256: {actual_sha256}"),
+            release,
+        ));
+    }
+
+    let temporary_executable = temporary.path.join(executable_name());
+    extract_zellij(&archive_path, &temporary_executable, release)?;
+    std::fs::remove_file(&archive_path).map_err(|error| {
+        acquisition_error(
+            "Managed Zellij install failed",
+            format!("cannot remove verified archive before publication: {error}"),
+            release,
+        )
+    })?;
+
+    match std::fs::rename(&temporary.path, version_dir) {
+        Ok(()) => {
+            temporary.disarm();
+            Ok(())
+        }
+        Err(_) if is_executable(executable_path) => Ok(()),
+        Err(error) => Err(acquisition_error(
+            "Managed Zellij install failed",
+            format!(
+                "cannot atomically publish {}: {error}",
+                version_dir.display()
+            ),
+            release,
+        )),
+    }
+}
+
 fn absolute_executable(path: &Path, mode: ZellijRuntimeMode) -> Result<PathBuf, String> {
     path.canonicalize().map_err(|error| {
         format!(
@@ -188,10 +517,13 @@ fn resolve_zellij_runtime_in(
     environment: &RuntimeEnvironment,
 ) -> Result<ResolvedZellijRuntime, String> {
     let (mode, path) = match request {
-        ZellijRuntimeRequest::Managed => (
-            ZellijRuntimeMode::Managed,
-            managed_zellij_path(environment)?,
-        ),
+        ZellijRuntimeRequest::Managed => {
+            let path = managed_zellij_path(environment)?;
+            if !is_executable(&path) {
+                ensure_managed_zellij(&path, managed_release()?)?;
+            }
+            (ZellijRuntimeMode::Managed, path)
+        }
         ZellijRuntimeRequest::System => {
             (ZellijRuntimeMode::System, find_system_zellij(environment)?)
         }
@@ -210,6 +542,145 @@ fn resolve_zellij_runtime_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    enum FixtureResponse {
+        Complete(Vec<u8>),
+        Interrupted(Vec<u8>),
+    }
+
+    struct FixtureServer {
+        url: String,
+        requests: Arc<AtomicUsize>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl FixtureServer {
+        fn start(response: FixtureResponse) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let thread_requests = Arc::clone(&requests);
+            let thread = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            thread_requests.fetch_add(1, AtomicOrdering::SeqCst);
+                            read_request_headers(&mut stream);
+                            match response {
+                                FixtureResponse::Complete(body) => {
+                                    write_response(&mut stream, body.len(), &body)
+                                }
+                                FixtureResponse::Interrupted(body) => {
+                                    let advertised = body.len() + 1024;
+                                    write_response(&mut stream, advertised, &body)
+                                }
+                            }
+                            break;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                url: format!("http://{address}/zellij.tar.gz"),
+                requests,
+                thread: Some(thread),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(AtomicOrdering::SeqCst)
+        }
+
+        fn join(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for FixtureServer {
+        fn drop(&mut self) {
+            self.join();
+        }
+    }
+
+    fn read_request_headers(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => request.extend_from_slice(&buffer[..read]),
+            }
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, content_length: usize, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fixture_archive() -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let script = b"#!/bin/sh\nprintf '%s\\n' 'zellij 0.43.1'\n";
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(script.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, executable_name(), &script[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn fixture_sha256(bytes: &[u8]) -> String {
+        sha256_reader(bytes).unwrap()
+    }
+
+    fn managed_fixture_path(root: &Path) -> PathBuf {
+        root.join("runtime/zellij-0.43.1/zellij")
+    }
+
+    fn assert_no_install_temporary_directories(executable_path: &Path) {
+        let runtime_root = executable_path.parent().unwrap().parent().unwrap();
+        if !runtime_root.exists() {
+            return;
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(runtime_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".install-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary directories: {leftovers:?}");
+    }
 
     #[cfg(unix)]
     fn write_stub(path: &Path, version_output: &str, exit_code: i32) {
@@ -375,5 +846,162 @@ mod tests {
         write_stub(&zellij, "zellij 0.44.0", 7);
         let failed = resolve_zellij_runtime_in(&ZellijRuntimeRequest::System, &env).unwrap_err();
         assert!(failed.contains("exited with"));
+    }
+
+    #[test]
+    fn production_release_metadata_is_pinned_to_managed_version() {
+        for (architecture, url, sha256) in [
+            (
+                "x86_64",
+                MANAGED_ZELLIJ_X86_64_URL,
+                MANAGED_ZELLIJ_X86_64_SHA256,
+            ),
+            (
+                "aarch64",
+                MANAGED_ZELLIJ_AARCH64_URL,
+                MANAGED_ZELLIJ_AARCH64_SHA256,
+            ),
+        ] {
+            assert_eq!(managed_release_for("linux", architecture).unwrap().url, url);
+            assert!(url.contains(&format!("/v{MANAGED_ZELLIJ_VERSION}/")));
+            assert!(url.contains("zellij-no-web-"));
+            assert!(url.ends_with("-unknown-linux-musl.tar.gz"));
+            assert_eq!(sha256.len(), 64);
+            assert!(sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_fetch_verify_and_atomic_store() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = managed_fixture_path(root.path());
+        let archive = fixture_archive();
+        let sha256 = fixture_sha256(&archive);
+        let mut server = FixtureServer::start(FixtureResponse::Complete(archive));
+        let url = server.url.clone();
+        let release = ManagedRelease {
+            url: &url,
+            sha256: &sha256,
+        };
+
+        ensure_managed_zellij(&executable, release).unwrap();
+        server.join();
+
+        assert_eq!(server.request_count(), 1);
+        assert!(is_executable(&executable));
+        assert_eq!(
+            inspect_zellij(&executable, ZellijRuntimeMode::Managed).unwrap(),
+            MANAGED_ZELLIJ_VERSION
+        );
+        assert!(!executable
+            .parent()
+            .unwrap()
+            .join("download.tar.gz")
+            .exists());
+        assert_no_install_temporary_directories(&executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checksum_mismatch_is_named_and_leaves_no_partial_install() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = managed_fixture_path(root.path());
+        let archive = fixture_archive();
+        let actual_sha256 = fixture_sha256(&archive);
+        let expected_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+        let mut server = FixtureServer::start(FixtureResponse::Complete(archive));
+        let release = ManagedRelease {
+            url: &server.url,
+            sha256: expected_sha256,
+        };
+
+        let error = ensure_managed_zellij(&executable, release).unwrap_err();
+        server.join();
+
+        assert!(error.contains("Managed Zellij checksum mismatch"));
+        assert!(error.contains(&server.url));
+        assert!(error.contains(expected_sha256));
+        assert!(error.contains(&actual_sha256));
+        assert_eq!(server.request_count(), 1);
+        assert!(!executable.parent().unwrap().exists());
+        assert_no_install_temporary_directories(&executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_download_leaves_no_torn_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = managed_fixture_path(root.path());
+        let archive = fixture_archive();
+        let sha256 = fixture_sha256(&archive);
+        let prefix = archive[..archive.len() / 2].to_vec();
+        let mut server = FixtureServer::start(FixtureResponse::Interrupted(prefix));
+        let release = ManagedRelease {
+            url: &server.url,
+            sha256: &sha256,
+        };
+
+        let error = ensure_managed_zellij(&executable, release).unwrap_err();
+        server.join();
+
+        assert!(error.contains("Managed Zellij"));
+        assert!(error.contains(&server.url));
+        assert!(error.contains(&sha256));
+        assert_eq!(server.request_count(), 1);
+        assert!(!executable.parent().unwrap().exists());
+        assert_no_install_temporary_directories(&executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_without_cache_is_one_bounded_named_error() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = managed_fixture_path(root.path());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/zellij.tar.gz");
+        let expected_sha256 = "1111111111111111111111111111111111111111111111111111111111111111";
+        let release = ManagedRelease {
+            url: &url,
+            sha256: expected_sha256,
+        };
+        let started = Instant::now();
+
+        let error = ensure_managed_zellij(&executable, release).unwrap_err();
+
+        assert!(error.contains("Managed Zellij download failed"));
+        assert!(error.contains(&url));
+        assert!(error.contains(expected_sha256));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!executable.parent().unwrap().exists());
+        assert_no_install_temporary_directories(&executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_managed_resolution_performs_zero_network_calls() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = managed_fixture_path(root.path());
+        let archive = fixture_archive();
+        let sha256 = fixture_sha256(&archive);
+        let mut server = FixtureServer::start(FixtureResponse::Complete(archive));
+        let url = server.url.clone();
+        let release = ManagedRelease {
+            url: &url,
+            sha256: &sha256,
+        };
+
+        ensure_managed_zellij(&executable, release).unwrap();
+        server.join();
+        ensure_managed_zellij(&executable, release).unwrap();
+
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(
+            inspect_zellij(&executable, ZellijRuntimeMode::Managed).unwrap(),
+            MANAGED_ZELLIJ_VERSION
+        );
+        assert_no_install_temporary_directories(&executable);
     }
 }
