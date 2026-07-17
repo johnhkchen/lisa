@@ -45,10 +45,11 @@ use lisa_core::completion::{
 use lisa_core::context::PURPOSE_PARAGRAPH;
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
-use lisa_core::disposition::{parse_review_disposition, ReviewDisposition};
+use lisa_core::disposition::{parse_review_disposition, RemedyOwner, ReviewDisposition};
 use lisa_core::provenance::{
-    self, AssignmentState, AssignmentTransitionRecord, ProvenanceLedgerRecord, ProvenanceRecord,
-    ProvenanceRecordType, Route, RunOutcome,
+    self, AssignmentState, AssignmentTransitionRecord, ParkingTransitionRecord,
+    ParkingTransitionType, ProvenanceLedgerRecord, ProvenanceRecord, ProvenanceRecordType, Route,
+    RunOutcome,
 };
 use lisa_core::ticket;
 use lisa_core::types::{
@@ -223,6 +224,10 @@ const ENTER_DELAY_SECS: f64 = 2.0;
 
 /// One same-attempt chat redelivery is allowed before operator-visible failure.
 const MAX_ASSIGNMENT_DELIVERY_RETRIES: u8 = 1;
+
+/// Fresh Review attempts allowed after an agent-owned block during one loop.
+/// The counter intentionally resets with the scheduler process.
+const MAX_AGENT_BLOCK_RETRIES: u8 = 2;
 
 /// Bounded startup grace for grace-mode providers (Codex). After a fresh launch
 /// Lisa waits this long for the TUI to become input-ready, then paces the first
@@ -424,6 +429,46 @@ enum FailureTransitionOutcome {
         ticket_id: TicketId,
         fenced: bool,
     },
+}
+
+/// Bounded scheduler consequence of one admitted blocking Review disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewBlockAction {
+    Retry {
+        retry_count: u8,
+        retry_limit: u8,
+    },
+    Park {
+        retry_count: Option<u8>,
+        retry_limit: Option<u8>,
+        recheck_eligible: bool,
+    },
+}
+
+fn review_block_action(owner: RemedyOwner, retries_consumed: u8) -> ReviewBlockAction {
+    match owner {
+        RemedyOwner::Agent if retries_consumed < MAX_AGENT_BLOCK_RETRIES => {
+            ReviewBlockAction::Retry {
+                retry_count: retries_consumed.saturating_add(1),
+                retry_limit: MAX_AGENT_BLOCK_RETRIES,
+            }
+        }
+        RemedyOwner::Agent => ReviewBlockAction::Park {
+            retry_count: Some(MAX_AGENT_BLOCK_RETRIES),
+            retry_limit: Some(MAX_AGENT_BLOCK_RETRIES),
+            recheck_eligible: false,
+        },
+        RemedyOwner::Operator => ReviewBlockAction::Park {
+            retry_count: None,
+            retry_limit: None,
+            recheck_eligible: false,
+        },
+        RemedyOwner::World => ReviewBlockAction::Park {
+            retry_count: None,
+            retry_limit: None,
+            recheck_eligible: true,
+        },
+    }
 }
 
 /// Test-only observation of the safety-critical timeout teardown order.
@@ -633,6 +678,11 @@ pub struct State {
     /// Latest lease ever minted for each ticket in this scheduler process.
     /// Entries survive revocation/release so redispatch remains monotonic.
     lease_high_water: HashMap<TicketId, AttemptLease>,
+
+    /// Agent-owned Review block retries consumed during this loop process.
+    /// Durable scheduling authority remains ticket `status: blocked`; this map
+    /// only decides when another open Review attempt is allowed.
+    agent_block_retries: HashMap<TicketId, u8>,
 
     /// Safety-order trace used only by native scheduler tests.
     #[cfg(test)]
@@ -4520,6 +4570,125 @@ impl State {
         }
     }
 
+    /// Apply bounded scheduler policy to complete, current-attempt Review
+    /// blocks. The admitted canonical disposition remains the structured
+    /// payload; ticket status is the only durable scheduling authority.
+    fn apply_review_block_policy(&mut self) {
+        let candidates: Vec<(TicketId, AttemptLease, std::time::SystemTime)> = self
+            .threads
+            .iter()
+            .filter(|(_, thread)| {
+                thread.status == lisa_core::types::ThreadStatus::Running
+                    && thread.current_phase == Phase::Review
+            })
+            .filter_map(|(ticket_id, thread)| {
+                let lease = thread.attempt_lease.clone()?;
+                (lease.ticket_id == *ticket_id
+                    && lease.is_current(self.current_leases.get(ticket_id)))
+                .then_some((ticket_id.clone(), lease, thread.started_at))
+            })
+            .collect();
+
+        let mut parked_any = false;
+        for (ticket_id, source_lease, attempt_started_at) in candidates {
+            let inputs = self.review_completion_inputs(&ticket_id, &source_lease);
+            if inputs.artifact_admission.is_none() {
+                continue;
+            }
+            let ReviewDisposition::Block {
+                remedy_owner, ask, ..
+            } = inputs.disposition
+            else {
+                continue;
+            };
+
+            let retries_consumed = self
+                .agent_block_retries
+                .get(&ticket_id)
+                .copied()
+                .unwrap_or(0);
+            match review_block_action(remedy_owner, retries_consumed) {
+                ReviewBlockAction::Retry {
+                    retry_count,
+                    retry_limit,
+                } => {
+                    self.emit_review_block_transition(
+                        &ticket_id,
+                        remedy_owner,
+                        ParkingTransitionType::Retry,
+                        Some(retry_count),
+                        Some(retry_limit),
+                        false,
+                        attempt_started_at,
+                    );
+                    self.agent_block_retries
+                        .insert(ticket_id.clone(), retry_count);
+                    self.release_slot_for_ticket(&ticket_id);
+                    self.threads.remove(&ticket_id);
+                    self.finish_up_sent.remove(&ticket_id);
+                    self.log_activity(ActivityEvent::Info {
+                        message: format!(
+                            "Retrying agent-owned Review block for {ticket_id} ({retry_count}/{retry_limit}): {ask}"
+                        ),
+                    });
+                }
+                ReviewBlockAction::Park {
+                    retry_count,
+                    retry_limit,
+                    recheck_eligible,
+                } => {
+                    let Some(file_path) = self
+                        .dag
+                        .get_ticket(&ticket_id)
+                        .map(|ticket| ticket.file_path.clone())
+                        .filter(|path| !path.as_os_str().is_empty())
+                    else {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Cannot park {ticket_id}: ticket file path is unavailable"
+                            ),
+                        });
+                        continue;
+                    };
+                    if let Err(error) =
+                        ticket::update_ticket_status(&file_path, TicketStatus::Blocked)
+                    {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Cannot park {ticket_id}: failed to write blocked status: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+
+                    let parked_at = std::time::SystemTime::now();
+                    self.emit_review_block_transition(
+                        &ticket_id,
+                        remedy_owner,
+                        ParkingTransitionType::Park,
+                        retry_count,
+                        retry_limit,
+                        recheck_eligible,
+                        parked_at,
+                    );
+                    self.release_slot_for_ticket(&ticket_id);
+                    self.threads.remove(&ticket_id);
+                    self.finish_up_sent.remove(&ticket_id);
+                    parked_any = true;
+                    self.log_activity(ActivityEvent::Info {
+                        message: format!(
+                            "Parked {ticket_id} ({remedy_owner:?}, recheck eligible: {recheck_eligible}): {ask}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        if parked_any {
+            self.rebuild_dag();
+        }
+    }
+
     /// Re-derive every current Review attempt's completion obligation from
     /// admitted artifacts and aggregate state. This is intentionally safe to
     /// call at every scheduler observation boundary.
@@ -5185,6 +5354,129 @@ impl State {
             return false;
         }
         true
+    }
+
+    /// Append one current-attempt block retry or park transition.
+    fn emit_review_block_transition(
+        &mut self,
+        ticket_id: &str,
+        remedy_owner: RemedyOwner,
+        record_type: ParkingTransitionType,
+        retry_count: Option<u8>,
+        retry_limit: Option<u8>,
+        recheck_eligible: bool,
+        started_at: std::time::SystemTime,
+    ) -> bool {
+        if self.ledger_path.as_os_str().is_empty() {
+            return false;
+        }
+        let attempt_lease = self
+            .threads
+            .get(ticket_id)
+            .and_then(|thread| thread.attempt_lease.clone())
+            .filter(|lease| {
+                lease.ticket_id == ticket_id && lease.is_current(self.current_leases.get(ticket_id))
+            });
+        let Some(attempt_lease) = attempt_lease else {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "block-transition provenance rejected for {ticket_id}: current attempt evidence is missing or inconsistent"
+                ),
+            });
+            return false;
+        };
+
+        let started = provenance::system_time_to_epoch(started_at);
+        let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
+        let record = ParkingTransitionRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            record_type,
+            ticket_id: ticket_id.to_string(),
+            attempt_lease,
+            remedy_owner,
+            retry_count,
+            retry_limit,
+            recheck_eligible,
+            started_at: started,
+            ended_at: ended,
+            wall_clock_secs: ended.saturating_sub(started),
+        };
+        if let Err(error) = provenance::append_parking_transition_record(&self.ledger_path, &record)
+        {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "block-transition provenance write failed for {ticket_id}: {error}"
+                ),
+            });
+            return false;
+        }
+        true
+    }
+
+    /// Record status-driven unparking without making provenance scheduling
+    /// authority. The latest Park row supplies the interval start and attempt.
+    fn reconcile_unpark_transitions(&mut self) {
+        if self.ledger_path.as_os_str().is_empty() {
+            return;
+        }
+        let Ok(ledger) = std::fs::read_to_string(&self.ledger_path) else {
+            return;
+        };
+        let mut latest = HashMap::<TicketId, ParkingTransitionRecord>::new();
+        for record in ledger
+            .lines()
+            .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
+        {
+            if let ProvenanceLedgerRecord::ParkingTransition(record) = record {
+                latest.insert(record.ticket_id.clone(), record);
+            }
+        }
+
+        let reopened: Vec<ParkingTransitionRecord> = latest
+            .into_values()
+            .filter(|record| record.record_type == ParkingTransitionType::Park)
+            .filter(|record| {
+                self.dag
+                    .get_ticket(&record.ticket_id)
+                    .is_some_and(|ticket| {
+                        ticket.status == TicketStatus::Open && ticket.phase != Phase::Done
+                    })
+            })
+            .collect();
+
+        for park in reopened {
+            let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
+            let unpark = ParkingTransitionRecord {
+                schema_version: provenance::SCHEMA_VERSION,
+                record_type: ParkingTransitionType::Unpark,
+                ticket_id: park.ticket_id.clone(),
+                attempt_lease: park.attempt_lease,
+                remedy_owner: park.remedy_owner,
+                retry_count: park.retry_count,
+                retry_limit: park.retry_limit,
+                recheck_eligible: park.recheck_eligible,
+                started_at: park.started_at,
+                ended_at: ended,
+                wall_clock_secs: ended.saturating_sub(park.started_at),
+            };
+            match provenance::append_parking_transition_record(&self.ledger_path, &unpark) {
+                Ok(()) => {
+                    self.agent_block_retries.remove(&park.ticket_id);
+                    self.log_activity(ActivityEvent::Info {
+                        message: format!(
+                            "Unparked {} after {}s; status open restored ordinary DAG eligibility",
+                            park.ticket_id, unpark.wall_clock_secs
+                        ),
+                    });
+                }
+                Err(error) => self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "unpark-transition provenance write failed for {}: {}",
+                        park.ticket_id, error
+                    ),
+                }),
+            }
+        }
     }
 
     /// Append one provenance record for a finishing ticket-run (T-027-01).
@@ -6154,6 +6446,11 @@ impl State {
         // ownership fallback before timeout policy, as well as a phase edge.
         self.check_artifact_advances();
 
+        // A complete blocking Review is a scheduler decision, not a completion
+        // failure. Externally owned remedies park immediately; agent-owned
+        // remedies consume their bounded per-loop retry before parking.
+        self.apply_review_block_policy();
+
         // Check for idle signals and advance phases / generate alerts
         self.check_idle_signals();
 
@@ -6189,6 +6486,11 @@ impl State {
         self.detect_stale_threads();
 
         self.rebuild_dag();
+
+        // An operator reopening a parked ticket restores ordinary DAG
+        // eligibility directly. Provenance observes that durable state change
+        // and never gates scheduling.
+        self.reconcile_unpark_transitions();
 
         // Post-timeout/reload reconciliation routes externally observed Done
         // through the typed adapter. The pending mask prevents this path from
@@ -7089,6 +7391,10 @@ impl ZellijPlugin for State {
             }
         }
 
+        // Reconstruct an unpark interval if status was reopened while the loop
+        // was stopped. Scheduling itself depends only on the scanned status.
+        self.reconcile_unpark_transitions();
+
         // A fresh State normally has no reconstructed attempt authority here,
         // making this a safe no-op. Any authority-preserving load path uses the
         // same level-triggered reconciliation boundary as polling.
@@ -7812,6 +8118,330 @@ mod tests {
 
     fn write_passing_review_disposition(state: &State, lease: &AttemptLease) {
         write_review_disposition(state, lease, r#"{"disposition":"pass","reason":null}"#);
+    }
+
+    fn write_block_policy_ticket(tickets_dir: &Path, ticket_id: &str, phase: Phase) {
+        let phase = phase.to_string();
+        std::fs::write(
+            tickets_dir.join(format!("{ticket_id}.md")),
+            format!(
+                "---\nid: {ticket_id}\ntitle: block policy {ticket_id}\ntype: task\nstatus: open\npriority: high\nphase: {phase}\n---\n\nFixture\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn attach_review_block_attempt(
+        state: &mut State,
+        ticket_id: &str,
+        pane_id: u32,
+        disposition: &str,
+    ) -> AttemptLease {
+        let slot = state
+            .agent_slots
+            .iter_mut()
+            .find(|slot| slot.pane_id == pane_id)
+            .expect("fixture pane exists");
+        slot.ticket_id = Some(ticket_id.to_string());
+        slot.transition_state = TransitionState::Idle;
+        slot.cooldown_until = None;
+
+        let mut thread = Thread::new(ticket_id, pane_id);
+        thread.current_phase = Phase::Review;
+        state.threads.insert(ticket_id.to_string(), thread);
+        let lease = install_current_attempt(state, ticket_id);
+        state
+            .seat_assignments
+            .insert(pane_id, SeatAssignmentState::Owned);
+
+        let attempt_dir = state.attempt_work_dir(&lease);
+        std::fs::create_dir_all(&attempt_dir).unwrap();
+        std::fs::write(attempt_dir.join("review.md"), "# Review\n\nBlocked.\n").unwrap();
+        std::fs::write(attempt_dir.join("review-disposition.json"), disposition).unwrap();
+        lease
+    }
+
+    fn write_current_review_block(state: &mut State, ticket_id: &str, disposition: &str) {
+        let lease = state.current_leases[ticket_id].clone();
+        let pane_id = state.threads[ticket_id].pane_id;
+        let slot = state
+            .agent_slots
+            .iter_mut()
+            .find(|slot| slot.pane_id == pane_id)
+            .expect("scheduled fixture pane exists");
+        slot.transition_state = TransitionState::Idle;
+        state
+            .seat_assignments
+            .insert(pane_id, SeatAssignmentState::Owned);
+        let attempt_dir = state.attempt_work_dir(&lease);
+        std::fs::create_dir_all(&attempt_dir).unwrap();
+        std::fs::write(attempt_dir.join("review.md"), "# Review\n\nBlocked.\n").unwrap();
+        std::fs::write(attempt_dir.join("review-disposition.json"), disposition).unwrap();
+    }
+
+    #[test]
+    fn review_block_policy_has_exact_owner_and_retry_bound() {
+        assert_eq!(
+            review_block_action(RemedyOwner::Agent, 0),
+            ReviewBlockAction::Retry {
+                retry_count: 1,
+                retry_limit: 2,
+            }
+        );
+        assert_eq!(
+            review_block_action(RemedyOwner::Agent, 1),
+            ReviewBlockAction::Retry {
+                retry_count: 2,
+                retry_limit: 2,
+            }
+        );
+        for consumed in [2, 3, u8::MAX] {
+            assert_eq!(
+                review_block_action(RemedyOwner::Agent, consumed),
+                ReviewBlockAction::Park {
+                    retry_count: Some(2),
+                    retry_limit: Some(2),
+                    recheck_eligible: false,
+                }
+            );
+        }
+        assert_eq!(
+            review_block_action(RemedyOwner::Operator, 0),
+            ReviewBlockAction::Park {
+                retry_count: None,
+                retry_limit: None,
+                recheck_eligible: false,
+            }
+        );
+        assert_eq!(
+            review_block_action(RemedyOwner::World, 0),
+            ReviewBlockAction::Park {
+                retry_count: None,
+                retry_limit: None,
+                recheck_eligible: true,
+            }
+        );
+    }
+
+    #[test]
+    fn park_instead_of_churn_replay_frees_two_seats_for_ready_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        write_block_policy_ticket(&tickets_dir, "T-OPERATOR", Phase::Review);
+        write_block_policy_ticket(&tickets_dir, "T-WORLD", Phase::Review);
+        write_block_policy_ticket(&tickets_dir, "T-READY-A", Phase::Ready);
+        write_block_policy_ticket(&tickets_dir, "T-READY-B", Phase::Ready);
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let ledger_path = dir.path().join("provenance.jsonl");
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
+                max_threads: 2,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            attempt_dir: dir.path().join("attempts"),
+            signal_dir: dir.path().join("signals"),
+            ledger_path: ledger_path.clone(),
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.push(fresh_slot(10, None));
+        state.agent_slots.push(fresh_slot(11, None));
+
+        attach_review_block_attempt(
+            &mut state,
+            "T-OPERATOR",
+            10,
+            r#"{"disposition":"block","reason":"human tests required","remedy_owner":"operator","ask":"Run the release tests."}"#,
+        );
+        attach_review_block_attempt(
+            &mut state,
+            "T-WORLD",
+            11,
+            r#"{"disposition":"block","reason":"release is not published","remedy_owner":"world","ask":"Publish the release.","check":"test -f release"}"#,
+        );
+        assert_eq!(
+            state
+                .threads
+                .values()
+                .filter(|thread| thread.status == lisa_core::types::ThreadStatus::Running)
+                .count(),
+            2
+        );
+
+        state.apply_review_block_policy();
+
+        for blocked in ["T-OPERATOR", "T-WORLD"] {
+            assert!(!state.threads.contains_key(blocked));
+            assert_eq!(
+                state.dag.get_ticket(&blocked.to_string()).unwrap().status,
+                TicketStatus::Blocked
+            );
+            assert!(!state.current_leases.contains_key(blocked));
+            assert!(state
+                .agent_slots
+                .iter()
+                .all(|slot| slot.ticket_id.as_deref() != Some(blocked)));
+        }
+
+        state.schedule_ready_tickets();
+        let mut scheduled: Vec<_> = state.threads.keys().cloned().collect();
+        scheduled.sort();
+        assert_eq!(scheduled, vec!["T-READY-A", "T-READY-B"]);
+        assert_eq!(
+            state
+                .agent_slots
+                .iter()
+                .filter(|slot| slot.ticket_id.is_some())
+                .count(),
+            2
+        );
+
+        state.schedule_ready_tickets();
+        assert!(!state.threads.contains_key("T-OPERATOR"));
+        assert!(!state.threads.contains_key("T-WORLD"));
+
+        let records = read_mixed_ledger(&ledger_path);
+        let parks: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                ProvenanceLedgerRecord::ParkingTransition(record)
+                    if record.record_type == ParkingTransitionType::Park =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(parks.len(), 2);
+        assert!(parks.iter().any(|record| {
+            record.ticket_id == "T-OPERATOR"
+                && record.remedy_owner == RemedyOwner::Operator
+                && !record.recheck_eligible
+        }));
+        assert!(parks.iter().any(|record| {
+            record.ticket_id == "T-WORLD"
+                && record.remedy_owner == RemedyOwner::World
+                && record.recheck_eligible
+        }));
+    }
+
+    #[test]
+    fn agent_owned_block_retries_exact_bound_then_parks_and_status_open_unparks() {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        write_block_policy_ticket(&tickets_dir, "T-AGENT", Phase::Review);
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let ledger_path = dir.path().join("provenance.jsonl");
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: dir.path().join("work"),
+                max_threads: 1,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            attempt_dir: dir.path().join("attempts"),
+            signal_dir: dir.path().join("signals"),
+            ledger_path: ledger_path.clone(),
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.push(fresh_slot(20, None));
+        let disposition = r#"{"disposition":"block","reason":"agent fix remains","remedy_owner":"agent","ask":"Fix the remaining defect."}"#;
+        let first = attach_review_block_attempt(&mut state, "T-AGENT", 20, disposition);
+        assert_eq!(first.attempt_id, 1);
+
+        for expected_attempt in [2, 3] {
+            state.apply_review_block_policy();
+            assert!(!state.threads.contains_key("T-AGENT"));
+            assert_eq!(
+                state.dag.get_ticket(&"T-AGENT".to_string()).unwrap().status,
+                TicketStatus::Open
+            );
+            state.schedule_ready_tickets();
+            let lease = state.current_leases["T-AGENT"].clone();
+            assert_eq!(lease.attempt_id, expected_attempt);
+            write_current_review_block(&mut state, "T-AGENT", disposition);
+        }
+
+        state.apply_review_block_policy();
+        assert!(!state.threads.contains_key("T-AGENT"));
+        assert_eq!(
+            state.dag.get_ticket(&"T-AGENT".to_string()).unwrap().status,
+            TicketStatus::Blocked
+        );
+        state.schedule_ready_tickets();
+        assert!(!state.threads.contains_key("T-AGENT"));
+
+        let records = read_mixed_ledger(&ledger_path);
+        let transitions: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                ProvenanceLedgerRecord::ParkingTransition(record) => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transitions.len(), 3);
+        assert_eq!(transitions[0].record_type, ParkingTransitionType::Retry);
+        assert_eq!(
+            (transitions[0].retry_count, transitions[0].retry_limit),
+            (Some(1), Some(2))
+        );
+        assert_eq!(transitions[1].record_type, ParkingTransitionType::Retry);
+        assert_eq!(
+            (transitions[1].retry_count, transitions[1].retry_limit),
+            (Some(2), Some(2))
+        );
+        assert_eq!(transitions[2].record_type, ParkingTransitionType::Park);
+        assert_eq!(
+            (transitions[2].retry_count, transitions[2].retry_limit),
+            (Some(2), Some(2))
+        );
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|record| record.attempt_lease.attempt_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        ticket::update_ticket_status(
+            tickets_dir.join("T-AGENT.md"),
+            lisa_core::types::TicketStatus::Open,
+        )
+        .unwrap();
+        state.rebuild_dag();
+        state.reconcile_unpark_transitions();
+        state.schedule_ready_tickets();
+
+        assert!(state.threads.contains_key("T-AGENT"));
+        assert_eq!(state.current_leases["T-AGENT"].attempt_id, 4);
+        assert!(!state.agent_block_retries.contains_key("T-AGENT"));
+        let records = read_mixed_ledger(&ledger_path);
+        assert_eq!(records.len(), 4);
+        let ProvenanceLedgerRecord::ParkingTransition(unpark) = &records[3] else {
+            panic!("expected unpark provenance")
+        };
+        assert_eq!(unpark.record_type, ParkingTransitionType::Unpark);
+        assert_eq!(unpark.ticket_id, "T-AGENT");
+        assert_eq!(unpark.attempt_lease.attempt_id, 3);
+
+        state.reconcile_unpark_transitions();
+        assert_eq!(
+            read_mixed_ledger(&ledger_path).len(),
+            4,
+            "latest Unpark makes reconciliation idempotent"
+        );
     }
 
     /// Construct an expired Review attempt around real scanned ticket and work
