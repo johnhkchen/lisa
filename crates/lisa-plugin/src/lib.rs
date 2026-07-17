@@ -4716,8 +4716,7 @@ impl State {
                         &ticket_id,
                         remedy_owner,
                         ParkingTransitionType::Retry,
-                        Some(retry_count),
-                        Some(retry_limit),
+                        Some((retry_count, retry_limit)),
                         false,
                         attempt_started_at,
                     );
@@ -4766,8 +4765,7 @@ impl State {
                         &ticket_id,
                         remedy_owner,
                         ParkingTransitionType::Park,
-                        retry_count,
-                        retry_limit,
+                        retry_count.zip(retry_limit),
                         recheck_eligible,
                         parked_at,
                     );
@@ -5457,13 +5455,15 @@ impl State {
     }
 
     /// Append one current-attempt block retry or park transition.
+    ///
+    /// `retry_progress` is `(count, limit)` — the pair is only meaningful
+    /// together, so it travels as one value.
     fn emit_review_block_transition(
         &mut self,
         ticket_id: &str,
         remedy_owner: RemedyOwner,
         record_type: ParkingTransitionType,
-        retry_count: Option<u8>,
-        retry_limit: Option<u8>,
+        retry_progress: Option<(u8, u8)>,
         recheck_eligible: bool,
         started_at: std::time::SystemTime,
     ) -> bool {
@@ -5488,6 +5488,10 @@ impl State {
 
         let started = provenance::system_time_to_epoch(started_at);
         let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
+        let (retry_count, retry_limit) = match retry_progress {
+            Some((count, limit)) => (Some(count), Some(limit)),
+            None => (None, None),
+        };
         let record = ParkingTransitionRecord {
             schema_version: provenance::SCHEMA_VERSION,
             record_type,
