@@ -18919,6 +18919,126 @@ owned\n\
     }
 
     #[test]
+    fn auto_pinned_commit_with_mid_run_repository_loss_parks_without_journal_seal() {
+        const TICKET_ID: &str = "T-PINNED-COMMIT";
+        let (mut state, lease, dir, journal, ledger) = completion_failure_fixture(TICKET_ID);
+        let resolution = lisa_core::completion::resolve_completion_seal(
+            lisa_core::completion::CompletionSealMode::Auto,
+            lisa_core::completion::CommitSealSupport::Available,
+        )
+        .unwrap();
+        assert_eq!(resolution.seal(), CompletionSeal::Commit);
+        state.config.completion_seal = resolution.seal();
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Pinned Commit Fixture"]);
+        git(&["config", "user.email", "pinned-commit@example.invalid"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "fixture root"]);
+
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease,
+        }));
+        assert_eq!(state.config.completion_seal, CompletionSeal::Commit);
+        assert_eq!(state.launched_completion_effects.len(), 1);
+        let completion_key = state.pending_completions[TICKET_ID].completion_key.clone();
+
+        let git_dir = dir.path().join(".git");
+        assert!(git_dir.is_dir());
+        std::fs::remove_dir_all(&git_dir).unwrap();
+
+        let ticket_file = state.config.ticket_dir.join(format!("{TICKET_ID}.md"));
+        let error = lisa_cli::commit_transaction::complete_ticket(
+            lisa_cli::commit_transaction::CompleteTicketRequest {
+                repo_root: dir.path().to_path_buf(),
+                ticket_id: TICKET_ID.to_string(),
+                message: format!("Complete {TICKET_ID}"),
+                ticket_file: ticket_file.strip_prefix(dir.path()).unwrap().to_path_buf(),
+                work_dir: state
+                    .config
+                    .work_dir
+                    .join(TICKET_ID)
+                    .strip_prefix(dir.path())
+                    .unwrap()
+                    .to_path_buf(),
+                completion_key,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("discover repository root"), "{error}");
+        state.handle_completion_result(
+            TICKET_ID,
+            Some(1),
+            Vec::new(),
+            format!("Error: {error}").into_bytes(),
+        );
+
+        assert_eq!(state.config.completion_seal, CompletionSeal::Commit);
+        assert!(!state.pending_completions.contains_key(TICKET_ID));
+        assert!(!state.threads.contains_key(TICKET_ID));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        let ticket = ticket::scan_tickets(&state.config.ticket_dir)
+            .unwrap()
+            .into_iter()
+            .find(|ticket| ticket.id == TICKET_ID)
+            .unwrap();
+        assert_eq!(ticket.phase, Phase::Review);
+        assert_eq!(ticket.status, TicketStatus::Blocked);
+        assert!(matches!(
+            parse_review_disposition(
+                state
+                    .config
+                    .work_dir
+                    .join(TICKET_ID)
+                    .join("review-disposition.json")
+            ),
+            ReviewDisposition::Block {
+                reason,
+                ask,
+                remedy_owner: RemedyOwner::Operator,
+                unstructured: true,
+                ..
+            } if !ask.trim().is_empty()
+                && ask == reason
+                && reason.contains("discover repository root")
+        ));
+
+        let journal_body = std::fs::read_to_string(journal).unwrap();
+        assert!(journal_body.contains("\"state\":\"failure-observed\""));
+        assert!(journal_body.contains("\"state\":\"rejected\""));
+        assert!(journal_body.contains("\"retryability\":\"action-required\""));
+        assert!(journal_body.contains("discover repository root"));
+        assert!(journal_body
+            .lines()
+            .all(|line| line.contains("\"seal\":\"commit\"")));
+        assert!(!journal_body.contains("\"seal\":\"journal\""));
+        assert!(!journal_body.contains("\"state\":\"confirmed\""));
+        assert!(!journal_body.contains("\"content_hashes\""));
+        assert!(!journal_body.contains("\"commit_id\""));
+
+        let records = read_mixed_ledger(&ledger);
+        let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
+            panic!("expected Park provenance")
+        };
+        assert_eq!(park.record_type, ParkingTransitionType::Park);
+        assert_eq!(park.seal, CompletionSeal::Commit);
+    }
+
+    #[test]
     fn transient_completion_failure_exhausts_launches_without_immediate_park() {
         const TICKET_ID: &str = "T-CONTENTION";
         let (mut state, lease, _dir, journal, ledger) = completion_failure_fixture(TICKET_ID);
