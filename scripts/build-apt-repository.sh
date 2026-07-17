@@ -157,6 +157,12 @@ GNUPGHOME=$verify_home gpg --batch --verify \
 install -m 0644 "$public_key" "$stage/lisa-archive-keyring.asc"
 : > "$stage/.nojekyll"
 
+# A published static apt site is world-readable by definition, and apt's
+# sandboxed `_apt` user must be able to read every index it fetches — gpg
+# writes some outputs 0600 regardless of umask, which broke file: repo
+# verification (v0.4.2 release run 29550709595). Normalize the whole site.
+chmod -R a+rX "$stage"
+
 rm -rf "$output_dir"
 mv "$stage" "$output_dir"
 stage="$output_parent/.lisa-apt-repository.consumed"
