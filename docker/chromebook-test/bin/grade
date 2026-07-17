@@ -33,6 +33,22 @@ mkdir -p "$HOME/demo" && cd "$HOME/demo"
 git init -q . 2>/dev/null || note "FINDING: git absent or init failed"
 init_rc=1; validate_rc=1; dry_rc=1
 bash -lc 'lisa init' >/dev/null 2>&1 && init_rc=0
+# validate requires a schedulable board — an empty scaffold correctly errors
+# with "no tickets found", so give it one smoke ticket first.
+mkdir -p docs/active/tickets
+cat > docs/active/tickets/T-001.md <<'EOF'
+---
+id: T-001
+title: smoke-ticket
+type: task
+status: open
+priority: medium
+phase: ready
+depends_on: []
+---
+
+Smoke ticket so validate and the dry run see a schedulable board.
+EOF
 bash -lc 'lisa validate' >/dev/null 2>&1 && validate_rc=0
 bash -lc 'lisa loop --dry-run' >/dev/null 2>&1 && dry_rc=0
 [ $init_rc -eq 0 ] && note "init 0" || failhard "init $init_rc"
@@ -52,9 +68,16 @@ done
 clones=$(find "$HOME" /tmp -maxdepth 3 -name Cargo.toml 2>/dev/null | grep -v "^$HOME/demo" || true)
 [ -n "$clones" ] && note "FINDING: Cargo.toml present (clone?): $clones"
 
-say "== sudo/apt actions (from apt history)"
-apt_hist=$(grep -h "Commandline:" /var/log/apt/history.log 2>/dev/null | tail -5 || true)
-[ -n "$apt_hist" ] && say "$apt_hist" || note "(no apt actions logged)"
+say "== sudo/apt actions during the leg"
+if [ -f /tmp/apt-history.baseline ]; then
+    apt_hist=$(diff /tmp/apt-history.baseline /var/log/apt/history.log 2>/dev/null |
+        sed -n 's/^> \(Commandline:.*\)/\1/p' || true)
+    [ -n "$apt_hist" ] && say "$apt_hist" || note "(none — agent used no apt)"
+else
+    apt_hist=$(grep -h "Commandline:" /var/log/apt/history.log 2>/dev/null | tail -5 || true)
+    note "(no prepare-time baseline: list below INCLUDES image-build entries)"
+    [ -n "$apt_hist" ] && say "$apt_hist" || note "(no apt actions logged)"
+fi
 
 {
     echo "### Run $(date -u +%F) — scripted grade"

@@ -383,6 +383,22 @@ fi
 
 lisa init
 init_exit=$?
+# validate requires a schedulable board — an empty scaffold correctly errors
+# with "no tickets found" (first exercised in the 2026-07-16 closing leg).
+mkdir -p docs/active/tickets
+cat > docs/active/tickets/T-001.md <<'EOF'
+---
+id: T-001
+title: smoke-ticket
+type: task
+status: open
+priority: medium
+phase: ready
+depends_on: []
+---
+
+Smoke ticket so validate and the dry run see a schedulable board.
+EOF
 lisa validate
 validate_exit=$?
 lisa loop --dry-run

@@ -62,6 +62,8 @@ if [ $XDG_SEED = 1 ]; then
     echo "seeded: XDG_CACHE_HOME=$HOME/.xdg-cache (applied at /cbt/run)"
 fi
 
+cp /var/log/apt/history.log /tmp/apt-history.baseline 2>/dev/null ||
+    : > /tmp/apt-history.baseline
 df -B1 --output=used / | tail -1 > /tmp/disk.before
 {
     echo "prepared_utc: $(date -u +%FT%TZ)"

@@ -137,6 +137,12 @@ emulate-debian LEG="":
     echo ">>> auth inside:  claude auth login   |   codex login --device-auth"
     exec docker run -it --memory=4g --cpus=2 --name "$name" lisa-chromebook-test bash
 
+# Re-run the acceptance grade inside an existing leg container with the
+# repo's current grader (preserves the leg; only the grading logic updates).
+cbt-regrade CONTAINER:
+    docker cp docker/chromebook-test/bin/grade {{CONTAINER}}:/cbt/grade
+    docker exec -it {{CONTAINER}} /cbt/grade
+
 # Pull a finished Chromebook-test leg's evidence off a container into the
 # closing-run ticket's work dir: run record, leg metadata, instruction,
 # tour page if present, and a docker-diff summary.
