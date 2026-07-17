@@ -1,8 +1,14 @@
 use crate::detect::DetectedProject;
 use lisa_core::context::PURPOSE_PARAGRAPH;
+use std::sync::LazyLock;
 
 /// The RDSPI workflow document, embedded at compile time
-pub const RDSPI_WORKFLOW: &str = include_str!("../data/rdspi-workflow.md");
+pub static RDSPI_WORKFLOW: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{PURPOSE_PARAGRAPH}\n\n{}",
+        include_str!("../data/rdspi-workflow.md")
+    )
+});
 
 /// Exact outgoing Lisa templates accepted as proof of an unmodified install.
 /// Keep only byte-distinct generations; current content is handled separately.
@@ -692,6 +698,11 @@ mod tests {
         assert!(RDSPI_WORKFLOW.contains("Plan"));
         assert!(RDSPI_WORKFLOW.contains("Implement"));
         assert!(RDSPI_WORKFLOW.contains("Review"));
+        assert_eq!(
+            RDSPI_WORKFLOW.as_str(),
+            include_str!("../../../docs/knowledge/rdspi-workflow.md"),
+            "checked-in project context must match the rendered template"
+        );
     }
 
     #[test]
@@ -793,7 +804,7 @@ mod tests {
         for (name, context) in [
             ("CLAUDE.md", claude_md.as_str()),
             ("AGENTS.md", agents_md.as_str()),
-            ("RDSPI workflow", RDSPI_WORKFLOW),
+            ("RDSPI workflow", RDSPI_WORKFLOW.as_str()),
         ] {
             assert_eq!(
                 context.matches(PURPOSE_PARAGRAPH).count(),
@@ -812,18 +823,19 @@ mod tests {
             }
         }
 
-        let rust_template_sources = [
+        let template_sources = [
             include_str!("../../lisa-core/src/context.rs"),
             include_str!("../../lisa-plugin/src/lib.rs"),
             include_str!("templates.rs"),
+            include_str!("../data/rdspi-workflow.md"),
         ];
         assert_eq!(
-            rust_template_sources
+            template_sources
                 .iter()
                 .map(|source| source.matches(PURPOSE_PARAGRAPH).count())
                 .sum::<usize>(),
             1,
-            "canonical prose must have exactly one Rust template source"
+            "canonical prose must have exactly one template source"
         );
     }
 

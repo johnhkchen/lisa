@@ -342,7 +342,7 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
     let workflow_path = root.join("docs/knowledge/rdspi-workflow.md");
     actions.push(plan_owned_template(
         workflow_path,
-        templates::RDSPI_WORKFLOW,
+        templates::RDSPI_WORKFLOW.as_str(),
         templates::LEGACY_RDSPI_WORKFLOWS,
     ));
 
@@ -2153,7 +2153,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
             dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            templates::RDSPI_WORKFLOW,
+            templates::RDSPI_WORKFLOW.as_str(),
         )
         .unwrap();
 
@@ -2210,7 +2210,7 @@ depends_on: [T-999]
         assert!(
             templates::LEGACY_RDSPI_WORKFLOWS
                 .iter()
-                .all(|legacy| *legacy != templates::RDSPI_WORKFLOW),
+                .all(|legacy| *legacy != templates::RDSPI_WORKFLOW.as_str()),
             "legacy workflow fixtures must be byte-distinct from current content"
         );
 
@@ -2226,7 +2226,7 @@ depends_on: [T-999]
                 actions.iter().any(
                     |action| matches!(action, InitAction::UpdateFile { path, content }
                         if path.ends_with("rdspi-workflow.md")
-                            && content == templates::RDSPI_WORKFLOW)
+                            && content == templates::RDSPI_WORKFLOW.as_str())
                 ),
                 "every exact prior Lisa workflow must upgrade to the current template"
             );
@@ -2240,7 +2240,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(
             dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            templates::RDSPI_WORKFLOW,
+            templates::RDSPI_WORKFLOW.as_str(),
         )
         .unwrap();
         for (name, content) in [
@@ -2445,7 +2445,7 @@ depends_on: [T-999]
 
         let workflow = format!(
             "{}\n## Story Layer\n\nRead the parent story before every ticket.\n",
-            templates::RDSPI_WORKFLOW
+            templates::RDSPI_WORKFLOW.as_str()
         );
         let stop_hook = format!(
             "{}\n# Project addition: notify the local supervisor.\n",
