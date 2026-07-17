@@ -161,6 +161,14 @@ pub struct ParkedThread {
     pub slot_number: usize,
 }
 
+/// One durable parked remedy reduced to its human-facing dashboard line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingItem {
+    pub ticket_id: String,
+    pub ask: String,
+    pub checks_on_own: bool,
+}
+
 /// Type of health alert for the attention banner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlertType {
@@ -366,6 +374,7 @@ pub struct PluginState {
     pub tickets: Vec<TicketNode>,
     pub active_threads: Vec<ActiveThread>,
     pub parked_threads: Vec<ParkedThread>,
+    pub waiting_items: Vec<WaitingItem>,
     pub activity_log: Vec<ActivityEntry>,
     pub alerts: Vec<HealthAlert>,
     pub slots: Vec<SlotInfo>,
@@ -385,6 +394,7 @@ impl Default for PluginState {
             tickets: Vec::new(),
             active_threads: Vec::new(),
             parked_threads: Vec::new(),
+            waiting_items: Vec::new(),
             activity_log: Vec::new(),
             alerts: Vec::new(),
             slots: Vec::new(),
@@ -426,6 +436,28 @@ fn format_time_since(timestamp: Duration, current_time: Duration) -> String {
 /// Render a horizontal separator line
 fn render_separator(width: usize) -> String {
     format!("{}{}{}", DIM, "─".repeat(width.min(80)), RESET)
+}
+
+// =============================================================================
+// Waiting on you
+// =============================================================================
+
+/// Render the ask-only surface for durable operator/world-owned parks.
+fn render_waiting_on_you(state: &PluginState, output: &mut Vec<String>) {
+    if state.waiting_items.is_empty() {
+        return;
+    }
+
+    output.push(format!("{BOLD}Waiting on you{RESET}"));
+    for item in &state.waiting_items {
+        let suffix = if item.checks_on_own {
+            " — Lisa checks on its own."
+        } else {
+            ""
+        };
+        output.push(format!("{}  {}{}", item.ticket_id, item.ask, suffix));
+    }
+    output.push(String::new());
 }
 
 // =============================================================================
@@ -1181,6 +1213,9 @@ fn render_operations_view(
     height: usize,
     output: &mut Vec<String>,
 ) {
+    // Durable parked asks are the first operational content.
+    render_waiting_on_you(state, output);
+
     // Attention banner (review gate + health alerts)
     render_attention_banner(state, width, output);
 
@@ -1617,6 +1652,7 @@ mod tests {
                 route: None,
             }],
             parked_threads: vec![],
+            waiting_items: vec![],
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(30),
@@ -1685,6 +1721,68 @@ mod tests {
         render_dag(&state, &mut output);
 
         assert!(output.iter().any(|line| line.contains("no tickets")));
+    }
+
+    #[test]
+    fn waiting_section_preserves_operator_ask_and_explains_world_waiting() {
+        let state = PluginState {
+            waiting_items: vec![
+                WaitingItem {
+                    ticket_id: "T-ASK".to_string(),
+                    ask: "Run the checkout test exactly once.".to_string(),
+                    checks_on_own: false,
+                },
+                WaitingItem {
+                    ticket_id: "T-WORLD".to_string(),
+                    ask: "Wait for the release link.".to_string(),
+                    checks_on_own: true,
+                },
+            ],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+
+        render_waiting_on_you(&state, &mut output);
+
+        let full = output.join("\n");
+        assert!(full.contains("Waiting on you"));
+        assert!(full.contains("T-ASK  Run the checkout test exactly once."));
+        assert!(full.contains("T-WORLD  Wait for the release link. — Lisa checks on its own."));
+        assert!(!full.contains("operator"));
+        assert!(!full.contains("remedy_owner"));
+        assert!(!full.contains("engineering-only reason"));
+    }
+
+    #[test]
+    fn waiting_section_is_empty_without_human_or_world_items() {
+        let mut output = Vec::new();
+        render_waiting_on_you(&PluginState::default(), &mut output);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn waiting_section_is_first_operations_content() {
+        let state = PluginState {
+            waiting_items: vec![WaitingItem {
+                ticket_id: "T-ASK".to_string(),
+                ask: "Run the release test.".to_string(),
+                checks_on_own: false,
+            }],
+            alerts: vec![HealthAlert {
+                ticket_id: "T-FAILED".to_string(),
+                alert_type: AlertType::Failed,
+                detail: "Session failed".to_string(),
+                suggested_actions: vec![],
+            }],
+            ..PluginState::default()
+        };
+
+        let full = render_dashboard_lines(&state, 80, 50).join("\n");
+        let waiting = full.find("Waiting on you").unwrap();
+        let attention = full.find("ATTENTION NEEDED").unwrap();
+        let threads = full.find("Threads").unwrap();
+        assert!(waiting < attention);
+        assert!(waiting < threads);
     }
 
     #[test]
@@ -2286,6 +2384,7 @@ mod tests {
                 parked_at: Duration::from_secs(80),
                 slot_number: 2,
             }],
+            waiting_items: Vec::new(),
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(50),

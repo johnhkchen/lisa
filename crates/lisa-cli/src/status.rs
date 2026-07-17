@@ -2,6 +2,35 @@ use std::path::Path;
 
 use crate::config;
 use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
+use lisa_core::disposition::RemedyOwner;
+use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
+
+fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
+    remedies
+        .iter()
+        .filter_map(|remedy| match remedy.remedy_owner {
+            RemedyOwner::Operator => Some(format!("{}  {}", remedy.ticket_id, remedy.ask)),
+            RemedyOwner::World => Some(format!(
+                "{}  {} — Lisa checks on its own.",
+                remedy.ticket_id, remedy.ask
+            )),
+            RemedyOwner::Agent => None,
+        })
+        .collect()
+}
+
+fn print_waiting_on_you(remedies: &[ParkedRemedy]) {
+    let lines = waiting_on_you_lines(remedies);
+    if lines.is_empty() {
+        return;
+    }
+
+    println!("Waiting on you");
+    for line in lines {
+        println!("{line}");
+    }
+    println!();
+}
 
 /// Run the status command: scan tickets, build DAG, print scheduling state.
 pub fn run_status(root: &Path) -> Result<(), String> {
@@ -51,6 +80,9 @@ pub fn run_status(root: &Path) -> Result<(), String> {
             return Err(format!("Cycle detected involving: {}", nodes.join(", ")));
         }
     }
+
+    let parked_remedies = collect_parked_remedies(tickets.iter(), &root.join(&work_dir_rel));
+    print_waiting_on_you(&parked_remedies);
 
     // Print summary header
     let stats = dag.stats();
@@ -270,5 +302,37 @@ mod tests {
         // Should find the ticket in the custom directory
         let result = run_status(dir.path());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn waiting_lines_preserve_operator_ask_and_explain_world_waiting() {
+        let remedies = vec![
+            ParkedRemedy {
+                ticket_id: "T-001".to_string(),
+                remedy_owner: RemedyOwner::Operator,
+                ask: "Run the checkout test exactly once.".to_string(),
+                check: None,
+            },
+            ParkedRemedy {
+                ticket_id: "T-002".to_string(),
+                remedy_owner: RemedyOwner::World,
+                ask: "Wait for the release link.".to_string(),
+                check: Some("test -f release".to_string()),
+            },
+            ParkedRemedy {
+                ticket_id: "T-003".to_string(),
+                remedy_owner: RemedyOwner::Agent,
+                ask: "Agent retry exhausted.".to_string(),
+                check: None,
+            },
+        ];
+
+        assert_eq!(
+            waiting_on_you_lines(&remedies),
+            vec![
+                "T-001  Run the checkout test exactly once.",
+                "T-002  Wait for the release link. — Lisa checks on its own.",
+            ]
+        );
     }
 }

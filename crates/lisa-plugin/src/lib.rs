@@ -7578,6 +7578,24 @@ impl State {
             })
             .collect();
 
+        let waiting_items: Vec<ui::WaitingItem> =
+            lisa_core::parking::collect_parked_remedies(self.dag.tickets(), &self.config.work_dir)
+                .into_iter()
+                .filter_map(|remedy| match remedy.remedy_owner {
+                    RemedyOwner::Operator => Some(ui::WaitingItem {
+                        ticket_id: remedy.ticket_id,
+                        ask: remedy.ask,
+                        checks_on_own: false,
+                    }),
+                    RemedyOwner::World => Some(ui::WaitingItem {
+                        ticket_id: remedy.ticket_id,
+                        ask: remedy.ask,
+                        checks_on_own: true,
+                    }),
+                    RemedyOwner::Agent => None,
+                })
+                .collect();
+
         let activity_log: Vec<ui::ActivityEntry> = self
             .activity_log
             .iter()
@@ -7729,6 +7747,7 @@ impl State {
             tickets,
             active_threads,
             parked_threads,
+            waiting_items,
             activity_log,
             alerts,
             slots,
