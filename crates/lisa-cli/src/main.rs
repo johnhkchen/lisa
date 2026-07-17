@@ -102,6 +102,13 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Verify observable world-owned waits without operator involvement.
+    #[command(hide = true)]
+    RecheckWorld {
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     /// Print setup instructions for an agent to follow.
     #[command(hide = true)]
     SetupGuide {
@@ -466,6 +473,20 @@ fn main() {
                 Ok(unblock::UnblockOutcome::Declined(message)) => {
                     eprintln!("{message}");
                     std::process::exit(1);
+                }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::RecheckWorld { path } => {
+            let path = resolve_path(&path);
+            match unblock::run_world_rechecks(&path) {
+                Ok(reopened) => {
+                    for ticket_id in reopened {
+                        println!("{ticket_id}");
+                    }
                 }
                 Err(error) => {
                     eprintln!("Error: {error}");

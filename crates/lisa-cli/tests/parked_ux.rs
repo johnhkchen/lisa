@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use lisa_core::dag::Dag;
 use lisa_core::ticket::{parse_ticket, scan_tickets};
@@ -46,6 +47,10 @@ fn lisa(args: &[&str]) -> Output {
 
 fn unblock(root: &Path, ticket_id: &str) -> Output {
     lisa(&["unblock", ticket_id, "--path", root.to_str().unwrap()])
+}
+
+fn recheck_world(root: &Path) -> Output {
+    lisa(&["recheck-world", "--path", root.to_str().unwrap()])
 }
 
 fn assert_ticket_status(ticket_path: &Path, expected: TicketStatus) {
@@ -150,6 +155,109 @@ fn passing_check_reopens_and_the_next_schedule_sees_the_ticket() {
     );
     assert_ticket_status(&ticket, TicketStatus::Open);
     assert_ready(&root, "T-PASS", true);
+}
+
+#[test]
+fn world_owned_passing_check_self_clears_without_an_operator_command() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-AUTO-PASS", "blocked");
+    fs::write(root.join("release-ready"), "ready\n").unwrap();
+    write_disposition(
+        &root,
+        "T-AUTO-PASS",
+        r#"{"disposition":"block","reason":"release missing","remedy_owner":"world","ask":"Wait for the release.","check":"test -f release-ready"}"#,
+    );
+
+    let output = recheck_world(&root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "T-AUTO-PASS\n");
+    assert_ticket_status(&ticket, TicketStatus::Open);
+    assert_ready(&root, "T-AUTO-PASS", true);
+}
+
+#[test]
+fn world_owned_failing_check_stays_parked_without_churn() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-AUTO-FAIL", "blocked");
+    write_disposition(
+        &root,
+        "T-AUTO-FAIL",
+        r#"{"disposition":"block","reason":"release missing","remedy_owner":"world","ask":"Wait for the release.","check":"exit 1"}"#,
+    );
+    let before = fs::read(&ticket).unwrap();
+
+    let output = recheck_world(&root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(fs::read(&ticket).unwrap(), before);
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+    assert_ready(&root, "T-AUTO-FAIL", false);
+}
+
+#[test]
+fn automatic_recheck_ignores_operator_owned_passing_checks() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-AUTO-OPERATOR", "blocked");
+    fs::write(root.join("operator-ready"), "ready\n").unwrap();
+    write_disposition(
+        &root,
+        "T-AUTO-OPERATOR",
+        r#"{"disposition":"block","reason":"manual approval missing","remedy_owner":"operator","ask":"Approve the release.","check":"test -f operator-ready"}"#,
+    );
+
+    let output = recheck_world(&root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+    assert_ready(&root, "T-AUTO-OPERATOR", false);
+}
+
+#[test]
+fn automatic_recheck_write_attempt_is_disposable_and_cannot_reopen() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-AUTO-WRITE", "blocked");
+    write_disposition(
+        &root,
+        "T-AUTO-WRITE",
+        r#"{"disposition":"block","reason":"write probe","remedy_owner":"world","ask":"Wait for the marker.","check":"touch must-not-exist"}"#,
+    );
+
+    let output = recheck_world(&root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert!(!root.join("must-not-exist").exists());
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+    assert_ready(&root, "T-AUTO-WRITE", false);
+}
+
+#[test]
+fn automatic_recheck_timeout_is_bounded_and_cannot_reopen() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-AUTO-TIMEOUT", "blocked");
+    write_disposition(
+        &root,
+        "T-AUTO-TIMEOUT",
+        r#"{"disposition":"block","reason":"slow probe","remedy_owner":"world","ask":"Wait for the probe.","check":"sleep 30"}"#,
+    );
+    let started = Instant::now();
+
+    let output = recheck_world(&root);
+
+    assert!(output.status.success());
+    assert!(started.elapsed() >= Duration::from_secs(4));
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+    assert_ready(&root, "T-AUTO-TIMEOUT", false);
 }
 
 #[test]

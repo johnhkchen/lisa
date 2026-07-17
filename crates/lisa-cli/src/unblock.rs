@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::config;
+use lisa_core::disposition::RemedyOwner;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -74,6 +75,50 @@ pub fn run_unblock(root: &Path, ticket_id: &str) -> Result<UnblockOutcome, Strin
     Ok(UnblockOutcome::Reopened(format!(
         "{ticket_id} can run again."
     )))
+}
+
+/// Verify every observable world-owned parked remedy and reopen only passes.
+///
+/// This is deliberately stricter than [`run_unblock`]: automation cannot act
+/// for an operator or agent, and a world-owned remedy without a check has no
+/// positive evidence that external reality changed. Ordinary failed, timed
+/// out, or mutating checks are expected no-op observations rather than command
+/// failures.
+pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
+    let validation = config::load_config(root)?;
+    let resolved = config::resolve_config(&validation.config, None, None);
+    let ticket_dir = root.join(&resolved.ticket_dir);
+    let work_dir = root.join(&resolved.work_dir);
+    let tickets = ticket::scan_tickets(&ticket_dir)
+        .map_err(|error| format!("Could not read the ticket board: {error}"))?;
+    let remedies = collect_parked_remedies(tickets.iter(), &work_dir);
+    let mut reopened = Vec::new();
+
+    for remedy in remedies {
+        if remedy.remedy_owner != RemedyOwner::World {
+            continue;
+        }
+        let Some(check) = remedy.check else {
+            continue;
+        };
+        let Some(ticket) = tickets.iter().find(|ticket| ticket.id == remedy.ticket_id) else {
+            continue;
+        };
+
+        match run_check(root, &check, CHECK_TIMEOUT)
+            .map_err(|error| format!("Could not recheck {}: {error}", remedy.ticket_id))?
+        {
+            CheckResult::Passed => {
+                ticket::update_ticket_status(&ticket.file_path, TicketStatus::Open).map_err(
+                    |error| format!("Could not let {} run again: {error}", remedy.ticket_id),
+                )?;
+                reopened.push(remedy.ticket_id);
+            }
+            CheckResult::Failed(_) | CheckResult::TimedOut | CheckResult::ChangedFiles => {}
+        }
+    }
+
+    Ok(reopened)
 }
 
 fn decline_message(result: CheckResult) -> String {
