@@ -128,7 +128,7 @@ fn list_ack_and_restart_processes_follow_durable_lifecycle() {
 
     let after = notes(&root);
     assert!(after.status.success());
-    assert_eq!(String::from_utf8_lossy(&after.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&after.stdout), "Nothing to read.\n");
     let duplicate = lisa(&[
         "notes",
         "--path",
@@ -154,11 +154,14 @@ fn list_ack_and_restart_processes_follow_durable_lifecycle() {
 }
 
 #[test]
-fn empty_queue_renders_nothing() {
+fn empty_queue_renders_nothing_to_read() {
     let (_temp, root) = project();
     let output = notes(&root);
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Nothing to read.\n"
+    );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 }
 

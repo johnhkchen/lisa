@@ -85,7 +85,7 @@ fn status_opens_with_the_operator_ask_then_the_reviewers_reason() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     assert!(stdout.starts_with(
-        "Waiting on you\nT-ASK  Run the checkout test exactly once.\n       Reviewer's note: engineering-only release gate reason\n\nDAG:"
+        "Waiting on you\nT-ASK  Run the checkout test exactly once.\n       Reviewer's note: engineering-only release gate reason\n\nNotes for you\nNothing to read.\n\nDAG:"
     ));
     assert!(
         stdout.find("Run the checkout test exactly once.").unwrap()
@@ -111,7 +111,7 @@ fn status_explains_that_lisa_checks_world_owned_waiting() {
 
     assert!(output.status.success());
     assert!(stdout.starts_with(
-        "Waiting on you\nT-WORLD  Wait for the release link. — Lisa checks on its own.\n       Reviewer's note: release absent\n\nDAG:"
+        "Waiting on you\nT-WORLD  Wait for the release link. — Lisa checks on its own.\n       Reviewer's note: release absent\n\nNotes for you\nNothing to read.\n\nDAG:"
     ));
 }
 
@@ -135,7 +135,7 @@ fn status_legacy_field_block_never_opens_with_the_raw_reason() {
 
     assert!(output.status.success());
     assert!(stdout.starts_with(&format!(
-        "Waiting on you\nT-046-06-03  {LEGACY_BLOCK_ASK}\n       Reviewer's note: {FIELD_REASON}\n\nDAG:"
+        "Waiting on you\nT-046-06-03  {LEGACY_BLOCK_ASK}\n       Reviewer's note: {FIELD_REASON}\n\nNotes for you\nNothing to read.\n\nDAG:"
     )));
     assert!(stdout.find(LEGACY_BLOCK_ASK).unwrap() < stdout.find(FIELD_REASON).unwrap());
 }
