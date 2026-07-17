@@ -87,15 +87,15 @@ fn doctor_names_missing_git_and_apt_remedy() {
 }
 
 #[test]
-fn loop_names_missing_git_before_git_root_discovery() {
+fn loop_auto_without_git_uses_journal_instead_of_requiring_git() {
     let output = run_with_zellij_version_and_path("loop", "zellij 0.44.3", false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(!output.status.success());
-    assert!(stderr.contains("Dependency preflight failed"));
-    assert!(stderr.contains("git"));
-    assert!(stderr.contains("not found"));
-    assert!(stderr.contains("sudo apt install git"));
+    assert!(output.status.success(), "auto loop failed: {stderr}");
+    assert!(stdout.contains("Lisa loop starting"));
+    assert!(!stderr.contains("Dependency preflight failed"));
+    assert!(!stderr.contains("sudo apt install git"));
     assert!(!stderr.contains("Failed to discover Git root"));
 }
 
