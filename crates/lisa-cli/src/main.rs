@@ -14,6 +14,7 @@ mod runtime;
 mod setup_guide;
 mod status;
 mod templates;
+mod unblock;
 
 use clap::{Parser, Subcommand};
 use lisa_cli::commit_transaction;
@@ -88,6 +89,19 @@ enum Commands {
         #[arg(long, requires = "ticket")]
         ledger: Option<PathBuf>,
     },
+    /// Verify what changed and let a waiting ticket run again.
+    #[command(
+        display_order = 3,
+        after_help = "Example: lisa unblock T-001 --path ./my-project"
+    )]
+    Unblock {
+        /// Ticket to let run again
+        ticket_id: String,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     /// Print setup instructions for an agent to follow.
     #[command(hide = true)]
     SetupGuide {
@@ -100,7 +114,7 @@ enum Commands {
     HooksGuide,
     /// Check that the tools Lisa needs are installed.
     #[command(
-        display_order = 3,
+        display_order = 4,
         after_help = "Example: lisa doctor --path ./my-project"
     )]
     Doctor {
@@ -241,7 +255,7 @@ enum Commands {
     },
     /// Start a run: work through the ready tickets, in parallel where they don't collide.
     #[command(
-        display_order = 4,
+        display_order = 5,
         after_help = "Example: lisa loop --path ./my-project --max-threads 3"
     )]
     Loop {
@@ -443,6 +457,20 @@ fn main() {
             if let Err(e) = result {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::Unblock { ticket_id, path } => {
+            let path = resolve_path(&path);
+            match unblock::run_unblock(&path, &ticket_id) {
+                Ok(unblock::UnblockOutcome::Reopened(message)) => println!("{message}"),
+                Ok(unblock::UnblockOutcome::Declined(message)) => {
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::SetupGuide { path } => {

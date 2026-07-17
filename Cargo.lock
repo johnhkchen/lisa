@@ -1607,6 +1607,7 @@ dependencies = [
  "directories",
  "flate2",
  "fs2",
+ "libc",
  "lisa-core",
  "serde",
  "serde_json",

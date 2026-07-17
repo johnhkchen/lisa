@@ -1,7 +1,7 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 13 of Lisa's own subcommands still resolve,
+//!   (a) all 14 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
 //!   (d) the five machinery-invoked plumbing commands stay outside the
@@ -14,8 +14,8 @@
 
 use std::process::{Command, Output};
 
-/// The five commands an operator runs, foregrounded in `--help`.
-const OPERATOR_COMMANDS: [&str; 5] = ["init", "validate", "status", "doctor", "loop"];
+/// The six commands an operator runs, foregrounded in `--help`.
+const OPERATOR_COMMANDS: [&str; 6] = ["init", "validate", "status", "unblock", "doctor", "loop"];
 
 /// The five machinery-invoked commands: omitted from Clap's generated list but
 /// still shown in the curated plumbing footer and directly invokable by name.
@@ -42,6 +42,7 @@ Commands:
   init      Set up a project to run with Lisa
   validate  Check your tickets and project setup for problems before a run
   status    Show which tickets are ready to run and which are waiting, and why
+  unblock   Verify what changed and let a waiting ticket run again
   doctor    Check that the tools Lisa needs are installed
   loop      Start a run: work through the ready tickets, in parallel where they don't collide
   help      Print this message or the help of the given subcommand(s)
@@ -63,7 +64,7 @@ struct OperatorHelpSnapshot {
     expected: &'static str,
 }
 
-const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 5] = [
+const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 6] = [
     OperatorHelpSnapshot {
         command: "init",
         expected: r#"Set up a project to run with Lisa
@@ -108,6 +109,22 @@ Example: lisa status --path ./my-project
 "#,
     },
     OperatorHelpSnapshot {
+        command: "unblock",
+        expected: r#"Verify what changed and let a waiting ticket run again
+
+Usage: lisa unblock [OPTIONS] <TICKET_ID>
+
+Arguments:
+  <TICKET_ID>  Ticket to let run again
+
+Options:
+      --path <PATH>  Path to the project root (defaults to current directory) [default: .]
+  -h, --help         Print help
+
+Example: lisa unblock T-001 --path ./my-project
+"#,
+    },
+    OperatorHelpSnapshot {
         command: "doctor",
         expected: r#"Check that the tools Lisa needs are installed
 
@@ -139,10 +156,11 @@ Example: lisa loop --path ./my-project --max-threads 3
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 13] = [
+const OWN_COMMANDS: [&str; 14] = [
     "init",
     "validate",
     "status",
+    "unblock",
     "doctor",
     "loop",
     "agent-exec",
@@ -237,14 +255,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 13 own subcommands resolves — including the hidden
+/// (a) Every one of the 14 own subcommands resolves — including the hidden
 /// three, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_thirteen_subcommands_resolve() {
+fn all_fourteen_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        13,
-        "the pinned command set must be exactly 13"
+        14,
+        "the pinned command set must be exactly 14"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);
