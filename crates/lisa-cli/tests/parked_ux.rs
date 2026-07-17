@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use lisa_core::dag::Dag;
+use lisa_core::parking::LEGACY_BLOCK_ASK;
 use lisa_core::ticket::{parse_ticket, scan_tickets};
 use lisa_core::types::TicketStatus;
 
@@ -69,7 +70,7 @@ fn assert_ready(root: &Path, ticket_id: &str, expected: bool) {
 }
 
 #[test]
-fn status_opens_with_the_operator_ask_and_no_block_internals() {
+fn status_opens_with_the_operator_ask_then_the_reviewers_reason() {
     let (_temp, root) = project();
     write_ticket(&root, "T-ASK", "blocked");
     write_disposition(
@@ -83,10 +84,13 @@ fn status_opens_with_the_operator_ask_and_no_block_internals() {
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert!(stdout.starts_with(
+        "Waiting on you\nT-ASK  Run the checkout test exactly once.\n       Reviewer's note: engineering-only release gate reason\n\nDAG:"
+    ));
     assert!(
-        stdout.starts_with("Waiting on you\nT-ASK  Run the checkout test exactly once.\n\nDAG:")
+        stdout.find("Run the checkout test exactly once.").unwrap()
+            < stdout.find("engineering-only release gate reason").unwrap()
     );
-    assert!(!stdout.contains("engineering-only release gate reason"));
     assert!(!stdout.contains("hidden implementation step"));
     assert!(!stdout.contains("remedy_owner"));
     assert!(!stdout.contains("operator"));
@@ -107,8 +111,33 @@ fn status_explains_that_lisa_checks_world_owned_waiting() {
 
     assert!(output.status.success());
     assert!(stdout.starts_with(
-        "Waiting on you\nT-WORLD  Wait for the release link. — Lisa checks on its own.\n\nDAG:"
+        "Waiting on you\nT-WORLD  Wait for the release link. — Lisa checks on its own.\n       Reviewer's note: release absent\n\nDAG:"
     ));
+}
+
+#[test]
+fn status_legacy_field_block_never_opens_with_the_raw_reason() {
+    const FIELD_REASON: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
+    let (_temp, root) = project();
+    write_ticket(&root, "T-046-06-03", "blocked");
+    write_disposition(
+        &root,
+        "T-046-06-03",
+        &serde_json::json!({
+            "disposition": "block",
+            "reason": FIELD_REASON,
+        })
+        .to_string(),
+    );
+
+    let output = lisa(&["status", "--path", root.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.starts_with(&format!(
+        "Waiting on you\nT-046-06-03  {LEGACY_BLOCK_ASK}\n       Reviewer's note: {FIELD_REASON}\n\nDAG:"
+    )));
+    assert!(stdout.find(LEGACY_BLOCK_ASK).unwrap() < stdout.find(FIELD_REASON).unwrap());
 }
 
 #[test]
