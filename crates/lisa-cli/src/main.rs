@@ -1,5 +1,6 @@
 mod agent_exec;
 mod capture_usage;
+mod check_disposition;
 mod claim;
 mod codex_launcher;
 mod completion_seal;
@@ -259,8 +260,18 @@ enum Commands {
         #[arg(long)]
         nonce: u128,
     },
-    /// Commit this ticket's own files without touching the repo's ordinary git index.
+    /// Check this attempt's Review disposition and name every required fix.
     #[command(display_order = 23, hide = true)]
+    CheckDisposition {
+        /// Ticket whose Review disposition was just written.
+        ticket_id: String,
+
+        /// Project root containing the attempt work directory.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Commit this ticket's own files without touching the repo's ordinary git index.
+    #[command(display_order = 24, hide = true)]
     CommitTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
@@ -279,7 +290,7 @@ enum Commands {
         includes: Vec<PathBuf>,
     },
     /// Mark a ticket done and commit its files in one step.
-    #[command(display_order = 24, hide = true)]
+    #[command(display_order = 25, hide = true)]
     CompleteTicket {
         /// Repository root containing the ticket changes.
         #[arg(long, default_value = ".")]
@@ -449,6 +460,16 @@ fn main() {
                         claim.ticket_id, claim.attempt_id, claim.nonce
                     );
                 }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::CheckDisposition { ticket_id, path } => {
+            let path = resolve_path(&path);
+            match check_disposition::run_check_disposition(&path, &ticket_id) {
+                Ok(message) => println!("{message}"),
                 Err(error) => {
                     eprintln!("Error: {error}");
                     std::process::exit(1);

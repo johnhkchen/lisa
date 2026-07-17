@@ -1,11 +1,11 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 16 of Lisa's own subcommands still resolve,
+//!   (a) all 17 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
 //!   (d) the five machinery-invoked plumbing commands stay outside the
-//!       operator listing and the three internal commands stay hidden out of it,
+//!       operator listing and the four internal commands stay hidden out of it,
 //!   (e) the about-line and operator help carry none of the banned category
 //!       jargon.
 //!
@@ -30,7 +30,7 @@ const PLUMBING_COMMANDS: [&str; 5] = [
 ];
 
 /// Hidden out of the primary listing (`hide = true`) but still resolvable.
-const HIDDEN_COMMANDS: [&str; 3] = ["setup-guide", "hooks-guide", "version"];
+const HIDDEN_COMMANDS: [&str; 4] = ["check-disposition", "setup-guide", "hooks-guide", "version"];
 
 const PLUMBING_HEADING: &str = "Plumbing commands (called by Lisa and agent hooks):";
 
@@ -196,7 +196,7 @@ Example: lisa loop --path ./my-project --max-threads 3
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 16] = [
+const OWN_COMMANDS: [&str; 17] = [
     "init",
     "validate",
     "status",
@@ -208,6 +208,7 @@ const OWN_COMMANDS: [&str; 16] = [
     "agent-exec",
     "capture-usage",
     "claim",
+    "check-disposition",
     "commit-ticket",
     "complete-ticket",
     "setup-guide",
@@ -297,14 +298,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 16 own subcommands resolves — including the hidden
-/// three, which `--help` reaches even though they are absent from the listing.
+/// (a) Every one of the 17 own subcommands resolves — including the hidden
+/// four, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_sixteen_subcommands_resolve() {
+fn all_seventeen_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        16,
-        "the pinned command set must be exactly 16"
+        17,
+        "the pinned command set must be exactly 17"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);
@@ -359,7 +360,7 @@ fn operator_help_matches_snapshots() {
 }
 
 /// (d) Plumbing has its own footer rather than leaking into the generated
-/// operator list, and the three internal commands remain hidden entirely.
+/// operator list, and the four internal commands remain hidden entirely.
 #[test]
 fn plumbing_commands_are_separate_and_internal_hidden() {
     let help = help_stdout(&["--help"]);
