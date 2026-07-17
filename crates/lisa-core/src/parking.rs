@@ -13,6 +13,59 @@ use crate::types::{Ticket, TicketStatus};
 /// Plain lead shown when an older block has no structured human ask.
 pub const LEGACY_BLOCK_ASK: &str = "This ticket needs a decision from you. The reviewer's note is below — you can paste it to your coding agent.";
 
+/// Correction shown when a block ask describes state but gives no human move.
+pub const BLOCK_ASK_ACTION_FIX: &str =
+    "lead ask with a plain action, for example: Run the test. Choose an option. Publish the release.";
+
+/// Correction shown when technical detail displaces the block ask's plain lead.
+pub const BLOCK_ASK_LEAD_FIX: &str = "make ask's first sentence one short line (160 characters or fewer); move technical detail to reason or steps";
+
+const MAX_BLOCK_ASK_LEAD_CHARS: usize = 160;
+
+/// Enforce the minimum authoring floor for a block's operator-facing ask.
+///
+/// Rendering still supplies [`LEGACY_BLOCK_ASK`] for unchecked historical
+/// blocks. This check is for newly authored structured blocks: their first
+/// sentence must stay short, single-line, and contain an action a bystander can
+/// take. Follow-up context may remain after that first sentence.
+pub fn validate_block_ask(ask: &str) -> Result<(), &'static str> {
+    let trimmed = ask.trim();
+    if trimmed.is_empty() || trimmed.contains(['\n', '\r']) {
+        return Err(BLOCK_ASK_LEAD_FIX);
+    }
+
+    let lead_end = trimmed
+        .char_indices()
+        .find_map(|(index, character)| {
+            matches!(character, '.' | '!' | '?').then_some(index + character.len_utf8())
+        })
+        .unwrap_or(trimmed.len());
+    let lead = &trimmed[..lead_end];
+    if lead.chars().count() > MAX_BLOCK_ASK_LEAD_CHARS {
+        return Err(BLOCK_ASK_LEAD_FIX);
+    }
+
+    const ACTION_WORDS: &[&str] = &[
+        "add", "amend", "apply", "approve", "attach", "choose", "complete", "confirm", "contact",
+        "create", "decide", "deploy", "fix", "grant", "install", "open", "provide", "publish",
+        "record", "remove", "replace", "rerun", "retry", "review", "run", "select", "send", "set",
+        "share", "sign", "update", "upload", "wait",
+    ];
+    let has_action = lead
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .filter(|word| !word.is_empty())
+        .any(|word| {
+            ACTION_WORDS
+                .iter()
+                .any(|action| word.eq_ignore_ascii_case(action))
+        });
+    if !has_action {
+        return Err(BLOCK_ASK_ACTION_FIX);
+    }
+
+    Ok(())
+}
+
 /// The small remedy projection needed by status, dashboard, and unblock UX.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedRemedy {
@@ -81,6 +134,51 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    const FIELD_ASK: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
+
+    #[test]
+    fn ask_floor_strings_are_one_shared_pinned_source() {
+        assert_eq!(
+            LEGACY_BLOCK_ASK,
+            "This ticket needs a decision from you. The reviewer's note is below — you can paste it to your coding agent."
+        );
+        assert_eq!(
+            BLOCK_ASK_ACTION_FIX,
+            "lead ask with a plain action, for example: Run the test. Choose an option. Publish the release."
+        );
+        assert_eq!(
+            BLOCK_ASK_LEAD_FIX,
+            "make ask's first sentence one short line (160 characters or fewer); move technical detail to reason or steps"
+        );
+    }
+
+    #[test]
+    fn ask_floor_accepts_plain_actions_and_the_workflow_example() {
+        for ask in [
+            "Run the checkout test.",
+            "Choose whether to amend the criterion.",
+            "Publish the release.",
+            "Wait for the release link.",
+            "Contact the repository owner.",
+            "Lisa needs the release published; run: just release. Lisa will notice on its own once it's live.",
+        ] {
+            assert_eq!(validate_block_ask(ask), Ok(()), "rejected {ask:?}");
+        }
+    }
+
+    #[test]
+    fn ask_floor_rejects_observations_multiline_text_and_field_jargon_wall() {
+        assert_eq!(
+            validate_block_ask("The release artifact is unavailable."),
+            Err(BLOCK_ASK_ACTION_FIX)
+        );
+        assert_eq!(
+            validate_block_ask("Run the test.\nThen inspect the output."),
+            Err(BLOCK_ASK_LEAD_FIX)
+        );
+        assert_eq!(validate_block_ask(FIELD_ASK), Err(BLOCK_ASK_LEAD_FIX));
+    }
 
     fn ticket(id: &str, status: TicketStatus) -> Ticket {
         let mut ticket = Ticket::new(id, "fixture");

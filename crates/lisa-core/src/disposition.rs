@@ -131,6 +131,165 @@ pub fn parse_review_disposition(path: impl AsRef<Path>) -> ReviewDisposition {
     validate_document(document)
 }
 
+/// Read and strictly validate a Review disposition as an authoring contract.
+///
+/// Unlike [`parse_review_disposition`], this entry point never coerces an
+/// incomplete block into the legacy operator-owned fallback. It is intended
+/// for the reviewer-side check that corrects newly written artifacts while
+/// preserving the tolerant downstream parser for unchecked historical input.
+pub fn check_review_disposition(path: impl AsRef<Path>) -> Result<ReviewDisposition, String> {
+    let path = path.as_ref();
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let document: Value =
+        serde_json::from_str(&contents).map_err(|error| format!("write valid JSON ({error})"))?;
+    check_document(document)
+}
+
+fn check_document(document: Value) -> Result<ReviewDisposition, String> {
+    let Value::Object(mut object) = document else {
+        return Err("write one JSON object".to_string());
+    };
+
+    let disposition = take_non_empty_string(&mut object, "disposition", "review")?;
+    match disposition.as_str() {
+        "pass" => check_pass_document(&mut object),
+        "note" => check_note_document(&mut object),
+        "block" => check_block_document(&mut object),
+        unknown => Err(format!(
+            "change disposition {unknown:?} to \"pass\", \"note\", or \"block\""
+        )),
+    }
+}
+
+fn check_pass_document(
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<ReviewDisposition, String> {
+    match object.remove("reason") {
+        Some(Value::Null) => {}
+        _ => return Err("set a pass disposition's reason to null".to_string()),
+    }
+    if !object.is_empty() {
+        return Err("keep pass exact: {\"disposition\":\"pass\",\"reason\":null}".to_string());
+    }
+    Ok(ReviewDisposition::Pass)
+}
+
+fn check_note_document(
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<ReviewDisposition, String> {
+    match object.remove("reason") {
+        Some(Value::Null) => {}
+        _ => return Err("set a note disposition's reason to null".to_string()),
+    }
+
+    let criterion_quote = take_non_empty_string(object, "criterion_quote", "note disposition")?;
+    let evidence_citation = take_non_empty_string(object, "evidence_citation", "note disposition")?;
+    let summary = take_non_empty_string(object, "summary", "note disposition")?;
+
+    const COMPLAINT_FIELDS: &[&str] = &[
+        "work_complaint",
+        "complaint",
+        "quality_complaint",
+        "quality_concern",
+        "work_concern",
+    ];
+    if COMPLAINT_FIELDS
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return Err(
+            "remove work-quality complaints from a note; use a block when the work itself needs changes"
+                .to_string(),
+        );
+    }
+    if !object.is_empty() {
+        return Err(
+            "remove extra note fields; keep only disposition, reason, criterion_quote, evidence_citation, and summary"
+                .to_string(),
+        );
+    }
+
+    let note = DispositionNote::new(criterion_quote, evidence_citation, summary)
+        .expect("strict non-empty field checks must construct a note");
+    Ok(ReviewDisposition::Note(note))
+}
+
+fn check_block_document(
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<ReviewDisposition, String> {
+    let reason = take_non_empty_string(object, "reason", "block disposition")?;
+    let remedy_owner =
+        match object.remove("remedy_owner") {
+            Some(Value::String(owner)) if owner == "agent" => RemedyOwner::Agent,
+            Some(Value::String(owner)) if owner == "operator" => RemedyOwner::Operator,
+            Some(Value::String(owner)) if owner == "world" => RemedyOwner::World,
+            _ => return Err(
+                "set a block disposition's remedy_owner to \"agent\", \"operator\", or \"world\""
+                    .to_string(),
+            ),
+        };
+    let ask = take_non_empty_string(object, "ask", "block disposition")?;
+    let steps = match object.remove("steps") {
+        None => None,
+        Some(Value::Array(values)) if !values.is_empty() => {
+            let mut steps = Vec::with_capacity(values.len());
+            for value in values {
+                let Value::String(step) = value else {
+                    return Err("make every block disposition step a non-empty string".to_string());
+                };
+                if step.trim().is_empty() {
+                    return Err("make every block disposition step a non-empty string".to_string());
+                }
+                steps.push(step);
+            }
+            Some(steps)
+        }
+        Some(_) => return Err(
+            "make block disposition steps a non-empty array of non-empty strings, or omit steps"
+                .to_string(),
+        ),
+    };
+    let check = match object.remove("check") {
+        None => None,
+        Some(Value::String(check)) if !check.trim().is_empty() => Some(check),
+        Some(_) => {
+            return Err(
+                "make the block disposition check a non-empty read-only command, or omit check"
+                    .to_string(),
+            )
+        }
+    };
+    if !object.is_empty() {
+        return Err(
+            "remove extra block fields; keep only disposition, reason, remedy_owner, ask, steps, and check"
+                .to_string(),
+        );
+    }
+
+    Ok(ReviewDisposition::Block {
+        reason,
+        remedy_owner,
+        ask,
+        steps,
+        check,
+        unstructured: false,
+    })
+}
+
+fn take_non_empty_string(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    class: &str,
+) -> Result<String, String> {
+    match object.remove(field) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(value),
+        _ => Err(format!(
+            "add a non-empty string {field} field to the {class}"
+        )),
+    }
+}
+
 fn validate_document(document: Value) -> ReviewDisposition {
     let Value::Object(mut object) = document else {
         return invalid("review disposition must be a JSON object");
@@ -257,6 +416,13 @@ mod tests {
         let path = dir.path().join("review-disposition.json");
         fs::write(&path, document).unwrap();
         parse_review_disposition(path)
+    }
+
+    fn check_authored_document(document: &str) -> Result<ReviewDisposition, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("review-disposition.json");
+        fs::write(&path, document).unwrap();
+        check_review_disposition(path)
     }
 
     fn assert_invalid(disposition: ReviewDisposition) {
@@ -492,5 +658,88 @@ mod tests {
     #[test]
     fn non_object_document_is_invalid() {
         assert_invalid(parse_document("[]"));
+    }
+
+    #[test]
+    fn strict_authoring_check_accepts_all_three_complete_classes() {
+        assert_eq!(
+            check_authored_document(r#"{"disposition":"pass","reason":null}"#).unwrap(),
+            ReviewDisposition::Pass
+        );
+
+        assert!(matches!(
+            check_authored_document(
+                r#"{"disposition":"block","reason":"release missing","remedy_owner":"world","ask":"Publish the release.","steps":["Run just release"],"check":"test -f release"}"#,
+            )
+            .unwrap(),
+            ReviewDisposition::Block {
+                remedy_owner: RemedyOwner::World,
+                unstructured: false,
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            check_authored_document(
+                r#"{"disposition":"note","reason":null,"criterion_quote":"approximately 200 MiB","evidence_citation":"docs/evidence.md","summary":"The measurement supports completion while the criterion is stale."}"#,
+            )
+            .unwrap(),
+            ReviewDisposition::Note(_)
+        ));
+    }
+
+    #[test]
+    fn strict_authoring_check_names_schema_fixes() {
+        let cases = [
+            ("{not json", "write valid JSON"),
+            (
+                r#"{"disposition":"pass","reason":null,"summary":"extra"}"#,
+                "keep pass exact",
+            ),
+            (
+                r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","summary":"The criterion is stale."}"#,
+                "evidence_citation",
+            ),
+            (
+                r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","evidence_citation":"docs/evidence.md","summary":"The implementation is poor.","work_complaint":"Tests are failing."}"#,
+                "remove work-quality complaints",
+            ),
+            (
+                r#"{"disposition":"block","reason":"tests are failing"}"#,
+                "remedy_owner",
+            ),
+            (
+                r#"{"disposition":"block","reason":"tests are failing","remedy_owner":"agent","ask":"Fix it.","steps":[]}"#,
+                "steps a non-empty array",
+            ),
+            (
+                r#"{"disposition":"block","reason":"tests are failing","remedy_owner":"agent","ask":"Fix it.","surprise":true}"#,
+                "remove extra block fields",
+            ),
+        ];
+
+        for (document, expected_fix) in cases {
+            let error = check_authored_document(document).unwrap_err();
+            assert!(
+                error.contains(expected_fix),
+                "{error:?} did not name fix {expected_fix:?} for {document}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_check_rejects_but_fallback_parser_preserves_legacy_block() {
+        let document = r#"{"disposition":"block","reason":"Run the old test."}"#;
+
+        assert!(check_authored_document(document)
+            .unwrap_err()
+            .contains("remedy_owner"));
+        assert!(matches!(
+            parse_document(document),
+            ReviewDisposition::Block {
+                unstructured: true,
+                ..
+            }
+        ));
     }
 }
