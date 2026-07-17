@@ -9305,6 +9305,85 @@ mod tests {
         (state, lease, dir, journal, ledger)
     }
 
+    fn initialize_unborn_identityless_repository(root: &Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.name", ""]);
+        run(&["config", "user.email", ""]);
+
+        for args in [
+            &["rev-parse", "--verify", "HEAD"][..],
+            &["var", "GIT_AUTHOR_IDENT"][..],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "field replay precondition unexpectedly succeeded: git {:?}",
+                args
+            );
+        }
+    }
+
+    fn real_unborn_completion_error(
+        state: &State,
+        lease: &AttemptLease,
+        ticket_id: &str,
+    ) -> String {
+        let ticket_file = state
+            .config
+            .ticket_dir
+            .join(format!("{ticket_id}.md"))
+            .strip_prefix(&state.project_root)
+            .unwrap()
+            .to_path_buf();
+        let work_dir = state
+            .config
+            .work_dir
+            .join(ticket_id)
+            .strip_prefix(&state.project_root)
+            .unwrap()
+            .to_path_buf();
+        let error = lisa_cli::commit_transaction::complete_ticket(
+            lisa_cli::commit_transaction::CompleteTicketRequest {
+                repo_root: state.project_root.clone(),
+                ticket_id: ticket_id.to_string(),
+                message: format!("Complete {ticket_id}"),
+                ticket_file,
+                work_dir,
+                completion_key: CompletionGenerationId::new(
+                    CompletionId::new(ticket_id),
+                    AttemptId::new(lease.attempt_id.to_string()),
+                    1,
+                ),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !state.project_root.join(".lisa-commit.lock").exists(),
+            "failed completion left .lisa-commit.lock behind: {error}"
+        );
+        format!("Error: {error}")
+    }
+
     fn assert_no_finish_up(state: &State, ticket_id: &str) {
         assert!(!state.finish_up_sent.contains(ticket_id));
         assert!(!state.activity_log.iter().any(|event| matches!(
@@ -18642,6 +18721,113 @@ owned\n\
             completion_failure_action(CompletionFailureClass::Unrecognized, 1),
             CompletionFailureAction::Park
         );
+    }
+
+    #[test]
+    fn field_journal_replay_bounds_unborn_identityless_completion_and_cleans_lock() {
+        const TICKET_ID: &str = "T-001";
+        const PRESERVED_JOURNAL: &str = include_str!(
+            "../../../docs/active/work/T-046-06-03/cbt-0716-211915-variant-xdg/demo-completion-journal.jsonl"
+        );
+
+        let field_rejections = PRESERVED_JOURNAL
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| {
+                row["state"] == "rejected"
+                    && row["completion_id"] == TICKET_ID
+                    && row["reason"].as_str().is_some_and(|reason| {
+                        reason.contains("discover prior completion commit")
+                            && reason.contains("does not have any commits yet")
+                    })
+            })
+            .count();
+        assert_eq!(
+            field_rejections, 80,
+            "the preserved 2026-07-16 journal remains the replay source"
+        );
+
+        let (mut state, lease, dir, journal, ledger) = completion_failure_fixture(TICKET_ID);
+        initialize_unborn_identityless_repository(dir.path());
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease.clone(),
+        }));
+        assert_eq!(state.launched_completion_effects.len(), 1);
+
+        let first = real_unborn_completion_error(&state, &lease, TICKET_ID);
+        assert!(first.contains("resolve HEAD for ticket commit"), "{first}");
+        assert!(first.contains("does not have any commits yet"), "{first}");
+        assert!(
+            !first.contains("discover prior completion commit"),
+            "{first}"
+        );
+        state.handle_completion_result(TICKET_ID, Some(1), Vec::new(), first.into_bytes());
+        assert_eq!(state.launched_completion_effects.len(), 2);
+        assert_eq!(state.completion_aggregates[TICKET_ID].failure_count(), 1);
+        assert!(state.pending_completions.contains_key(TICKET_ID));
+
+        let second = real_unborn_completion_error(&state, &lease, TICKET_ID);
+        state.handle_completion_result(TICKET_ID, Some(1), Vec::new(), second.into_bytes());
+
+        assert_eq!(
+            state.launched_completion_effects.len(),
+            2,
+            "one initial command plus one bounded retry"
+        );
+        assert!(!state.pending_completions.contains_key(TICKET_ID));
+        assert!(!state.threads.contains_key(TICKET_ID));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        let ticket = ticket::scan_tickets(&state.config.ticket_dir)
+            .unwrap()
+            .into_iter()
+            .find(|ticket| ticket.id == TICKET_ID)
+            .unwrap();
+        assert_eq!(ticket.phase, Phase::Review);
+        assert_eq!(ticket.status, TicketStatus::Blocked);
+        assert!(matches!(
+            parse_review_disposition(
+                state
+                    .config
+                    .work_dir
+                    .join(TICKET_ID)
+                    .join("review-disposition.json")
+            ),
+            ReviewDisposition::Block {
+                remedy_owner: RemedyOwner::Operator,
+                ask,
+                unstructured: false,
+                ..
+            } if ask == HISTORY_IDENTITY_ASK
+        ));
+
+        let journal_body = std::fs::read_to_string(&journal).unwrap();
+        assert_eq!(
+            journal_body
+                .matches("\"state\":\"failure-observed\"")
+                .count(),
+            2
+        );
+        assert!(journal_body.contains("\"failure_count\":1,\"failure_limit\":2"));
+        assert!(journal_body.contains("\"consequence\":\"retry-scheduled\""));
+        assert!(journal_body.contains("\"failure_count\":2,\"failure_limit\":2"));
+        assert!(journal_body.contains("\"consequence\":\"park\""));
+        let records = read_mixed_ledger(&ledger);
+        assert_eq!(records.len(), 1);
+        let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
+            panic!("expected exactly one Park provenance row")
+        };
+        assert_eq!(park.record_type, ParkingTransitionType::Park);
+        assert_eq!(park.retry_count, Some(2));
+        assert_eq!(park.retry_limit, Some(2));
+
+        state.reconcile_review_completions();
+        assert_eq!(
+            state.launched_completion_effects.len(),
+            2,
+            "blocked replay must not launch a third completion command"
+        );
+        assert!(!dir.path().join(".lisa-commit.lock").exists());
     }
 
     #[test]
