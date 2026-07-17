@@ -42,7 +42,11 @@ pub(crate) fn print_notes(notes: &[QueuedNote]) {
 pub fn run_list(root: &Path) -> Result<(), String> {
     let (journal, ledger) = durable_paths(root);
     let notes = collect_notes(&journal, &ledger)?;
-    print_notes(&notes);
+    if notes.is_empty() {
+        println!("Nothing to read.");
+    } else {
+        print_notes(&notes);
+    }
     Ok(())
 }
 

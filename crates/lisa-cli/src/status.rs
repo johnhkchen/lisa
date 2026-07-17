@@ -4,7 +4,7 @@ use crate::config;
 use lisa_core::completion::CompletionSeal;
 use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
 use lisa_core::disposition::RemedyOwner;
-use lisa_core::notes::collect_notes;
+use lisa_core::notes::{collect_notes, QueuedNote};
 use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
 
 fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
@@ -45,6 +45,8 @@ fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
 fn print_waiting_on_you(remedies: &[ParkedRemedy]) {
     let lines = waiting_on_you_lines(remedies);
     if lines.is_empty() {
+        println!("Waiting on you");
+        println!("Nothing waiting.\n");
         return;
     }
 
@@ -53,6 +55,15 @@ fn print_waiting_on_you(remedies: &[ParkedRemedy]) {
         println!("{line}");
     }
     println!();
+}
+
+fn print_status_notes(notes: &[QueuedNote]) {
+    if notes.is_empty() {
+        println!("Notes for you");
+        println!("Nothing to read.\n");
+    } else {
+        crate::notes::print_notes(notes);
+    }
 }
 
 fn format_config_summary(resolved: &config::ResolvedConfig, seal: CompletionSeal) -> String {
@@ -103,6 +114,14 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     let tickets = lisa_core::ticket::scan_tickets(&ticket_dir)
         .map_err(|e| format!("Failed to scan tickets: {}", e))?;
 
+    let parked_remedies = collect_parked_remedies(tickets.iter(), &root.join(&work_dir_rel));
+    print_waiting_on_you(&parked_remedies);
+    let notes = collect_notes(
+        &root.join(".lisa/completion-journal.jsonl"),
+        &root.join(".lisa/provenance.jsonl"),
+    )?;
+    print_status_notes(&notes);
+
     if tickets.is_empty() {
         println!("No tickets found in {}", ticket_dir_rel);
         return Ok(());
@@ -129,14 +148,6 @@ pub fn run_status(root: &Path) -> Result<(), String> {
             return Err(format!("Cycle detected involving: {}", nodes.join(", ")));
         }
     }
-
-    let parked_remedies = collect_parked_remedies(tickets.iter(), &root.join(&work_dir_rel));
-    print_waiting_on_you(&parked_remedies);
-    let notes = collect_notes(
-        &root.join(".lisa/completion-journal.jsonl"),
-        &root.join(".lisa/provenance.jsonl"),
-    )?;
-    crate::notes::print_notes(&notes);
 
     // Print summary header
     let stats = dag.stats();

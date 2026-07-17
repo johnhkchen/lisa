@@ -26,7 +26,9 @@ use lisa_cli::commit_transaction;
 use lisa_core::claim::AssignmentClaim;
 use lisa_core::client::AgentClient;
 use lisa_core::completion::{AttemptId, CompletionGenerationId, CompletionId};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const SETUP_FIRST_LINE: &str = "This folder isn't set up yet. Run: lisa init";
 
 #[derive(Parser)]
 #[command(
@@ -375,6 +377,7 @@ fn main() {
     match cli.command {
         Commands::Doctor { path } => {
             let path = resolve_path(&path);
+            require_lisa_project(&path);
             if let Err(e) = doctor::run_doctor(&path) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -547,6 +550,7 @@ fn main() {
         }
         Commands::Validate { path, check_tools } => {
             let path = resolve_path(&path);
+            require_lisa_project(&path);
             if let Err(e) = init::run_validate(&path, check_tools) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -558,6 +562,7 @@ fn main() {
             ledger,
         } => {
             let path = resolve_path(&path);
+            require_lisa_project(&path);
             let result = if let Some(ticket_id) = ticket {
                 let ledger_path = match ledger {
                     Some(ledger) if ledger.is_absolute() => ledger,
@@ -686,6 +691,7 @@ fn main() {
             dry_run,
         } => {
             let path = resolve_path(&path);
+            require_lisa_project(&path);
             // Parse the --client override up front so an invalid value fails fast
             // with an actionable message, before loading the project config.
             let cli_client = match client.as_deref().map(AgentClient::parse).transpose() {
@@ -722,4 +728,16 @@ fn resolve_path(path: &PathBuf) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+fn require_lisa_project(root: &Path) {
+    if root.join(".lisa.toml").exists() || root.join("docs/active/tickets").is_dir() {
+        return;
+    }
+
+    eprintln!(
+        "{SETUP_FIRST_LINE}\n\nTechnical detail: Lisa couldn't find .lisa.toml or docs/active/tickets/ in {}.",
+        root.display()
+    );
+    std::process::exit(1);
 }
