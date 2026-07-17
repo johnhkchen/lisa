@@ -751,11 +751,7 @@ fn create_initial_history_commit(repository_root: &Path) -> Result<(), String> {
     run_history_command(&mut advance_head, "make project history ready")
 }
 
-fn initialize_project_history(root: &Path) -> Result<(), String> {
-    let mut initialize = ProcessCommand::new("git");
-    initialize.args(["init", "--quiet"]).arg(root);
-    run_history_command(&mut initialize, "prepare project history")?;
-
+fn configure_project_history_identity(root: &Path) -> Result<(), String> {
     let mut name = ProcessCommand::new("git");
     name.arg("-C")
         .arg(root)
@@ -767,8 +763,15 @@ fn initialize_project_history(root: &Path) -> Result<(), String> {
         .arg("-C")
         .arg(root)
         .args(["config", "--local", "user.email", HISTORY_EMAIL]);
-    run_history_command(&mut email, "set the project-history email")?;
+    run_history_command(&mut email, "set the project-history email")
+}
 
+fn initialize_project_history(root: &Path) -> Result<(), String> {
+    let mut initialize = ProcessCommand::new("git");
+    initialize.args(["init", "--quiet"]).arg(root);
+    run_history_command(&mut initialize, "prepare project history")?;
+
+    configure_project_history_identity(root)?;
     create_initial_history_commit(root)
 }
 
@@ -963,6 +966,7 @@ fn run_init_with_history_state(
             write_init_line(out, format_args!(""))?;
         }
         HistoryAction::CreateInitialCommit { root } => {
+            configure_project_history_identity(&root)?;
             create_initial_history_commit(&root)?;
             write_init_line(out, format_args!("{HISTORY_KEPT}"))?;
             write_init_line(out, format_args!(""))?;

@@ -337,7 +337,7 @@ fn folder_inside_born_repository_leaves_repository_metadata_and_config_unchanged
 }
 
 #[test]
-fn existing_unborn_repository_changes_head_only_after_explicit_acceptance() {
+fn existing_unborn_repository_acceptance_adds_commit_ready_local_identity() {
     let fixture = Fixture::new("unborn-fixtures");
     let declined = fixture.root.join("declined");
     let accepted = fixture.root.join("accepted");
@@ -346,14 +346,24 @@ fn existing_unborn_repository_changes_head_only_after_explicit_acceptance() {
 
     for root in [&declined, &accepted] {
         fixture.init_repository(root);
-        fixture.git_ok(root, &["config", "--local", "user.name", "Existing Local"]);
-        fixture.git_ok(
-            root,
-            &["config", "--local", "user.email", "local@example.invalid"],
-        );
         fs::write(root.join("already-staged.txt"), "operator staged work\n").unwrap();
         fixture.git_ok(root, &["add", "already-staged.txt"]);
     }
+    fixture.git_ok(
+        &declined,
+        &["config", "--local", "user.name", "Existing Local"],
+    );
+    fixture.git_ok(
+        &declined,
+        &["config", "--local", "user.email", "local@example.invalid"],
+    );
+    fixture.git_ok(&accepted, &["config", "--local", "user.name", ""]);
+    fixture.git_ok(&accepted, &["config", "--local", "user.email", ""]);
+    assert_eq!(
+        fixture.git_ok(&accepted, &["config", "--get", "user.email"]),
+        "",
+        "fixture must begin with the completion identity gap"
+    );
 
     let declined_config = fs::read(declined.join(".git/config")).unwrap();
     let declined_index = fs::read(declined.join(".git/index")).unwrap();
@@ -375,8 +385,8 @@ fn existing_unborn_repository_changes_head_only_after_explicit_acceptance() {
         declined_index
     );
 
-    let accepted_config = fs::read(accepted.join(".git/config")).unwrap();
     let accepted_index = fs::read(accepted.join(".git/index")).unwrap();
+    let global_before = fs::read(&fixture.global_config).unwrap();
     let accept = fixture.lisa(&[
         "init",
         "--path",
@@ -386,9 +396,14 @@ fn existing_unborn_repository_changes_head_only_after_explicit_acceptance() {
     assert_success(&accept, "accept in unborn repository");
     fixture.git_ok(&accepted, &["rev-parse", "--verify", "HEAD"]);
     assert_eq!(
-        fs::read(accepted.join(".git/config")).unwrap(),
-        accepted_config
+        fixture.git_ok(&accepted, &["config", "--local", "user.name"]),
+        "Lisa (project history)"
     );
+    assert_eq!(
+        fixture.git_ok(&accepted, &["config", "--local", "user.email"]),
+        "lisa@project"
+    );
+    assert_eq!(fs::read(&fixture.global_config).unwrap(), global_before);
     assert_eq!(
         fs::read(accepted.join(".git/index")).unwrap(),
         accepted_index
@@ -407,4 +422,33 @@ fn existing_unborn_repository_changes_head_only_after_explicit_acceptance() {
         "already-staged.txt",
         "the existing ordinary index must remain intact"
     );
+
+    fs::write(accepted.join("completion-marker.txt"), "finished\n").unwrap();
+    let completion = fixture.lisa(&[
+        "commit-ticket",
+        "--path",
+        accepted.to_str().unwrap(),
+        "--ticket-id",
+        "T-FIXTURE",
+        "--message",
+        "Complete unborn fixture work",
+        "--include",
+        "completion-marker.txt",
+    ]);
+    assert_success(
+        &completion,
+        "completion commit after accepted unborn history",
+    );
+    assert_eq!(
+        fixture.git_ok(
+            &accepted,
+            &["show", "--pretty=format:", "--name-only", "HEAD"]
+        ),
+        "completion-marker.txt"
+    );
+
+    let doctor = fixture.lisa(&["doctor", "--path", accepted.to_str().unwrap()]);
+    let doctor_stdout = String::from_utf8(doctor.stdout).unwrap();
+    assert!(!doctor_stdout
+        .contains("no commit identity is configured (git config user.email did not resolve)"));
 }
