@@ -53,7 +53,7 @@ fn assert_ticket_status(ticket_path: &Path, expected: TicketStatus) {
 }
 
 fn assert_ready(root: &Path, ticket_id: &str, expected: bool) {
-    let tickets = scan_tickets(&root.join("docs/active/tickets")).unwrap();
+    let tickets = scan_tickets(root.join("docs/active/tickets")).unwrap();
     let dag = Dag::from_tickets(tickets).unwrap();
     assert_eq!(
         dag.get_ready_tickets()

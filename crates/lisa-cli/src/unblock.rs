@@ -436,7 +436,7 @@ fn fingerprint_tree(root: &Path) -> io::Result<Vec<u8>> {
         let metadata = fs::symlink_metadata(&path)?;
         hash.update(path_bytes(&relative));
         hash.update([0]);
-        hash.update(if metadata.is_dir() { [b'd'] } else { [b'f'] });
+        hash.update(if metadata.is_dir() { b"d" } else { b"f" });
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
