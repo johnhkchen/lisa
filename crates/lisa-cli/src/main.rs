@@ -741,3 +741,285 @@ fn require_lisa_project(root: &Path) {
     );
     std::process::exit(1);
 }
+
+#[cfg(test)]
+mod flag_audit_tests {
+    use super::*;
+    use clap::{ArgAction, Command, CommandFactory};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const FLAG_AUDIT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/knowledge/flag-audit.md"
+    ));
+    const MISSING_ROW_FIXTURE: &str = include_str!("../tests/fixtures/flag-audit-missing-row.md");
+
+    const PROMPT_IDS: [&str; 4] = [
+        "prompt:init-project-history",
+        "prompt:dashboard-mark-done",
+        "prompt:dashboard-reset-ticket",
+        "prompt:dashboard-quit-pending",
+    ];
+    const ALLOWED_ASK_CATEGORIES: [&str; 2] = ["destructive/irreversible", "expert override"];
+    const BANNED_VOICE: [&str; 9] = [
+        "dag",
+        "orchestrat",
+        "scheduling",
+        "leverage",
+        "solutions",
+        "deployment",
+        "case study",
+        "build log",
+        "research release",
+    ];
+
+    #[derive(Debug)]
+    struct AuditRow {
+        id: String,
+        surface: String,
+        bar: String,
+        rule: String,
+        fixture: String,
+        category: String,
+    }
+
+    fn parse_audit_rows(markdown: &str) -> Result<BTreeMap<String, AuditRow>, String> {
+        let mut rows = BTreeMap::new();
+
+        for (index, line) in markdown.lines().enumerate() {
+            let cells: Vec<&str> = line
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect();
+            let Some(raw_id) = cells.first() else {
+                continue;
+            };
+            let id = raw_id
+                .strip_prefix('`')
+                .and_then(|value| value.strip_suffix('`'))
+                .unwrap_or(raw_id);
+            if !id.starts_with("flag:") && !id.starts_with("config:") && !id.starts_with("prompt:")
+            {
+                continue;
+            }
+            if cells.len() != 6 {
+                return Err(format!(
+                    "audit row {} ({id}) has {} cells; expected 6",
+                    index + 1,
+                    cells.len()
+                ));
+            }
+
+            let row = AuditRow {
+                id: id.to_string(),
+                surface: cells[1].to_string(),
+                bar: cells[2].to_string(),
+                rule: cells[3].to_string(),
+                fixture: cells[4].to_string(),
+                category: cells[5].to_string(),
+            };
+            if rows.insert(row.id.clone(), row).is_some() {
+                return Err(format!("audit contains duplicate row {id}"));
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn collect_flags() -> BTreeMap<String, bool> {
+        fn visit(command: &Command, path: &str, flags: &mut BTreeMap<String, bool>) {
+            for argument in command.get_arguments() {
+                if matches!(
+                    argument.get_action(),
+                    ArgAction::Help
+                        | ArgAction::HelpShort
+                        | ArgAction::HelpLong
+                        | ArgAction::Version
+                ) {
+                    continue;
+                }
+                if let Some(long) = argument.get_long() {
+                    flags.insert(format!("flag:{path}:--{long}"), argument.is_required_set());
+                }
+            }
+
+            for subcommand in command.get_subcommands() {
+                if subcommand.get_name() == "help" {
+                    continue;
+                }
+                visit(
+                    subcommand,
+                    &format!("{path}/{}", subcommand.get_name()),
+                    flags,
+                );
+            }
+        }
+
+        let mut command = Cli::command();
+        command.build();
+        let mut flags = BTreeMap::new();
+        visit(&command, command.get_name(), &mut flags);
+        flags
+    }
+
+    fn collect_config_ids() -> Result<BTreeSet<String>, String> {
+        let ids: BTreeSet<String> = config::CONFIG_KEYS
+            .iter()
+            .map(|key| format!("config:{}", key.path))
+            .collect();
+        if ids.len() != config::CONFIG_KEYS.len() {
+            return Err("CONFIG_KEYS contains a duplicate dotted path".to_string());
+        }
+        Ok(ids)
+    }
+
+    fn validate_row_policy(row: &AuditRow) -> Result<(), String> {
+        if row.surface.is_empty() || row.surface.contains(['\n', '\r']) {
+            return Err(format!("{} needs a one-line surface description", row.id));
+        }
+        if row.rule.is_empty()
+            || row.rule.contains(['\n', '\r'])
+            || !row.rule.ends_with(['.', '?', '!'])
+        {
+            return Err(format!(
+                "{} needs a complete one-line default or justification",
+                row.id
+            ));
+        }
+
+        match row.bar.as_str() {
+            "working default" => {
+                if row.fixture.is_empty() || row.fixture == "—" {
+                    return Err(format!("{} default needs a pinning fixture", row.id));
+                }
+                if row.category != "—" {
+                    return Err(format!("{} default category must be —", row.id));
+                }
+            }
+            "justified ask" => {
+                if !ALLOWED_ASK_CATEGORIES.contains(&row.category.as_str()) {
+                    return Err(format!(
+                        "{} ask category must be destructive/irreversible or expert override",
+                        row.id
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{} bar must be working default or justified ask",
+                    row.id
+                ));
+            }
+        }
+
+        let voiced = format!("{} {}", row.surface, row.rule).to_ascii_lowercase();
+        if let Some(term) = BANNED_VOICE.iter().find(|term| voiced.contains(**term)) {
+            return Err(format!(
+                "{} operator-facing copy contains banned term {term:?}",
+                row.id
+            ));
+        }
+        Ok(())
+    }
+
+    fn coverage_error(
+        kind: &str,
+        expected: &BTreeSet<String>,
+        actual: &BTreeSet<String>,
+    ) -> Option<String> {
+        let missing: Vec<&String> = expected.difference(actual).collect();
+        let unexpected: Vec<&String> = actual.difference(expected).collect();
+        if missing.is_empty() && unexpected.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{kind} rows differ; missing: [{}]; unexpected: [{}]",
+            missing
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            unexpected
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    fn verify_audit(markdown: &str) -> Result<(), String> {
+        let rows = parse_audit_rows(markdown)?;
+        let mut errors = Vec::new();
+        for row in rows.values() {
+            if let Err(error) = validate_row_policy(row) {
+                errors.push(error);
+            }
+        }
+
+        let actual_flags: BTreeSet<String> = rows
+            .keys()
+            .filter(|id| id.starts_with("flag:"))
+            .cloned()
+            .collect();
+        let flags = collect_flags();
+        let expected_flags = flags.keys().cloned().collect();
+        if let Some(error) = coverage_error("flag", &expected_flags, &actual_flags) {
+            errors.push(error);
+        }
+        for (id, required) in flags {
+            let Some(row) = rows.get(&id) else {
+                continue;
+            };
+            let expected_bar = if required {
+                "justified ask"
+            } else {
+                "working default"
+            };
+            if row.bar != expected_bar {
+                errors.push(format!(
+                    "{id} must use {expected_bar:?} because Clap required={required}"
+                ));
+            }
+        }
+
+        let actual_config: BTreeSet<String> = rows
+            .keys()
+            .filter(|id| id.starts_with("config:"))
+            .cloned()
+            .collect();
+        if let Some(error) = coverage_error("config", &collect_config_ids()?, &actual_config) {
+            errors.push(error);
+        }
+
+        let expected_prompts: BTreeSet<String> =
+            PROMPT_IDS.iter().map(|id| id.to_string()).collect();
+        let actual_prompts: BTreeSet<String> = rows
+            .keys()
+            .filter(|id| id.starts_with("prompt:"))
+            .cloned()
+            .collect();
+        if let Some(error) = coverage_error("prompt", &expected_prompts, &actual_prompts) {
+            errors.push(error);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+
+    #[test]
+    fn flag_audit_covers_live_cli_config_and_prompts() {
+        verify_audit(FLAG_AUDIT).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn flag_audit_missing_row_fixture_names_every_gap() {
+        let error = verify_audit(MISSING_ROW_FIXTURE).unwrap_err();
+        assert!(error.contains("flag:lisa/loop:--client"), "{error}");
+        assert!(error.contains("config:agent.client"), "{error}");
+    }
+}

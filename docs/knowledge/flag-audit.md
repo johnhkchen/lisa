@@ -1,0 +1,142 @@
+# Flag and question audit
+
+Lisa chooses the common answer and keeps expert controls available. A flag,
+question, or config key clears this audit only when it has a working default for
+the expected user or a one-line reason Lisa must ask.
+
+The expected user is a solo product owner who wants a run to keep moving without
+giving up deliberate control. “Working default” means omission produces a useful,
+safe decision and the Fixture column names the test that pins it. “Justified ask”
+means Lisa needs a value; its category must be `destructive/irreversible` or
+`expert override`.
+
+## What this inventory counts
+
+- Every Lisa-authored long flag in the derived Clap command tree, including
+  hidden commands called by Lisa and agent hooks.
+- Every fixed `.lisa.toml` path in `CONFIG_KEYS`. The map entries below
+  `phase_timeouts` and `provider_caps` are values of those fixed parent keys, not
+  additional fixed keys.
+- The native terminal question and the dashboard's three confirmation/selection
+  modals.
+- Clap's generated `--help` and top-level `--version` are framework defaults
+  pinned by `top_level_help_matches_snapshot`; they are not repeated for every
+  command. Positional command operands are not flags.
+
+The machine-readable ID is the first cell. Keep it exact: the test compares these
+rows with the live command tree and config catalog.
+
+## CLI flags
+
+### Everyday commands
+
+| ID | Surface | Bar | Default / justification | Fixture | Category |
+| --- | --- | --- | --- | --- | --- |
+| `flag:lisa/init:--dry-run` | Preview project setup | working default | Default is off, so Lisa sets up the project unless a preview is requested. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/init:--no-history` | Use Lisa's journal instead of project history | working default | Default is off, so bare init keeps history when available and falls back only when needed. | `noninteractive_init_keeps_history_by_default_when_available` | — |
+| `flag:lisa/init:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/init:--with-history` | Require project history | working default | Default is off, so bare init can choose history or a journal fallback from what the machine supports. | `unavailable_history_falls_back_unless_explicitly_required` | — |
+| `flag:lisa/validate:--check-tools` | Also check installed tools | working default | Default is off, so ordinary validation checks the project without requiring optional tool probes. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/validate:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/status:--ledger` | Read a different retained-failure ledger | working default | Without the flag, ticket detail reads `.lisa/provenance.jsonl`. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/status:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/status:--ticket` | Show one ticket's retained failures | working default | Without the flag, Lisa shows the whole board status. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/notes:--path` | Choose the project folder for notes | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/notes/ack:--path` | Choose the project folder while acknowledging a note | working default | The inherited default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/unblock:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/proposal/apply:--path` | Choose the project folder for applying advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/proposal/dismiss:--path` | Choose the project folder for dismissing advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/doctor:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/loop:--client` | Override the detected coding agent | working default | Without the flag, explicit config wins, then Lisa detects installed agents and prefers Claude when both are present. | `test_resolve_client_from_detected_availability` | — |
+| `flag:lisa/loop:--dry-run` | Preview a run | working default | Default is off, so Lisa starts the run unless a preview is requested. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/loop:--max-threads` | Override the concurrent-agent limit | working default | Without the flag, Lisa uses `.lisa.toml` and then the default of `2`. | `test_resolve_cli_overrides_default` | — |
+| `flag:lisa/loop:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+
+### Hidden and machine-facing commands
+
+These commands are callable for hooks, tests, recovery, and expert diagnosis.
+Required values are explicit protocol inputs, not questions on the everyday path.
+
+| ID | Surface | Bar | Default / justification | Fixture | Category |
+| --- | --- | --- | --- | --- | --- |
+| `flag:lisa/recheck-world:--path` | Choose the project folder for world-owned wait checks | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/triage-agent:--agent-bin` | Override the first responder's executable | working default | Without the flag, Lisa uses the executable for the selected client. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/triage-agent:--client` | Name the first responder's client | justified ask | The internal caller must bind the read-only pass to the client chosen for this attempt. | — | expert override |
+| `flag:lisa/triage-agent:--disposition-path` | Name the disposition the first responder reads | justified ask | The internal caller must identify the exact attempt disposition so advice cannot cross attempts. | — | expert override |
+| `flag:lisa/triage-agent:--model` | Override the first responder's model | working default | Without the flag, the selected client uses its configured model. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/triage-agent:--path` | Choose the project folder for first response | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/triage-agent:--ticket-path` | Name the blocked ticket the first responder reads | justified ask | The internal caller must identify the exact ticket whose evidence is being inspected. | — | expert override |
+| `flag:lisa/triage-agent:--timeout-secs` | Bound the first responder pass | justified ask | The internal caller must carry the already-resolved time limit for this attempt. | — | expert override |
+| `flag:lisa/setup-guide:--path` | Choose the project folder for setup instructions | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/agent-exec:--bypass-sandbox` | Bypass Codex approvals and sandboxing | working default | Default is off, so Codex runs with approvals denied and workspace writes contained. | `argv_default_flags` | — |
+| `flag:lisa/agent-exec:--codex-arg` | Pass an extra Codex argument | working default | Without the flag, Lisa adds no expert passthrough arguments. | `argv_passes_extra_codex_args` | — |
+| `flag:lisa/agent-exec:--codex-bin` | Override the Codex executable | working default | Default is `codex` from `PATH`. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/agent-exec:--cwd` | Choose the Codex working folder | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/agent-exec:--resume` | Resume a persisted Codex thread | working default | Default is off, so a new headless execution starts unless resume is requested. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/agent-exec:--signal-dir` | Override the pane-signal folder | working default | Default is `.lisa/signals`. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/capture-usage:--cwd` | Choose the capture-ledger project folder | working default | Default is `.`, the current folder. | `two_cli_captures_for_one_pane_append_honest_records_without_ticket_artifact` | — |
+| `flag:lisa/launch-codex:--codex-bin` | Override the interactive Codex executable | working default | Default is `codex` from `PATH`. | `assignment_path_is_one_uninterpolated_codex_argument` | — |
+| `flag:lisa/launch-codex:--model` | Override the interactive Codex model | working default | Without the flag, Codex uses its configured default model. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/claim:--attempt-id` | Carry the assignment attempt number | justified ask | The hook must identify the exact attempt so a stale assignment cannot claim the ticket. | — | expert override |
+| `flag:lisa/claim:--nonce` | Carry the assignment nonce | justified ask | The hook must prove it received the exact nonce-bearing assignment file. | — | expert override |
+| `flag:lisa/claim:--path` | Choose the claim's project folder | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/claim:--ticket-id` | Carry the claimed ticket ID | justified ask | The hook must bind the claim to one exact ticket rather than infer from mutable files. | — | expert override |
+| `flag:lisa/check-disposition:--path` | Choose the disposition's project folder | working default | Default is `.`, the current folder. | `well_formed_pass_block_and_note_each_pass_in_the_active_attempt` | — |
+| `flag:lisa/commit-ticket:--include` | Name a ticket-owned path to commit | justified ask | The agent must name every owned path so the isolated transaction never consumes unrelated work. | — | expert override |
+| `flag:lisa/commit-ticket:--message` | Supply the ticket commit message | justified ask | The agent must describe the meaningful source unit being made durable. | — | expert override |
+| `flag:lisa/commit-ticket:--path` | Choose the repository root for a ticket commit | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/commit-ticket:--ticket-id` | Name the ticket owning a commit | justified ask | The transaction must attribute diagnostics and ownership to one exact ticket. | — | expert override |
+| `flag:lisa/complete-ticket:--attempt-id` | Carry the completing attempt ID | justified ask | Completion must prove which leased attempt is authorized to finish the ticket. | — | expert override |
+| `flag:lisa/complete-ticket:--completion-generation` | Carry the completion generation | justified ask | Completion must carry its idempotency generation so replay cannot duplicate effects. | — | expert override |
+| `flag:lisa/complete-ticket:--message` | Supply the completion commit message | justified ask | The completion transaction must describe the durable Done publication. | — | expert override |
+| `flag:lisa/complete-ticket:--path` | Choose the repository root for completion | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/complete-ticket:--ticket-file` | Name the ticket file to finish | justified ask | Completion must select one exact ticket file rather than discover mutable candidates. | — | expert override |
+| `flag:lisa/complete-ticket:--ticket-id` | Name the ticket being completed | justified ask | Completion must bind publication and diagnostics to one exact ticket. | — | expert override |
+| `flag:lisa/complete-ticket:--work-dir` | Name the admitted work-artifact folder | justified ask | Completion must publish the exact artifact set admitted for this attempt. | — | expert override |
+
+## Interactive prompts
+
+| ID | Surface | Bar | Default / justification | Fixture | Category |
+| --- | --- | --- | --- | --- | --- |
+| `prompt:init-project-history` | Bring project history along? | working default | Pressing Enter chooses yes; nonterminal init also keeps history when available and uses the journal when it is not. | `project_history_prompt_accepts_defaults_and_retries_invalid_answers` | — |
+| `prompt:dashboard-mark-done` | Mark one ticket done | justified ask | Lisa confirms the exact ticket before requesting durable completion. | `test_modal_title_mark_done` | destructive/irreversible |
+| `prompt:dashboard-reset-ticket` | Reset one ticket to ready | justified ask | Lisa confirms the exact ticket before replacing its current progress state. | `test_modal_title_reset` | destructive/irreversible |
+| `prompt:dashboard-quit-pending` | Quit while work remains | justified ask | Lisa warns before stopping a run that still has current or newly discovered work. | — | destructive/irreversible |
+
+## Config keys
+
+The values shown are the behavior when a key is absent, not merely sample text in
+the generated file.
+
+| ID | Surface | Bar | Default / justification | Fixture | Category |
+| --- | --- | --- | --- | --- | --- |
+| `config:version` | Project setup version | working default | Fresh setup records the running Lisa version. | `test_default_config_toml_has_version` | — |
+| `config:dirs.tickets` | Ticket folder | working default | Default is `docs/active/tickets`. | `test_resolve_defaults` | — |
+| `config:dirs.stories` | Story folder | working default | Default is `docs/active/stories`. | `test_resolve_defaults` | — |
+| `config:dirs.work` | Work-record folder | working default | Default is `docs/active/work`. | `test_resolve_defaults` | — |
+| `config:runtime.zellij` | Zellij runtime source | working default | Default is managed mode, which chooses the compatible runtime Lisa can support. | `test_resolve_zellij_runtime_modes_and_precedence` | — |
+| `config:agent.client` | Coding agent | working default | Without a key, Lisa detects installed agents and prefers Claude when both are present. | `test_resolve_client_from_detected_availability` | — |
+| `config:guards.completion` | Finished-work seal | working default | Default is `auto`, which chooses the strongest seal the project supports. | `test_completion_guard_defaults_to_auto_and_resolves_all_valid_values` | — |
+| `config:triage.enabled` | First-responder inspection | working default | Default is `true`, so Lisa inspects work that needs help before asking the operator. | `triage_config_defaults_resolves_and_validates_bounds` | — |
+| `config:triage.timeout_secs` | First-responder time limit | working default | Default is `120` seconds. | `triage_config_defaults_resolves_and_validates_bounds` | — |
+| `config:scheduling.max_threads` | Concurrent-agent limit | working default | Default is `2`. | `test_resolve_defaults` | — |
+| `config:scheduling.auto_advance` | Automatic move after review | working default | Default is `false`, so reviewed work waits unless the project opts in. | `test_resolve_defaults` | — |
+| `config:scheduling.review_timeout_secs` | Review time limit | working default | Default is `600` seconds. | `test_resolve_review_timeout_default` | — |
+| `config:scheduling.session_timeout_secs` | Agent-session time limit | working default | Default is `3600` seconds. | `test_resolve_session_timeout_default` | — |
+| `config:scheduling.wind_down_secs` | Session wrap-up time | working default | Default is `300` seconds. | `test_config_wind_down_default` | — |
+| `config:scheduling.assignment_ack_timeout_secs` | Assignment acceptance time | working default | Default is `30` seconds. | `test_assignment_ack_timeout_config_contract` | — |
+| `config:scheduling.phase_timeouts` | Per-phase time overrides | working default | Default is an empty map, so each phase uses its built-in limit. | `test_resolve_phase_timeouts_empty_default` | — |
+| `config:scheduling.provider_caps` | Per-agent concurrency overrides | working default | Default is an empty map, so the overall thread limit applies without extra caps. | `test_resolve_provider_caps_empty_default` | — |
+
+## Proposed for follow-up
+
+No current row fails the bar. Every question protects work, every expert input is
+outside the everyday path, and every optional control has a working omission
+behavior.
+
+## Maintaining the bar
+
+Add the audit row in the same change as a flag or fixed config key. Name the test
+that pins any claimed default. If neither a useful default nor one of the two ask
+categories fits, list the row under “Proposed for follow-up” with one direct
+rationale; removal belongs to a separate ticket.
