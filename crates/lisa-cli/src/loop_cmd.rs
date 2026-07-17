@@ -5,6 +5,7 @@ use std::process::Command;
 use crate::config::ResolvedConfig;
 use crate::templates::PLUGIN_WASM;
 use lisa_core::client::AgentClient;
+use lisa_core::completion::CompletionSeal;
 
 /// Providers that may be scheduled in this loop: the loop default plus every
 /// valid per-ticket route. Preflight must cover all of them, not just the default.
@@ -71,6 +72,20 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         return run_dry(root, config);
     }
 
+    // Resolve configured guard intent against the environment exactly once.
+    // The immutable result is retained through dependency checks and layout
+    // generation; the plugin receives only the pinned tier and never probes.
+    let completion = crate::completion_seal::resolve_for_run(root, config.completion_mode)?;
+    let git_root = match completion.git_root() {
+        Some(root) => root.to_path_buf(),
+        None => root.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve project root {} for journal completion: {error}",
+                root.display()
+            )
+        })?,
+    };
+
     // Freeze one configured runtime decision before any launch side effects.
     // The resulting path is the exact executable reported by doctor and run
     // below; managed and pinned modes never fall back to PATH.
@@ -82,14 +97,9 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     // not have them installed). This matters for mixed Claude+Codex loops whose
     // loop default names only one of the two binaries.
     for client in &clients {
-        crate::doctor::check_required_deps(*client)
+        crate::doctor::check_required_deps(*client, completion.seal() == CompletionSeal::Commit)
             .map_err(|failures| format_dependency_preflight_error(*client, &failures))?;
     }
-
-    // Dependency preflight checks Git explicitly and provides an actionable
-    // install remedy. Discover the root only after that check so a missing Git
-    // executable never escapes as a raw command-spawn error.
-    let git_root = discover_git_root(root)?;
 
     // The native Codex TUI can stop at its directory-trust prompt before Lisa's
     // injected ticket is handled, so pre-seed trust for every loop that may route
@@ -141,7 +151,13 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     let lisa_bin = std::env::current_exe().ok();
 
     // Generate KDL layout
-    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), &git_root, config);
+    let layout = generate_layout(
+        &wasm_path,
+        lisa_bin.as_deref(),
+        &git_root,
+        completion.seal(),
+        config,
+    );
     let layout_path = root.join(".lisa-layout.kdl");
     std::fs::write(&layout_path, &layout)
         .map_err(|e| format!("Failed to write layout to {}: {}", layout_path.display(), e))?;
@@ -252,7 +268,17 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
     // Dry-run remains useful for a freshly initialized, not-yet-committed
     // project, while real loops require a discoverable repository.
     let git_root = discover_git_root(root).unwrap_or_else(|_| root.to_path_buf());
-    let layout = generate_layout(&wasm_path, lisa_bin.as_deref(), &git_root, config);
+    let completion_seal = config
+        .completion_mode
+        .explicit_seal()
+        .unwrap_or(CompletionSeal::Commit);
+    let layout = generate_layout(
+        &wasm_path,
+        lisa_bin.as_deref(),
+        &git_root,
+        completion_seal,
+        config,
+    );
     println!();
     println!("Generated layout:");
     println!("{}", layout);
@@ -343,6 +369,7 @@ fn generate_layout(
     wasm_path: &Path,
     lisa_bin: Option<&Path>,
     git_root: &Path,
+    completion_seal: CompletionSeal,
     config: &ResolvedConfig,
 ) -> String {
     // Create 2x max_threads pane slots so transitions don't block scheduling.
@@ -391,6 +418,7 @@ fn generate_layout(
         pane size="30%" {{
             plugin location="file://{wasm_path}" {{
                 git_root "{git_root}"
+                completion_seal "{completion_seal}"
                 ticket_dir "{ticket_dir}"
                 story_dir  "{story_dir}"
                 work_dir   "{work_dir}"
@@ -409,6 +437,7 @@ fn generate_layout(
         agent_panes = agent_panes,
         wasm_path = wasm_path.display(),
         git_root = git_root.display(),
+        completion_seal = completion_seal,
         lisa_bin_line = lisa_bin_line,
         provider_cap_lines = provider_cap_lines,
         ticket_dir = config.ticket_dir,
@@ -450,7 +479,13 @@ mod tests {
     }
 
     fn test_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedConfig) -> String {
-        generate_layout(wasm_path, lisa_bin, Path::new("/repo"), config)
+        generate_layout(
+            wasm_path,
+            lisa_bin,
+            Path::new("/repo"),
+            CompletionSeal::Commit,
+            config,
+        )
     }
 
     #[test]
@@ -462,6 +497,7 @@ mod tests {
 
         assert!(layout.contains("file:///tmp/lisa-plugin.wasm"));
         assert!(layout.contains("git_root \"/repo\""));
+        assert!(layout.contains("completion_seal \"commit\""));
         assert!(layout.contains("ticket_dir \"docs/active/tickets\""));
         assert!(layout.contains("story_dir  \"docs/active/stories\""));
         assert!(layout.contains("work_dir   \"docs/active/work\""));
@@ -477,6 +513,20 @@ mod tests {
         // max_threads=3 should produce 6 pane lines (2x)
         let pane_count = layout.matches("            pane").count();
         assert_eq!(pane_count, 6, "Expected 6 panes (2 * max_threads=3)");
+    }
+
+    #[test]
+    fn test_generate_layout_carries_the_pinned_journal_tier() {
+        let layout = generate_layout(
+            Path::new("/tmp/lisa-plugin.wasm"),
+            None,
+            Path::new("/project"),
+            CompletionSeal::Journal,
+            &default_config(),
+        );
+
+        assert!(layout.contains("completion_seal \"journal\""));
+        assert!(!layout.contains("completion_seal \"auto\""));
     }
 
     #[test]

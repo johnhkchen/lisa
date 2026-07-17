@@ -27,10 +27,6 @@ impl RunCompletionSeal {
         self.resolution.seal()
     }
 
-    pub(crate) fn commit_unavailable(&self) -> Option<&CommitSealUnavailable> {
-        self.resolution.commit_unavailable()
-    }
-
     pub(crate) fn git_root(&self) -> Option<&Path> {
         self.git_root.as_deref()
     }
@@ -240,7 +236,7 @@ mod tests {
         .unwrap();
         assert_eq!(journal.seal(), CompletionSeal::Journal);
         assert_eq!(
-            journal.commit_unavailable(),
+            journal.resolution.commit_unavailable(),
             Some(&CommitSealUnavailable::RepositoryMissing)
         );
     }
@@ -255,7 +251,7 @@ mod tests {
 
         assert_eq!(result.seal(), CompletionSeal::Journal);
         assert_eq!(result.git_root(), None);
-        assert_eq!(result.commit_unavailable(), None);
+        assert_eq!(result.resolution.commit_unavailable(), None);
     }
 
     #[test]

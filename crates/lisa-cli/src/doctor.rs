@@ -224,30 +224,32 @@ fn check_wasm_target() -> CheckResult {
 /// The Zellij runtime is resolved independently so its configured mode and path
 /// are preserved. The agent binary checked is exactly the one the loop drives
 /// (`claude --version` or `codex --version`), never both.
-fn build_required_deps_checks(client: AgentClient) -> Vec<DependencyCheck> {
+fn build_required_deps_checks(client: AgentClient, require_git: bool) -> Vec<DependencyCheck> {
     let (agent_name, agent_check): (&'static str, Box<dyn Fn() -> CheckResult>) = match client {
         AgentClient::Claude => ("claude", Box::new(check_claude)),
         AgentClient::Codex => ("codex", Box::new(check_codex)),
     };
-    vec![
-        DependencyCheck {
+    let mut checks = Vec::new();
+    if require_git {
+        checks.push(DependencyCheck {
             name: "git",
             required: true,
             check: Box::new(check_git),
-        },
-        DependencyCheck {
-            name: agent_name,
-            required: true,
-            check: agent_check,
-        },
-    ]
+        });
+    }
+    checks.push(DependencyCheck {
+        name: agent_name,
+        required: true,
+        check: agent_check,
+    });
+    checks
 }
 
 fn build_checks(client: AgentClient) -> Vec<DependencyCheck> {
     // Doctor also diagnoses packaging and optional developer-tool state. Loop
     // retains its adjacent empty-WASM guard so that failure has loop-specific
     // shell-installer guidance at the point before the bytes are consumed.
-    let mut checks = build_required_deps_checks(client);
+    let mut checks = build_required_deps_checks(client, true);
     checks.extend([
         DependencyCheck {
             name: "embedded WASM",
@@ -311,8 +313,11 @@ fn has_failures(reports: &[CheckReport]) -> bool {
 /// Check that all non-Zellij runtime dependencies are present.
 /// Returns Ok(()) if all are found and supported, or rendered failure details
 /// for unavailable and unsupported dependencies otherwise.
-pub(crate) fn check_required_deps(client: AgentClient) -> Result<(), Vec<String>> {
-    check_required_deps_inner(build_required_deps_checks(client))
+pub(crate) fn check_required_deps(
+    client: AgentClient,
+    require_git: bool,
+) -> Result<(), Vec<String>> {
+    check_required_deps_inner(build_required_deps_checks(client, require_git))
 }
 
 fn check_required_deps_inner(checks: Vec<DependencyCheck>) -> Result<(), Vec<String>> {
@@ -1206,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_loop_required_deps_include_git_but_leave_wasm_to_loop_guard() {
-        let names: Vec<&str> = build_required_deps_checks(AgentClient::Claude)
+        let names: Vec<&str> = build_required_deps_checks(AgentClient::Claude, true)
             .iter()
             .map(|c| c.name)
             .collect();
@@ -1215,6 +1220,16 @@ mod tests {
         assert!(names.contains(&"claude"));
         assert!(!names.contains(&"embedded WASM"));
         assert!(!names.contains(&"wasm target"));
+    }
+
+    #[test]
+    fn test_journal_loop_required_deps_exclude_git() {
+        let names: Vec<&str> = build_required_deps_checks(AgentClient::Codex, false)
+            .iter()
+            .map(|c| c.name)
+            .collect();
+
+        assert_eq!(names, vec!["codex"]);
     }
 
     #[test]
