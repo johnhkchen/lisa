@@ -101,7 +101,7 @@ impl Default for ResolvedConfig {
             assignment_ack_timeout_secs: PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
-            zellij_runtime: ZellijRuntimeRequest::Managed,
+            zellij_runtime: crate::runtime::default_runtime_request(),
             provider_caps: std::collections::HashMap::new(),
         }
     }
@@ -157,7 +157,8 @@ pub fn resolve_config(
             .unwrap_or_else(|| defaults.project_version.clone()),
         client,
         zellij_runtime: match config.runtime.zellij.as_deref() {
-            None | Some("managed") => ZellijRuntimeRequest::Managed,
+            None => crate::runtime::default_runtime_request(),
+            Some("managed") => ZellijRuntimeRequest::Managed,
             Some("system") => ZellijRuntimeRequest::System,
             Some(path) => ZellijRuntimeRequest::Pinned(path.into()),
         },
@@ -571,14 +572,17 @@ max_threads = 6
         assert_eq!(config.scheduling.max_threads, Some(2));
         assert_eq!(
             resolve_config(&config, None, None).zellij_runtime,
-            ZellijRuntimeRequest::Managed
+            crate::runtime::default_runtime_request()
         );
     }
 
     #[test]
     fn test_resolve_zellij_runtime_modes_and_precedence() {
         let default = resolve_config(&LisaConfig::default(), None, None);
-        assert_eq!(default.zellij_runtime, ZellijRuntimeRequest::Managed);
+        assert_eq!(
+            default.zellij_runtime,
+            crate::runtime::default_runtime_request()
+        );
 
         let managed: LisaConfig = toml::from_str("[runtime]\nzellij = \"managed\"\n").unwrap();
         assert_eq!(

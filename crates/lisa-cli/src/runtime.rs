@@ -81,6 +81,22 @@ fn managed_release() -> Result<ManagedRelease<'static>, String> {
     })
 }
 
+/// True when Lisa's managed-runtime matrix covers this host.
+pub fn managed_runtime_supported() -> bool {
+    managed_release_for(std::env::consts::OS, std::env::consts::ARCH).is_some()
+}
+
+/// The runtime request an unconfigured project gets: managed where the
+/// matrix covers the host, otherwise the system Zellij on PATH — an
+/// unconfigured default must never resolve to a mode that cannot work here.
+pub fn default_runtime_request() -> ZellijRuntimeRequest {
+    if managed_runtime_supported() {
+        ZellijRuntimeRequest::Managed
+    } else {
+        ZellijRuntimeRequest::System
+    }
+}
+
 fn managed_release_for(os: &str, architecture: &str) -> Option<ManagedRelease<'static>> {
     let target = match (os, architecture) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",

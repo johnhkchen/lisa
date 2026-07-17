@@ -16,6 +16,9 @@ Install the latest release with one command:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh
 ```
 
+On Linux that's everything: Lisa brings its own Zellij, downloaded
+automatically on first run. Do not install Zellij separately.
+
 On macOS, you can also use Homebrew:
 
 ```bash
@@ -79,7 +82,9 @@ its work documents.
 ## Prerequisites
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — the default AI coding assistant that does the work
-- [Zellij](https://zellij.dev/) — terminal multiplexer that hosts Lisa as a plugin
+- On Linux, that's it: Zellij comes with Lisa. The first run downloads Lisa's
+  own pinned copy (about 15 MB) — there is nothing for you to install. On
+  macOS, install [Zellij](https://zellij.dev/) yourself: `brew install zellij`.
 
 Claude Code is the default and only required agent client. Lisa can alternatively
 drive [Codex](https://developers.openai.com/codex) — see

@@ -136,7 +136,7 @@ fn check_zellij_runtime(request: &ZellijRuntimeRequest) -> CheckResult {
         Ok(runtime) => resolved_zellij_check(&runtime),
         Err(description) => CheckResult::Unsupported {
             description,
-            remedy: "Set `[runtime] zellij = \"managed\"` to use Lisa's managed runtime, or configure a compatible absolute path.".to_string(),
+            remedy: "On Linux, set `[runtime] zellij = \"managed\"` and Lisa downloads its own managed runtime. Elsewhere, install Zellij yourself (macOS: `brew install zellij`) and set `[runtime] zellij = \"system\"`, or configure a compatible absolute path.".to_string(),
         },
     }
 }
