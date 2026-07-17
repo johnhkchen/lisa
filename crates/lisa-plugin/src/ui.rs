@@ -938,7 +938,10 @@ fn format_completion_rejection(
     correlation_id: &str,
     detail: &str,
 ) -> String {
-    format!("{ticket_id} completion {kind} [correlation {correlation_id}]: {detail}")
+    format!(
+        "{ticket_id}: {} — {detail} [ref {kind} · {correlation_id}]",
+        kind.plain_line()
+    )
 }
 
 /// Render the activity log
@@ -1288,7 +1291,7 @@ fn render_operator_outcome_modal(
 ) -> Vec<String> {
     let box_w = width.min(50);
     let inner_w = box_w.saturating_sub(4);
-    let (ticket_id, correlation_id, status, color, detail, pending) = match outcome {
+    let (ticket_id, correlation_id, status, color, detail, kind, pending) = match outcome {
         OperatorModalOutcome::Pending {
             ticket_id,
             correlation_id,
@@ -1297,6 +1300,7 @@ fn render_operator_outcome_modal(
             correlation_id,
             "Completion pending".to_string(),
             YELLOW,
+            None,
             None,
             true,
         ),
@@ -1309,6 +1313,7 @@ fn render_operator_outcome_modal(
             "Completion accepted".to_string(),
             BRIGHT_GREEN,
             None,
+            None,
             false,
         ),
         OperatorModalOutcome::Rejected {
@@ -1319,21 +1324,32 @@ fn render_operator_outcome_modal(
         } => (
             ticket_id,
             correlation_id,
-            format!("Completion rejected: {kind}"),
+            "Not finished yet".to_string(),
             RED,
             Some(detail.as_str()),
+            Some(*kind),
             false,
         ),
     };
 
     let mut body = vec![format!("Ticket: {ticket_id}"), status.clone()];
-    body.extend(wrap_modal_text(
-        &format!("Correlation: {correlation_id}"),
-        inner_w,
-    ));
-    if let Some(detail) = detail {
-        body.extend(wrap_modal_text(&format!("Reason: {detail}"), inner_w));
+    if let Some(kind) = kind {
+        body.extend(wrap_modal_text(kind.plain_line(), inner_w));
     }
+    if let Some(detail) = detail {
+        body.extend(wrap_modal_text(&format!("Note: {detail}"), inner_w));
+        if kind == Some(CompletionRejectionKind::DispositionBlocked) {
+            body.extend(wrap_modal_text(
+                "You can paste this note to your coding agent.",
+                inner_w,
+            ));
+        }
+    }
+    let reference = match kind {
+        Some(kind) => format!("Ref: {kind} · {correlation_id}"),
+        None => format!("Ref: {correlation_id}"),
+    };
+    body.extend(wrap_modal_text(&reference, inner_w));
 
     let box_h = body.len() + 5;
     let pad_top = height.saturating_sub(box_h) / 2;
@@ -3030,7 +3046,17 @@ mod tests {
                     correlation_id,
                     detail,
                 } => {
-                    assert!(rendered.contains(&format!("Completion rejected: {kind}")));
+                    assert!(rendered.contains("Not finished yet"));
+                    assert!(
+                        kind.plain_line()
+                            .split_whitespace()
+                            .all(|word| rendered.contains(word)),
+                        "wrapped plain line lost content for {kind}: {rendered}"
+                    );
+                    assert!(
+                        rendered.contains(&kind.to_string()),
+                        "machine token missing from Ref line for {kind}: {rendered}"
+                    );
                     assert!(rendered.contains(&ticket_id));
                     assert!(rendered.contains(&correlation_id));
                     assert!(
@@ -3039,6 +3065,9 @@ mod tests {
                             .all(|word| rendered.contains(word)),
                         "wrapped rejection detail lost content: {rendered}"
                     );
+                    if kind == CompletionRejectionKind::DispositionBlocked {
+                        assert!(rendered.contains("paste this note"));
+                    }
                     assert!(rendered.contains("Enter/Esc=close"));
                 }
             }

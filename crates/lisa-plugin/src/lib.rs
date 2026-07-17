@@ -1569,7 +1569,7 @@ impl State {
             | CompletionRejection::CorrelationMismatch { .. } => {
                 self.log_activity(ActivityEvent::Warning {
                     message: format!(
-                        "Completion rejected for {ticket_id} [correlation {correlation}]: {rejection}"
+                        "{ticket_id}: a completion reply arrived out of order and was set aside; Lisa continues from the current state. [{rejection}; ref {correlation}]"
                     ),
                 });
                 return;

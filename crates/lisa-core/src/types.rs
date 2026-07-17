@@ -903,6 +903,27 @@ pub enum CompletionRejectionKind {
     LaunchFailed,
 }
 
+impl CompletionRejectionKind {
+    /// The sentence an operator reads first, before any technical detail.
+    /// The `Display` token stays the stable machine identifier; this is the
+    /// human line every operator surface must lead with.
+    pub fn plain_line(self) -> &'static str {
+        match self {
+            Self::AlreadyPending => "Lisa is already finishing this ticket — give it a moment.",
+            Self::StaleLease => {
+                "An older session tried to finish this ticket; the current run is in charge. Try again."
+            }
+            Self::DispositionBlocked => {
+                "The reviewer asked for a decision instead of a pass. Settle the reviewer's note, then finish this ticket."
+            }
+            Self::DependencyBlocked => "This ticket is waiting for earlier tickets to finish first.",
+            Self::LaunchFailed => {
+                "Lisa couldn't record the finish. Try again; if it keeps failing, the activity log has details."
+            }
+        }
+    }
+}
+
 impl fmt::Display for CompletionRejectionKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
