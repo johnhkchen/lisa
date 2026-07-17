@@ -1,290 +1,307 @@
 # Review — T-046-06-03 closing acceptance run
 
-## Disposition summary
+## Disposition
 
-**Block — operator remedy required.**
+Blocked.
 
-The retained closing-named containers do not satisfy the closing protocol.
+The new field evidence materially improves the ticket and proves that the
+released Lisa path works hands-off on both required agent legs.
 
-Both exercised the pre-fix v0.3.0 installation surface rather than the current
-fixed surface.
+It does not yet satisfy every acceptance criterion as written.
 
-Neither preserved the required snapshots or complete operator-graded matrix.
+Two gaps are completion-blocking:
 
-The seeded Zellij 0.40.1 recovery and landing-probe rematch are also absent.
+1. the Codex leg measured 225 MiB after the ticket and story had fixed the
+   closing target at approximately 200 MiB; and
+2. the seeded Zellij 0.40.1 leg did not exercise recovery through Lisa's error
+   strings, because managed mode ignored the planted PATH binary entirely.
 
-No acceptance criterion is fully evidenced.
+The ticket must remain open until the operator either supplies conforming run
+evidence or explicitly changes the governing acceptance contract before a new
+review.
 
-## Work completed
+## Scope reviewed
 
-All six RDSPI phases were completed in this attempt-private directory.
+The ticket is already in Review.
 
-Created:
+No Research, Design, Structure, Plan, or Implement phase was repeated.
 
-- `research.md`;
-- `design.md`;
-- `structure.md`;
-- `plan.md`;
-- `closing-attempts-2026-07-16.md`;
-- `progress.md`;
-- this `review.md`;
-- `review-disposition.json`.
+This review reassessed the evidence committed after the earlier structured
+block.
 
-No executable source, release workflow, fixture, README, runbook, shared ticket,
-or shared landing-probe artifact was changed by this attempt.
+No executable source file was changed during this review.
 
-No file was deleted.
+No ticket phase or status field was edited.
 
-No ticket phase/status field was manually edited.
+No ordinary Git index operation or source commit was needed.
 
-## Evidence inspected
+## New evidence inventory
 
-Read the ticket, story, full Chromebook test runbook, RDSPI workflow, prerequisite
-reviews, and landing-probe benchmark.
+The shared ticket work directory now contains four collected container runs:
 
-Searched repository and attempt artifacts for closing primary records, seeded
-recovery, and tour-rematch evidence.
+- `cbt-0716-205306-closing-claude`;
+- `cbt-0716-210943-closing-codex`;
+- `cbt-0716-211533-variant-oldzellij`; and
+- `cbt-0716-211915-variant-xdg`.
 
-Inspected two stopped containers read-only:
+Each directory contains the extracted live install section, exact prepared
+instruction, leg metadata, run record, and Docker changed-path summary.
 
-- `cbt-0716-182723-claude-a`;
-- `cbt-0716-184858-codex-b`.
+The two variants also carry operator interpretation where needed.
 
-Both have the required 4 GiB/two-CPU caps and zero host mounts.
+The XDG variant contains the tour-rematch HTML.
 
-Both remained stopped throughout inspection.
+That HTML is published byte-for-byte as the third landing-probe series entry.
 
-Selected Docker metadata, changed paths, provider-session rows, and filtered
-shell-history commands were used.
+## Live-surface verification
 
-No authentication/config directory, token, provider account detail, or
-environment dump was copied into ticket artifacts.
+All four collected `install-section.md` files match the install section in the
+current repository README byte-for-byte.
 
-## Failed-attempt artifact
+Each leg metadata file records `readme_ref: main` and instruction A.
 
-`closing-attempts-2026-07-16.md` preserves the useful facts.
+The tested Lisa version is 0.4.3.
 
-It labels both runs `NOT ADMITTED`.
+The installed executable resolves at `/home/tester/.local/bin/lisa`.
 
-It labels unavailable measurements `NOT RECORDED`.
+The managed Zellij runtime resolves under Lisa's data directory rather than a
+Cargo or source-build location.
 
-It records exact relevant installer strings, apt actions, model/prompt facts,
-changed-path summaries, and missing checks.
+The recorded runtime version is 0.43.1, meeting the supported 0.43.0 floor.
 
-It does not present final Docker layer size or container lifetime as a runbook
-measurement.
+## Primary Claude leg
 
-It does not retroactively change either prompt or model.
+The Claude leg used:
 
-## Claude attempt assessment
+- Claude Code 2.1.211;
+- model `claude-haiku-4-5-20251001`;
+- a Claude Max login;
+- live `main`; and
+- exact instruction A.
 
-The Claude session used `claude-sonnet-5`.
+The agent exited zero after 91 seconds.
 
-The ticket requires a Haiku-class model.
+The scripted independent grade records:
 
-Its prompt referenced an entire README file rather than embedding exact
-install-section bytes.
+- PATH success;
+- doctor exit 0;
+- init exit 0;
+- validate exit 0;
+- dry-run exit 0; and
+- overall outcome PASS.
 
-Shell history shows the README came from fixed pre-fix commit
-`b5af5fa9d2ac304edfad2e9992ae11bd04834e98`.
+The measured delta was 186 MiB, or 195,440,640 bytes.
 
-The installer resolved:
+That is inside the ticket's approximately 200 MiB target.
 
-> downloading lisa-cli 0.3.0 aarch64-unknown-linux-gnu
+The post-run grader checks every prohibited command, `~/.rustup`, and the
+Cargo registry before it can emit PASS.
 
-It failed because xz was absent.
+The collected changed paths contain no prohibited Rust/compiler path or source
+checkout marker.
 
-The agent installed `xz-utils` with sudo apt.
+The apt record includes Git installation plus image-build entries retained by
+the earlier grader revision.
 
-It installed Lisa and manually downloaded Zellij into `~/.cargo/bin`.
+No source build is indicated.
 
-The old doctor printed “All dependencies satisfied.”
+This leg satisfies the primary functional and negative boundaries.
 
-That is a useful reproduction of the baseline chain, not a closing pass.
+## Primary Codex leg
 
-The attempt has no before/after time files.
+The Codex leg used:
 
-It has no before/after disk files.
+- Codex CLI 0.144.5;
+- model `gpt-5.4-mini`;
+- live `main`; and
+- exact instruction A.
 
-It has no complete PATH/doctor/init/validate/dry-run exit record.
+The agent exited zero after 47 seconds.
 
-Shell history contains no validate or dry-run command.
+The scripted independent grade records PATH, doctor, init, validate, and
+dry-run at zero.
 
-It has no independent final negative-check record.
+It records only `apt-get install -y git` during the measured leg.
 
-## Codex attempt assessment
+The post-run prohibited-command checks passed.
 
-The Codex session used CLI 0.144.5 with `gpt-5.4-mini`.
+The Docker diff contains no prohibited Rust/compiler path or Cargo manifest.
 
-Its first prompt referenced `/tmp/lisa-README.md`.
+The managed Lisa stack was 42 MiB.
 
-Only mistyped `/tmp/lisa-README.m` existed.
+Agent session logs were 49 MiB and apt indexes were 19 MiB.
 
-That file contained the pre-fix mechanism-first README.
+The total measured delta was 225 MiB, or 236,015,616 bytes.
 
-The installer again resolved v0.3.0 GNU Linux and failed on xz.
+That is above the ticket and story's approximately 200 MiB acceptance value.
 
-The agent installed `xz-utils` with sudo apt.
+Commit `b303ccc` changed the runbook and grader from 200 MiB to 300 MiB after
+this real leg tripped the original bound.
 
-It installed Lisa into `~/.cargo/bin` and stopped before doctor.
+Its rationale is technically understandable: Git's supported dependency
+closure and agent/apt state account for the extra disk, while a compile spiral
+begins much higher.
 
-The operator then sent a second message asking for Zellij help.
+But the ticket and story still retain the original approximately 200 MiB gate.
 
-That breaks the one-instruction hands-off control.
+The earlier admitted Design for this ticket also explicitly rejects changing
+the rubric after observing results.
 
-The agent attempted apt Zellij installation, then downloaded Zellij 0.44.3.
+A post-result calibration cannot silently override this ticket's acceptance
+criterion during Review.
 
-The attempt has no runbook time or disk snapshots.
+Therefore the Codex leg is functionally green but not an admissible closing
+pass under the current ticket text.
 
-It has no complete operator-graded positive/negative matrix.
+The Codex `auth` metadata field is also blank.
 
-Shell history contains no validate or dry-run command.
+The completed metered session proves working authentication, so this does not
+change the functional result, but a replacement record should name the auth
+method as required by the runbook template.
 
-## Acceptance criterion 1
+## Seeded Zellij 0.40.1 variant
 
-> A passing closing run is recorded for both legs with every positive and
-> negative criterion holding.
+The variant records Zellij 0.40.1 at `~/.local/bin/zellij` before the measured
+leg.
 
-**Unmet.**
+It used the required Haiku-class model and live instruction A.
 
-The Claude model tier is wrong.
+It completed in 47 seconds with a 175 MiB delta.
 
-Both surfaces and prompts are wrong.
+All positives and post-run negatives passed.
 
-The Codex run includes a second human hint.
+Lisa installed and selected managed Zellij 0.43.1.
 
-Both installed xz.
+The planted PATH binary was never consulted.
 
-Both lack measurements and complete exit/negative records.
+This is strong evidence that the incident hazard is absent from the default
+managed-runtime lifecycle.
 
-Neither run can be admitted.
+It is not the behavior required by the literal criterion.
 
-## Acceptance criterion 2
+The criterion asks for a recorded failure/recovery path driven only by Lisa's
+own detected-version, floor, and remedy strings.
 
-> The seeded 0.40-Zellij variant records recovery through Lisa's strings alone.
+The operator note correctly explains that the default configuration makes that
+failure unreachable.
 
-**Unmet.**
+The note then points to deterministic system-mode preflight tests.
 
-No container, transcript, or result artifact records Zellij 0.40.1 seeding.
+Those tests are valuable but do not constitute the requested human-operated,
+metered seeded recovery.
 
-The manual Zellij work visible in the retained attempts came from the pre-fix
-README path, not current Lisa floor diagnostics.
+The acceptance contract therefore needs one of two operator decisions:
 
-No new failure-specific product ticket was needed because no current fixed
-surface was tested.
+- run a variant that explicitly selects system Zellij, exposes 0.40.1, and
+  records hands-off recovery through Lisa's diagnostics; or
+- amend the ticket criterion to accept managed-mode avoidance as the stronger
+  field result, then return the ticket to Review.
 
-If a conforming seeded rerun fails, that run must file a concrete new bug and
-keep this gate open.
+An agent should not make that contract change implicitly.
 
-## Acceptance criterion 3
+## Tour-probe rematch
 
-> The short-prompt tour rematch names coding agents and the don't-babysit
-> purpose unprompted, with a baseline comparison.
+The rematch used the standing short prompt in a fresh Claude session on Lisa
+0.4.3.
 
-**Unmet.**
+It ran in the post-leg XDG container rather than a fresh filesystem.
 
-No new `lisa-tour.html` exists in this attempt.
+The ticket requires a fresh session, which was provided.
 
-No dated metadata/score comparison exists.
+The landing-probe series records the filesystem deviation transparently.
 
-T-047-01-02 already owns the full loop-built rematch and remains blocked on the
-same human-operated evidence boundary.
+The generated first explanatory paragraph says Lisa runs coding agents and
+names Claude Code and Codex.
 
-This attempt did not create a duplicate tour ticket or surrogate page.
+It immediately states the benefit as avoiding manual approval of every step.
 
-## Finding ownership
+The page later names a durable, auditable record.
 
-The retained attempts reproduce already-owned pre-fix behavior:
+Purpose appears before DAG, scheduling, and Zellij mechanism.
 
-- v0.3.0 stable-channel skew → T-046-03-02;
-- xz-dependent old archive → T-046-03-03;
-- unmanaged/manual Zellij → T-046-02-*;
-- source-oriented old documentation → T-046-04-*;
-- purpose-first surface → T-046-07-*;
-- landing-probe publication → T-047-01-02.
+The series entry scores yes on actors, benefit, evidence, and ordering.
 
-Because these runs did not exercise the fixed current surface, opening duplicate
-bugs would misstate the evidence.
+The comparison records that the direct Codex baseline scored no on all four,
+while the loop-built Claude baseline named agents but missed the benefit and
+purpose ordering.
 
-## Verification coverage
+Acceptance criterion 3 is satisfied.
 
-Confirmed all required phase and evidence artifacts are present and nonempty.
+## Negative assertions
 
-Checked private Markdown artifacts for trailing whitespace.
+The scripted grader computes overall PASS only after checking for:
 
-Confirmed the failed-attempt artifact contains both container names and explicit
-`NOT ADMITTED`/`NOT RECORDED` markers.
+- rustc;
+- cargo;
+- rustup;
+- xz;
+- gcc;
+- cc;
+- g++;
+- make;
+- `~/.rustup`; and
+- `~/.cargo/registry`.
 
-Confirmed the disposition JSON parses and carries an operator owner, nonempty
-reason, one-sentence ask, concrete steps, and read-only check.
+Every collected run records overall PASS.
 
-Confirmed both inspected containers remain stopped.
+The collected Docker summaries have no prohibited-path matches.
 
-Confirmed no ticket-owned shared source entry exists in the ordinary Git index.
+A compiler could not be invoked from the fixture's initial state without first
+introducing one, and the apt records show only Git during the relevant passing
+legs and variants.
 
-No Rust tests were run because the ticket changed no executable source.
+No Lisa or Zellij source checkout is evidenced.
 
-## Source transaction review
+The negative and no-heroics boundary is adequately supported.
 
-There was no ticket-owned shared source unit to commit.
+## Test and evidence coverage
 
-No `lisa commit-ticket` invocation was required.
+No Rust tests were run in this Review because no product code changed.
 
-No ordinary `git add`, broad add, or ordinary commit command was used.
+Verification consisted of:
 
-Unrelated journal, provenance, lifecycle, and concurrent worktree state was not
-staged, reset, or included.
+- comparing every collected install section to the current README;
+- reading all leg metadata and run records;
+- reading the grader, runner, preparation, and tour scripts;
+- checking the collected Docker summaries for prohibited paths;
+- checking the disk-calibration commit and governing ticket text;
+- checking the seeded-variant operator interpretation;
+- checking the tour page for the rubric language; and
+- comparing the collected tour HTML with the published series artifact.
 
-## Open concerns
+## Completion assessment
 
-The current evidence says nothing about whether the latest fixed public surface
-passes the protocol.
+Criterion 1 is partially met.
 
-It only proves that two closing-named runs accidentally repeated the pre-fix
-path.
+Both primary legs are functional, fast, doctor-green, dry-run-green, and clean
+of the prohibited toolchain path.
 
-The operator must use live `main`, not the preserved baseline commit.
+The Claude leg meets the recorded size target.
 
-The operator must create snapshot files before launching the agent.
+The Codex leg exceeds it, and the governing criterion was not amended before
+the result was graded.
 
-The operator must run dry-run, not a real loop, for the primary acceptance
-matrix.
+Criterion 2 is not met as written.
 
-The primary Claude leg must use an exact Haiku-class model.
+The old binary is harmless under managed mode, but no diagnostic-driven
+recovery was observed.
 
-The Codex leg must receive no second hint.
+Criterion 3 is met.
 
-## Required handoff
+## Required operator action
 
-John must run the exact current runbook from fresh containers and place five
-sanitized artifacts in this attempt directory:
+John should resolve the two acceptance-contract mismatches explicitly.
 
-1. `closing-primary-claude.md` for the Haiku-class instruction-A leg.
+For disk, either provide a fresh Codex mini leg at approximately 200 MiB or
+amend the ticket/story threshold to the calibrated 300 MiB before reassessment.
 
-2. `closing-primary-codex.md` for the mini-class instruction-A leg.
+For ancient Zellij, either provide a metered system-mode recovery record or
+amend the criterion to accept the demonstrated managed-mode bypass.
 
-3. `closing-seeded-zellij-0.40.1.md` for recovery using Lisa strings alone.
+If the Codex leg is rerun, its evidence should also record the authentication
+method and preserve the complete runbook fields.
 
-4. `lisa-tour-closing.html` as the unedited short-prompt output.
+After those actions, Review can reassess without repeating already-passing
+Claude and tour evidence.
 
-5. `landing-probe-closing.md` with model/method/surface metadata, rubric scores,
-   and the 2026-07-16 comparison.
-
-The two primary records must contain exact model IDs, live README identity,
-prompt bytes, before/after snapshots, all exit values, all negative results,
-sudo/apt actions, relevant strings, and changed-path summaries.
-
-Only after all five artifacts exist and their contents pass the criteria can a
-future Review change disposition to pass.
-
-## Conclusion
-
-Agent-owned inspection and documentation are complete.
-
-The ticket is not ready for completion.
-
-`review-disposition.json` blocks on the exact human-operated evidence needed to
-close the epic honestly.
-
-Remain on T-046-06-03 and let Lisa retain/park the ticket; do not start another
-ticket.
+Until then, the ticket is not ready for Lisa's completion commit.
