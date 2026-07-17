@@ -750,6 +750,11 @@ pub struct State {
     /// Number of outstanding timers. Used to prevent timer chain duplication.
     pending_timer_count: u32,
 
+    /// Whether one aggregate native check of observable world-owned parks is
+    /// already running. This is cadence coordination only; ticket status stays
+    /// the durable scheduling authority.
+    world_recheck_in_flight: bool,
+
     /// Path to the idle signal directory (`.lisa/signals/` under /host/).
     signal_dir: PathBuf,
 
@@ -1351,6 +1356,101 @@ impl State {
         let mut context = BTreeMap::new();
         context.insert("lisa_completion".to_string(), ticket_id.to_string());
         Ok((argv, context))
+    }
+
+    /// Build the native automation command that safely verifies every
+    /// observable world-owned parked remedy.
+    fn build_world_recheck_command(
+        &self,
+    ) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+        let lisa_bin = self
+            .config
+            .lisa_bin
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "lisa_bin is not configured".to_string())?;
+        if self.project_root.as_os_str().is_empty() {
+            return Err("project root is not available".to_string());
+        }
+        let argv = vec![
+            lisa_bin.to_string(),
+            "recheck-world".to_string(),
+            "--path".to_string(),
+            self.project_root.display().to_string(),
+        ];
+        let mut context = BTreeMap::new();
+        context.insert("lisa_world_recheck".to_string(), "world".to_string());
+        Ok((argv, context))
+    }
+
+    /// True when the current durable board has a world-owned park with an
+    /// observable check. The native command independently repeats this filter
+    /// before it executes anything.
+    fn has_observable_world_park(&self) -> bool {
+        lisa_core::parking::collect_parked_remedies(self.dag.tickets(), &self.config.work_dir)
+            .into_iter()
+            .any(|remedy| remedy.remedy_owner == RemedyOwner::World && remedy.check.is_some())
+    }
+
+    /// Launch at most one asynchronous native recheck at the scheduler's
+    /// existing cadence. Checks never execute on the WASM event thread.
+    fn request_world_recheck(&mut self) -> bool {
+        if self.world_recheck_in_flight || !self.has_observable_world_park() {
+            return false;
+        }
+        let (argv, context) = match self.build_world_recheck_command() {
+            Ok(command) => command,
+            Err(error) => {
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!("World recheck unavailable: {error}"),
+                });
+                return false;
+            }
+        };
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.world_recheck_in_flight = true;
+        run_command_with_env_variables_and_cwd(
+            &argv_refs,
+            BTreeMap::new(),
+            self.project_root.clone(),
+            context,
+        );
+        true
+    }
+
+    /// Consume one attributed native recheck result. A nonempty successful
+    /// result means at least one ticket status was durably reopened; the DAG,
+    /// Unpark provenance, and ordinary scheduler then observe that change.
+    fn handle_world_recheck_result(
+        &mut self,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        _stderr: Vec<u8>,
+    ) {
+        self.world_recheck_in_flight = false;
+        if exit_code != Some(0) {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!("World recheck failed (exit {exit_code:?})"),
+            });
+            return;
+        }
+
+        let reopened: Vec<_> = String::from_utf8_lossy(&stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        if reopened.is_empty() {
+            return;
+        }
+
+        self.rebuild_dag();
+        self.reconcile_unpark_transitions();
+        self.schedule_ready_tickets();
+        self.log_activity(ActivityEvent::Info {
+            message: format!("World recheck reopened {}", reopened.join(", ")),
+        });
     }
 
     /// Admit and validate the current attempt's explicit Review outcome.
@@ -6546,6 +6646,11 @@ impl State {
         // Always try to schedule (slots may have freed up)
         self.schedule_ready_tickets();
 
+        // Observable world-owned parks are verified by the native CLI without
+        // blocking this WASM poll. The in-flight guard prevents overlap when a
+        // check approaches the same duration as the poll interval.
+        self.request_world_recheck();
+
         // Log poll cycle summary
         let ready_count = self.dag.get_ready_tickets().len();
         let running_count = self
@@ -7420,6 +7525,9 @@ impl ZellijPlugin for State {
                 self.arm_timer(POLL_INTERVAL_SECS);
                 // Try to schedule immediately if slots are already discovered
                 self.schedule_ready_tickets();
+                // Run the first world check at loop start; later checks share
+                // the existing poll cadence.
+                self.request_world_recheck();
                 should_render = true;
             }
 
@@ -7458,6 +7566,11 @@ impl ZellijPlugin for State {
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
                 if let Some(ticket_id) = context.get("lisa_completion") {
                     self.handle_completion_result(ticket_id, exit_code, stdout, stderr);
+                    should_render = true;
+                    return should_render;
+                }
+                if context.contains_key("lisa_world_recheck") {
+                    self.handle_world_recheck_result(exit_code, stdout, stderr);
                     should_render = true;
                     return should_render;
                 }
@@ -8150,6 +8263,201 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn world_recheck_state(root: &Path, ticket_id: &str) -> State {
+        let tickets_dir = root.join("tickets");
+        let work_dir = root.join("work");
+        let ledger_path = root.join("provenance.jsonl");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        write_block_policy_ticket(&tickets_dir, ticket_id, Phase::Review);
+        ticket::update_ticket_status(
+            tickets_dir.join(format!("{ticket_id}.md")),
+            TicketStatus::Blocked,
+        )
+        .unwrap();
+        let tickets = ticket::scan_tickets(&tickets_dir).unwrap();
+        let lease = AttemptLease::mint(ticket_id.to_string(), None).unwrap();
+        let park = ParkingTransitionRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            record_type: ParkingTransitionType::Park,
+            ticket_id: ticket_id.to_string(),
+            attempt_lease: lease.clone(),
+            remedy_owner: RemedyOwner::World,
+            retry_count: None,
+            retry_limit: None,
+            recheck_eligible: true,
+            started_at: 10,
+            ended_at: 20,
+            wall_clock_secs: 10,
+        };
+        provenance::append_parking_transition_record(&ledger_path, &park).unwrap();
+
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir,
+                max_threads: 1,
+                wind_down_secs: 0,
+                lisa_bin: Some("/opt/lisa bin".to_string()),
+                ..PluginConfig::new()
+            },
+            project_root: root.to_path_buf(),
+            git_root: root.to_path_buf(),
+            attempt_dir: root.join("attempts"),
+            signal_dir: root.join("signals"),
+            ledger_path,
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.lease_high_water.insert(ticket_id.to_string(), lease);
+        state.agent_slots.push(fresh_slot(30, None));
+        write_canonical_review_disposition(
+            &state,
+            ticket_id,
+            r#"{"disposition":"block","reason":"release missing","remedy_owner":"world","ask":"Wait for the release.","check":"test -f release"}"#,
+        );
+        state
+    }
+
+    #[test]
+    fn world_recheck_command_is_exact_and_requires_host_boundaries() {
+        let mut state = State {
+            config: PluginConfig {
+                lisa_bin: Some("/opt/lisa bin".to_string()),
+                ..PluginConfig::new()
+            },
+            project_root: PathBuf::from("/project with spaces"),
+            ..State::default()
+        };
+
+        let (argv, context) = state.build_world_recheck_command().unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "/opt/lisa bin",
+                "recheck-world",
+                "--path",
+                "/project with spaces"
+            ]
+        );
+        assert_eq!(
+            context.get("lisa_world_recheck").map(String::as_str),
+            Some("world")
+        );
+
+        state.config.lisa_bin = None;
+        assert_eq!(
+            state.build_world_recheck_command().unwrap_err(),
+            "lisa_bin is not configured"
+        );
+        state.config.lisa_bin = Some("lisa".to_string());
+        state.project_root = PathBuf::new();
+        assert_eq!(
+            state.build_world_recheck_command().unwrap_err(),
+            "project root is not available"
+        );
+    }
+
+    #[test]
+    fn world_recheck_eligibility_requires_world_owner_and_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = world_recheck_state(dir.path(), "T-WORLD");
+        assert!(state.has_observable_world_park());
+
+        write_canonical_review_disposition(
+            &state,
+            "T-WORLD",
+            r#"{"disposition":"block","reason":"approval missing","remedy_owner":"operator","ask":"Approve the release.","check":"test -f release"}"#,
+        );
+        assert!(!state.has_observable_world_park());
+
+        write_canonical_review_disposition(
+            &state,
+            "T-WORLD",
+            r#"{"disposition":"block","reason":"release missing","remedy_owner":"world","ask":"Wait for the release."}"#,
+        );
+        assert!(!state.has_observable_world_park());
+    }
+
+    #[test]
+    fn world_recheck_runs_at_start_and_existing_poll_cadence_without_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = world_recheck_state(dir.path(), "T-WORLD");
+        state.permissions_granted = false;
+
+        state.update(Event::PermissionRequestResult(PermissionStatus::Granted));
+        assert!(state.world_recheck_in_flight);
+        assert!(
+            !state.request_world_recheck(),
+            "an in-flight check suppresses overlap"
+        );
+
+        state.handle_world_recheck_result(Some(0), Vec::new(), Vec::new());
+        assert!(!state.world_recheck_in_flight);
+        state.poll_tick();
+        assert!(state.world_recheck_in_flight);
+    }
+
+    #[test]
+    fn passing_world_recheck_records_unpark_and_seats_on_the_result_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = world_recheck_state(dir.path(), "T-WORLD");
+        ticket::update_ticket_status(
+            state.config.ticket_dir.join("T-WORLD.md"),
+            TicketStatus::Open,
+        )
+        .unwrap();
+        state.world_recheck_in_flight = true;
+
+        state.handle_world_recheck_result(Some(0), b"T-WORLD\n".to_vec(), Vec::new());
+
+        assert!(!state.world_recheck_in_flight);
+        assert_eq!(
+            state.dag.get_ticket(&"T-WORLD".to_string()).unwrap().status,
+            TicketStatus::Open
+        );
+        assert!(state.threads.contains_key("T-WORLD"));
+        assert_eq!(state.current_leases["T-WORLD"].attempt_id, 2);
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-WORLD"));
+
+        let records = read_mixed_ledger(&state.ledger_path);
+        assert_eq!(records.len(), 2);
+        let ProvenanceLedgerRecord::ParkingTransition(unpark) = &records[1] else {
+            panic!("expected unpark provenance")
+        };
+        assert_eq!(unpark.record_type, ParkingTransitionType::Unpark);
+        assert_eq!(unpark.remedy_owner, RemedyOwner::World);
+        assert!(unpark.recheck_eligible);
+        assert_eq!(unpark.attempt_lease.attempt_id, 1);
+
+        state.reconcile_unpark_transitions();
+        assert_eq!(read_mixed_ledger(&state.ledger_path).len(), 2);
+    }
+
+    #[test]
+    fn unsuccessful_world_rechecks_clear_in_flight_without_durable_churn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = world_recheck_state(dir.path(), "T-WORLD");
+        let ticket_path = state.config.ticket_dir.join("T-WORLD.md");
+        let ticket_before = std::fs::read(&ticket_path).unwrap();
+        let ledger_before = std::fs::read(&state.ledger_path).unwrap();
+
+        state.world_recheck_in_flight = true;
+        state.handle_world_recheck_result(Some(0), Vec::new(), Vec::new());
+        assert!(!state.world_recheck_in_flight);
+        assert_eq!(std::fs::read(&ticket_path).unwrap(), ticket_before);
+        assert_eq!(std::fs::read(&state.ledger_path).unwrap(), ledger_before);
+        assert!(!state.threads.contains_key("T-WORLD"));
+
+        state.world_recheck_in_flight = true;
+        state.handle_world_recheck_result(Some(1), Vec::new(), b"failed".to_vec());
+        assert!(!state.world_recheck_in_flight);
+        assert_eq!(std::fs::read(&ticket_path).unwrap(), ticket_before);
+        assert_eq!(std::fs::read(&state.ledger_path).unwrap(), ledger_before);
+        assert!(!state.threads.contains_key("T-WORLD"));
     }
 
     #[test]
