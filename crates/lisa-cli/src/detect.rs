@@ -1,6 +1,15 @@
 use std::fs;
 use std::path::Path;
 
+/// Agent executables visible on the current process PATH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentAvailability {
+    Neither,
+    ClaudeOnly,
+    CodexOnly,
+    Both,
+}
+
 /// Detected project type
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectType {
@@ -20,6 +29,67 @@ pub struct DetectedProject {
     pub test_command: String,
     pub lint_command: String,
     pub source_layout: String,
+}
+
+/// Detect installed agent clients from executable presence on PATH.
+///
+/// This deliberately does not run either client: selection depends only on
+/// PATH presence, while doctor and loop preflight retain responsibility for
+/// checking the selected executable itself.
+pub(crate) fn detect_agent_availability() -> AgentAvailability {
+    classify_agent_availability(executable_on_path("claude"), executable_on_path("codex"))
+}
+
+fn classify_agent_availability(claude: bool, codex: bool) -> AgentAvailability {
+    match (claude, codex) {
+        (false, false) => AgentAvailability::Neither,
+        (true, false) => AgentAvailability::ClaudeOnly,
+        (false, true) => AgentAvailability::CodexOnly,
+        (true, true) => AgentAvailability::Both,
+    }
+}
+
+fn executable_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&path).any(|dir| executable_in(&dir, name))
+}
+
+#[cfg(unix)]
+fn executable_in(dir: &Path, name: &str) -> bool {
+    is_executable_file(&dir.join(name))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn executable_in(dir: &Path, name: &str) -> bool {
+    if Path::new(name).extension().is_some() && dir.join(name).is_file() {
+        return true;
+    }
+
+    let path_ext = std::env::var_os("PATHEXT")
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
+        .to_string_lossy()
+        .into_owned();
+    path_ext
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .any(|extension| dir.join(format!("{name}{extension}")).is_file())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn executable_in(dir: &Path, name: &str) -> bool {
+    dir.join(name).is_file()
 }
 
 /// Detect the project type by checking for marker files in priority order.
@@ -203,6 +273,38 @@ fn scan_source_layout(root: &Path, src_dir: &str, extensions: &[&str]) -> String
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_classify_agent_availability() {
+        for (claude, codex, expected) in [
+            (false, false, AgentAvailability::Neither),
+            (true, false, AgentAvailability::ClaudeOnly),
+            (false, true, AgentAvailability::CodexOnly),
+            (true, true, AgentAvailability::Both),
+        ] {
+            assert_eq!(classify_agent_availability(claude, codex), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_executable_file_requires_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("codex");
+        fs::write(&candidate, "#!/bin/sh\n").unwrap();
+
+        let mut permissions = fs::metadata(&candidate).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&candidate, permissions).unwrap();
+        assert!(!is_executable_file(&candidate));
+
+        let mut permissions = fs::metadata(&candidate).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&candidate, permissions).unwrap();
+        assert!(is_executable_file(&candidate));
+    }
 
     #[test]
     fn test_detect_rust_project() {
