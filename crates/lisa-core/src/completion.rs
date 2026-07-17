@@ -933,7 +933,7 @@ pub fn reconcile(
     let Some(admission) = durable_inputs.artifact_admission.as_ref() else {
         return Reconciliation::None;
     };
-    if !matches!(durable_inputs.disposition, ReviewDisposition::Pass) {
+    if !durable_inputs.disposition.authorizes_completion() {
         return Reconciliation::None;
     }
 
@@ -1306,6 +1306,39 @@ mod tests {
                 Reconciliation::None
             );
         }
+    }
+
+    #[test]
+    fn reconcile_note_is_eligible_exactly_like_pass() {
+        let admission = CurrentLeaseArtifactAdmission {
+            attempt_id: AttemptId::new("attempt-1"),
+            completion_id: CompletionId::new("T-046-06-03"),
+        };
+        let expected = reconcile(
+            &DurableCompletionInputs {
+                artifact_admission: Some(admission.clone()),
+                disposition: ReviewDisposition::Pass,
+            },
+            &CompletionState::Eligible,
+            deadline(1),
+        );
+        let actual = reconcile(
+            &DurableCompletionInputs {
+                artifact_admission: Some(admission),
+                disposition: ReviewDisposition::Note(
+                    crate::disposition::DispositionNote::new(
+                        "approximately 200 MiB",
+                        "docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md",
+                        "The 225 MiB measurement supports completion while the written gate is stale.",
+                    )
+                    .unwrap(),
+                ),
+            },
+            &CompletionState::Eligible,
+            deadline(1),
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

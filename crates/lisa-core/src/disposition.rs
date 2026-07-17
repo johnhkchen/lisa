@@ -21,11 +21,63 @@ pub enum RemedyOwner {
     World,
 }
 
+/// A criteria-versus-evidence dispute that does not stop completed work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispositionNote {
+    criterion_quote: String,
+    evidence_citation: String,
+    summary: String,
+}
+
+impl DispositionNote {
+    /// Build a note whose required fields all contain visible content.
+    pub fn new(
+        criterion_quote: impl Into<String>,
+        evidence_citation: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<Self, String> {
+        let criterion_quote = criterion_quote.into();
+        if criterion_quote.trim().is_empty() {
+            return Err("a note disposition requires a non-empty criterion quote".to_string());
+        }
+        let evidence_citation = evidence_citation.into();
+        if evidence_citation.trim().is_empty() {
+            return Err("a note disposition requires a non-empty evidence citation".to_string());
+        }
+        let summary = summary.into();
+        if summary.trim().is_empty() {
+            return Err("a note disposition requires a non-empty summary".to_string());
+        }
+        Ok(Self {
+            criterion_quote,
+            evidence_citation,
+            summary,
+        })
+    }
+
+    /// Borrow the disputed acceptance criterion exactly as supplied.
+    pub fn criterion_quote(&self) -> &str {
+        &self.criterion_quote
+    }
+
+    /// Borrow the project-relative evidence citation exactly as supplied.
+    pub fn evidence_citation(&self) -> &str {
+        &self.evidence_citation
+    }
+
+    /// Borrow the plain one-sentence summary exactly as supplied.
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+}
+
 /// The validated outcome of a Review disposition file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDisposition {
     /// The agent explicitly declared that Review passed.
     Pass,
+    /// The work passed with a recorded criteria-versus-evidence dispute.
+    Note(DispositionNote),
     /// The agent blocked completion with an actionable reason.
     Block {
         reason: String,
@@ -39,6 +91,13 @@ pub enum ReviewDisposition {
     },
     /// The file could not be trusted as either valid disposition.
     Invalid { reason: String },
+}
+
+impl ReviewDisposition {
+    /// Return whether this validated disposition authorizes completion.
+    pub const fn authorizes_completion(&self) -> bool {
+        matches!(self, Self::Pass | Self::Note(_))
+    }
 }
 
 /// Read and validate a Review disposition file.
@@ -90,6 +149,8 @@ fn validate_document(document: Value) -> ReviewDisposition {
     match (disposition.as_str(), reason) {
         ("pass", Value::Null) => ReviewDisposition::Pass,
         ("pass", _) => invalid("a passing review disposition must have a null reason"),
+        ("note", Value::Null) => validate_note_structure(&mut object),
+        ("note", _) => invalid("a note review disposition must have a null reason"),
         ("block", Value::String(reason)) if !reason.trim().is_empty() => {
             validate_block_structure(reason, &mut object)
         }
@@ -97,8 +158,26 @@ fn validate_document(document: Value) -> ReviewDisposition {
             invalid("a blocking review disposition must have a non-empty string reason")
         }
         (unknown, _) => invalid(format!(
-            "unknown review disposition {unknown:?}; expected \"pass\" or \"block\""
+            "unknown review disposition {unknown:?}; expected \"pass\", \"note\", or \"block\""
         )),
+    }
+}
+
+fn validate_note_structure(object: &mut serde_json::Map<String, Value>) -> ReviewDisposition {
+    let note = (|| {
+        DispositionNote::new(
+            non_empty_string(object.remove("criterion_quote")?)?,
+            non_empty_string(object.remove("evidence_citation")?)?,
+            non_empty_string(object.remove("summary")?)?,
+        )
+        .ok()
+    })();
+
+    match note {
+        Some(note) => ReviewDisposition::Note(note),
+        None => invalid(
+            "a note review disposition requires non-empty criterion_quote, evidence_citation, and summary string fields",
+        ),
     }
 }
 
@@ -192,6 +271,38 @@ mod tests {
             parse_document(r#"{"disposition":"pass","reason":null}"#),
             ReviewDisposition::Pass
         );
+    }
+
+    #[test]
+    fn parses_criteria_evidence_note_without_normalizing_content() {
+        assert_eq!(
+            parse_document(
+                r#"{"disposition":"note","reason":null,"criterion_quote":"  approximately 200 MiB  ","evidence_citation":"docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md","summary":"The 225 MiB measurement supports completion while the written gate is stale."}"#,
+            ),
+            ReviewDisposition::Note(
+                DispositionNote::new(
+                    "  approximately 200 MiB  ",
+                    "docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md",
+                    "The 225 MiB measurement supports completion while the written gate is stale.",
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_note_shapes_are_invalid() {
+        for document in [
+            r#"{"disposition":"note","reason":null,"evidence_citation":"docs/evidence.md","summary":"The criterion is stale."}"#,
+            r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","summary":"The criterion is stale."}"#,
+            r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","evidence_citation":"docs/evidence.md"}"#,
+            r#"{"disposition":"note","reason":null,"criterion_quote":" ","evidence_citation":"docs/evidence.md","summary":"The criterion is stale."}"#,
+            r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","evidence_citation":" ","summary":"The criterion is stale."}"#,
+            r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","evidence_citation":"docs/evidence.md","summary":" "}"#,
+            r#"{"disposition":"note","reason":"work is questionable","criterion_quote":"criterion","evidence_citation":"docs/evidence.md","summary":"The criterion is stale."}"#,
+        ] {
+            assert_invalid(parse_document(document));
+        }
     }
 
     #[test]
