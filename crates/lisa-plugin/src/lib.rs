@@ -1265,18 +1265,42 @@ impl State {
         Ok(relative.to_path_buf())
     }
 
-    /// Private workflow directory for one execution attempt. Production uses
-    /// `.lisa/attempts`; the fallback keeps directly-constructed native tests
-    /// deterministic without requiring `load()`.
-    fn attempt_work_dir(&self, lease: &AttemptLease) -> PathBuf {
-        let root = if self.attempt_dir.as_os_str().is_empty() {
+    /// Root of the private attempt tree. Production uses `.lisa/attempts`; the
+    /// fallback keeps directly-constructed native tests deterministic without
+    /// requiring `load()`.
+    fn attempt_root(&self) -> PathBuf {
+        if self.attempt_dir.as_os_str().is_empty() {
             self.config.work_dir.join(".attempts")
         } else {
             self.attempt_dir.clone()
-        };
-        root.join(&lease.ticket_id)
+        }
+    }
+
+    /// Private workflow directory for one execution attempt.
+    fn attempt_work_dir(&self, lease: &AttemptLease) -> PathBuf {
+        self.attempt_root()
+            .join(&lease.ticket_id)
             .join(lease.attempt_id.to_string())
             .join("work")
+    }
+
+    /// Highest positive attempt generation retained on disk for one ticket.
+    ///
+    /// Directory names are the durable generation namespace. Malformed
+    /// entries cannot manufacture lease history and are ignored.
+    fn durable_attempt_high_water(&self, ticket_id: &str) -> Option<AttemptLease> {
+        let entries = std::fs::read_dir(self.attempt_root().join(ticket_id)).ok()?;
+        let attempt_id = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter(|entry| entry.path().join("work").is_dir())
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
+            .filter(|attempt_id| *attempt_id > 0)
+            .max()?;
+        Some(AttemptLease {
+            ticket_id: ticket_id.to_string(),
+            attempt_id,
+        })
     }
 
     fn pane_attempt_lease(&self, pane_id: u32) -> Option<AttemptLease> {
@@ -1359,28 +1383,13 @@ impl State {
         Ok(())
     }
 
-    /// Admit one phase artifact. Leased attempts publish only from their
-    /// private staging directory after exact current-lease validation. The
-    /// unleased branch exists solely for historical fixtures with no authority
-    /// registered for the ticket.
-    fn admit_artifact(
+    /// Atomically publish one artifact from an explicit private attempt.
+    /// Authority validation remains the caller's responsibility.
+    fn publish_attempt_artifact(
         &self,
-        ticket_id: &str,
-        candidate: Option<&AttemptLease>,
+        lease: &AttemptLease,
         artifact_name: &str,
     ) -> Result<bool, String> {
-        let canonical_dir = self.config.work_dir.join(ticket_id);
-        let canonical = canonical_dir.join(artifact_name);
-        let Some(lease) = candidate else {
-            return Ok(!self.current_leases.contains_key(ticket_id) && canonical.exists());
-        };
-        if lease.ticket_id != ticket_id || !lease.is_current(self.current_leases.get(ticket_id)) {
-            return Err(format!(
-                "attempt {:?} does not hold the current lease for {ticket_id}",
-                lease
-            ));
-        }
-
         let staged = self.attempt_work_dir(lease).join(artifact_name);
         if !staged.is_file() {
             return Ok(false);
@@ -1388,6 +1397,7 @@ impl State {
         let body = std::fs::read(&staged).map_err(|error| {
             format!("cannot read staged artifact {}: {error}", staged.display())
         })?;
+        let canonical_dir = self.config.work_dir.join(&lease.ticket_id);
         std::fs::create_dir_all(&canonical_dir).map_err(|error| {
             format!(
                 "cannot create canonical artifact directory {}: {error}",
@@ -1396,7 +1406,7 @@ impl State {
         })?;
         RustPublication {
             path: PublicationPath {
-                destination: canonical,
+                destination: canonical_dir.join(artifact_name),
                 temporary_name: TemporaryName::Exact {
                     file_name: format!(".{artifact_name}.attempt-{}.tmp", lease.attempt_id),
                 },
@@ -1409,6 +1419,29 @@ impl State {
         }
         .publish()?;
         Ok(true)
+    }
+
+    /// Admit one phase artifact. Leased attempts publish only from their
+    /// private staging directory after exact current-lease validation. The
+    /// unleased branch exists solely for historical fixtures with no authority
+    /// registered for the ticket.
+    fn admit_artifact(
+        &self,
+        ticket_id: &str,
+        candidate: Option<&AttemptLease>,
+        artifact_name: &str,
+    ) -> Result<bool, String> {
+        let canonical = self.config.work_dir.join(ticket_id).join(artifact_name);
+        let Some(lease) = candidate else {
+            return Ok(!self.current_leases.contains_key(ticket_id) && canonical.exists());
+        };
+        if lease.ticket_id != ticket_id || !lease.is_current(self.current_leases.get(ticket_id)) {
+            return Err(format!(
+                "attempt {:?} does not hold the current lease for {ticket_id}",
+                lease
+            ));
+        }
+        self.publish_attempt_artifact(lease, artifact_name)
     }
 
     fn build_completion_command(
@@ -4451,6 +4484,11 @@ impl State {
 
     /// Schedule ready tickets into idle agent slots.
     fn schedule_ready_tickets(&mut self) {
+        // Scheduling is an admission boundary as well as a poll consequence.
+        // Permission and pane events can call this outside `poll_tick`, so an
+        // orphaned durable Block must park before any scheduling early return.
+        self.reconcile_orphaned_review_blocks();
+
         if (!self.completion_journal_path.as_os_str().is_empty()
             && !self.completion_journal_healthy)
             || !self.permissions_granted
@@ -4571,6 +4609,16 @@ impl State {
             // side effects. Retaining the predecessor in `lease_high_water`
             // makes revocation/release followed by redispatch monotonic while
             // `current_leases` remains a truthful authority registry.
+            if let Some(durable) = self.durable_attempt_high_water(&ticket_id) {
+                let replace = self
+                    .lease_high_water
+                    .get(&ticket_id)
+                    .map(|memory| durable.attempt_id > memory.attempt_id)
+                    .unwrap_or(true);
+                if replace {
+                    self.lease_high_water.insert(ticket_id.clone(), durable);
+                }
+            }
             let attempt_lease = match AttemptLease::mint(
                 ticket_id.clone(),
                 self.lease_high_water.get(&ticket_id),
@@ -5180,6 +5228,140 @@ impl State {
                     });
                 }
             }
+        }
+
+        if parked_any {
+            self.rebuild_dag();
+        }
+    }
+
+    /// Reconcile blocking Review verdicts whose writing attempt no longer has
+    /// a live current thread.
+    ///
+    /// Attempt directories retain generation identity after lease revocation.
+    /// An exact-generation Retry/Park/Unpark row means that generation's
+    /// verdict was already consumed; otherwise a valid Block parks directly so
+    /// scheduling never spends a seat re-deriving durable evidence.
+    fn reconcile_orphaned_review_blocks(&mut self) {
+        const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
+
+        let latest_transitions = self.latest_parking_transitions();
+        let candidates: Vec<_> = self
+            .dag
+            .tickets()
+            .filter(|ticket| {
+                ticket.phase == Phase::Review
+                    && !matches!(
+                        ticket.status,
+                        TicketStatus::Blocked | TicketStatus::Done | TicketStatus::Cancelled
+                    )
+            })
+            .filter(|ticket| {
+                !self.threads.get(&ticket.id).is_some_and(|thread| {
+                    thread.status == lisa_core::types::ThreadStatus::Running
+                        && thread.current_phase == Phase::Review
+                        && thread.attempt_lease.as_ref().is_some_and(|lease| {
+                            lease.ticket_id == ticket.id
+                                && lease.is_current(self.current_leases.get(&ticket.id))
+                        })
+                })
+            })
+            .filter_map(|ticket| {
+                let lease = self
+                    .current_leases
+                    .get(&ticket.id)
+                    .cloned()
+                    .or_else(|| self.durable_attempt_high_water(&ticket.id))?;
+                if latest_transitions
+                    .get(&ticket.id)
+                    .is_some_and(|transition| {
+                        transition.attempt_lease.attempt_id >= lease.attempt_id
+                    })
+                {
+                    return None;
+                }
+                let private_path = self.attempt_work_dir(&lease).join(DISPOSITION_ARTIFACT);
+                let canonical_path = self
+                    .config
+                    .work_dir
+                    .join(&ticket.id)
+                    .join(DISPOSITION_ARTIFACT);
+                let private = std::fs::read(&private_path).ok()?;
+                let canonical = std::fs::read(&canonical_path).ok()?;
+                if private != canonical {
+                    return None;
+                }
+                let started_at = private_path
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or_else(|_| std::time::SystemTime::now());
+                let ReviewDisposition::Block {
+                    remedy_owner, ask, ..
+                } = parse_review_disposition(&canonical_path)
+                else {
+                    return None;
+                };
+                Some((ticket.id.clone(), lease, remedy_owner, ask, started_at))
+            })
+            .collect();
+
+        let mut parked_any = false;
+        for (ticket_id, lease, remedy_owner, ask, started_at) in candidates {
+            let Some(ticket) = self.dag.get_ticket(&ticket_id) else {
+                continue;
+            };
+            if ticket.phase != Phase::Review
+                || matches!(
+                    ticket.status,
+                    TicketStatus::Blocked | TicketStatus::Done | TicketStatus::Cancelled
+                )
+            {
+                continue;
+            }
+            let file_path = ticket.file_path.clone();
+            if file_path.as_os_str().is_empty() {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Cannot park orphaned Review block for {ticket_id}: ticket file path is unavailable"
+                    ),
+                });
+                continue;
+            }
+            if let Err(error) = ticket::update_ticket_status(&file_path, TicketStatus::Blocked) {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Cannot park orphaned Review block for {ticket_id}: failed to write blocked status: {error}"
+                    ),
+                });
+                continue;
+            }
+
+            let retry_progress = (remedy_owner == RemedyOwner::Agent)
+                .then(|| {
+                    self.agent_block_retries
+                        .get(&ticket_id)
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .filter(|count| *count > 0)
+                .map(|count| (count.min(MAX_AGENT_BLOCK_RETRIES), MAX_AGENT_BLOCK_RETRIES));
+            self.append_review_block_transition(
+                lease,
+                remedy_owner,
+                ParkingTransitionType::Park,
+                retry_progress,
+                remedy_owner == RemedyOwner::World,
+                started_at,
+            );
+            self.release_slot_for_ticket(&ticket_id);
+            self.threads.remove(&ticket_id);
+            self.finish_up_sent.remove(&ticket_id);
+            parked_any = true;
+            self.log_activity(ActivityEvent::Info {
+                message: format!(
+                    "Parked orphaned Review block for {ticket_id} ({remedy_owner:?}): {ask}"
+                ),
+            });
         }
 
         if parked_any {
@@ -5887,6 +6069,35 @@ impl State {
             return false;
         };
 
+        self.append_review_block_transition(
+            attempt_lease,
+            remedy_owner,
+            record_type,
+            retry_progress,
+            recheck_eligible,
+            started_at,
+        )
+    }
+
+    /// Append one block transition attributed to an explicit durable attempt.
+    ///
+    /// The lease is attribution, not restored execution authority. Live
+    /// callers validate it in `emit_review_block_transition`; level-triggered
+    /// orphan reconciliation validates it against the durable attempt tree.
+    fn append_review_block_transition(
+        &mut self,
+        attempt_lease: AttemptLease,
+        remedy_owner: RemedyOwner,
+        record_type: ParkingTransitionType,
+        retry_progress: Option<(u8, u8)>,
+        recheck_eligible: bool,
+        started_at: std::time::SystemTime,
+    ) -> bool {
+        if self.ledger_path.as_os_str().is_empty() {
+            return false;
+        }
+
+        let ticket_id = attempt_lease.ticket_id.clone();
         let started = provenance::system_time_to_epoch(started_at);
         let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
         let (retry_count, retry_limit) = match retry_progress {
@@ -5897,7 +6108,7 @@ impl State {
             schema_version: provenance::SCHEMA_VERSION,
             seal: self.config.completion_seal,
             record_type,
-            ticket_id: ticket_id.to_string(),
+            ticket_id: ticket_id.clone(),
             attempt_lease,
             remedy_owner,
             retry_count,
@@ -5919,16 +6130,15 @@ impl State {
         true
     }
 
-    /// Record status-driven unparking without making provenance scheduling
-    /// authority. The latest Park row supplies the interval start and attempt.
-    fn reconcile_unpark_transitions(&mut self) {
+    /// Latest blocked-work transition per ticket from the mixed ledger.
+    fn latest_parking_transitions(&self) -> HashMap<TicketId, ParkingTransitionRecord> {
         if self.ledger_path.as_os_str().is_empty() {
-            return;
+            return HashMap::new();
         }
         let Ok(ledger) = std::fs::read_to_string(&self.ledger_path) else {
-            return;
+            return HashMap::new();
         };
-        let mut latest = HashMap::<TicketId, ParkingTransitionRecord>::new();
+        let mut latest = HashMap::new();
         for record in ledger
             .lines()
             .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
@@ -5937,8 +6147,14 @@ impl State {
                 latest.insert(record.ticket_id.clone(), record);
             }
         }
+        latest
+    }
 
-        let reopened: Vec<ParkingTransitionRecord> = latest
+    /// Record status-driven unparking without making provenance scheduling
+    /// authority. The latest Park row supplies the interval start and attempt.
+    fn reconcile_unpark_transitions(&mut self) {
+        let reopened: Vec<ParkingTransitionRecord> = self
+            .latest_parking_transitions()
             .into_values()
             .filter(|record| record.record_type == ParkingTransitionType::Park)
             .filter(|record| {
@@ -6961,6 +7177,11 @@ impl State {
         // remedies consume their bounded per-loop retry before parking.
         self.apply_review_block_policy();
 
+        // A writer can disappear between publishing its durable disposition
+        // and the live-thread policy above. Re-derive that unmet park
+        // obligation from the latest attempt generation on every poll.
+        self.reconcile_orphaned_review_blocks();
+
         // Check for idle signals and advance phases / generate alerts
         self.check_idle_signals();
 
@@ -7909,6 +8130,10 @@ impl ZellijPlugin for State {
         // Reconstruct an unpark interval if status was reopened while the loop
         // was stopped. Scheduling itself depends only on the scanned status.
         self.reconcile_unpark_transitions();
+
+        // Park an unconsumed current-generation Block before permission or pane
+        // events can schedule from the freshly scanned DAG.
+        self.reconcile_orphaned_review_blocks();
 
         // A fresh State normally has no reconstructed attempt authority here,
         // making this a safe no-op. Any authority-preserving load path uses the
@@ -8951,6 +9176,255 @@ mod tests {
         std::fs::create_dir_all(&attempt_dir).unwrap();
         std::fs::write(attempt_dir.join("review.md"), "# Review\n\nBlocked.\n").unwrap();
         std::fs::write(attempt_dir.join("review-disposition.json"), disposition).unwrap();
+    }
+
+    fn orphan_review_state(root: &Path, ticket_id: &str, pane_id: u32) -> State {
+        let tickets_dir = root.join("tickets");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        write_block_policy_ticket(&tickets_dir, ticket_id, Phase::Review);
+        let tickets = ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: root.join("work"),
+                max_threads: 1,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            attempt_dir: root.join("attempts"),
+            signal_dir: root.join("signals"),
+            ledger_path: root.join("provenance.jsonl"),
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.push(fresh_slot(pane_id, None));
+        state
+    }
+
+    fn write_orphan_review_disposition(state: &State, lease: &AttemptLease, disposition: &str) {
+        let work = state.attempt_work_dir(lease);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("review-disposition.json"), disposition).unwrap();
+        write_canonical_review_disposition(state, &lease.ticket_id, disposition);
+    }
+
+    #[test]
+    fn orphaned_legacy_block_parks_at_load_boundary_without_spawning() {
+        const TICKET_ID: &str = "T-ORPHAN-LOAD";
+        const FIELD_REASON: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = orphan_review_state(dir.path(), TICKET_ID, 41);
+        let lease = AttemptLease::mint(TICKET_ID, None).unwrap();
+        let disposition = serde_json::json!({
+            "disposition": "block",
+            "reason": FIELD_REASON,
+        })
+        .to_string();
+        write_orphan_review_disposition(&state, &lease, &disposition);
+
+        // This is the production load ordering before permission/pane events
+        // are allowed to schedule from the freshly scanned DAG.
+        state.reconcile_unpark_transitions();
+        state.reconcile_orphaned_review_blocks();
+        state.schedule_ready_tickets();
+
+        assert_eq!(
+            state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().status,
+            TicketStatus::Blocked
+        );
+        assert!(
+            std::fs::read_to_string(state.config.ticket_dir.join(format!("{TICKET_ID}.md")))
+                .unwrap()
+                .contains("status: blocked")
+        );
+        assert!(!state.threads.contains_key(TICKET_ID));
+        assert!(!state.current_leases.contains_key(TICKET_ID));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        assert_eq!(
+            std::fs::read_to_string(
+                state
+                    .config
+                    .work_dir
+                    .join(TICKET_ID)
+                    .join("review-disposition.json")
+            )
+            .unwrap(),
+            disposition
+        );
+        assert_eq!(
+            state.to_ui_state().waiting_items,
+            vec![ui::WaitingItem {
+                ticket_id: TICKET_ID.to_string(),
+                ask: FIELD_REASON.to_string(),
+                checks_on_own: false,
+            }]
+        );
+
+        let records = read_mixed_ledger(&state.ledger_path);
+        assert_eq!(records.len(), 1);
+        let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
+            panic!("expected orphan park provenance")
+        };
+        assert_eq!(park.record_type, ParkingTransitionType::Park);
+        assert_eq!(park.attempt_lease, lease);
+        assert_eq!(park.remedy_owner, RemedyOwner::Operator);
+
+        state.reconcile_orphaned_review_blocks();
+        state.schedule_ready_tickets();
+        assert_eq!(read_mixed_ledger(&state.ledger_path).len(), 1);
+        assert!(!state.threads.contains_key(TICKET_ID));
+    }
+
+    #[test]
+    fn orphaned_block_appearing_after_thread_loss_parks_and_releases_seat() {
+        const TICKET_ID: &str = "T-ORPHAN-MID";
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = orphan_review_state(dir.path(), TICKET_ID, 42);
+        let disposition = r#"{"disposition":"block","reason":"manual verification remains","remedy_owner":"operator","ask":"Run the checkout test."}"#;
+        let lease = attach_review_block_attempt(&mut state, TICKET_ID, 42, disposition);
+        write_canonical_review_disposition(&state, TICKET_ID, disposition);
+
+        // The session disappears after writing its verdict but before the live
+        // block-policy pass. Retain the slot/current lease to prove the durable
+        // reconciliation does not require the thread and still releases both.
+        state.threads.remove(TICKET_ID);
+        state.reconcile_orphaned_review_blocks();
+
+        assert_eq!(
+            state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().status,
+            TicketStatus::Blocked
+        );
+        assert!(!state.threads.contains_key(TICKET_ID));
+        assert!(!state.current_leases.contains_key(TICKET_ID));
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        assert_eq!(state.seat_assignment(42), None);
+        let records = read_mixed_ledger(&state.ledger_path);
+        assert_eq!(records.len(), 1);
+        let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
+            panic!("expected mid-run orphan park provenance")
+        };
+        assert_eq!(park.attempt_lease, lease);
+        assert_eq!(park.record_type, ParkingTransitionType::Park);
+
+        state.schedule_ready_tickets();
+        assert!(!state.threads.contains_key(TICKET_ID));
+    }
+
+    #[test]
+    fn scheduling_parks_durable_block_then_unpark_seats_fresh_generation() {
+        const TICKET_ID: &str = "T-ORPHAN-SCHEDULE";
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = orphan_review_state(dir.path(), TICKET_ID, 43);
+        let blocked = AttemptLease::mint(TICKET_ID, None).unwrap();
+        let disposition = r#"{"disposition":"block","reason":"operator decision remains","remedy_owner":"operator","ask":"Choose whether to amend the requirement."}"#;
+        write_orphan_review_disposition(&state, &blocked, disposition);
+
+        // The scheduling entry point itself is the final admission guard.
+        state.schedule_ready_tickets();
+        assert_eq!(
+            state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().status,
+            TicketStatus::Blocked
+        );
+        assert!(!state.threads.contains_key(TICKET_ID));
+        assert!(!state.current_leases.contains_key(TICKET_ID));
+
+        ticket::update_ticket_status(
+            state.config.ticket_dir.join(format!("{TICKET_ID}.md")),
+            TicketStatus::Open,
+        )
+        .unwrap();
+        state.rebuild_dag();
+        state.reconcile_unpark_transitions();
+        state.schedule_ready_tickets();
+
+        let fresh = state.current_leases[TICKET_ID].clone();
+        assert_eq!(fresh.attempt_id, blocked.attempt_id + 1);
+        assert_eq!(
+            state.threads[TICKET_ID].attempt_lease.as_ref(),
+            Some(&fresh)
+        );
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some(TICKET_ID));
+        assert_eq!(
+            state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().status,
+            TicketStatus::Open
+        );
+
+        // Generation 1 remains on disk but cannot park the live generation 2.
+        state.reconcile_orphaned_review_blocks();
+        assert_eq!(state.current_leases.get(TICKET_ID), Some(&fresh));
+        assert!(state.threads.contains_key(TICKET_ID));
+        assert_eq!(
+            std::fs::read_to_string(
+                state
+                    .attempt_work_dir(&blocked)
+                    .join("review-disposition.json")
+            )
+            .unwrap(),
+            disposition
+        );
+
+        let records = read_mixed_ledger(&state.ledger_path);
+        assert_eq!(records.len(), 2);
+        let transitions: Vec<_> = records
+            .iter()
+            .map(|record| match record {
+                ProvenanceLedgerRecord::ParkingTransition(record) => record.record_type,
+                other => panic!("expected parking transition, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![ParkingTransitionType::Park, ParkingTransitionType::Unpark]
+        );
+    }
+
+    #[test]
+    fn stale_prior_generation_disposition_does_not_park_fresh_attempt() {
+        const TICKET_ID: &str = "T-ORPHAN-STALE";
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = orphan_review_state(dir.path(), TICKET_ID, 44);
+        let stale = AttemptLease::mint(TICKET_ID, None).unwrap();
+        write_orphan_review_disposition(
+            &state,
+            &stale,
+            r#"{"disposition":"block","reason":"stale predecessor verdict","remedy_owner":"operator","ask":"Do not replay this old verdict."}"#,
+        );
+
+        // A later durable attempt directory is the current generation even
+        // after its thread/lease disappears. Its missing disposition must not
+        // fall back to generation 1's retained Block.
+        let fresh = AttemptLease::mint(TICKET_ID, Some(&stale)).unwrap();
+        std::fs::create_dir_all(state.attempt_work_dir(&fresh)).unwrap();
+        let canonical = state
+            .config
+            .work_dir
+            .join(TICKET_ID)
+            .join("review-disposition.json");
+        assert!(canonical.exists());
+        state.reconcile_orphaned_review_blocks();
+        assert_eq!(
+            state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().status,
+            TicketStatus::Open
+        );
+        assert!(read_mixed_ledger(&state.ledger_path).is_empty());
+
+        state.schedule_ready_tickets();
+
+        let scheduled = state.current_leases[TICKET_ID].clone();
+        assert_eq!(scheduled.attempt_id, fresh.attempt_id + 1);
+        assert_eq!(
+            state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().status,
+            TicketStatus::Open
+        );
+        assert_eq!(
+            state.threads[TICKET_ID].attempt_lease.as_ref(),
+            Some(&scheduled)
+        );
+        assert!(read_mixed_ledger(&state.ledger_path).is_empty());
+        assert!(canonical.exists());
     }
 
     #[test]
