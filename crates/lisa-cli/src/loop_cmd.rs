@@ -165,7 +165,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     crate::run_summary::record_run_baseline(root)?;
     let status = run_zellij(&zellij_runtime.path, root, &layout_path)?;
 
-    let tickets = lisa_core::ticket::scan_tickets(&root.join(&config.ticket_dir))
+    let tickets = lisa_core::ticket::scan_tickets(root.join(&config.ticket_dir))
         .map_err(|error| format!("Failed to scan tickets after Lisa loop: {error}"))?;
     crate::run_summary::print_run_summary(root, &tickets, Path::new(&config.work_dir))?;
 
