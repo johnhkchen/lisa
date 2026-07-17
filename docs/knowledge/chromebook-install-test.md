@@ -20,10 +20,13 @@ path a person can walk.
 - **Proves:** the README's install path works end-to-end on the target class of
   machine; our error strings steer a weak agent correctly; the install never enters
   the compile spiral; the live managed-runtime download (unproven in CI, which uses
-  fixture servers) works against real releases.
+  fixture servers) works against real releases. A scored `--no-git` leg additionally
+  proves that one ticket in a bare folder reaches Done with hash-verifiable journal
+  evidence and no project history.
 - **Does not prove:** real-Chromebook behavior (this fixture is a stand-in — see
   *Fixture honesty* below), Codex/Claude agent-session quality inside Lisa, or anything
-  about `lisa loop` beyond `--dry-run`.
+  about `lisa loop` beyond `--dry-run` in an ordinary install leg. Only the separately
+  recorded no-Git leg makes the narrower live-loop completion claim.
 
 Fixture smoke tests are setup checks, not recorded agent legs. T-046-06-02 owns the
 baseline evidence and T-046-06-03 owns the closing evidence. Do not report a preflight
@@ -44,6 +47,7 @@ Inside a leg container (after fresh auth):
 /cbt/prepare --pin <SHA>          # baseline-style leg against a pinned README
 /cbt/prepare --seed-old-zellij    # variant: Zellij 0.40.1 in ~/.local/bin
 /cbt/prepare --xdg-cache          # variant: XDG_CACHE_HOME set for the agent
+/cbt/prepare --no-git             # full loop: bare folder finishes journal-sealed
 /cbt/run claude|codex [model]     # stamps clock + identity, launches — then hands off
 /cbt/grade                        # all acceptance checks, writes /tmp/run-record.md
 /cbt/tour claude|codex [model]    # landing-probe rematch (FRESH session only)
@@ -51,7 +55,9 @@ Inside a leg container (after fresh auth):
 
 On the host, `just cbt-collect <container-name>` copies the run record, leg
 metadata, instruction, tour page, and a docker-diff summary into
-`docs/active/work/T-046-06-03/<container-name>/`.
+`docs/active/work/T-046-06-03/<container-name>/`. For a no-Git leg it also copies
+the completion journal, final ticket, and admitted ticket work under a
+`no-git-demo/` evidence subtree. It never copies agent authentication state.
 
 ## Fixture
 
@@ -287,9 +293,13 @@ run.
 |---|---|---|---|
 | A | claude | Haiku-class (for example `claude-haiku-4-5-20251001`) | Pin and record the exact available id. |
 | B | codex | Mini-class | Pin and record the exact available id. |
+| N | claude **or** codex | Same low-end class as its selected install leg | `/cbt/prepare --no-git`; full RDSPI completion, not an install-only dry run. |
 
 Primary OS fixture: bookworm. Stretch: bullseye (glibc 2.31 — exercises the musl
-claim). Use a fresh container for every leg and every seeded-failure variant.
+claim). Use a fresh container for every leg and every seeded-failure variant. Leg N
+is its own manual, authenticated, token-metered leg; do not reuse A or B merely
+because its installation already passed. This ticket adds the standing fixture and
+rubric but does not execute leg N.
 
 ## Prepare the measured instruction (inside the container)
 
@@ -331,6 +341,48 @@ printf '%s\n' \
   "Please install lisa (github.com/johnhkchen/lisa) on this machine so I can use it. When you're done, \`lisa doctor\` should pass." \
   > /tmp/instruction.txt
 ```
+
+## Prepare the no-Git completion leg (leg N)
+
+Leg N uses the same fresh-image, fresh-authentication discipline, but it scores a
+real Lisa completion rather than stopping at installation and dry-run. After authenticating
+exactly the selected CLI, run:
+
+```bash
+/cbt/prepare --no-git
+cat /tmp/leg-meta
+cat /tmp/instruction.txt
+```
+
+The prepare flag fails if `git` is already on PATH, refuses to replace an existing
+`~/no-git-demo`, and creates exactly one ready ticket at
+`~/no-git-demo/docs/active/tickets/T-NOGIT-001.md`. The ticket is intentionally
+evidence-only: its RDSPI phase artifacts are the whole deliverable and it forbids
+project source changes. There is therefore no meaningful source unit for the nested
+agent to send through `lisa commit-ticket` in a repository-less project.
+
+The generated measured instruction hands the agent the live README install section,
+requires Git to remain absent, and directs it to:
+
+1. install Lisa;
+2. run `lisa init --no-history` in `~/no-git-demo`;
+3. set `[agent] client` in `.lisa.toml` to the same authenticated CLI conducting
+   the leg (`claude` or `codex`);
+4. run `lisa loop` until `T-NOGIT-001` is Done; and
+5. leave project-local `lisa doctor` green.
+
+Do not perform those actions for the tested agent and do not mention `/cbt`. Launch
+with the ordinary scripted handoff:
+
+```bash
+/cbt/run claude '<exact-low-end-model-id>'
+# or, in a separate selected Codex leg:
+/cbt/run codex '<exact-low-end-model-id>'
+```
+
+The operator remains hands-off under the same response rule. Leg N has a 20-minute
+hard stop for the full install-plus-RDSPI loop. Its record must not be compared to the
+ten-minute install-only score as though the workloads were identical.
 
 ## Snapshot and start (inside the container)
 
@@ -409,6 +461,35 @@ printf 'init exit: %s  validate exit: %s  dry-run exit: %s\n' \
 
 Required values: PATH 0, doctor 0, init 0, validate 0, and dry-run 0.
 
+### Additional scored checks for the no-Git completion leg
+
+Run `/cbt/grade` after the tested agent exits. The grader detects `no_git: 1` in
+`/tmp/leg-meta` and grades `~/no-git-demo` instead of creating the ordinary smoke
+project. Leg N passes only when all of these are true:
+
+- `git` is absent from PATH after the run and `~/no-git-demo/.git` does not exist;
+- project-local `lisa doctor` exits zero;
+- the run record quotes this exact doctor line:
+
+  ```text
+  completion seal: journal-only — finished work is recorded but not undoable
+  ```
+
+- `T-NOGIT-001.md` contains both `status: done` and `phase: done`;
+- `.lisa/completion-journal.jsonl` contains a confirmed row for `T-NOGIT-001`
+  whose `seal` is `journal`, whose `content_hashes` array is nonempty, and which
+  carries no `commit_id`;
+- every recorded path is relative, remains below the project root, is unique, and
+  has a SHA-256 digest matching the current file bytes;
+- the content hashes include the final ticket file itself; and
+- the full measured instruction completes within 1,200 seconds, with the ordinary
+  disk and no-compiler/source-build negatives still green.
+
+The grader uses the fixture's required Node runtime to parse JSONL and recompute every
+SHA-256 binding. A grep match or merely present journal row is not sufficient. Its
+one-line verification summary names the attempt, generation, and number of verified
+bindings; that exact summary is copied into `/tmp/run-record.md`.
+
 Negative — the run fails if any trip, even with green positives. Success by heroics is
 a fail:
 
@@ -450,6 +531,10 @@ Pass thresholds:
 - all positive exits zero; and
 - no negative condition or source-build path.
 
+The first threshold is the install-leg score for A/B. Leg N instead applies the
+explicit 1,200-second full-loop hard stop above; it does not relax the ten-minute
+score for any ordinary install leg.
+
 ## Seeded-failure variants (after the epic's fixes land)
 
 1. **Ancient Zellij on PATH:** place a Zellij 0.40.1 binary in `~/.local/bin` before
@@ -477,6 +562,18 @@ Use `docker cp` only for explicitly selected non-secret evidence such as snapsho
 files. Never copy `~/.claude`, `~/.codex`, environment dumps, or auth output into the
 repository or run record.
 
+For leg N, `just cbt-collect <container-name>` additionally preserves these exact
+paths beneath the collected `no-git-demo/` subtree:
+
+```text
+.lisa/completion-journal.jsonl
+docs/active/tickets/T-NOGIT-001.md
+docs/active/work/T-NOGIT-001/
+```
+
+Those bytes are the independent replay surface for the grader's hash claim. Do not
+substitute a screenshot or a copied home directory.
+
 Once the Markdown result is complete and no further diagnosis is needed:
 
 ```bash
@@ -496,7 +593,10 @@ Append one section per run to this file or the driving ticket's private work dir
 - CLI+version / model id / auth method (no secret):
 - outcome: PASS | FAIL(reason) | HARD-STOP
 - wall clock: __ min (__ sec)  disk delta: __ MiB (__ bytes)
+- wall limit applied: 600 sec install-only | 1200 sec no-Git full loop
 - positives: PATH __, doctor __, init __, validate __, dry-run __
+- doctor completion line: exact `completion seal: ...` line
+- journal verification: not a no-git leg | confirmed row identity and verified hash count | failure
 - negatives tripped: none | list
 - sudo/apt actions taken:
 - agent questions asked:
