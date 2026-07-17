@@ -8152,6 +8152,41 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn dashboard_projection_reads_the_canonical_operator_ask_for_a_durable_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        std::fs::write(
+            tickets_dir.join("T-ASK.md"),
+            "---\nid: T-ASK\ntitle: parked ask\ntype: task\nstatus: blocked\npriority: high\nphase: review\n---\n\nFixture\n",
+        )
+        .unwrap();
+        let state = State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                work_dir,
+                ..PluginConfig::default()
+            },
+            ..State::default()
+        };
+        write_canonical_review_disposition(
+            &state,
+            "T-ASK",
+            r#"{"disposition":"block","reason":"engineering reason","remedy_owner":"operator","ask":"Run the checkout test."}"#,
+        );
+
+        assert_eq!(
+            state.to_ui_state().waiting_items,
+            vec![ui::WaitingItem {
+                ticket_id: "T-ASK".to_string(),
+                ask: "Run the checkout test.".to_string(),
+                checks_on_own: false,
+            }]
+        );
+    }
+
     fn attach_review_block_attempt(
         state: &mut State,
         ticket_id: &str,
