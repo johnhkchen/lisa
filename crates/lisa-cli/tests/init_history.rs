@@ -5,12 +5,14 @@ use std::process::{Command, Output};
 
 const HISTORY_OFFER: &str = "Bring project history along? Finished work can be undone, and you'll have a record of what the agents did. [Y/n]";
 const HISTORY_DECLINED: &str = "Continuing without project history: finished work will be recorded in Lisa's journal but won't be undoable.";
+const HISTORY_KEPT: &str = "Keeping project history — finished work will be undoable.";
 
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
     home: PathBuf,
     global_config: PathBuf,
+    empty_path: PathBuf,
 }
 
 impl Fixture {
@@ -19,8 +21,10 @@ impl Fixture {
         let root = temp.path().join(name);
         let home = temp.path().join("home");
         let global_config = temp.path().join("global.gitconfig");
+        let empty_path = temp.path().join("empty-path");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&empty_path).unwrap();
         fs::write(
             &global_config,
             "[user]\n\tname = Existing Global\n\temail = global@example.invalid\n",
@@ -31,6 +35,7 @@ impl Fixture {
             root,
             home,
             global_config,
+            empty_path,
         }
     }
 
@@ -45,6 +50,14 @@ impl Fixture {
 
     fn lisa(&self, args: &[&str]) -> Output {
         self.command(env!("CARGO_BIN_EXE_lisa"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn lisa_without_git(&self, args: &[&str]) -> Output {
+        self.command(env!("CARGO_BIN_EXE_lisa"))
+            .env("PATH", &self.empty_path)
             .args(args)
             .output()
             .unwrap()
@@ -127,20 +140,15 @@ fn write_status_ticket(root: &Path) {
 }
 
 #[test]
-fn bare_folder_acceptance_creates_commit_ready_project_history() {
+fn bare_folder_default_creates_commit_ready_project_history() {
     let fixture = Fixture::new("accepted-project");
     let global_before = fs::read(&fixture.global_config).unwrap();
     fs::write(fixture.root.join("existing.txt"), "operator work\n").unwrap();
 
-    let output = fixture.lisa(&[
-        "init",
-        "--path",
-        fixture.root.to_str().unwrap(),
-        "--with-history",
-    ]);
-    assert_success(&output, "lisa init --with-history");
+    let output = fixture.lisa(&["init", "--path", fixture.root.to_str().unwrap()]);
+    assert_success(&output, "bare lisa init");
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Project history is ready."));
+    assert!(stdout.contains(HISTORY_KEPT));
     assert!(fixture.root.join(".git").is_dir());
     assert_eq!(
         fixture.git_ok(&fixture.root, &["config", "--local", "user.name"]),
@@ -220,14 +228,46 @@ fn bare_folder_decline_stays_journal_only_and_explains_the_consequence() {
 }
 
 #[test]
-fn flags_are_explicit_noninteractive_contract_and_offer_copy_is_plain() {
-    let fixture = Fixture::new("flag-contract");
-    let missing_choice = fixture.lisa(&["init", "--path", fixture.root.to_str().unwrap()]);
-    assert_failure(&missing_choice, "non-interactive init without history flag");
-    let stderr = String::from_utf8(missing_choice.stderr).unwrap();
+fn bare_folder_without_git_uses_journal_and_explains_the_consequence() {
+    let fixture = Fixture::new("no-git-default");
+    let output = fixture.lisa_without_git(&["init", "--path", fixture.root.to_str().unwrap()]);
+    assert_success(&output, "bare lisa init without git");
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains(HISTORY_DECLINED));
+    assert!(!fixture.root.join(".git").exists());
+    assert!(fixture.root.join("CLAUDE.md").exists());
+
+    write_status_ticket(&fixture.root);
+    let status = fixture.lisa_without_git(&["status", "--path", fixture.root.to_str().unwrap()]);
+    assert_success(&status, "lisa status without git");
+    assert!(String::from_utf8(status.stdout)
+        .unwrap()
+        .contains("completion seal: journal-only — finished work is recorded but not undoable"));
+}
+
+#[test]
+fn explicit_with_history_without_git_names_the_remedy() {
+    let fixture = Fixture::new("no-git-explicit-history");
+    let output = fixture.lisa_without_git(&[
+        "init",
+        "--path",
+        fixture.root.to_str().unwrap(),
+        "--with-history",
+    ]);
+    assert_failure(&output, "lisa init --with-history without git");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Git is not available"));
+    assert!(stderr.contains("Install or repair Git"));
     assert!(stderr.contains("--with-history"));
     assert!(stderr.contains("--no-history"));
+    assert!(!fixture.root.join(".git").exists());
     assert!(!fixture.root.join("CLAUDE.md").exists());
+}
+
+#[test]
+fn history_flags_remain_overrides_and_offer_copy_is_plain() {
+    let fixture = Fixture::new("flag-contract");
 
     let conflict = fixture.lisa(&[
         "init",
@@ -246,12 +286,9 @@ fn flags_are_explicit_noninteractive_contract_and_offer_copy_is_plain() {
     ]);
     assert_success(&dry_run, "history-offer dry run");
     let stdout = String::from_utf8(dry_run.stdout).unwrap();
-    let offer = stdout
-        .lines()
-        .find(|line| line.contains("Bring project history along?"))
-        .unwrap();
-    assert_eq!(offer.trim_end(), HISTORY_OFFER);
-    assert!(!offer.to_ascii_lowercase().contains("git"));
+    assert!(stdout.contains("Project history would be kept."));
+    assert!(!stdout.contains(HISTORY_OFFER));
+    assert!(!HISTORY_OFFER.to_ascii_lowercase().contains("git"));
     assert!(!fixture.root.join(".git").exists());
 }
 

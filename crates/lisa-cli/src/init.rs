@@ -10,6 +10,7 @@ use crate::templates;
 
 const HISTORY_OFFER: &str = "Bring project history along? Finished work can be undone, and you'll have a record of what the agents did. [Y/n] ";
 const HISTORY_DECLINED: &str = "Continuing without project history: finished work will be recorded in Lisa's journal but won't be undoable.";
+const HISTORY_KEPT: &str = "Keeping project history — finished work will be undoable.";
 const HISTORY_NAME: &str = "Lisa (project history)";
 const HISTORY_EMAIL: &str = "lisa@project";
 const HISTORY_COMMIT_MESSAGE: &str = "Start project history";
@@ -24,6 +25,7 @@ pub enum HistoryPreference {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RepositoryState {
+    Unavailable { reason: String },
     Missing,
     Unborn { root: PathBuf },
     Born,
@@ -596,34 +598,48 @@ fn repository_state(root: &Path) -> Result<RepositoryState, String> {
     let repository = match repository {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RepositoryState::Missing);
+            return Ok(RepositoryState::Unavailable {
+                reason: "Git is not available on this machine".to_string(),
+            });
         }
-        Err(error) => return Err(format!("Could not inspect project history: {error}")),
+        Err(error) => {
+            return Ok(RepositoryState::Unavailable {
+                reason: format!("Could not inspect project history: {error}"),
+            });
+        }
     };
     if !repository.status.success() {
         let stderr = String::from_utf8_lossy(&repository.stderr);
         if stderr.to_ascii_lowercase().contains("not a git repository") {
             return Ok(RepositoryState::Missing);
         }
-        return Err(history_command_failure(
-            "inspect existing project history",
-            repository,
-        ));
+        return Ok(RepositoryState::Unavailable {
+            reason: history_command_failure("inspect existing project history", repository),
+        });
     }
 
     let raw_root = String::from_utf8_lossy(&repository.stdout)
         .trim()
         .to_string();
     if raw_root.is_empty() {
-        return Err("Could not inspect project history: command returned no result".to_string());
+        return Ok(RepositoryState::Unavailable {
+            reason: "Could not inspect project history: command returned no result".to_string(),
+        });
     }
     let repository_root = PathBuf::from(raw_root);
     let head = ProcessCommand::new("git")
         .arg("-C")
         .arg(&repository_root)
         .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .map_err(|error| format!("Could not inspect project history: {error}"))?;
+        .output();
+    let head = match head {
+        Ok(output) => output,
+        Err(error) => {
+            return Ok(RepositoryState::Unavailable {
+                reason: format!("Could not inspect project history: {error}"),
+            });
+        }
+    };
     if head.status.success() {
         return Ok(RepositoryState::Born);
     }
@@ -632,17 +648,23 @@ fn repository_state(root: &Path) -> Result<RepositoryState, String> {
         .arg("-C")
         .arg(&repository_root)
         .args(["symbolic-ref", "--quiet", "HEAD"])
-        .output()
-        .map_err(|error| format!("Could not inspect project history: {error}"))?;
+        .output();
+    let symbolic_head = match symbolic_head {
+        Ok(output) => output,
+        Err(error) => {
+            return Ok(RepositoryState::Unavailable {
+                reason: format!("Could not inspect project history: {error}"),
+            });
+        }
+    };
     if symbolic_head.status.success() && !symbolic_head.stdout.is_empty() {
         Ok(RepositoryState::Unborn {
             root: repository_root,
         })
     } else {
-        Err(history_command_failure(
-            "inspect the existing project-history branch",
-            head,
-        ))
+        Ok(RepositoryState::Unavailable {
+            reason: history_command_failure("inspect the existing project-history branch", head),
+        })
     }
 }
 
@@ -773,24 +795,11 @@ fn resolve_history_action(
         return Ok(HistoryAction::None);
     }
 
-    if dry_run && preference == HistoryPreference::Ask {
-        write_init_line(out, format_args!("{HISTORY_OFFER}"))?;
-        write_init_line(
-            out,
-            format_args!("Dry run: choose --with-history or --no-history when making changes."),
-        )?;
-        return Ok(HistoryAction::None);
-    }
-
     let accepted = match preference {
         HistoryPreference::WithHistory => true,
         HistoryPreference::NoHistory => false,
-        HistoryPreference::Ask if interactive => prompt_for_history(input, out)?,
-        HistoryPreference::Ask => {
-            return Err(
-                "Choose --with-history or --no-history when input is not interactive".to_string(),
-            );
-        }
+        HistoryPreference::Ask if interactive && !dry_run => prompt_for_history(input, out)?,
+        HistoryPreference::Ask => !matches!(&state, RepositoryState::Unavailable { .. }),
     };
 
     if !accepted {
@@ -798,6 +807,14 @@ fn resolve_history_action(
     }
 
     Ok(match state {
+        RepositoryState::Unavailable { reason } => {
+            if preference == HistoryPreference::WithHistory {
+                return Err(format!(
+                    "Project history was requested, but Lisa cannot keep it: {reason}. Install or repair Git, then rerun `lisa init --with-history`; or run `lisa init --no-history` to use Lisa's journal."
+                ));
+            }
+            HistoryAction::Decline
+        }
         RepositoryState::Missing => HistoryAction::CreateRepository,
         RepositoryState::Unborn { root } => HistoryAction::CreateInitialCommit { root },
         RepositoryState::Born => HistoryAction::None,
@@ -856,14 +873,29 @@ fn run_init_with_io(
         return Err(format!("Path does not exist: {}", root.display()));
     }
 
-    let history_action = resolve_history_action(
-        repository_state(root)?,
-        history_preference,
+    let state = repository_state(root)?;
+    run_init_with_history_state(
+        root,
         dry_run,
+        history_preference,
         interactive,
         input,
         out,
-    )?;
+        state,
+    )
+}
+
+fn run_init_with_history_state(
+    root: &Path,
+    dry_run: bool,
+    history_preference: HistoryPreference,
+    interactive: bool,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    state: RepositoryState,
+) -> Result<(), String> {
+    let history_action =
+        resolve_history_action(state, history_preference, dry_run, interactive, input, out)?;
 
     // Step 1: Detect project type
     let project = detect_project(root);
@@ -897,7 +929,7 @@ fn run_init_with_io(
     if dry_run {
         match history_action {
             HistoryAction::CreateRepository | HistoryAction::CreateInitialCommit { .. } => {
-                write_init_line(out, format_args!("Project history would be included."))?;
+                write_init_line(out, format_args!("Project history would be kept."))?;
             }
             HistoryAction::Decline => {
                 write_init_line(out, format_args!("{HISTORY_DECLINED}"))?;
@@ -913,12 +945,12 @@ fn run_init_with_io(
     match history_action {
         HistoryAction::CreateRepository => {
             initialize_project_history(root)?;
-            write_init_line(out, format_args!("Project history is ready."))?;
+            write_init_line(out, format_args!("{HISTORY_KEPT}"))?;
             write_init_line(out, format_args!(""))?;
         }
         HistoryAction::CreateInitialCommit { root } => {
             create_initial_history_commit(&root)?;
-            write_init_line(out, format_args!("Project history is ready."))?;
+            write_init_line(out, format_args!("{HISTORY_KEPT}"))?;
             write_init_line(out, format_args!(""))?;
         }
         HistoryAction::Decline => {
@@ -1535,6 +1567,10 @@ mod tests {
         assert!(!HISTORY_DECLINED.to_ascii_lowercase().contains("git"));
         assert!(HISTORY_DECLINED
             .contains("finished work will be recorded in Lisa's journal but won't be undoable"));
+        assert_eq!(
+            HISTORY_KEPT,
+            "Keeping project history — finished work will be undoable."
+        );
     }
 
     #[test]
@@ -1563,11 +1599,11 @@ mod tests {
     }
 
     #[test]
-    fn noninteractive_init_requires_an_explicit_history_flag() {
+    fn noninteractive_init_keeps_history_by_default_when_available() {
         let dir = tempfile::tempdir().unwrap();
         let mut input = io::Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
-        let error = run_init_with_io(
+        run_init_with_io(
             dir.path(),
             false,
             HistoryPreference::Ask,
@@ -1575,11 +1611,106 @@ mod tests {
             &mut input,
             &mut output,
         )
+        .unwrap();
+        assert!(dir.path().join(".git").exists());
+        assert!(dir.path().join("CLAUDE.md").exists());
+        assert!(String::from_utf8(output).unwrap().contains(HISTORY_KEPT));
+    }
+
+    #[test]
+    fn unavailable_history_falls_back_unless_explicitly_required() {
+        let unavailable = || RepositoryState::Unavailable {
+            reason: "Git is not available on this machine".to_string(),
+        };
+
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        assert_eq!(
+            resolve_history_action(
+                unavailable(),
+                HistoryPreference::Ask,
+                false,
+                false,
+                &mut input,
+                &mut output,
+            )
+            .unwrap(),
+            HistoryAction::Decline
+        );
+        assert!(output.is_empty());
+
+        let mut input = io::Cursor::new(b"yes\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            resolve_history_action(
+                unavailable(),
+                HistoryPreference::Ask,
+                false,
+                true,
+                &mut input,
+                &mut output,
+            )
+            .unwrap(),
+            HistoryAction::Decline
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), HISTORY_OFFER);
+
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = resolve_history_action(
+            unavailable(),
+            HistoryPreference::WithHistory,
+            false,
+            false,
+            &mut input,
+            &mut output,
+        )
         .unwrap_err();
+        assert!(error.contains("Git is not available"));
+        assert!(error.contains("Install or repair Git"));
         assert!(error.contains("--with-history"));
         assert!(error.contains("--no-history"));
+
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        assert_eq!(
+            resolve_history_action(
+                unavailable(),
+                HistoryPreference::NoHistory,
+                false,
+                false,
+                &mut input,
+                &mut output,
+            )
+            .unwrap(),
+            HistoryAction::Decline
+        );
+    }
+
+    #[test]
+    fn interactive_accept_without_git_completes_with_journal_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = io::Cursor::new(b"\n");
+        let mut output = Vec::new();
+        run_init_with_history_state(
+            dir.path(),
+            false,
+            HistoryPreference::Ask,
+            true,
+            &mut input,
+            &mut output,
+            RepositoryState::Unavailable {
+                reason: "Git is not available on this machine".to_string(),
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with(HISTORY_OFFER));
+        assert!(output.contains(HISTORY_DECLINED));
+        assert!(output.contains("Initialization complete."));
         assert!(!dir.path().join(".git").exists());
-        assert!(!dir.path().join("CLAUDE.md").exists());
+        assert!(dir.path().join("CLAUDE.md").exists());
     }
 
     #[test]
@@ -1597,7 +1728,7 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Project history would be included."));
+        assert!(output.contains("Project history would be kept."));
         assert!(output.contains("Dry run complete. No changes made."));
         assert!(!output.contains(HISTORY_OFFER));
         assert!(!dir.path().join(".git").exists());
@@ -1614,12 +1745,9 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        let offer_line = output
-            .lines()
-            .find(|line| line.contains("Bring project history along?"))
-            .unwrap();
-        assert!(!offer_line.to_ascii_lowercase().contains("git"));
-        assert!(output.contains("choose --with-history or --no-history"));
+        assert!(output.contains("Project history would be kept."));
+        assert!(!output.contains(HISTORY_OFFER));
+        assert!(!output.contains("choose --with-history or --no-history"));
         assert!(!dir.path().join(".git").exists());
     }
 
