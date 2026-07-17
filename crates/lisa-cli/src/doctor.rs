@@ -573,6 +573,8 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     let validation = config::load_config(root)?;
     let resolved_config = config::resolve_config(&validation.config, None, None);
     let client = resolved_config.client;
+    let completion_seal =
+        crate::completion_seal::resolve_for_inspection(root, resolved_config.completion_mode);
 
     let checks = build_checks(client);
     let mut reports = vec![CheckReport {
@@ -592,6 +594,7 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
         output.push_str("\n\nChecking project...\n\n");
         output.push_str(&format!("{}\n", project_report));
     }
+    append_completion_seal_report(&mut output, completion_seal);
     reports.push(project_report);
 
     // Clean stale Zellij plugin cache
@@ -645,6 +648,12 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn append_completion_seal_report(output: &mut String, seal: lisa_core::completion::CompletionSeal) {
+    output.push_str("\n\nChecking completion...\n\n  ");
+    output.push_str(crate::completion_seal::visibility_line(seal));
+    output.push('\n');
 }
 
 #[cfg(test)]
@@ -962,6 +971,28 @@ mod tests {
         assert!(output.contains("claude"));
         assert!(output.contains("All dependencies satisfied."));
         assert!(!output.contains("missing"));
+    }
+
+    #[test]
+    fn doctor_completion_fixtures_show_both_plain_language_tiers() {
+        for (seal, expected) in [
+            (
+                lisa_core::completion::CompletionSeal::Commit,
+                "completion seal: commit-sealed — finished work lands as history",
+            ),
+            (
+                lisa_core::completion::CompletionSeal::Journal,
+                "completion seal: journal-only — finished work is recorded but not undoable",
+            ),
+        ] {
+            let mut output = String::new();
+            append_completion_seal_report(&mut output, seal);
+            assert!(output.contains(expected));
+        }
+
+        let mut journal = String::new();
+        append_completion_seal_report(&mut journal, lisa_core::completion::CompletionSeal::Journal);
+        assert!(!journal.to_ascii_lowercase().contains("git"));
     }
 
     #[test]

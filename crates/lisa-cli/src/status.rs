@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::config;
+use lisa_core::completion::CompletionSeal;
 use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
 use lisa_core::disposition::RemedyOwner;
 use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
@@ -32,6 +33,30 @@ fn print_waiting_on_you(remedies: &[ParkedRemedy]) {
     println!();
 }
 
+fn format_config_summary(resolved: &config::ResolvedConfig, seal: CompletionSeal) -> String {
+    let timeout_str = if resolved.session_timeout_secs == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{}s", resolved.session_timeout_secs)
+    };
+    let mut output = format!(
+        "Config: max_threads={}, session_timeout={}\n",
+        resolved.max_threads, timeout_str
+    );
+    if !resolved.phase_timeouts.is_empty() {
+        let mut entries: Vec<_> = resolved.phase_timeouts.iter().collect();
+        entries.sort_by_key(|(key, _)| (*key).clone());
+        let parts: Vec<String> = entries
+            .iter()
+            .map(|(key, value)| format!("{}={}s", key, value))
+            .collect();
+        output.push_str(&format!("  phase_timeouts: {}\n", parts.join(" ")));
+    }
+    output.push_str(crate::completion_seal::visibility_line(seal));
+    output.push('\n');
+    output
+}
+
 /// Run the status command: scan tickets, build DAG, print scheduling state.
 pub fn run_status(root: &Path) -> Result<(), String> {
     // Load config to get ticket directory and scheduling settings
@@ -41,6 +66,8 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     };
     let ticket_dir_rel = resolved.ticket_dir.clone();
     let work_dir_rel = resolved.work_dir.clone();
+    let completion_seal =
+        crate::completion_seal::resolve_for_inspection(root, resolved.completion_mode);
 
     let ticket_dir = root.join(&ticket_dir_rel);
     if !ticket_dir.exists() {
@@ -96,24 +123,7 @@ pub fn run_status(root: &Path) -> Result<(), String> {
         "Status: {} done, {} in progress, {} ready, {} blocked",
         stats.done_tickets, stats.in_progress_tickets, stats.ready_tickets, stats.blocked_tickets
     );
-    let timeout_str = if resolved.session_timeout_secs == 0 {
-        "disabled".to_string()
-    } else {
-        format!("{}s", resolved.session_timeout_secs)
-    };
-    println!(
-        "Config: max_threads={}, session_timeout={}",
-        resolved.max_threads, timeout_str
-    );
-    if !resolved.phase_timeouts.is_empty() {
-        let mut entries: Vec<_> = resolved.phase_timeouts.iter().collect();
-        entries.sort_by_key(|(k, _)| (*k).clone());
-        let parts: Vec<String> = entries
-            .iter()
-            .map(|(k, v)| format!("{}={}s", k, v))
-            .collect();
-        println!("  phase_timeouts: {}", parts.join(" "));
-    }
+    print!("{}", format_config_summary(&resolved, completion_seal));
     println!();
 
     // Print execution waves
@@ -210,6 +220,19 @@ mod tests {
 
         let result = run_status(dir.path());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn status_completion_fixtures_show_both_plain_language_tiers() {
+        let resolved = config::ResolvedConfig::default();
+        let commit = format_config_summary(&resolved, CompletionSeal::Commit);
+        assert!(commit.contains("completion seal: commit-sealed — finished work lands as history"));
+
+        let journal = format_config_summary(&resolved, CompletionSeal::Journal);
+        assert!(journal.contains(
+            "completion seal: journal-only — finished work is recorded but not undoable"
+        ));
+        assert!(!journal.to_ascii_lowercase().contains("git"));
     }
 
     #[test]

@@ -32,6 +32,33 @@ impl RunCompletionSeal {
     }
 }
 
+/// Resolve the completion tier shown by read-only state inspection commands.
+///
+/// Explicit modes are already tiers. Only `auto` needs the environment probe;
+/// if an unexpected resolution error occurs, inspection fails closed to the
+/// historical commit tier instead of weakening the displayed contract.
+pub(crate) fn resolve_for_inspection(
+    project_root: &Path,
+    mode: CompletionSealMode,
+) -> CompletionSeal {
+    if let Some(seal) = mode.explicit_seal() {
+        return seal;
+    }
+    resolve_for_run(project_root, mode)
+        .map(|resolved| resolved.seal())
+        .unwrap_or(CompletionSeal::Commit)
+}
+
+/// Stable plain-language description shared by doctor and status.
+pub(crate) const fn visibility_line(seal: CompletionSeal) -> &'static str {
+    match seal {
+        CompletionSeal::Commit => "completion seal: commit-sealed — finished work lands as history",
+        CompletionSeal::Journal => {
+            "completion seal: journal-only — finished work is recorded but not undoable"
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitProbeOutcome {
     support: CommitSealSupport,
@@ -270,5 +297,36 @@ mod tests {
         assert!(error.contains("[guards].completion = \"commit\""));
         assert!(error.contains("git config user.name \"You\""));
         assert!(error.contains("git config user.email you@example.com"));
+    }
+
+    #[test]
+    fn visibility_copy_is_exact_and_journal_copy_never_names_git() {
+        assert_eq!(
+            visibility_line(CompletionSeal::Commit),
+            "completion seal: commit-sealed — finished work lands as history"
+        );
+        let journal = visibility_line(CompletionSeal::Journal);
+        assert_eq!(
+            journal,
+            "completion seal: journal-only — finished work is recorded but not undoable"
+        );
+        assert!(!journal.to_ascii_lowercase().contains("git"));
+    }
+
+    #[test]
+    fn inspection_uses_explicit_tiers_without_requiring_a_repository() {
+        let missing = Path::new("/path/that/does/not/exist");
+        assert_eq!(
+            resolve_for_inspection(missing, CompletionSealMode::Commit),
+            CompletionSeal::Commit
+        );
+        assert_eq!(
+            resolve_for_inspection(missing, CompletionSealMode::Journal),
+            CompletionSeal::Journal
+        );
+        assert_eq!(
+            resolve_for_inspection(missing, CompletionSealMode::Auto),
+            CompletionSeal::Journal
+        );
     }
 }
