@@ -1,9 +1,9 @@
 //! Execution-provenance ledger: append-only JSONL learning data.
 //!
 //! The ledger contains terminal execution [`ProvenanceRecord`] rows,
-//! pre-ownership [`AssignmentTransitionRecord`] rows, and block retry/park/unpark
-//! [`ParkingTransitionRecord`] rows. Use [`ProvenanceLedgerRecord`] to read a
-//! ledger containing all three shapes. Terminal execution rows are written by
+//! pre-ownership [`AssignmentTransitionRecord`] rows, block retry/park/unpark
+//! [`ParkingTransitionRecord`] rows, and completion-note acknowledgments. Use
+//! [`ProvenanceLedgerRecord`] to read the mixed ledger. Terminal execution rows are written by
 //! the plugin *after* the attempt ends
 //! (write-after; they never race the agent and never touch the agent-owned
 //! ticket frontmatter — epic E-001 Decision 2). `.lisa/` gitignores only
@@ -32,13 +32,14 @@ use crate::client::AgentClient;
 use crate::completion::CompletionSeal;
 use crate::disposition::DispositionNote;
 use crate::disposition::RemedyOwner;
+use crate::notes::NoteAcknowledgmentRecord;
 use crate::triage::TriageProposal;
 use crate::types::AttemptLease;
 
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -288,6 +289,7 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProvenanceLedgerRecord {
+    NoteAcknowledgment(NoteAcknowledgmentRecord),
     AssignmentTransition(AssignmentTransitionRecord),
     ParkingTransition(ParkingTransitionRecord),
     TriageTransition(TriageTransitionRecord),
@@ -358,6 +360,14 @@ pub fn append_triage_transition_record(
 pub fn append_proposal_action_record(
     path: &Path,
     record: &ProposalActionRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+/// Append one exact completion-note acknowledgment as a single JSONL row.
+pub fn append_note_acknowledgment_record(
+    path: &Path,
+    record: &NoteAcknowledgmentRecord,
 ) -> std::io::Result<()> {
     append_serialized(path, record)
 }
@@ -478,7 +488,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":7"));
+        assert!(json.contains("\"schema_version\":8"));
         assert!(json.contains("\"seal\":\"commit\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
@@ -519,7 +529,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":7"));
+        assert!(json.contains("\"schema_version\":8"));
         assert!(json.contains("\"seal\":\"journal\""));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
@@ -559,7 +569,7 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
-            assert!(json.contains("\"schema_version\":7"));
+            assert!(json.contains("\"schema_version\":8"));
             assert!(json.contains("\"seal\":\"journal\""));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",

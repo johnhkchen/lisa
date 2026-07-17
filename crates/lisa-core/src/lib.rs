@@ -6,6 +6,7 @@ pub mod context;
 pub mod dag;
 pub mod diagnostics;
 pub mod disposition;
+pub mod notes;
 pub mod parking;
 pub mod provenance;
 pub mod route;
