@@ -22,6 +22,12 @@ for architecture in amd64 arm64; do
 done
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/lisa-apt-verification.XXXXXX")
+# mktemp creates 0700. On a Linux host that mode rides the bind mount into the
+# client container, where apt's sandboxed `_apt` user must traverse /fixture to
+# read the file: repository — 0700 denies it and `apt-get update` fails with
+# EACCES on the index fetch. (Docker Desktop on macOS remaps ownership, which
+# is why this only bites on Linux CI runners.)
+chmod 0755 "$work_dir"
 tool_container=
 client_container=
 cleanup() {
@@ -31,6 +37,11 @@ cleanup() {
     if [[ -n $tool_container ]]; then
         docker rm -f "$tool_container" >/dev/null 2>&1 || true
     fi
+    # Container-root-owned files inside the fixture are not removable by the
+    # host user on Linux; loosen them from inside a throwaway container first.
+    docker run --rm \
+        --mount "type=bind,source=$work_dir,target=/fixture" \
+        debian:bookworm-slim chmod -R a+rwX /fixture >/dev/null 2>&1 || true
     rm -rf "$work_dir"
 }
 trap cleanup EXIT
