@@ -9,6 +9,7 @@ mod doctor;
 mod hooks_guide;
 mod init;
 mod loop_cmd;
+mod notes;
 mod preownership_status;
 mod proposal;
 mod run_summary;
@@ -100,9 +101,22 @@ enum Commands {
         #[arg(long, requires = "ticket")]
         ledger: Option<PathBuf>,
     },
-    /// Verify what changed and let a waiting ticket run again.
+    /// Read or acknowledge updates from work that kept moving.
     #[command(
         display_order = 3,
+        after_help = "Examples:\n  lisa notes --path ./my-project\n  lisa notes ack T-001 --path ./my-project"
+    )]
+    Notes {
+        #[command(subcommand)]
+        action: Option<NotesCommands>,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".", global = true)]
+        path: PathBuf,
+    },
+    /// Verify what changed and let a waiting ticket run again.
+    #[command(
+        display_order = 4,
         after_help = "Example: lisa unblock T-001 --path ./my-project"
     )]
     Unblock {
@@ -114,7 +128,7 @@ enum Commands {
         path: PathBuf,
     },
     /// Settle a first-responder proposal for a waiting ticket.
-    #[command(display_order = 4)]
+    #[command(display_order = 6)]
     Proposal {
         #[command(subcommand)]
         action: ProposalCommands,
@@ -156,7 +170,7 @@ enum Commands {
     HooksGuide,
     /// Check that the tools Lisa needs are installed.
     #[command(
-        display_order = 4,
+        display_order = 5,
         after_help = "Example: lisa doctor --path ./my-project"
     )]
     Doctor {
@@ -297,7 +311,7 @@ enum Commands {
     },
     /// Start a run: work through the ready tickets, in parallel where they don't collide.
     #[command(
-        display_order = 5,
+        display_order = 7,
         after_help = "Example: lisa loop --path ./my-project --max-threads 3"
     )]
     Loop {
@@ -332,6 +346,15 @@ enum ProposalCommands {
         ticket_id: String,
         #[arg(long, default_value = ".")]
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotesCommands {
+    /// Mark one ticket's current note as read.
+    Ack {
+        /// Ticket whose note has been read
+        ticket_id: String,
     },
 }
 
@@ -526,6 +549,17 @@ fn main() {
             };
             if let Err(e) = result {
                 eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Notes { action, path } => {
+            let path = resolve_path(&path);
+            let result = match action {
+                None => notes::run_list(&path),
+                Some(NotesCommands::Ack { ticket_id }) => notes::run_ack(&path, &ticket_id),
+            };
+            if let Err(error) = result {
+                eprintln!("Error: {error}");
                 std::process::exit(1);
             }
         }

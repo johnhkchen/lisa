@@ -1,7 +1,7 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 15 of Lisa's own subcommands still resolve,
+//!   (a) all 16 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
 //!   (d) the five machinery-invoked plumbing commands stay outside the
@@ -14,9 +14,9 @@
 
 use std::process::{Command, Output};
 
-/// The six commands an operator runs, foregrounded in `--help`.
-const OPERATOR_COMMANDS: [&str; 7] = [
-    "init", "validate", "status", "unblock", "doctor", "proposal", "loop",
+/// The commands an operator runs, foregrounded in `--help`.
+const OPERATOR_COMMANDS: [&str; 8] = [
+    "init", "validate", "status", "notes", "unblock", "doctor", "proposal", "loop",
 ];
 
 /// The five machinery-invoked commands: omitted from Clap's generated list but
@@ -44,6 +44,7 @@ Commands:
   init      Set up a project to run with Lisa
   validate  Check your tickets and project setup for problems before a run
   status    Show which tickets are ready to run and which are waiting, and why
+  notes     Read or acknowledge updates from work that kept moving
   unblock   Verify what changed and let a waiting ticket run again
   doctor    Check that the tools Lisa needs are installed
   proposal  Settle a first-responder proposal for a waiting ticket
@@ -67,7 +68,7 @@ struct OperatorHelpSnapshot {
     expected: &'static str,
 }
 
-const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 7] = [
+const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 8] = [
     OperatorHelpSnapshot {
         command: "init",
         expected: r#"Set up a project to run with Lisa
@@ -111,6 +112,25 @@ Options:
   -h, --help             Print help
 
 Example: lisa status --path ./my-project
+"#,
+    },
+    OperatorHelpSnapshot {
+        command: "notes",
+        expected: r#"Read or acknowledge updates from work that kept moving
+
+Usage: lisa notes [OPTIONS] [COMMAND]
+
+Commands:
+  ack   Mark one ticket's current note as read
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --path <PATH>  Path to the project root (defaults to current directory) [default: .]
+  -h, --help         Print help
+
+Examples:
+  lisa notes --path ./my-project
+  lisa notes ack T-001 --path ./my-project
 "#,
     },
     OperatorHelpSnapshot {
@@ -176,10 +196,11 @@ Example: lisa loop --path ./my-project --max-threads 3
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 15] = [
+const OWN_COMMANDS: [&str; 16] = [
     "init",
     "validate",
     "status",
+    "notes",
     "unblock",
     "doctor",
     "proposal",
@@ -276,14 +297,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 15 own subcommands resolves — including the hidden
+/// (a) Every one of the 16 own subcommands resolves — including the hidden
 /// three, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_fifteen_subcommands_resolve() {
+fn all_sixteen_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        15,
-        "the pinned command set must be exactly 15"
+        16,
+        "the pinned command set must be exactly 16"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);

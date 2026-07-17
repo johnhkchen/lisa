@@ -4,6 +4,7 @@ use crate::config;
 use lisa_core::completion::CompletionSeal;
 use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
 use lisa_core::disposition::RemedyOwner;
+use lisa_core::notes::collect_notes;
 use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
 
 fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
@@ -131,6 +132,11 @@ pub fn run_status(root: &Path) -> Result<(), String> {
 
     let parked_remedies = collect_parked_remedies(tickets.iter(), &root.join(&work_dir_rel));
     print_waiting_on_you(&parked_remedies);
+    let notes = collect_notes(
+        &root.join(".lisa/completion-journal.jsonl"),
+        &root.join(".lisa/provenance.jsonl"),
+    )?;
+    crate::notes::print_notes(&notes);
 
     // Print summary header
     let stats = dag.stats();
