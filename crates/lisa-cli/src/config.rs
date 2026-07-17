@@ -8,8 +8,173 @@ use lisa_core::types::PluginConfig;
 
 use crate::runtime::ZellijRuntimeRequest;
 
+/// One operator-facing `.lisa.toml` setting.
+///
+/// This catalog is the shared source for validation, inert init stubs, and
+/// operator documentation. `default` is a valid TOML right-hand side so a stub
+/// can be enabled by removing its comment marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConfigKey {
+    pub path: &'static str,
+    pub section: &'static str,
+    pub key: &'static str,
+    pub default: &'static str,
+    pub description: &'static str,
+}
+
+impl ConfigKey {
+    /// Render an inert, directly enableable assignment with its purpose.
+    pub(crate) fn commented_stub(self) -> String {
+        format!("# {}\n# {} = {}", self.description, self.key, self.default)
+    }
+}
+
+/// Every fixed key parsed from `.lisa.toml`, in operator-facing render order.
+///
+/// Map children under `phase_timeouts` and `provider_caps` are not fixed config
+/// keys: their parent maps are cataloged here and their allowed child names are
+/// validated separately.
+pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey {
+        path: "version",
+        section: "",
+        key: "version",
+        default: concat!("\"", env!("CARGO_PKG_VERSION"), "\""),
+        description: "Tracks the Lisa version used to set up this project.",
+    },
+    ConfigKey {
+        path: "dirs.tickets",
+        section: "dirs",
+        key: "tickets",
+        default: "\"docs/active/tickets\"",
+        description: "Chooses where Lisa reads ticket files.",
+    },
+    ConfigKey {
+        path: "dirs.stories",
+        section: "dirs",
+        key: "stories",
+        default: "\"docs/active/stories\"",
+        description: "Chooses where Lisa reads story files.",
+    },
+    ConfigKey {
+        path: "dirs.work",
+        section: "dirs",
+        key: "work",
+        default: "\"docs/active/work\"",
+        description: "Chooses where Lisa keeps work records.",
+    },
+    ConfigKey {
+        path: "runtime.zellij",
+        section: "runtime",
+        key: "zellij",
+        default: "\"managed\"",
+        description: "Chooses how Lisa starts Zellij.",
+    },
+    ConfigKey {
+        path: "agent.client",
+        section: "agent",
+        key: "client",
+        default: "\"claude\"",
+        description: "Chooses which coding agent Lisa drives.",
+    },
+    ConfigKey {
+        path: "guards.completion",
+        section: "guards",
+        key: "completion",
+        default: "\"auto\"",
+        description:
+            "Controls how finished work is sealed. auto picks the strongest your project supports.",
+    },
+    ConfigKey {
+        path: "triage.enabled",
+        section: "triage",
+        key: "enabled",
+        default: "true",
+        description: "Lets Lisa inspect work that needs you before asking for help.",
+    },
+    ConfigKey {
+        path: "triage.timeout_secs",
+        section: "triage",
+        key: "timeout_secs",
+        default: "120",
+        description: "Limits how long Lisa can inspect work that needs you.",
+    },
+    ConfigKey {
+        path: "scheduling.max_threads",
+        section: "scheduling",
+        key: "max_threads",
+        default: "2",
+        description: "Limits how many coding agents can work at once.",
+    },
+    ConfigKey {
+        path: "scheduling.auto_advance",
+        section: "scheduling",
+        key: "auto_advance",
+        default: "false",
+        description: "Lets Lisa move reviewed work forward without waiting for approval.",
+    },
+    ConfigKey {
+        path: "scheduling.review_timeout_secs",
+        section: "scheduling",
+        key: "review_timeout_secs",
+        default: "600",
+        description: "Limits how long Lisa waits for review to finish.",
+    },
+    ConfigKey {
+        path: "scheduling.session_timeout_secs",
+        section: "scheduling",
+        key: "session_timeout_secs",
+        default: "3600",
+        description: "Limits how long one coding-agent session can run.",
+    },
+    ConfigKey {
+        path: "scheduling.wind_down_secs",
+        section: "scheduling",
+        key: "wind_down_secs",
+        default: "300",
+        description: "Sets aside time for an agent to wrap up before its session ends.",
+    },
+    ConfigKey {
+        path: "scheduling.assignment_ack_timeout_secs",
+        section: "scheduling",
+        key: "assignment_ack_timeout_secs",
+        default: "30",
+        description: "Limits how long Lisa waits for an agent to accept assigned work.",
+    },
+    ConfigKey {
+        path: "scheduling.phase_timeouts",
+        section: "scheduling",
+        key: "phase_timeouts",
+        default: "{}",
+        description: "Limits how long each kind of work can run.",
+    },
+    ConfigKey {
+        path: "scheduling.provider_caps",
+        section: "scheduling",
+        key: "provider_caps",
+        default: "{}",
+        description: "Limits how many agents of each kind can work at once.",
+    },
+];
+
+pub(crate) fn config_key(path: &str) -> Option<&'static ConfigKey> {
+    CONFIG_KEYS.iter().find(|entry| entry.path == path)
+}
+
+fn is_known_top_level(key: &str) -> bool {
+    CONFIG_KEYS
+        .iter()
+        .any(|entry| entry.path == key || entry.section == key)
+}
+
+fn is_known_section_key(section: &str, key: &str) -> bool {
+    CONFIG_KEYS
+        .iter()
+        .any(|entry| entry.section == section && entry.key == key)
+}
+
 /// Top-level .lisa.toml structure.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct LisaConfig {
     pub version: Option<String>,
     #[serde(default)]
@@ -26,7 +191,7 @@ pub struct LisaConfig {
     pub triage: TriageConfig,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct TriageConfig {
     pub enabled: Option<bool>,
     pub timeout_secs: Option<u64>,
@@ -36,13 +201,13 @@ pub struct TriageConfig {
 ///
 /// Kept raw so invalid values surface through the same actionable semantic
 /// validation path as `[agent].client`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct GuardsConfig {
     pub completion: Option<String>,
 }
 
 /// Zellij runtime selection (`[runtime]`).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct RuntimeConfig {
     /// `managed` (default), `system`, or an absolute executable path.
     pub zellij: Option<String>,
@@ -53,13 +218,13 @@ pub struct RuntimeConfig {
 /// `client` is kept a raw `String` here so an invalid value surfaces as an
 /// actionable *validation* error (via [`validate_config`] / [`AgentClient::parse`])
 /// rather than a raw serde deserialize failure.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct AgentConfig {
     pub client: Option<String>,
 }
 
 /// Directory configuration section.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DirsConfig {
     pub tickets: Option<String>,
     pub stories: Option<String>,
@@ -67,7 +232,7 @@ pub struct DirsConfig {
 }
 
 /// Scheduling configuration section.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SchedulingConfig {
     pub max_threads: Option<usize>,
     pub auto_advance: Option<bool>,
@@ -244,31 +409,6 @@ pub struct ConfigValidation {
 /// Returns the parsed config plus any warnings about unknown keys.
 /// Returns `Err` for parse failures or invalid values (e.g. max_threads = 0).
 pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
-    let known_top = &[
-        "version",
-        "dirs",
-        "scheduling",
-        "agent",
-        "runtime",
-        "guards",
-        "triage",
-    ];
-    let known_dirs = &["tickets", "stories", "work"];
-    let known_agent = &["client"];
-    let known_runtime = &["zellij"];
-    let known_guards = &["completion"];
-    let known_triage = &["enabled", "timeout_secs"];
-    let known_scheduling = &[
-        "max_threads",
-        "auto_advance",
-        "review_timeout_secs",
-        "session_timeout_secs",
-        "wind_down_secs",
-        "assignment_ack_timeout_secs",
-        "phase_timeouts",
-        "provider_caps",
-    ];
-
     // Parse as generic Value to detect unknown keys
     let value: toml::Value = content
         .parse()
@@ -278,14 +418,14 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
 
     if let Some(table) = value.as_table() {
         for key in table.keys() {
-            if !known_top.contains(&key.as_str()) {
+            if !is_known_top_level(key) {
                 warnings.push(format!("Unknown config section: [{}]", key));
             }
         }
 
         if let Some(toml::Value::Table(dirs)) = table.get("dirs") {
             for key in dirs.keys() {
-                if !known_dirs.contains(&key.as_str()) {
+                if !is_known_section_key("dirs", key) {
                     warnings.push(format!("Unknown key in [dirs]: {}", key));
                 }
             }
@@ -293,7 +433,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
 
         if let Some(toml::Value::Table(agent)) = table.get("agent") {
             for key in agent.keys() {
-                if !known_agent.contains(&key.as_str()) {
+                if !is_known_section_key("agent", key) {
                     warnings.push(format!("Unknown key in [agent]: {}", key));
                 }
             }
@@ -301,7 +441,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
 
         if let Some(toml::Value::Table(runtime)) = table.get("runtime") {
             for key in runtime.keys() {
-                if !known_runtime.contains(&key.as_str()) {
+                if !is_known_section_key("runtime", key) {
                     warnings.push(format!("Unknown key in [runtime]: {}", key));
                 }
             }
@@ -309,7 +449,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
 
         if let Some(toml::Value::Table(guards)) = table.get("guards") {
             for key in guards.keys() {
-                if !known_guards.contains(&key.as_str()) {
+                if !is_known_section_key("guards", key) {
                     warnings.push(format!("Unknown key in [guards]: {}", key));
                 }
             }
@@ -317,7 +457,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
 
         if let Some(toml::Value::Table(triage)) = table.get("triage") {
             for key in triage.keys() {
-                if !known_triage.contains(&key.as_str()) {
+                if !is_known_section_key("triage", key) {
                     warnings.push(format!("Unknown key in [triage]: {}", key));
                 }
             }
@@ -325,7 +465,7 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
 
         if let Some(toml::Value::Table(sched)) = table.get("scheduling") {
             for key in sched.keys() {
-                if !known_scheduling.contains(&key.as_str()) {
+                if !is_known_section_key("scheduling", key) {
                     warnings.push(format!("Unknown key in [scheduling]: {}", key));
                 }
             }
@@ -476,62 +616,249 @@ pub fn version_is_stale(project_version: &str, current_version: &str) -> bool {
 
 /// Returns the default .lisa.toml content for `lisa init`.
 pub fn default_config_toml() -> String {
+    let key = |path| config_key(path).expect("every rendered config key must be cataloged");
+
     format!(
         r#"# Lisa project configuration
-version = "{}"
+# {}
+version = {}
 
-[dirs]"#,
-        LISA_VERSION,
-    ) + r#"
-tickets = "docs/active/tickets"
-stories = "docs/active/stories"
-work = "docs/active/work"
+[dirs]
+# {}
+tickets = {}
+# {}
+stories = {}
+# {}
+work = {}
 
 [runtime]
-# Zellij runtime: "managed" (default), "system" (PATH), or an absolute path.
-# zellij = "managed"
-# zellij = "system"
-# zellij = "/opt/zellij/bin/zellij"
+{}
 
 [agent]
-# Which agent client the loop drives (default: claude). Set to "codex" to run
-# the Codex client; `lisa doctor` then checks the codex binary + directory trust.
-# client = "claude"
+{}
 
 [guards]
-# Completion guard: "auto" (strongest available), "commit", or "journal".
-# completion = "auto"
+{}
 
 [triage]
-# Give operator-owned parks one bounded, read-only first-responder pass.
-# enabled = true
-# timeout_secs = 120
+{}
+{}
 
 [scheduling]
-max_threads = 2
-# auto_advance = false
-# review_timeout_secs = 600
-# session_timeout_secs = 3600
-# wind_down_secs = 300
-# assignment_ack_timeout_secs = 30
-
-# [scheduling.phase_timeouts]
-# research = 300
-# design = 300
-# implement = 1800
-
-# Optional per-provider concurrency sub-caps (within the global max_threads
-# ceiling). Useful when mixing providers so one provider's rate-limit pool
-# isn't saturated. Omit for a single global cap.
-# [scheduling.provider_caps]
-# claude = 8
-# codex = 8
-"#
+# {}
+max_threads = {}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+"#,
+        key("version").description,
+        key("version").default,
+        key("dirs.tickets").description,
+        key("dirs.tickets").default,
+        key("dirs.stories").description,
+        key("dirs.stories").default,
+        key("dirs.work").description,
+        key("dirs.work").default,
+        key("runtime.zellij").commented_stub(),
+        key("agent.client").commented_stub(),
+        key("guards.completion").commented_stub(),
+        key("triage.enabled").commented_stub(),
+        key("triage.timeout_secs").commented_stub(),
+        key("scheduling.max_threads").description,
+        key("scheduling.max_threads").default,
+        key("scheduling.auto_advance").commented_stub(),
+        key("scheduling.review_timeout_secs").commented_stub(),
+        key("scheduling.session_timeout_secs").commented_stub(),
+        key("scheduling.wind_down_secs").commented_stub(),
+        key("scheduling.assignment_ack_timeout_secs").commented_stub(),
+        key("scheduling.phase_timeouts").commented_stub(),
+        key("scheduling.provider_caps").commented_stub(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    const COMPLETE_CONFIG_FIXTURE: &str = r#"version = "0.4.4"
+
+[dirs]
+tickets = "tickets"
+stories = "stories"
+work = "work"
+
+[runtime]
+zellij = "managed"
+
+[agent]
+client = "codex"
+
+[guards]
+completion = "journal"
+
+[triage]
+enabled = false
+timeout_secs = 9
+
+[scheduling]
+max_threads = 3
+auto_advance = true
+review_timeout_secs = 10
+session_timeout_secs = 20
+wind_down_secs = 5
+assignment_ack_timeout_secs = 2
+phase_timeouts = {}
+provider_caps = {}
+"#;
+
+    fn parsed_fixed_paths(content: &str) -> BTreeSet<String> {
+        let value: toml::Value = content.parse().unwrap();
+        let root = value.as_table().unwrap();
+        let mut paths = BTreeSet::new();
+
+        for (top_level, value) in root {
+            if top_level == "version" {
+                paths.insert(top_level.clone());
+                continue;
+            }
+
+            let section = value
+                .as_table()
+                .unwrap_or_else(|| panic!("[{top_level}] must be a table in the complete fixture"));
+            for key in section.keys() {
+                paths.insert(format!("{top_level}.{key}"));
+            }
+        }
+
+        paths
+    }
+
+    #[test]
+    fn config_catalog_covers_every_parsed_key_exactly_once() {
+        validate_config(COMPLETE_CONFIG_FIXTURE).unwrap();
+
+        let parsed = parsed_fixed_paths(COMPLETE_CONFIG_FIXTURE);
+        let catalog: BTreeSet<String> = CONFIG_KEYS
+            .iter()
+            .map(|entry| entry.path.to_string())
+            .collect();
+
+        assert_eq!(
+            catalog.len(),
+            CONFIG_KEYS.len(),
+            "config catalog contains a duplicate dotted path"
+        );
+        assert_eq!(
+            catalog, parsed,
+            "config catalog and the complete parsed-key fixture differ"
+        );
+
+        let section_keys: BTreeSet<(&str, &str)> = CONFIG_KEYS
+            .iter()
+            .map(|entry| (entry.section, entry.key))
+            .collect();
+        assert_eq!(
+            section_keys.len(),
+            CONFIG_KEYS.len(),
+            "config catalog contains a duplicate section/key pair"
+        );
+    }
+
+    #[test]
+    fn config_catalog_defaults_are_valid_toml() {
+        for entry in CONFIG_KEYS {
+            let assignment = if entry.section.is_empty() {
+                format!("{} = {}\n", entry.key, entry.default)
+            } else {
+                format!("[{}]\n{} = {}\n", entry.section, entry.key, entry.default)
+            };
+            assignment.parse::<toml::Value>().unwrap_or_else(|error| {
+                panic!(
+                    "{} has invalid TOML default {:?}: {error}",
+                    entry.path, entry.default
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn config_catalog_descriptions_pass_brand_voice_checks() {
+        const DIRECT_VERBS: &[&str] = &[
+            "Tracks ",
+            "Chooses ",
+            "Controls ",
+            "Lets ",
+            "Limits ",
+            "Sets ",
+        ];
+        const BANNED: &[&str] = &[
+            "dag",
+            "orchestrat",
+            "scheduling",
+            "leverage",
+            "solutions",
+            "deployment",
+            "case study",
+            "build log",
+            "research release",
+        ];
+
+        for entry in CONFIG_KEYS {
+            assert!(
+                !entry.description.contains(['\n', '\r']),
+                "{} description must stay on one line: {:?}",
+                entry.path,
+                entry.description
+            );
+            assert!(
+                entry.description.ends_with('.'),
+                "{} description must be a complete sentence: {:?}",
+                entry.path,
+                entry.description
+            );
+            assert!(
+                DIRECT_VERBS
+                    .iter()
+                    .any(|verb| entry.description.starts_with(verb)),
+                "{} description must lead with a direct verb: {:?}",
+                entry.path,
+                entry.description
+            );
+
+            let lower = entry.description.to_ascii_lowercase();
+            for banned in BANNED {
+                assert!(
+                    !lower.contains(banned),
+                    "{} description contains banned voice term {banned:?}: {:?}",
+                    entry.path,
+                    entry.description
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_config_renders_every_catalog_description_and_default() {
+        let rendered = default_config_toml();
+
+        for entry in CONFIG_KEYS {
+            assert!(
+                rendered.contains(entry.description),
+                "fresh config is missing the {} description",
+                entry.path
+            );
+            assert!(
+                rendered.contains(&format!("{} = {}", entry.key, entry.default)),
+                "fresh config is missing the {} default",
+                entry.path
+            );
+        }
+    }
 
     #[test]
     fn test_parse_full_config() {

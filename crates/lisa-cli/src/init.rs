@@ -177,34 +177,48 @@ fn upsert_missing_config_keys(existing: &str) -> String {
         out
     };
 
-    // [scheduling] keys to upsert
-    let scheduling_keys: &[(&str, &str)] = &[
-        ("auto_advance", "# auto_advance = false"),
-        ("review_timeout_secs", "# review_timeout_secs = 600"),
-        ("session_timeout_secs", "# session_timeout_secs = 3600"),
-        ("wind_down_secs", "# wind_down_secs = 300"),
-        (
-            "assignment_ack_timeout_secs",
-            "# assignment_ack_timeout_secs = 30",
-        ),
-    ];
-
-    for (key, commented_line) in scheduling_keys {
-        if !has_key(&result, "scheduling", key) {
+    // Every fixed [scheduling] key comes from the shared config catalog. Active
+    // and commented assignments both count as present, so customized values
+    // and earlier stubs remain byte-for-byte untouched.
+    for entry in config::CONFIG_KEYS
+        .iter()
+        .filter(|entry| entry.section == "scheduling")
+    {
+        if !has_key(&result, entry.section, entry.key) {
             if let Some(end) = find_section_end(&result, "scheduling") {
-                result = insert_after(&result, end, &format!("{}\n", commented_line));
+                result = insert_after(&result, end, &format!("{}\n", entry.commented_stub()));
             }
         }
     }
 
-    // [scheduling.phase_timeouts] section
-    if !has_section(&result, "scheduling.phase_timeouts") {
-        let phase_block = "\n# [scheduling.phase_timeouts]\n# research = 300\n# design = 300\n# implement = 1800\n";
-        if let Some(end) = find_section_end(&result, "scheduling") {
-            result = insert_after(&result, end, phase_block);
-        } else {
-            // No scheduling section at all — append
-            result.push_str(phase_block);
+    // Append a complete inert block without trimming or normalizing any byte
+    // that was already in the user's file.
+    let append_commented_section = |content: &str, section: &str| -> String {
+        let mut out = content.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+
+        out.push_str(&format!("# [{section}]\n"));
+        for entry in config::CONFIG_KEYS
+            .iter()
+            .filter(|entry| entry.section == section)
+        {
+            out.push_str(&entry.commented_stub());
+            out.push('\n');
+        }
+        out
+    };
+
+    // These sections were added after the earliest Lisa project templates.
+    // Only a genuinely absent section is appended; a user's active or
+    // commented section is complete ownership evidence and is never repaired.
+    for section in ["agent", "guards", "triage"] {
+        if !has_section(&result, section) {
+            result = append_commented_section(&result, section);
         }
     }
 
@@ -2608,15 +2622,13 @@ depends_on: [T-999]
     #[test]
     fn test_plan_init_upserts_missing_config_keys() {
         let dir = tempfile::tempdir().unwrap();
-        // Current version but missing new keys
-        fs::write(
-            dir.path().join(".lisa.toml"),
-            format!(
-                "version = \"{}\"\n\n[scheduling]\nmax_threads = 4\n",
-                config::LISA_VERSION
-            ),
-        )
-        .unwrap();
+        let existing = format!(
+            "# Keep this project note exactly here.\nversion = \"{}\"\n\n\
+[dirs]\ntickets = \"custom/tickets\"\nstories = \"custom/stories\"\nwork = \"custom/work\"\n\n\
+[scheduling]\n# Keep this timeout.\nmax_threads = 4\nsession_timeout_secs = 900",
+            config::LISA_VERSION
+        );
+        fs::write(dir.path().join(".lisa.toml"), &existing).unwrap();
 
         let project = detect_project(dir.path());
         let actions = plan_init_actions(dir.path(), &project);
@@ -2629,15 +2641,89 @@ depends_on: [T-999]
             .collect();
         assert_eq!(updated.len(), 1, "should update to add missing keys");
 
-        // Verify the content has the new keys
         if let InitAction::UpdateFile { content, .. } = &updated[0] {
-            assert!(content.contains("session_timeout_secs"));
-            assert!(content.contains("phase_timeouts"));
-            assert!(content.contains("review_timeout_secs"));
-            assert!(content.contains("assignment_ack_timeout_secs"));
-            // Original content preserved
-            assert!(content.contains("max_threads = 4"));
+            assert!(
+                content.starts_with(&existing),
+                "every legacy byte must remain an exact prefix"
+            );
+            assert_eq!(content.matches("session_timeout_secs").count(), 1);
+            assert_eq!(
+                content
+                    .matches("# Keep this project note exactly here.")
+                    .count(),
+                1
+            );
+            assert_eq!(content.matches("# Keep this timeout.").count(), 1);
+
+            for section in ["agent", "guards", "triage"] {
+                assert_eq!(
+                    content.matches(&format!("# [{section}]")).count(),
+                    1,
+                    "missing section {section} must be appended once"
+                );
+                for entry in config::CONFIG_KEYS
+                    .iter()
+                    .filter(|entry| entry.section == section)
+                {
+                    assert!(
+                        content.contains(&entry.commented_stub()),
+                        "missing appended stub for {}",
+                        entry.path
+                    );
+                }
+            }
+
+            for entry in config::CONFIG_KEYS
+                .iter()
+                .filter(|entry| entry.section == "scheduling")
+            {
+                assert!(
+                    content.contains(&format!("{} = ", entry.key)),
+                    "missing scheduling setting {}",
+                    entry.path
+                );
+            }
+
+            let before: config::LisaConfig = toml::from_str(&existing).unwrap();
+            let after: config::LisaConfig = toml::from_str(content).unwrap();
+            assert_eq!(
+                after, before,
+                "commented stubs must not change parsed configuration"
+            );
+            assert_eq!(
+                upsert_missing_config_keys(content),
+                *content,
+                "a second upsert must be byte-identical"
+            );
         }
+    }
+
+    #[test]
+    fn test_upsert_preserves_custom_values_comments_and_current_order() {
+        let customized = config::default_config_toml()
+            .replace(
+                "[agent]\n",
+                "[agent]\n# Keep Codex selected for this project.\n",
+            )
+            .replace("# client = \"claude\"", "client = \"codex\"")
+            .replace("# completion = \"auto\"", "completion = \"journal\"")
+            .replace("# enabled = true", "enabled = false")
+            .replace("# timeout_secs = 120", "timeout_secs = 45")
+            .replace("max_threads = 2", "max_threads = 7");
+
+        let result = upsert_missing_config_keys(&customized);
+        assert_eq!(
+            result, customized,
+            "a customized current file must remain byte-identical"
+        );
+        assert_eq!(result.matches("client = \"codex\"").count(), 1);
+        assert_eq!(result.matches("completion = \"journal\"").count(), 1);
+        assert_eq!(
+            result
+                .matches("# Keep Codex selected for this project.")
+                .count(),
+            1
+        );
     }
 
     #[test]
