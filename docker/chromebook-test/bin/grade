@@ -57,7 +57,15 @@ bash -lc 'lisa loop --dry-run' >/dev/null 2>&1 && dry_rc=0
 
 say "== bounds"
 [ "$wall" -le 600 ] && note "wall ${wall}s (<=600)" || failhard "wall ${wall}s exceeds 600s"
-[ "$disk_mib" -le 200 ] && note "disk ${disk_mib}MiB (<=200)" || failhard "disk ${disk_mib}MiB exceeds 200MiB"
+# 300MiB calibrated from real legs (2026-07-16): lisa's own stack is ~42MiB;
+# the rest is the agent CLI's session logs (~50MiB), git's dependency
+# closure (~110MiB — doctor's sanctioned remedy), and apt indexes (~20MiB).
+# The bound exists to catch compile spirals, which start at ~700MiB.
+[ "$disk_mib" -le 300 ] && note "disk ${disk_mib}MiB (<=300)" || failhard "disk ${disk_mib}MiB exceeds 300MiB"
+lisa_stack=$(du -sm "$HOME/.local/share/lisa" "$HOME/.local/bin" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+agent_logs=$(du -sm "$HOME/.codex" "$HOME/.claude" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+apt_lists=$(du -sm /var/lib/apt/lists 2>/dev/null | awk '{print $1+0}')
+note "composition: lisa stack ${lisa_stack}MiB, agent session logs ${agent_logs}MiB, apt indexes ${apt_lists}MiB"
 
 say "== negatives (success by heroics is a fail)"
 for b in rustc cargo rustup xz gcc cc g++ make; do
@@ -84,6 +92,7 @@ fi
     sed 's/^/- /' /tmp/leg-meta 2>/dev/null
     echo "- outcome: $overall"
     echo "- wall clock: ${wall}s   disk delta: ${disk_mib} MiB (${disk} bytes)"
+    echo "- disk composition: lisa stack ${lisa_stack:-?}MiB, agent session logs ${agent_logs:-?}MiB, apt indexes ${apt_lists:-?}MiB"
     echo "- positives: PATH ${lisa_path:-MISSING}, doctor $doctor_rc, init $init_rc, validate $validate_rc, dry-run $dry_rc"
     echo "- doctor zellij line: $zellij_line"
     echo "- apt actions:"

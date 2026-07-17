@@ -446,7 +446,7 @@ awk -v bytes="$disk_bytes" 'BEGIN { printf "disk MiB: %.2f\n", bytes / 1048576 }
 Pass thresholds:
 
 - instruction to doctor-green at most 10 minutes (hard stop at 20 minutes);
-- disk delta approximately 200 MiB or less;
+- disk delta 300 MiB or less, composition recorded (lisa's own stack is expected under ~60 MiB; agent-CLI session logs, git's dependency closure, and apt indexes account for the rest — a compile spiral starts at ~700 MiB and trips the bound regardless);
 - all positive exits zero; and
 - no negative condition or source-build path.
 
