@@ -7,19 +7,22 @@ set -eu
 PIN=""
 SEED_OLD_ZELLIJ=0
 XDG_SEED=0
+NO_GIT=0
 INSTR=A
 while [ $# -gt 0 ]; do
     case "$1" in
         --pin) PIN=$2; shift 2 ;;
         --seed-old-zellij) SEED_OLD_ZELLIJ=1; shift ;;
         --xdg-cache) XDG_SEED=1; shift ;;
+        --no-git) NO_GIT=1; shift ;;
         --discovery) INSTR=B; shift ;;
         *)
-            echo "usage: /cbt/prepare [--pin SHA] [--seed-old-zellij] [--xdg-cache] [--discovery]"
+            echo "usage: /cbt/prepare [--pin SHA] [--seed-old-zellij] [--xdg-cache] [--no-git] [--discovery]"
             echo "  no flags      closing-run leg: live README, instruction A"
             echo "  --pin SHA     baseline-style leg against a pinned README"
             echo "  --seed-old-zellij   place Zellij 0.40.1 in ~/.local/bin first"
             echo "  --xdg-cache   set XDG_CACHE_HOME for the agent session"
+            echo "  --no-git      finish T-NOGIT-001 in a bare folder with journal sealing"
             echo "  --discovery   instruction B (no README handed over)"
             exit 2 ;;
     esac
@@ -35,7 +38,50 @@ awk '/^## Install( Lisa)?$/{f=1} f&&/^## /&&!/^## Install( Lisa)?$/{exit} f{prin
     exit 1
 }
 
-if [ "$INSTR" = A ]; then
+if [ "$NO_GIT" = 1 ]; then
+    if command -v git >/dev/null 2>&1; then
+        echo "FAIL: --no-git requires git to be absent before the measured leg" >&2
+        exit 1
+    fi
+    project="$HOME/no-git-demo"
+    if [ -e "$project" ]; then
+        echo "FAIL: refusing to replace existing no-git fixture: $project" >&2
+        exit 1
+    fi
+    mkdir -p "$project/docs/active/tickets"
+    cat > "$project/docs/active/tickets/T-NOGIT-001.md" <<'EOF'
+---
+id: T-NOGIT-001
+title: record-journal-only-proof
+type: task
+status: open
+priority: medium
+phase: ready
+depends_on: []
+---
+
+## Context
+
+Exercise Lisa's phase and completion protocol without project history.
+This is an evidence-only task: create the required RDSPI phase artifacts, but do
+not create or modify project source files.
+
+## Acceptance Criteria
+
+- [ ] Review records that the evidence-only workflow is ready for journal sealing.
+- [ ] No project source file is created or modified.
+EOF
+    [ ! -e "$project/.git" ] || {
+        echo "FAIL: no-git fixture unexpectedly contains .git" >&2
+        exit 1
+    }
+    {
+        echo "Here are the install instructions from lisa's README:"
+        cat /tmp/install-section.md
+        printf '%s\n' \
+            'Please install lisa on this machine. Do not install Git. Then use the prepared empty-history project at `~/no-git-demo`: run `lisa init --no-history`, set `[agent] client` in `.lisa.toml` to the CLI running this instruction (`claude` for a Claude leg or `codex` for a Codex leg), and run `lisa loop` until `T-NOGIT-001` is Done. The ticket is evidence-only, so do not add or modify project source files. When you are done, `lisa doctor` run from `~/no-git-demo` should pass.'
+    } > /tmp/instruction.txt
+elif [ "$INSTR" = A ]; then
     {
         echo "Here are the install instructions from lisa's README:"
         cat /tmp/install-section.md
@@ -71,6 +117,7 @@ df -B1 --output=used / | tail -1 > /tmp/disk.before
     echo "instruction: $INSTR"
     echo "seed_old_zellij: $SEED_OLD_ZELLIJ"
     echo "xdg_cache_seed: $XDG_SEED"
+    echo "no_git: $NO_GIT"
 } > /tmp/leg-meta
 
 echo "READY. Next: /cbt/run claude|codex [model] — then hands off until it exits."

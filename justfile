@@ -155,6 +155,17 @@ cbt-collect CONTAINER:
     for f in run-record.md leg-meta instruction.txt install-section.md; do
         docker cp "{{CONTAINER}}:/tmp/$f" "$dest/" 2>/dev/null || true
     done
+    if docker exec "{{CONTAINER}}" test -f /home/tester/no-git-demo/.lisa/completion-journal.jsonl; then
+        mkdir -p "$dest/no-git-demo/.lisa" \
+            "$dest/no-git-demo/docs/active/tickets" \
+            "$dest/no-git-demo/docs/active/work"
+        docker cp "{{CONTAINER}}:/home/tester/no-git-demo/.lisa/completion-journal.jsonl" \
+            "$dest/no-git-demo/.lisa/completion-journal.jsonl"
+        docker cp "{{CONTAINER}}:/home/tester/no-git-demo/docs/active/tickets/T-NOGIT-001.md" \
+            "$dest/no-git-demo/docs/active/tickets/T-NOGIT-001.md"
+        docker cp "{{CONTAINER}}:/home/tester/no-git-demo/docs/active/work/T-NOGIT-001" \
+            "$dest/no-git-demo/docs/active/work/"
+    fi
     docker cp "{{CONTAINER}}:/home/tester/lisa-tour.html" "$dest/" 2>/dev/null || true
     docker diff "{{CONTAINER}}" 2>/dev/null | head -100 > "$dest/docker-diff.txt" || true
     echo "collected into $dest:"

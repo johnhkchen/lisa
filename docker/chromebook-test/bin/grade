@@ -19,24 +19,47 @@ before_d=$(cat /tmp/disk.before 2>/dev/null || echo 0)
 after_d=$(cat /tmp/disk.after)
 disk=$((after_d - before_d))
 disk_mib=$((disk / 1048576))
+no_git=0
+grep -q '^no_git: 1$' /tmp/leg-meta 2>/dev/null && no_git=1
+project_root="$HOME/demo"
+wall_limit=600
+if [ "$no_git" = 1 ]; then
+    project_root="$HOME/no-git-demo"
+    wall_limit=1200
+fi
+doctor_seal_line="(no completion-seal line)"
+journal_verify="(not a no-git leg)"
+journal_rc=0
 
 say "== positives"
 lisa_path=$(bash -lc 'command -v lisa' 2>/dev/null || true)
 if [ -n "$lisa_path" ]; then note "PATH: $lisa_path"; else failhard "lisa not on login PATH"; fi
 
-doctor_out=$(bash -lc 'lisa doctor' 2>&1); doctor_rc=$?
+if [ "$no_git" = 1 ]; then
+    doctor_out=$(cd "$project_root" 2>/dev/null && bash -lc 'lisa doctor' 2>&1); doctor_rc=$?
+else
+    doctor_out=$(bash -lc 'lisa doctor' 2>&1); doctor_rc=$?
+fi
 if [ $doctor_rc -eq 0 ]; then note "doctor exit 0"; else failhard "doctor exit $doctor_rc"; fi
 zellij_line=$(printf '%s\n' "$doctor_out" | grep -m1 zellij || echo "(no zellij line)")
 note "doctor zellij: $zellij_line"
+doctor_seal_line=$(printf '%s\n' "$doctor_out" |
+    grep -m1 'completion seal:' | sed 's/^[[:space:]]*//' || true)
+[ -n "$doctor_seal_line" ] || doctor_seal_line="(no completion-seal line)"
+note "doctor completion: $doctor_seal_line"
 
-mkdir -p "$HOME/demo" && cd "$HOME/demo"
-git init -q . 2>/dev/null || note "FINDING: git absent or init failed"
 init_rc=1; validate_rc=1; dry_rc=1
-bash -lc 'lisa init' >/dev/null 2>&1 && init_rc=0
-# validate requires a schedulable board — an empty scaffold correctly errors
-# with "no tickets found", so give it one smoke ticket first.
-mkdir -p docs/active/tickets
-cat > docs/active/tickets/T-001.md <<'EOF'
+if [ "$no_git" = 1 ]; then
+    cd "$project_root" 2>/dev/null || failhard "missing prepared no-git project"
+    bash -lc 'cd "$HOME/no-git-demo" && lisa init --no-history' >/dev/null 2>&1 && init_rc=0
+else
+    mkdir -p "$project_root" && cd "$project_root"
+    git init -q . 2>/dev/null || note "FINDING: git absent or init failed"
+    bash -lc 'cd "$HOME/demo" && lisa init --no-history' >/dev/null 2>&1 && init_rc=0
+    # validate requires a schedulable board — an empty scaffold correctly errors
+    # with "no tickets found", so give it one smoke ticket first.
+    mkdir -p docs/active/tickets
+    cat > docs/active/tickets/T-001.md <<'EOF'
 ---
 id: T-001
 title: smoke-ticket
@@ -49,14 +72,120 @@ depends_on: []
 
 Smoke ticket so validate and the dry run see a schedulable board.
 EOF
-bash -lc 'lisa validate' >/dev/null 2>&1 && validate_rc=0
-bash -lc 'lisa loop --dry-run' >/dev/null 2>&1 && dry_rc=0
+fi
+bash -lc "cd '$project_root' && lisa validate" >/dev/null 2>&1 && validate_rc=0
+bash -lc "cd '$project_root' && lisa loop --dry-run" >/dev/null 2>&1 && dry_rc=0
 [ $init_rc -eq 0 ] && note "init 0" || failhard "init $init_rc"
 [ $validate_rc -eq 0 ] && note "validate 0" || failhard "validate $validate_rc"
 [ $dry_rc -eq 0 ] && note "dry-run 0" || failhard "dry-run $dry_rc"
 
+if [ "$no_git" = 1 ]; then
+    say "== no-git completion evidence"
+    if command -v git >/dev/null 2>&1; then
+        failhard "git present during no-git leg"
+    else
+        note "git absent"
+    fi
+    [ ! -e "$project_root/.git" ] || failhard "$project_root/.git exists"
+    expected_seal='completion seal: journal-only — finished work is recorded but not undoable'
+    [ "$doctor_seal_line" = "$expected_seal" ] ||
+        failhard "doctor did not report the exact journal-only completion line"
+    ticket="$project_root/docs/active/tickets/T-NOGIT-001.md"
+    if [ -f "$ticket" ] && grep -q '^status: done$' "$ticket" && grep -q '^phase: done$' "$ticket"; then
+        note "T-NOGIT-001 is Done"
+    else
+        failhard "T-NOGIT-001 is not durably Done"
+    fi
+
+    journal_verify=$(node - "$project_root" <<'NODE'
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+try {
+  const project = path.resolve(process.argv[2]);
+  const journalPath = path.join(project, ".lisa", "completion-journal.jsonl");
+  const rows = fs.readFileSync(journalPath, "utf8")
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "")
+    .map((line, index) => {
+      try {
+        return JSON.parse(line);
+      } catch (error) {
+        throw new Error(`journal line ${index + 1} is invalid JSON: ${error.message}`);
+      }
+    });
+  const confirmed = rows.filter((row) =>
+    row.state === "confirmed" &&
+    row.completion_id === "T-NOGIT-001" &&
+    row.seal === "journal"
+  );
+  if (confirmed.length === 0) {
+    throw new Error("no confirmed journal-sealed row for T-NOGIT-001");
+  }
+  const row = confirmed[confirmed.length - 1];
+  if (Object.prototype.hasOwnProperty.call(row, "commit_id")) {
+    throw new Error("journal-sealed row unexpectedly carries commit_id");
+  }
+  if (!Array.isArray(row.content_hashes) || row.content_hashes.length === 0) {
+    throw new Error("journal-sealed row has no content hashes");
+  }
+
+  const seen = new Set();
+  let ticketBound = false;
+  for (const binding of row.content_hashes) {
+    if (!binding || typeof binding.path !== "string" ||
+        typeof binding.sha256 !== "string") {
+      throw new Error("journal content hash binding is malformed");
+    }
+    if (path.isAbsolute(binding.path) || binding.path.split("/").includes("..")) {
+      throw new Error(`unsafe journal path: ${binding.path}`);
+    }
+    if (!/^[0-9a-f]{64}$/.test(binding.sha256)) {
+      throw new Error(`invalid SHA-256 for ${binding.path}`);
+    }
+    if (seen.has(binding.path)) {
+      throw new Error(`duplicate journal path: ${binding.path}`);
+    }
+    seen.add(binding.path);
+    const absolute = path.resolve(project, binding.path);
+    if (!absolute.startsWith(project + path.sep)) {
+      throw new Error(`journal path escapes project: ${binding.path}`);
+    }
+    const actual = crypto.createHash("sha256")
+      .update(fs.readFileSync(absolute))
+      .digest("hex");
+    if (actual !== binding.sha256) {
+      throw new Error(`SHA-256 mismatch for ${binding.path}`);
+    }
+    if (binding.path === "docs/active/tickets/T-NOGIT-001.md") {
+      ticketBound = true;
+    }
+  }
+  if (!ticketBound) {
+    throw new Error("confirmed row does not bind the final ticket file");
+  }
+  console.log(
+    `confirmed journal row T-NOGIT-001 attempt ${row.attempt_id} generation ${row.generation}; ` +
+    `verified ${row.content_hashes.length} SHA-256 bindings`
+  );
+} catch (error) {
+  console.error(`journal verification failed: ${error.message}`);
+  process.exit(1);
+}
+NODE
+    )
+    journal_rc=$?
+    if [ $journal_rc -eq 0 ]; then
+        note "$journal_verify"
+    else
+        failhard "$journal_verify"
+    fi
+fi
+
 say "== bounds"
-[ "$wall" -le 600 ] && note "wall ${wall}s (<=600)" || failhard "wall ${wall}s exceeds 600s"
+[ "$wall" -le "$wall_limit" ] && note "wall ${wall}s (<=${wall_limit})" ||
+    failhard "wall ${wall}s exceeds ${wall_limit}s"
 # 300MiB calibrated from real legs (2026-07-16): lisa's own stack is ~42MiB;
 # the rest is the agent CLI's session logs (~50MiB), git's dependency
 # closure (~110MiB — doctor's sanctioned remedy), and apt indexes (~20MiB).
@@ -92,9 +221,12 @@ fi
     sed 's/^/- /' /tmp/leg-meta 2>/dev/null
     echo "- outcome: $overall"
     echo "- wall clock: ${wall}s   disk delta: ${disk_mib} MiB (${disk} bytes)"
+    echo "- wall limit: ${wall_limit}s"
     echo "- disk composition: lisa stack ${lisa_stack:-?}MiB, agent session logs ${agent_logs:-?}MiB, apt indexes ${apt_lists:-?}MiB"
     echo "- positives: PATH ${lisa_path:-MISSING}, doctor $doctor_rc, init $init_rc, validate $validate_rc, dry-run $dry_rc"
     echo "- doctor zellij line: $zellij_line"
+    echo "- doctor completion line: $doctor_seal_line"
+    echo "- journal verification: $journal_verify"
     echo "- apt actions:"
     printf '%s\n' "${apt_hist:-  (none)}" | sed 's/^/    /'
     echo "- lisa version: $(bash -lc 'lisa --version' 2>/dev/null || echo unknown)"
