@@ -213,7 +213,7 @@ fn write_run_summary(
         }
     }
 
-    let evidence = existing_evidence_paths(root, work_dir);
+    let evidence = existing_evidence_paths(root, work_dir, tickets);
     if !evidence.is_empty() {
         writeln!(output, "Evidence: {}", evidence.join("; "))?;
     }
@@ -286,7 +286,7 @@ fn parse_json_lines<T: Default>(
     Some(result)
 }
 
-fn existing_evidence_paths(root: &Path, work_dir: &Path) -> Vec<String> {
+fn existing_evidence_paths(root: &Path, work_dir: &Path, tickets: &[Ticket]) -> Vec<String> {
     let mut evidence = Vec::new();
     for relative in [PROVENANCE_PATH, COMPLETION_JOURNAL_PATH] {
         if root.join(relative).exists() {
@@ -299,7 +299,12 @@ fn existing_evidence_paths(root: &Path, work_dir: &Path) -> Vec<String> {
     } else {
         root.join(work_dir)
     };
-    if work_path.exists() {
+    let has_current_ticket_docs = tickets.iter().any(|ticket| {
+        fs::read_dir(work_path.join(&ticket.id))
+            .ok()
+            .is_some_and(|entries| entries.flatten().any(|entry| entry.path().is_file()))
+    });
+    if has_current_ticket_docs {
         evidence.push(display_path(root, &work_path));
     }
     evidence
@@ -367,6 +372,11 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join(COMPLETION_JOURNAL_PATH), "{}\n").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work/T-1")).unwrap();
+        fs::write(
+            dir.path().join("docs/active/work/T-1/review.md"),
+            "review evidence\n",
+        )
+        .unwrap();
 
         let output = render(
             dir.path(),
@@ -447,6 +457,16 @@ mod tests {
         assert!(!output.contains(COMPLETION_JOURNAL_PATH));
         assert!(!output.contains("docs/active/work/"));
         assert!(output.contains("tracking is unavailable"));
+    }
+
+    #[test]
+    fn empty_work_root_is_not_presented_as_per_ticket_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
+
+        let output = render(dir.path(), &[ticket("T-1", Phase::Ready)]);
+
+        assert!(!output.contains("docs/active/work/"));
     }
 
     #[test]
