@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use crate::disposition::{parse_review_disposition, RemedyOwner, ReviewDisposition};
+use crate::triage::{read_stored_proposal, ProposalState, TriageProposal, TRIAGE_PROPOSAL_FILE};
 use crate::types::{Ticket, TicketStatus};
 
 /// Plain lead shown when an older block has no structured human ask.
@@ -20,6 +21,7 @@ pub struct ParkedRemedy {
     pub ask: String,
     pub reason: String,
     pub check: Option<String>,
+    pub proposal: Option<TriageProposal>,
 }
 
 /// Collect valid canonical remedies for tickets durably parked by status.
@@ -52,12 +54,21 @@ pub fn collect_parked_remedies<'a>(
             } else {
                 ask
             };
+            let proposal =
+                read_stored_proposal(&work_dir.join(&ticket.id).join(TRIAGE_PROPOSAL_FILE))
+                    .ok()
+                    .flatten()
+                    .filter(|stored| {
+                        stored.ticket_id == ticket.id && stored.state == ProposalState::Pending
+                    })
+                    .map(|stored| stored.proposal);
             Some(ParkedRemedy {
                 ticket_id: ticket.id.clone(),
                 remedy_owner,
                 ask,
                 reason,
                 check,
+                proposal,
             })
         })
         .collect();
@@ -111,6 +122,7 @@ mod tests {
                     ask: "Run the checkout test.".to_string(),
                     reason: "manual test missing".to_string(),
                     check: None,
+                    proposal: None,
                 },
                 ParkedRemedy {
                     ticket_id: "T-002".to_string(),
@@ -118,6 +130,7 @@ mod tests {
                     ask: "Wait for the release link.".to_string(),
                     reason: "release missing".to_string(),
                     check: Some("test -f release".to_string()),
+                    proposal: None,
                 },
             ]
         );
@@ -142,6 +155,7 @@ mod tests {
                 ask: LEGACY_BLOCK_ASK.to_string(),
                 reason: "  Run the old test.  ".to_string(),
                 check: None,
+                proposal: None,
             }]
         );
     }
@@ -165,5 +179,51 @@ mod tests {
         ];
 
         assert!(collect_parked_remedies(&tickets, &work).is_empty());
+    }
+
+    #[test]
+    fn projects_only_a_matching_pending_proposal() {
+        use crate::triage::{
+            write_stored_proposal, PreparedStep, ProposalState, StoredTriageProposal,
+            TriageProposal,
+        };
+        use crate::types::AttemptLease;
+
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        write_disposition(
+            &work,
+            "T-PROPOSAL",
+            r#"{"disposition":"block","reason":"criteria mismatch","remedy_owner":"operator","ask":"Choose an amendment."}"#,
+        );
+        let proposal = TriageProposal {
+            summary: "The criterion conflicts with its cited evidence.".to_string(),
+            recommendation: "Amend the stale criterion.".to_string(),
+            prepared_steps: vec![PreparedStep::Command {
+                description: "Apply the prepared amendment.".to_string(),
+                command: "git apply amendment.patch".to_string(),
+            }],
+        };
+        let path = work.join("T-PROPOSAL").join(TRIAGE_PROPOSAL_FILE);
+        let mut stored = StoredTriageProposal {
+            ticket_id: "T-PROPOSAL".to_string(),
+            source_attempt_lease: AttemptLease {
+                ticket_id: "T-PROPOSAL".to_string(),
+                attempt_id: 3,
+            },
+            state: ProposalState::Pending,
+            proposal: proposal.clone(),
+        };
+        write_stored_proposal(&path, &stored).unwrap();
+
+        let remedies =
+            collect_parked_remedies([&ticket("T-PROPOSAL", TicketStatus::Blocked)], &work);
+        assert_eq!(remedies[0].proposal, Some(proposal));
+
+        stored.state = ProposalState::Dismissed;
+        write_stored_proposal(&path, &stored).unwrap();
+        let remedies =
+            collect_parked_remedies([&ticket("T-PROPOSAL", TicketStatus::Blocked)], &work);
+        assert_eq!(remedies[0].proposal, None);
     }
 }

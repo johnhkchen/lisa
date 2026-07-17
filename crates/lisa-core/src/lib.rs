@@ -10,5 +10,6 @@ pub mod parking;
 pub mod provenance;
 pub mod route;
 pub mod ticket;
+pub mod triage;
 pub mod types;
 pub mod version;

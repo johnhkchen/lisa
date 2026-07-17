@@ -701,6 +701,14 @@ pub struct PluginConfig {
     /// spawn-time slot assignment in the plugin scheduler.
     #[serde(default)]
     pub provider_caps: HashMap<AgentClient, usize>,
+
+    /// Whether parked operator blocks receive one bounded first-responder pass.
+    #[serde(default = "PluginConfig::default_triage_enabled")]
+    pub triage_enabled: bool,
+
+    /// Hard wall-clock bound for one first-responder pass.
+    #[serde(default = "PluginConfig::default_triage_timeout_secs")]
+    pub triage_timeout_secs: u64,
 }
 
 impl PluginConfig {
@@ -732,6 +740,18 @@ impl PluginConfig {
     /// Default recycled-Codex assignment acknowledgment timeout (30 seconds).
     pub const DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS: u64 = 30;
 
+    pub const DEFAULT_TRIAGE_ENABLED: bool = true;
+
+    pub const DEFAULT_TRIAGE_TIMEOUT_SECS: u64 = 120;
+
+    fn default_triage_enabled() -> bool {
+        Self::DEFAULT_TRIAGE_ENABLED
+    }
+
+    fn default_triage_timeout_secs() -> u64 {
+        Self::DEFAULT_TRIAGE_TIMEOUT_SECS
+    }
+
     /// Creates a new PluginConfig with default values.
     pub fn new() -> Self {
         Self {
@@ -751,6 +771,8 @@ impl PluginConfig {
             client: AgentClient::default(),
             lisa_bin: None,
             provider_caps: HashMap::new(),
+            triage_enabled: Self::DEFAULT_TRIAGE_ENABLED,
+            triage_timeout_secs: Self::DEFAULT_TRIAGE_TIMEOUT_SECS,
         }
     }
 
@@ -818,6 +840,17 @@ impl PluginConfig {
             if let Ok(n) = ack_timeout.parse::<u64>() {
                 if n > 0 {
                     result.assignment_ack_timeout_secs = n;
+                }
+            }
+        }
+
+        if let Some(enabled) = config.get("triage_enabled") {
+            result.triage_enabled = enabled == "true" || enabled == "1";
+        }
+        if let Some(timeout) = config.get("triage_timeout_secs") {
+            if let Ok(timeout) = timeout.parse::<u64>() {
+                if timeout > 0 {
+                    result.triage_timeout_secs = timeout;
                 }
             }
         }
@@ -1690,6 +1723,26 @@ mod tests {
         // But explicit override still works
         config.phase_timeouts.insert(Phase::Research, 300);
         assert_eq!(config.timeout_for_phase(Phase::Research), 300);
+    }
+
+    #[test]
+    fn triage_config_defaults_and_runtime_map_are_bounded() {
+        let defaults = PluginConfig::new();
+        assert!(defaults.triage_enabled);
+        assert_eq!(defaults.triage_timeout_secs, 120);
+
+        let mut map = BTreeMap::new();
+        map.insert("triage_enabled".to_string(), "false".to_string());
+        map.insert("triage_timeout_secs".to_string(), "7".to_string());
+        let configured = PluginConfig::from_config_map(&map);
+        assert!(!configured.triage_enabled);
+        assert_eq!(configured.triage_timeout_secs, 7);
+
+        map.insert("triage_timeout_secs".to_string(), "0".to_string());
+        assert_eq!(
+            PluginConfig::from_config_map(&map).triage_timeout_secs,
+            PluginConfig::DEFAULT_TRIAGE_TIMEOUT_SECS
+        );
     }
 
     #[test]

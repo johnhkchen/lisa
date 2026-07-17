@@ -53,10 +53,15 @@ use lisa_core::disposition::{
 };
 use lisa_core::provenance::{
     self, AssignmentState, AssignmentTransitionRecord, ParkingTransitionRecord,
-    ParkingTransitionType, ProvenanceLedgerRecord, ProvenanceRecord, ProvenanceRecordType, Route,
-    RunOutcome,
+    ParkingTransitionType, ProposalAction, ProposalActionRecord, ProposalRecordType,
+    ProvenanceLedgerRecord, ProvenanceRecord, ProvenanceRecordType, Route, RunOutcome,
+    TriageRecordType, TriageState, TriageTransitionRecord,
 };
 use lisa_core::ticket;
+use lisa_core::triage::{
+    write_stored_proposal, ProposalState, StoredTriageProposal, TriageProposal,
+    TRIAGE_PROPOSAL_FILE,
+};
 use lisa_core::types::{
     ActivityEvent, AttemptLease, CompletionRejectionKind, Phase, PluginConfig, Thread, TicketId,
     TicketStatus,
@@ -455,6 +460,15 @@ enum ReviewBlockAction {
     },
 }
 
+#[derive(Debug, Clone)]
+struct TriageInFlight {
+    source_attempt_lease: AttemptLease,
+    route: Route,
+    client: AgentClient,
+    started_at: std::time::SystemTime,
+    timeout_secs: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionFailureAction {
     Retry,
@@ -851,6 +865,10 @@ pub struct State {
     /// already running. This is cadence coordination only; ticket status stays
     /// the durable scheduling authority.
     world_recheck_in_flight: bool,
+
+    /// One-shot first-responder jobs. They are host processes, but consume the
+    /// same configured concurrency and provider budgets as interactive seats.
+    triage_in_flight: HashMap<TicketId, TriageInFlight>,
 
     /// Path to the idle signal directory (`.lisa/signals/` under /host/).
     signal_dir: PathBuf,
@@ -1580,6 +1598,314 @@ impl State {
         self.schedule_ready_tickets();
         self.log_activity(ActivityEvent::Info {
             message: format!("World recheck reopened {}", reopened.join(", ")),
+        });
+    }
+
+    fn latest_triage_transitions(&self) -> HashMap<(TicketId, u64), TriageTransitionRecord> {
+        let Ok(ledger) = std::fs::read_to_string(&self.ledger_path) else {
+            return HashMap::new();
+        };
+        let mut latest = HashMap::new();
+        for record in ledger
+            .lines()
+            .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
+        {
+            if let ProvenanceLedgerRecord::TriageTransition(record) = record {
+                latest.insert(
+                    (
+                        record.ticket_id.clone(),
+                        record.source_attempt_lease.attempt_id,
+                    ),
+                    record,
+                );
+            }
+        }
+        latest
+    }
+
+    fn append_triage_transition(
+        &mut self,
+        ticket_id: &str,
+        flight: &TriageInFlight,
+        state: TriageState,
+        reason: Option<String>,
+    ) -> bool {
+        if self.ledger_path.as_os_str().is_empty() {
+            return false;
+        }
+        let started_at = provenance::system_time_to_epoch(flight.started_at);
+        let ended_at = provenance::system_time_to_epoch(std::time::SystemTime::now());
+        let record = TriageTransitionRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            seal: self.config.completion_seal,
+            record_type: TriageRecordType::TriageTransition,
+            ticket_id: ticket_id.to_string(),
+            source_attempt_lease: flight.source_attempt_lease.clone(),
+            route: flight.route.clone(),
+            timeout_secs: flight.timeout_secs,
+            state,
+            reason: reason.map(|value| value.chars().take(240).collect()),
+            started_at,
+            ended_at,
+            wall_clock_secs: ended_at.saturating_sub(started_at),
+        };
+        if let Err(error) = provenance::append_triage_transition_record(&self.ledger_path, &record)
+        {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!("Triage provenance failed for {ticket_id}: {error}"),
+            });
+            return false;
+        }
+        true
+    }
+
+    fn build_triage_command(
+        &self,
+        ticket_id: &str,
+        client: AgentClient,
+        model: Option<&str>,
+    ) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+        let lisa_bin = self
+            .config
+            .lisa_bin
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "lisa_bin is not configured".to_string())?;
+        if self.project_root.as_os_str().is_empty() {
+            return Err("project root is not available".to_string());
+        }
+        let ticket = self
+            .dag
+            .tickets()
+            .find(|ticket| ticket.id == ticket_id)
+            .ok_or_else(|| format!("ticket {ticket_id} is unavailable"))?;
+        let ticket_path = strip_host_prefix(&ticket.file_path);
+        let disposition_path = strip_host_prefix(
+            &self
+                .config
+                .work_dir
+                .join(ticket_id)
+                .join("review-disposition.json"),
+        );
+        let mut argv = vec![
+            lisa_bin.to_string(),
+            "triage-agent".to_string(),
+            "--path".to_string(),
+            self.project_root.display().to_string(),
+            "--client".to_string(),
+            client.as_str().to_string(),
+            "--ticket-path".to_string(),
+            ticket_path.display().to_string(),
+            "--disposition-path".to_string(),
+            disposition_path.display().to_string(),
+            "--timeout-secs".to_string(),
+            self.config.triage_timeout_secs.to_string(),
+        ];
+        if let Some(model) = model {
+            argv.push("--model".to_string());
+            argv.push(model.to_string());
+        }
+        let mut context = BTreeMap::new();
+        context.insert("lisa_triage".to_string(), ticket_id.to_string());
+        Ok((argv, context))
+    }
+
+    /// Start at most one bounded first-responder pass per durable source park.
+    /// A Started row is the restart fence and is written before provider spend.
+    fn request_operator_triage(&mut self) -> usize {
+        if !self.config.triage_enabled || !self.permissions_granted || self.paused {
+            return 0;
+        }
+        let latest_parks = self.latest_parking_transitions();
+        let attempted = self.latest_triage_transitions();
+        let remedies =
+            lisa_core::parking::collect_parked_remedies(self.dag.tickets(), &self.config.work_dir);
+        let mut launched = 0;
+
+        for remedy in remedies {
+            if remedy.remedy_owner != RemedyOwner::Operator
+                || remedy.proposal.is_some()
+                || self.triage_in_flight.contains_key(&remedy.ticket_id)
+            {
+                continue;
+            }
+            let Some(park) = latest_parks.get(&remedy.ticket_id).filter(|record| {
+                record.record_type == ParkingTransitionType::Park
+                    && record.remedy_owner == RemedyOwner::Operator
+            }) else {
+                continue;
+            };
+            if attempted.contains_key(&(remedy.ticket_id.clone(), park.attempt_lease.attempt_id)) {
+                continue;
+            }
+            let (_, resolved) = resolve_adapter_or_native(
+                self.dag.get_ticket(&remedy.ticket_id),
+                self.config.client,
+                self.config.lisa_bin.as_deref(),
+            );
+            let running = self
+                .threads
+                .values()
+                .filter(|thread| thread.status == lisa_core::types::ThreadStatus::Running)
+                .count()
+                + self.triage_in_flight.len();
+            if running >= self.config.max_threads {
+                continue;
+            }
+            let provider_running = self
+                .threads
+                .values()
+                .filter(|thread| {
+                    thread.status == lisa_core::types::ThreadStatus::Running
+                        && thread.client == resolved.agent
+                })
+                .count()
+                + self
+                    .triage_in_flight
+                    .values()
+                    .filter(|flight| flight.client == resolved.agent)
+                    .count();
+            if self
+                .config
+                .provider_cap_for(resolved.agent)
+                .is_some_and(|cap| provider_running >= cap)
+            {
+                continue;
+            }
+            let mut route = Route::from_client(resolved.agent);
+            route.model = resolved.model.clone();
+            let flight = TriageInFlight {
+                source_attempt_lease: park.attempt_lease.clone(),
+                route,
+                client: resolved.agent,
+                started_at: std::time::SystemTime::now(),
+                timeout_secs: self.config.triage_timeout_secs,
+            };
+            if !self.append_triage_transition(
+                &remedy.ticket_id,
+                &flight,
+                TriageState::Started,
+                None,
+            ) {
+                continue;
+            }
+            let (argv, context) = match self.build_triage_command(
+                &remedy.ticket_id,
+                resolved.agent,
+                resolved.model.as_deref(),
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    self.append_triage_transition(
+                        &remedy.ticket_id,
+                        &flight,
+                        TriageState::Failed,
+                        Some(error),
+                    );
+                    continue;
+                }
+            };
+            self.triage_in_flight
+                .insert(remedy.ticket_id.clone(), flight);
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            run_command_with_env_variables_and_cwd(
+                &argv_refs,
+                BTreeMap::new(),
+                self.project_root.clone(),
+                context,
+            );
+            launched += 1;
+        }
+        launched
+    }
+
+    fn handle_triage_result(
+        &mut self,
+        ticket_id: &str,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) {
+        let Some(flight) = self.triage_in_flight.remove(ticket_id) else {
+            return;
+        };
+        let failure_reason = || {
+            String::from_utf8_lossy(&stderr)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("triage provider failed")
+                .to_string()
+        };
+        if exit_code == Some(124) {
+            self.append_triage_transition(
+                ticket_id,
+                &flight,
+                TriageState::TimedOut,
+                Some(format!("bounded pass exceeded {}s", flight.timeout_secs)),
+            );
+            return;
+        }
+        if exit_code != Some(0) {
+            self.append_triage_transition(
+                ticket_id,
+                &flight,
+                TriageState::Failed,
+                Some(failure_reason()),
+            );
+            return;
+        }
+        let proposal =
+            match TriageProposal::parse(String::from_utf8_lossy(&stdout).trim().as_bytes()) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    self.append_triage_transition(
+                        ticket_id,
+                        &flight,
+                        TriageState::Invalid,
+                        Some(error),
+                    );
+                    return;
+                }
+            };
+        let action = ProposalActionRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            seal: self.config.completion_seal,
+            record_type: ProposalRecordType::ProposalAction,
+            ticket_id: ticket_id.to_string(),
+            source_attempt_lease: flight.source_attempt_lease.clone(),
+            action: ProposalAction::Proposed,
+            actor: "agent".to_string(),
+            proposal: Some(proposal.clone()),
+            occurred_at: provenance::system_time_to_epoch(std::time::SystemTime::now()),
+        };
+        if let Err(error) = provenance::append_proposal_action_record(&self.ledger_path, &action) {
+            self.append_triage_transition(
+                ticket_id,
+                &flight,
+                TriageState::Failed,
+                Some(format!("proposal provenance failed: {error}")),
+            );
+            return;
+        }
+        let stored = StoredTriageProposal {
+            ticket_id: ticket_id.to_string(),
+            source_attempt_lease: flight.source_attempt_lease.clone(),
+            state: ProposalState::Pending,
+            proposal,
+        };
+        let path = self
+            .config
+            .work_dir
+            .join(ticket_id)
+            .join(TRIAGE_PROPOSAL_FILE);
+        if let Err(error) = write_stored_proposal(&path, &stored) {
+            self.append_triage_transition(ticket_id, &flight, TriageState::Failed, Some(error));
+            return;
+        }
+        self.append_triage_transition(ticket_id, &flight, TriageState::Proposed, None);
+        self.log_activity(ActivityEvent::Info {
+            message: format!("First responder prepared a proposal for {ticket_id}"),
         });
     }
 
@@ -4321,7 +4647,12 @@ impl State {
                     .filter(|t| {
                         t.status == lisa_core::types::ThreadStatus::Running && t.client == client
                     })
-                    .count();
+                    .count()
+                    + self
+                        .triage_in_flight
+                        .values()
+                        .filter(|flight| flight.client == client)
+                        .count();
                 running_for_provider < cap
             }
         }
@@ -4586,7 +4917,8 @@ impl State {
                 .threads
                 .values()
                 .filter(|t| t.status == lisa_core::types::ThreadStatus::Running)
-                .count();
+                .count()
+                + self.triage_in_flight.len();
             if running_count >= self.config.max_threads {
                 unscheduled += 1;
                 continue;
@@ -6357,7 +6689,9 @@ impl State {
                     .filter_map(|record| match record {
                         ProvenanceLedgerRecord::Execution(record) => Some(record),
                         ProvenanceLedgerRecord::AssignmentTransition(_)
-                        | ProvenanceLedgerRecord::ParkingTransition(_) => None,
+                        | ProvenanceLedgerRecord::ParkingTransition(_)
+                        | ProvenanceLedgerRecord::TriageTransition(_)
+                        | ProvenanceLedgerRecord::ProposalAction(_) => None,
                     })
                     .collect()
             })
@@ -7321,6 +7655,10 @@ impl State {
         self.over_budget_warned
             .retain(|tid| self.threads.contains_key(tid));
 
+        // First responders have priority over new ticket work after a cord pull,
+        // while still consuming the same configured capacity.
+        self.request_operator_triage();
+
         // Always try to schedule (slots may have freed up)
         self.schedule_ready_tickets();
 
@@ -8206,6 +8544,7 @@ impl ZellijPlugin for State {
                 // Start the poll timer
                 self.arm_timer(POLL_INTERVAL_SECS);
                 // Try to schedule immediately if slots are already discovered
+                self.request_operator_triage();
                 self.schedule_ready_tickets();
                 // Run the first world check at loop start; later checks share
                 // the existing poll cadence.
@@ -8253,6 +8592,13 @@ impl ZellijPlugin for State {
                 }
                 if context.contains_key("lisa_world_recheck") {
                     self.handle_world_recheck_result(exit_code, stdout, stderr);
+                    should_render = true;
+                    return should_render;
+                }
+                if let Some(ticket_id) = context.get("lisa_triage") {
+                    self.handle_triage_result(ticket_id, exit_code, stdout, stderr);
+                    self.request_operator_triage();
+                    self.schedule_ready_tickets();
                     should_render = true;
                     return should_render;
                 }
@@ -8382,12 +8728,14 @@ impl State {
                         ask: remedy.ask,
                         reason: remedy.reason,
                         checks_on_own: false,
+                        proposal: remedy.proposal,
                     }),
                     RemedyOwner::World => Some(ui::WaitingItem {
                         ticket_id: remedy.ticket_id,
                         ask: remedy.ask,
                         reason: remedy.reason,
                         checks_on_own: true,
+                        proposal: remedy.proposal,
                     }),
                     RemedyOwner::Agent => None,
                 })
@@ -9025,6 +9373,186 @@ mod tests {
         state
     }
 
+    fn operator_triage_state(root: &Path, enabled: bool) -> State {
+        const TICKET_ID: &str = "T-046-06-03";
+        let tickets_dir = root.join("tickets");
+        let work_dir = root.join("work");
+        let ticket_work = work_dir.join(TICKET_ID);
+        let ledger_path = root.join("provenance.jsonl");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        std::fs::create_dir_all(&ticket_work).unwrap();
+        std::fs::write(
+            tickets_dir.join(format!("{TICKET_ID}.md")),
+            format!(
+                "---\nid: {TICKET_ID}\ntitle: field block\ntype: task\nstatus: blocked\npriority: high\nphase: review\n---\n\nAcceptance says approximately 200 MiB.\n"
+            ),
+        )
+        .unwrap();
+        const FIELD_REASON: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB; amend the acceptance requirement before Review can pass.";
+        std::fs::write(
+            ticket_work.join("review-disposition.json"),
+            format!(r#"{{"disposition":"block","reason":{FIELD_REASON:?}}}"#),
+        )
+        .unwrap();
+        let lease = AttemptLease {
+            ticket_id: TICKET_ID.to_string(),
+            attempt_id: 1,
+        };
+        provenance::append_parking_transition_record(
+            &ledger_path,
+            &ParkingTransitionRecord {
+                schema_version: provenance::SCHEMA_VERSION,
+                seal: CompletionSeal::Commit,
+                record_type: ParkingTransitionType::Park,
+                ticket_id: TICKET_ID.to_string(),
+                attempt_lease: lease,
+                remedy_owner: RemedyOwner::Operator,
+                retry_count: None,
+                retry_limit: None,
+                recheck_eligible: false,
+                started_at: 10,
+                ended_at: 10,
+                wall_clock_secs: 0,
+            },
+        )
+        .unwrap();
+        State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir,
+                max_threads: 1,
+                triage_enabled: enabled,
+                triage_timeout_secs: 1,
+                lisa_bin: Some("/opt/lisa".to_string()),
+                ..PluginConfig::new()
+            },
+            project_root: root.to_path_buf(),
+            git_root: root.to_path_buf(),
+            ledger_path,
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        }
+    }
+
+    fn insert_triage_flight(state: &mut State) {
+        let ticket_id = "T-046-06-03".to_string();
+        let flight = TriageInFlight {
+            source_attempt_lease: AttemptLease {
+                ticket_id: ticket_id.clone(),
+                attempt_id: 1,
+            },
+            route: Route::from_client(AgentClient::Codex),
+            client: AgentClient::Codex,
+            started_at: std::time::SystemTime::now(),
+            timeout_secs: 1,
+        };
+        assert!(state.append_triage_transition(&ticket_id, &flight, TriageState::Started, None,));
+        state.triage_in_flight.insert(ticket_id, flight);
+    }
+
+    #[test]
+    fn disabled_triage_leaves_the_park_bytes_and_timing_unmodified() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = operator_triage_state(dir.path(), false);
+        let ticket = state.config.ticket_dir.join("T-046-06-03.md");
+        let disposition = state
+            .config
+            .work_dir
+            .join("T-046-06-03/review-disposition.json");
+        let before_ticket = std::fs::read(&ticket).unwrap();
+        let before_disposition = std::fs::read(&disposition).unwrap();
+        let before_ledger = std::fs::read(&state.ledger_path).unwrap();
+
+        assert_eq!(state.request_operator_triage(), 0);
+        assert_eq!(std::fs::read(ticket).unwrap(), before_ticket);
+        assert_eq!(std::fs::read(disposition).unwrap(), before_disposition);
+        assert_eq!(std::fs::read(&state.ledger_path).unwrap(), before_ledger);
+        assert!(!state
+            .config
+            .work_dir
+            .join("T-046-06-03/triage-proposal.json")
+            .exists());
+    }
+
+    #[test]
+    fn triage_failure_and_timeout_preserve_the_already_durable_park() {
+        for (exit, expected) in [
+            (Some(1), TriageState::Failed),
+            (Some(124), TriageState::TimedOut),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = operator_triage_state(dir.path(), true);
+            let ticket = state.config.ticket_dir.join("T-046-06-03.md");
+            let disposition = state
+                .config
+                .work_dir
+                .join("T-046-06-03/review-disposition.json");
+            let before_ticket = std::fs::read(&ticket).unwrap();
+            let before_disposition = std::fs::read(&disposition).unwrap();
+            insert_triage_flight(&mut state);
+
+            state.handle_triage_result(
+                "T-046-06-03",
+                exit,
+                Vec::new(),
+                b"provider unavailable".to_vec(),
+            );
+
+            assert_eq!(std::fs::read(ticket).unwrap(), before_ticket);
+            assert_eq!(std::fs::read(disposition).unwrap(), before_disposition);
+            assert!(!state
+                .config
+                .work_dir
+                .join("T-046-06-03/triage-proposal.json")
+                .exists());
+            let records: Vec<ProvenanceLedgerRecord> = std::fs::read_to_string(&state.ledger_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(records.iter().any(|record| matches!(
+                record,
+                ProvenanceLedgerRecord::TriageTransition(record) if record.state == expected
+            )));
+        }
+    }
+
+    #[test]
+    fn t046_field_result_publishes_criteria_evidence_amendment_and_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = operator_triage_state(dir.path(), true);
+        insert_triage_flight(&mut state);
+        let proposal = serde_json::json!({
+            "summary": "The written criteria conflict with the measured field evidence.",
+            "recommendation": "Amend the stale size criterion to the calibrated bound.",
+            "prepared_steps": [{
+                "kind": "file-edit",
+                "description": "Use the calibrated field bound.",
+                "path": "tickets/T-046-06-03.md",
+                "old": "approximately 200 MiB",
+                "new": "the calibrated 300 MiB bound"
+            }]
+        })
+        .to_string();
+
+        state.handle_triage_result("T-046-06-03", Some(0), proposal.into_bytes(), Vec::new());
+
+        let remedies = lisa_core::parking::collect_parked_remedies(
+            state.dag.tickets(),
+            &state.config.work_dir,
+        );
+        let proposal = remedies[0].proposal.as_ref().unwrap();
+        assert!(proposal.summary.contains("criteria"));
+        assert!(proposal.summary.contains("evidence"));
+        assert!(proposal.recommendation.contains("Amend"));
+        let ledger = std::fs::read_to_string(&state.ledger_path).unwrap();
+        assert!(ledger.contains("\"record_type\":\"proposal-action\""));
+        assert!(ledger.contains("\"action\":\"proposed\""));
+        assert!(ledger.contains("\"state\":\"proposed\""));
+    }
+
     #[test]
     fn world_recheck_command_is_exact_and_requires_host_boundaries() {
         let mut state = State {
@@ -9195,6 +9723,7 @@ mod tests {
                 ask: "Run the checkout test.".to_string(),
                 reason: "engineering reason".to_string(),
                 checks_on_own: false,
+                proposal: None,
             }]
         );
     }
@@ -9330,6 +9859,7 @@ mod tests {
                 ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
                 reason: FIELD_REASON.to_string(),
                 checks_on_own: false,
+                proposal: None,
             }]
         );
 

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use lisa_core::triage::TriageProposal;
 use lisa_core::types::CompletionRejectionKind;
 
 /// ANSI color codes for terminal output
@@ -168,6 +169,7 @@ pub struct WaitingItem {
     pub ask: String,
     pub reason: String,
     pub checks_on_own: bool,
+    pub proposal: Option<TriageProposal>,
 }
 
 /// Type of health alert for the attention banner.
@@ -456,7 +458,22 @@ fn render_waiting_on_you(state: &PluginState, output: &mut Vec<String>) {
         } else {
             ""
         };
-        output.push(format!("{}  {}{}", item.ticket_id, item.ask, suffix));
+        if let Some(proposal) = &item.proposal {
+            output.push(format!(
+                "{}  First responder: {}",
+                item.ticket_id, proposal.summary
+            ));
+            output.push(format!("       Suggested: {}", proposal.recommendation));
+            output.extend(
+                proposal
+                    .prepared_steps
+                    .iter()
+                    .map(|step| format!("       Prepared: {}", step.display())),
+            );
+            output.push(format!("       Original ask: {}", item.ask));
+        } else {
+            output.push(format!("{}  {}{}", item.ticket_id, item.ask, suffix));
+        }
         output.push(format!("       Reviewer's note: {}", item.reason));
     }
     output.push(String::new());
@@ -1750,12 +1767,14 @@ mod tests {
                     ask: "Run the checkout test exactly once.".to_string(),
                     reason: "The checkout evidence is missing.".to_string(),
                     checks_on_own: false,
+                    proposal: None,
                 },
                 WaitingItem {
                     ticket_id: "T-WORLD".to_string(),
                     ask: "Wait for the release link.".to_string(),
                     reason: "The release has not reached the mirror.".to_string(),
                     checks_on_own: true,
+                    proposal: None,
                 },
             ],
             ..PluginState::default()
@@ -1783,6 +1802,7 @@ mod tests {
                 ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
                 reason: FIELD_REASON.to_string(),
                 checks_on_own: false,
+                proposal: None,
             }],
             ..PluginState::default()
         };
@@ -1808,6 +1828,44 @@ mod tests {
     }
 
     #[test]
+    fn first_responder_proposal_precedes_original_ask_and_raw_reason() {
+        use lisa_core::triage::{PreparedStep, TriageProposal};
+
+        let state = PluginState {
+            waiting_items: vec![WaitingItem {
+                ticket_id: "T-046-06-03".to_string(),
+                ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
+                reason: "225 MiB conflicts with approximately 200 MiB.".to_string(),
+                checks_on_own: false,
+                proposal: Some(TriageProposal {
+                    summary: "The written criteria conflict with the measured evidence."
+                        .to_string(),
+                    recommendation: "Amend the stale criteria.".to_string(),
+                    prepared_steps: vec![PreparedStep::FileEdit {
+                        description: "Use the calibrated bound.".to_string(),
+                        path: std::path::PathBuf::from("docs/active/tickets/T-046-06-03.md"),
+                        old: "approximately 200 MiB".to_string(),
+                        new: "the calibrated 300 MiB bound".to_string(),
+                    }],
+                }),
+            }],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+        render_waiting_on_you(&state, &mut output);
+        let joined = output.join("\n");
+        let summary = joined.find("First responder:").unwrap();
+        let suggested = joined.find("Suggested:").unwrap();
+        let prepared = joined.find("Prepared:").unwrap();
+        let original = joined.find("Original ask:").unwrap();
+        let raw = joined.find("Reviewer's note:").unwrap();
+        assert!(summary < suggested);
+        assert!(suggested < prepared);
+        assert!(prepared < original);
+        assert!(original < raw);
+    }
+
+    #[test]
     fn waiting_section_is_first_operations_content() {
         let state = PluginState {
             waiting_items: vec![WaitingItem {
@@ -1815,6 +1873,7 @@ mod tests {
                 ask: "Run the release test.".to_string(),
                 reason: "The release evidence is missing.".to_string(),
                 checks_on_own: false,
+                proposal: None,
             }],
             alerts: vec![HealthAlert {
                 ticket_id: "T-FAILED".to_string(),

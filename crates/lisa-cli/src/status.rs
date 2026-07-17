@@ -18,7 +18,25 @@ fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
                 ),
                 RemedyOwner::Agent => return Vec::new(),
             };
-            vec![lead, format!("       Reviewer's note: {}", remedy.reason)]
+            let mut lines = Vec::new();
+            if let Some(proposal) = &remedy.proposal {
+                lines.push(format!(
+                    "{}  First responder: {}",
+                    remedy.ticket_id, proposal.summary
+                ));
+                lines.push(format!("       Suggested: {}", proposal.recommendation));
+                lines.extend(
+                    proposal
+                        .prepared_steps
+                        .iter()
+                        .map(|step| format!("       Prepared: {}", step.display())),
+                );
+                lines.push(format!("       Original ask: {}", remedy.ask));
+            } else {
+                lines.push(lead);
+            }
+            lines.push(format!("       Reviewer's note: {}", remedy.reason));
+            lines
         })
         .collect()
 }
@@ -339,6 +357,7 @@ mod tests {
                 ask: "Run the checkout test exactly once.".to_string(),
                 reason: "The checkout evidence is missing.".to_string(),
                 check: None,
+                proposal: None,
             },
             ParkedRemedy {
                 ticket_id: "T-002".to_string(),
@@ -346,6 +365,7 @@ mod tests {
                 ask: "Wait for the release link.".to_string(),
                 reason: "The release has not reached the mirror.".to_string(),
                 check: Some("test -f release".to_string()),
+                proposal: None,
             },
             ParkedRemedy {
                 ticket_id: "T-003".to_string(),
@@ -353,6 +373,7 @@ mod tests {
                 ask: "Agent retry exhausted.".to_string(),
                 reason: "The agent can retry this work.".to_string(),
                 check: None,
+                proposal: None,
             },
         ];
 
@@ -376,6 +397,7 @@ mod tests {
             ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
             reason: FIELD_REASON.to_string(),
             check: None,
+            proposal: None,
         }];
 
         let lines = waiting_on_you_lines(&remedies);
@@ -388,5 +410,37 @@ mod tests {
             ]
         );
         assert!(!lines[0].contains(FIELD_REASON));
+    }
+
+    #[test]
+    fn field_proposal_leads_with_gap_amendment_and_prepared_edit() {
+        use lisa_core::triage::{PreparedStep, TriageProposal};
+
+        let remedies = vec![ParkedRemedy {
+            ticket_id: "T-046-06-03".to_string(),
+            remedy_owner: RemedyOwner::Operator,
+            ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
+            reason: "The 225 MiB measurement conflicts with the approximately 200 MiB criterion."
+                .to_string(),
+            check: None,
+            proposal: Some(TriageProposal {
+                summary: "The written criteria conflict with the measured evidence.".to_string(),
+                recommendation: "Amend the stale criteria.".to_string(),
+                prepared_steps: vec![PreparedStep::FileEdit {
+                    description: "Use the calibrated bound.".to_string(),
+                    path: std::path::PathBuf::from("docs/active/tickets/T-046-06-03.md"),
+                    old: "approximately 200 MiB".to_string(),
+                    new: "the calibrated 300 MiB bound".to_string(),
+                }],
+            }),
+        }];
+        let lines = waiting_on_you_lines(&remedies);
+        assert!(lines[0].contains("First responder"));
+        assert!(lines[0].contains("criteria"));
+        assert!(lines[0].contains("evidence"));
+        assert!(lines[1].contains("Suggested: Amend"));
+        assert!(lines[2].contains("Prepared:"));
+        assert!(lines[3].contains("Original ask:"));
+        assert!(lines[4].contains("Reviewer's note:"));
     }
 }

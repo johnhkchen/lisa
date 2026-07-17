@@ -22,6 +22,14 @@ pub struct LisaConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub guards: GuardsConfig,
+    #[serde(default)]
+    pub triage: TriageConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TriageConfig {
+    pub enabled: Option<bool>,
+    pub timeout_secs: Option<u64>,
 }
 
 /// Completion guard selection (`[guards]`).
@@ -99,6 +107,8 @@ pub struct ResolvedConfig {
     /// Resolved per-provider concurrency sub-caps, keyed by raw client name.
     /// Empty when none configured (T-026-02).
     pub provider_caps: std::collections::HashMap<String, usize>,
+    pub triage_enabled: bool,
+    pub triage_timeout_secs: u64,
 }
 
 impl Default for ResolvedConfig {
@@ -119,6 +129,8 @@ impl Default for ResolvedConfig {
             zellij_runtime: crate::runtime::default_runtime_request(),
             completion_mode: CompletionSealMode::Auto,
             provider_caps: std::collections::HashMap::new(),
+            triage_enabled: PluginConfig::DEFAULT_TRIAGE_ENABLED,
+            triage_timeout_secs: PluginConfig::DEFAULT_TRIAGE_TIMEOUT_SECS,
         }
     }
 }
@@ -212,6 +224,11 @@ pub fn resolve_config(
             .unwrap_or(defaults.assignment_ack_timeout_secs),
         phase_timeouts: config.scheduling.phase_timeouts.clone().unwrap_or_default(),
         provider_caps: config.scheduling.provider_caps.clone().unwrap_or_default(),
+        triage_enabled: config.triage.enabled.unwrap_or(defaults.triage_enabled),
+        triage_timeout_secs: config
+            .triage
+            .timeout_secs
+            .unwrap_or(defaults.triage_timeout_secs),
     }
 }
 
@@ -234,11 +251,13 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
         "agent",
         "runtime",
         "guards",
+        "triage",
     ];
     let known_dirs = &["tickets", "stories", "work"];
     let known_agent = &["client"];
     let known_runtime = &["zellij"];
     let known_guards = &["completion"];
+    let known_triage = &["enabled", "timeout_secs"];
     let known_scheduling = &[
         "max_threads",
         "auto_advance",
@@ -296,6 +315,14 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
             }
         }
 
+        if let Some(toml::Value::Table(triage)) = table.get("triage") {
+            for key in triage.keys() {
+                if !known_triage.contains(&key.as_str()) {
+                    warnings.push(format!("Unknown key in [triage]: {}", key));
+                }
+            }
+        }
+
         if let Some(toml::Value::Table(sched)) = table.get("scheduling") {
             for key in sched.keys() {
                 if !known_scheduling.contains(&key.as_str()) {
@@ -347,6 +374,9 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     }
     if config.scheduling.assignment_ack_timeout_secs == Some(0) {
         return Err("assignment_ack_timeout_secs must be at least 1".to_string());
+    }
+    if config.triage.timeout_secs == Some(0) {
+        return Err("triage timeout_secs must be at least 1".to_string());
     }
     if let Some(client) = &config.agent.client {
         AgentClient::parse(client)?;
@@ -471,6 +501,11 @@ work = "docs/active/work"
 [guards]
 # Completion guard: "auto" (strongest available), "commit", or "journal".
 # completion = "auto"
+
+[triage]
+# Give operator-owned parks one bounded, read-only first-responder pass.
+# enabled = true
+# timeout_secs = 120
 
 [scheduling]
 max_threads = 2
@@ -1120,5 +1155,24 @@ implement = 1800
         let pt = config.scheduling.phase_timeouts.unwrap();
         assert_eq!(pt.len(), 1);
         assert_eq!(pt.get("implement"), Some(&1800));
+    }
+
+    #[test]
+    fn triage_config_defaults_resolves_and_validates_bounds() {
+        let defaults = resolve_config(&LisaConfig::default(), None, None);
+        assert!(defaults.triage_enabled);
+        assert_eq!(defaults.triage_timeout_secs, 120);
+
+        let validation = validate_config("[triage]\nenabled = false\ntimeout_secs = 9\n").unwrap();
+        assert!(validation.warnings.is_empty());
+        let resolved = resolve_config(&validation.config, None, None);
+        assert!(!resolved.triage_enabled);
+        assert_eq!(resolved.triage_timeout_secs, 9);
+
+        assert!(validate_config("[triage]\ntimeout_secs = 0\n")
+            .unwrap_err()
+            .contains("at least 1"));
+        let warning = validate_config("[triage]\nmystery = true\n").unwrap();
+        assert!(warning.warnings[0].contains("[triage]"));
     }
 }

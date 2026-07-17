@@ -32,12 +32,13 @@ use crate::client::AgentClient;
 use crate::completion::CompletionSeal;
 use crate::disposition::DispositionNote;
 use crate::disposition::RemedyOwner;
+use crate::triage::TriageProposal;
 use crate::types::AttemptLease;
 
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -96,6 +97,36 @@ pub enum ParkingTransitionType {
     Retry,
     Park,
     Unpark,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriageRecordType {
+    TriageTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriageState {
+    Started,
+    Proposed,
+    Failed,
+    TimedOut,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProposalRecordType {
+    ProposalAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProposalAction {
+    Proposed,
+    Applied,
+    Dismissed,
 }
 
 /// Stable, operator-visible assignment state retained in provenance.
@@ -208,6 +239,41 @@ pub struct ParkingTransitionRecord {
     pub wall_clock_secs: u64,
 }
 
+/// One bounded first-responder attempt against an already durable park.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageTransitionRecord {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub seal: CompletionSeal,
+    pub record_type: TriageRecordType,
+    pub ticket_id: String,
+    pub source_attempt_lease: AttemptLease,
+    pub route: Route,
+    pub timeout_secs: u64,
+    pub state: TriageState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub started_at: u64,
+    pub ended_at: u64,
+    pub wall_clock_secs: u64,
+}
+
+/// Creation or explicit operator disposition of one triage proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalActionRecord {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub seal: CompletionSeal,
+    pub record_type: ProposalRecordType,
+    pub ticket_id: String,
+    pub source_attempt_lease: AttemptLease,
+    pub action: ProposalAction,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<TriageProposal>,
+    pub occurred_at: u64,
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -224,6 +290,8 @@ fn is_false(value: &bool) -> bool {
 pub enum ProvenanceLedgerRecord {
     AssignmentTransition(AssignmentTransitionRecord),
     ParkingTransition(ParkingTransitionRecord),
+    TriageTransition(TriageTransitionRecord),
+    ProposalAction(ProposalActionRecord),
     Execution(ProvenanceRecord),
 }
 
@@ -276,6 +344,20 @@ pub fn append_assignment_transition_record(
 pub fn append_parking_transition_record(
     path: &Path,
     record: &ParkingTransitionRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+pub fn append_triage_transition_record(
+    path: &Path,
+    record: &TriageTransitionRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+pub fn append_proposal_action_record(
+    path: &Path,
+    record: &ProposalActionRecord,
 ) -> std::io::Result<()> {
     append_serialized(path, record)
 }
@@ -396,7 +478,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":6"));
+        assert!(json.contains("\"schema_version\":7"));
         assert!(json.contains("\"seal\":\"commit\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
@@ -437,7 +519,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":6"));
+        assert!(json.contains("\"schema_version\":7"));
         assert!(json.contains("\"seal\":\"journal\""));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
@@ -477,7 +559,7 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
-            assert!(json.contains("\"schema_version\":6"));
+            assert!(json.contains("\"schema_version\":7"));
             assert!(json.contains("\"seal\":\"journal\""));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",
@@ -525,6 +607,65 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ParkingTransitionRecord>(&world_json).unwrap(),
             world
+        );
+    }
+
+    #[test]
+    fn triage_attempt_and_proposal_action_append_as_distinct_mixed_rows() {
+        use crate::triage::{PreparedStep, TriageProposal};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.jsonl");
+        let lease = AttemptLease {
+            ticket_id: "T-046-06-03".to_string(),
+            attempt_id: 4,
+        };
+        let proposal = TriageProposal {
+            summary: "The criterion conflicts with the measured evidence.".to_string(),
+            recommendation: "Amend the stale criterion.".to_string(),
+            prepared_steps: vec![PreparedStep::Command {
+                description: "Apply the amendment.".to_string(),
+                command: "git apply amendment.patch".to_string(),
+            }],
+        };
+        let attempt = TriageTransitionRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: TriageRecordType::TriageTransition,
+            ticket_id: lease.ticket_id.clone(),
+            source_attempt_lease: lease.clone(),
+            route: Route::from_client(AgentClient::Codex),
+            timeout_secs: 120,
+            state: TriageState::Proposed,
+            reason: None,
+            started_at: 10,
+            ended_at: 12,
+            wall_clock_secs: 2,
+        };
+        let action = ProposalActionRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: ProposalRecordType::ProposalAction,
+            ticket_id: lease.ticket_id.clone(),
+            source_attempt_lease: lease,
+            action: ProposalAction::Proposed,
+            actor: "agent".to_string(),
+            proposal: Some(proposal),
+            occurred_at: 12,
+        };
+        append_triage_transition_record(&path, &attempt).unwrap();
+        append_proposal_action_record(&path, &action).unwrap();
+        let rows: Vec<ProvenanceLedgerRecord> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ProvenanceLedgerRecord::TriageTransition(attempt),
+                ProvenanceLedgerRecord::ProposalAction(action),
+            ]
         );
     }
 

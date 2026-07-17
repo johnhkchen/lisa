@@ -428,6 +428,8 @@ fn generate_layout(
                 session_timeout_secs "{session_timeout_secs}"
                 wind_down_secs "{wind_down_secs}"
                 assignment_ack_timeout_secs "{assignment_ack_timeout_secs}"
+                triage_enabled "{triage_enabled}"
+                triage_timeout_secs "{triage_timeout_secs}"
                 client "{client}"
 {provider_cap_lines}{lisa_bin_line}            }}
         }}
@@ -449,6 +451,8 @@ fn generate_layout(
         session_timeout_secs = config.session_timeout_secs,
         wind_down_secs = config.wind_down_secs,
         assignment_ack_timeout_secs = config.assignment_ack_timeout_secs,
+        triage_enabled = config.triage_enabled,
+        triage_timeout_secs = config.triage_timeout_secs,
         client = config.client.as_str(),
     )
 }

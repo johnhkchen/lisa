@@ -10,11 +10,13 @@ mod hooks_guide;
 mod init;
 mod loop_cmd;
 mod preownership_status;
+mod proposal;
 mod run_summary;
 mod runtime;
 mod setup_guide;
 mod status;
 mod templates;
+mod triage_agent;
 mod unblock;
 
 use clap::{Parser, Subcommand};
@@ -111,12 +113,36 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Settle a first-responder proposal for a waiting ticket.
+    #[command(display_order = 4)]
+    Proposal {
+        #[command(subcommand)]
+        action: ProposalCommands,
+    },
     /// Verify observable world-owned waits without operator involvement.
     #[command(hide = true)]
     RecheckWorld {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
+    },
+    /// Run one bounded read-only first-responder pass.
+    #[command(hide = true)]
+    TriageAgent {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        client: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        ticket_path: PathBuf,
+        #[arg(long)]
+        disposition_path: PathBuf,
+        #[arg(long)]
+        timeout_secs: u64,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
     },
     /// Print setup instructions for an agent to follow.
     #[command(hide = true)]
@@ -290,6 +316,22 @@ enum Commands {
         /// Show what would be done without launching zellij
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProposalCommands {
+    /// Run the prepared steps and let the ticket re-review.
+    Apply {
+        ticket_id: String,
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Discard the advice while keeping the original park.
+    Dismiss {
+        ticket_id: String,
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
     },
 }
 
@@ -501,6 +543,23 @@ fn main() {
                 }
             }
         }
+        Commands::Proposal { action } => {
+            let (ticket_id, path, action) = match action {
+                ProposalCommands::Apply { ticket_id, path } => {
+                    (ticket_id, path, proposal::OperatorProposalAction::Apply)
+                }
+                ProposalCommands::Dismiss { ticket_id, path } => {
+                    (ticket_id, path, proposal::OperatorProposalAction::Dismiss)
+                }
+            };
+            match proposal::run_proposal_action(&resolve_path(&path), &ticket_id, action) {
+                Ok(message) => println!("{message}"),
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::RecheckWorld { path } => {
             let path = resolve_path(&path);
             match unblock::run_world_rechecks(&path) {
@@ -510,6 +569,43 @@ fn main() {
                     }
                 }
                 Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::TriageAgent {
+            path,
+            client,
+            model,
+            ticket_path,
+            disposition_path,
+            timeout_secs,
+            agent_bin,
+        } => {
+            let client = match AgentClient::parse(&client) {
+                Ok(client) => client,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            let args = triage_agent::TriageAgentArgs {
+                root: resolve_path(&path),
+                client,
+                model,
+                ticket_path,
+                disposition_path,
+                timeout_secs,
+                agent_bin,
+            };
+            match triage_agent::run_triage_agent(&args) {
+                Ok(proposal) => println!("{proposal}"),
+                Err(triage_agent::TriageAgentError::TimedOut) => {
+                    eprintln!("triage timed out after {timeout_secs}s");
+                    std::process::exit(124);
+                }
+                Err(triage_agent::TriageAgentError::Failed(error)) => {
                     eprintln!("Error: {error}");
                     std::process::exit(1);
                 }
