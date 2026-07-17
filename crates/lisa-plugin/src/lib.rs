@@ -38,9 +38,9 @@ use lisa_core::client::AgentClient;
 use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
     reconcile as reconcile_completion, reduce as reduce_completion, AttemptId, CompletionDeadline,
-    CompletionEvent, CompletionGenerationId, CompletionId, CompletionRejection, CompletionState,
-    CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand,
-    Reconciliation, Retryability,
+    CompletionEvent, CompletionGenerationId, CompletionId, CompletionRejection, CompletionSeal,
+    CompletionState, CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs,
+    EffectCommand, Reconciliation, Retryability,
 };
 use lisa_core::context::PURPOSE_PARAGRAPH;
 use lisa_core::dag::Dag;
@@ -1661,7 +1661,11 @@ impl State {
         if !self.completion_journal_healthy {
             return Err("completion journal is unavailable after a failed restore".to_string());
         }
-        let aggregate = completion_journal::append(&self.completion_journal_path, transition)?;
+        let aggregate = completion_journal::append_with_seal(
+            &self.completion_journal_path,
+            self.config.completion_seal,
+            transition,
+        )?;
         self.completion_aggregates.insert(
             aggregate.completion_key().completion_id().to_string(),
             aggregate,
@@ -5429,6 +5433,7 @@ impl State {
         let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
         let record = AssignmentTransitionRecord {
             schema_version: provenance::SCHEMA_VERSION,
+            seal: self.config.completion_seal,
             record_type: ProvenanceRecordType::AssignmentTransition,
             ticket_id: ticket_id.to_string(),
             attempt_lease,
@@ -5494,6 +5499,7 @@ impl State {
         };
         let record = ParkingTransitionRecord {
             schema_version: provenance::SCHEMA_VERSION,
+            seal: self.config.completion_seal,
             record_type,
             ticket_id: ticket_id.to_string(),
             attempt_lease,
@@ -5552,6 +5558,7 @@ impl State {
             let ended = provenance::system_time_to_epoch(std::time::SystemTime::now());
             let unpark = ParkingTransitionRecord {
                 schema_version: provenance::SCHEMA_VERSION,
+                seal: park.seal,
                 record_type: ParkingTransitionType::Unpark,
                 ticket_id: park.ticket_id.clone(),
                 attempt_lease: park.attempt_lease,
@@ -5626,6 +5633,7 @@ impl State {
         let route = Route::from_client(client);
         let record = ProvenanceRecord {
             schema_version: provenance::SCHEMA_VERSION,
+            seal: self.config.completion_seal,
             ticket_id: ticket_id.to_string(),
             attempt_lease,
             outcome,
@@ -8284,6 +8292,7 @@ mod tests {
         let lease = AttemptLease::mint(ticket_id.to_string(), None).unwrap();
         let park = ParkingTransitionRecord {
             schema_version: provenance::SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
             record_type: ParkingTransitionType::Park,
             ticket_id: ticket_id.to_string(),
             attempt_lease: lease.clone(),
@@ -20284,6 +20293,7 @@ owned\n\
         let route = Route::from_client(AgentClient::Codex);
         let a_without_usage = ProvenanceRecord {
             schema_version: provenance::SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
             ticket_id: TICKET_A.to_string(),
             attempt_lease: AttemptLease {
                 ticket_id: TICKET_A.to_string(),
@@ -20512,6 +20522,7 @@ owned\n\
             let ended_at = started_at + 49;
             let current = ProvenanceRecord {
                 schema_version: provenance::SCHEMA_VERSION,
+                seal: CompletionSeal::Commit,
                 ticket_id: ticket_id.clone(),
                 attempt_lease: AttemptLease {
                     ticket_id: ticket_id.clone(),
@@ -20643,6 +20654,7 @@ owned\n\
         let route = Route::from_client(AgentClient::Codex);
         let current = ProvenanceRecord {
             schema_version: provenance::SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
             ticket_id: "T-CDX-01".to_string(),
             attempt_lease: AttemptLease {
                 ticket_id: "T-CDX-01".to_string(),

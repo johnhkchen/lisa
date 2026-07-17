@@ -41,6 +41,7 @@ pub(crate) fn owner_at<'a>(
 
 #[cfg(test)]
 mod tests {
+    use lisa_core::completion::CompletionSeal;
     use lisa_core::provenance::{ProvenanceRecord, Route, RunOutcome, SCHEMA_VERSION};
     use lisa_core::types::AttemptLease;
 
@@ -60,6 +61,7 @@ mod tests {
         };
         ProvenanceRecord {
             schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
             ticket_id: ticket_id.to_string(),
             attempt_lease: AttemptLease {
                 ticket_id: ticket_id.to_string(),

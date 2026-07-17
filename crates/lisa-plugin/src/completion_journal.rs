@@ -12,7 +12,7 @@ use std::path::Path;
 
 use lisa_core::completion::{
     reduce, AttemptId, CompletionDeadline, CompletionEvent, CompletionGenerationId, CompletionId,
-    CompletionState, CorrelationId, LaunchFailure, Retryability,
+    CompletionSeal, CompletionState, CorrelationId, LaunchFailure, Retryability,
 };
 use lisa_core::types::{Phase, TicketId, TicketStatus};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,7 @@ impl CompletionJournalTransition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompletionJournalAggregate {
     completion_key: CompletionGenerationId,
+    seal: CompletionSeal,
     state: CompletionState,
     prior_phase: Phase,
     prior_status: TicketStatus,
@@ -72,6 +73,11 @@ pub(crate) struct CompletionJournalAggregate {
 impl CompletionJournalAggregate {
     pub(crate) fn completion_key(&self) -> &CompletionGenerationId {
         &self.completion_key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal(&self) -> CompletionSeal {
+        self.seal
     }
 
     pub(crate) fn state(&self) -> &CompletionState {
@@ -107,6 +113,8 @@ impl CompletionJournalAggregate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct JournalRecord {
     schema_version: u32,
+    #[serde(default)]
+    seal: CompletionSeal,
     #[serde(flatten)]
     body: JournalRecordBody,
 }
@@ -172,7 +180,7 @@ impl From<JournalRetryability> for Retryability {
 }
 
 impl JournalRecord {
-    fn from_transition(transition: &CompletionJournalTransition) -> Self {
+    fn from_transition(seal: CompletionSeal, transition: &CompletionJournalTransition) -> Self {
         let body = match transition {
             CompletionJournalTransition::Requested {
                 key,
@@ -223,18 +231,19 @@ impl JournalRecord {
         };
         Self {
             schema_version: SCHEMA_VERSION,
+            seal,
             body,
         }
     }
 
-    fn into_transition(self) -> Result<CompletionJournalTransition, String> {
+    fn into_transition(self) -> Result<(CompletionSeal, CompletionJournalTransition), String> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(format!(
                 "unsupported completion journal schema version {} (expected {SCHEMA_VERSION})",
                 self.schema_version
             ));
         }
-        Ok(match self.body {
+        let transition = match self.body {
             JournalRecordBody::Requested {
                 completion_id,
                 attempt_id,
@@ -283,7 +292,8 @@ impl JournalRecord {
                 correlation: CorrelationId::new(correlation_id),
                 commit_id,
             },
-        })
+        };
+        Ok((self.seal, transition))
     }
 }
 
@@ -315,8 +325,9 @@ pub(crate) fn load(path: &Path) -> Result<HashMap<TicketId, CompletionJournalAgg
 }
 
 /// Atomically append one validated transition and return its new aggregate.
-pub(crate) fn append(
+pub(crate) fn append_with_seal(
     path: &Path,
+    seal: CompletionSeal,
     transition: CompletionJournalTransition,
 ) -> Result<CompletionJournalAggregate, String> {
     let mut bytes = match fs::read(path) {
@@ -330,9 +341,9 @@ pub(crate) fn append(
         }
     };
     let mut aggregates = fold_bytes(&bytes)?;
-    let record = JournalRecord::from_transition(&transition);
+    let record = JournalRecord::from_transition(seal, &transition);
     let ticket_id = transition.key().completion_id().to_string();
-    let aggregate = apply_transition(&mut aggregates, transition)?;
+    let aggregate = apply_transition(&mut aggregates, seal, transition)?;
 
     let mut line = serde_json::to_vec(&record)
         .map_err(|error| format!("cannot serialize completion journal transition: {error}"))?;
@@ -368,6 +379,14 @@ pub(crate) fn append(
     Ok(aggregate)
 }
 
+#[cfg(test)]
+fn append(
+    path: &Path,
+    transition: CompletionJournalTransition,
+) -> Result<CompletionJournalAggregate, String> {
+    append_with_seal(path, CompletionSeal::Commit, transition)
+}
+
 fn fold_bytes(bytes: &[u8]) -> Result<HashMap<TicketId, CompletionJournalAggregate>, String> {
     let mut aggregates = HashMap::new();
     if bytes.is_empty() {
@@ -390,10 +409,10 @@ fn fold_bytes(bytes: &[u8]) -> Result<HashMap<TicketId, CompletionJournalAggrega
         let record: JournalRecord = serde_json::from_slice(line).map_err(|error| {
             format!("cannot parse completion journal line {line_number}: {error}")
         })?;
-        let transition = record
+        let (seal, transition) = record
             .into_transition()
             .map_err(|error| format!("invalid completion journal line {line_number}: {error}"))?;
-        apply_transition(&mut aggregates, transition)
+        apply_transition(&mut aggregates, seal, transition)
             .map_err(|error| format!("invalid completion journal line {line_number}: {error}"))?;
     }
     Ok(aggregates)
@@ -401,6 +420,7 @@ fn fold_bytes(bytes: &[u8]) -> Result<HashMap<TicketId, CompletionJournalAggrega
 
 fn apply_transition(
     aggregates: &mut HashMap<TicketId, CompletionJournalAggregate>,
+    seal: CompletionSeal,
     transition: CompletionJournalTransition,
 ) -> Result<CompletionJournalAggregate, String> {
     let ticket_id = transition.key().completion_id().to_string();
@@ -410,6 +430,14 @@ fn apply_transition(
             prior_phase,
             prior_status,
         } => {
+            if let Some(aggregate) = aggregates.get(&ticket_id) {
+                if aggregate.completion_key == key && aggregate.seal != seal {
+                    return Err(format!(
+                        "completion {ticket_id} seal mismatch: expected {}, got {seal}",
+                        aggregate.seal
+                    ));
+                }
+            }
             let state = match aggregates.get(&ticket_id) {
                 Some(aggregate)
                     if aggregate.completion_key != key
@@ -439,6 +467,7 @@ fn apply_transition(
             }
             CompletionJournalAggregate {
                 completion_key: key,
+                seal,
                 state: reduced.state,
                 prior_phase,
                 prior_status,
@@ -450,7 +479,7 @@ fn apply_transition(
             correlation,
             deadline,
         } => {
-            let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key)?;
+            let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key, seal)?;
             let reduced = reduce(
                 aggregate.state.clone(),
                 CompletionEvent::CommandLaunched {
@@ -477,7 +506,7 @@ fn apply_transition(
             reason,
             retryability,
         } => {
-            let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key)?;
+            let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key, seal)?;
             let event = match &aggregate.state {
                 CompletionState::Requested => {
                     if correlation.is_some() {
@@ -529,7 +558,7 @@ fn apply_transition(
                     "confirmed transition for {ticket_id} requires a commit id"
                 ));
             }
-            let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key)?;
+            let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key, seal)?;
             let reduced = reduce(
                 aggregate.state.clone(),
                 CompletionEvent::CommandSucceeded { correlation },
@@ -555,6 +584,7 @@ fn matching_aggregate(
     aggregates: &HashMap<TicketId, CompletionJournalAggregate>,
     ticket_id: &str,
     key: &CompletionGenerationId,
+    seal: CompletionSeal,
 ) -> Result<CompletionJournalAggregate, String> {
     let aggregate = aggregates
         .get(ticket_id)
@@ -564,6 +594,12 @@ fn matching_aggregate(
         return Err(format!(
             "completion {ticket_id} generation key mismatch: expected {}, got {key}",
             aggregate.completion_key
+        ));
+    }
+    if aggregate.seal != seal {
+        return Err(format!(
+            "completion {ticket_id} seal mismatch: expected {}, got {seal}",
+            aggregate.seal
         ));
     }
     Ok(aggregate)
@@ -876,6 +912,7 @@ mod tests {
         .unwrap();
 
         let aggregate = load(&path).unwrap().remove("T-LEGACY").unwrap();
+        assert_eq!(aggregate.seal(), CompletionSeal::Commit);
         assert_eq!(
             aggregate.state(),
             &CompletionState::CommandInFlight {
@@ -902,5 +939,39 @@ mod tests {
             }
         ));
         assert!(rejected.masks_durable_done());
+    }
+
+    #[test]
+    fn new_rows_carry_the_pinned_seal_and_mixed_generations_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+        let generation = key("T-SEAL", "1", 1);
+
+        let requested = append_with_seal(
+            &path,
+            CompletionSeal::Journal,
+            CompletionJournalTransition::Requested {
+                key: generation.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Review,
+            },
+        )
+        .unwrap();
+        assert_eq!(requested.seal(), CompletionSeal::Journal);
+        let requested_bytes = fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&requested_bytes).contains("\"seal\":\"journal\""));
+
+        let error = append_with_seal(
+            &path,
+            CompletionSeal::Commit,
+            CompletionJournalTransition::CommandInFlight {
+                key: generation,
+                correlation: correlation("mixed-tier-command"),
+                deadline: deadline(42),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("seal mismatch"));
+        assert_eq!(fs::read(&path).unwrap(), requested_bytes);
     }
 }
