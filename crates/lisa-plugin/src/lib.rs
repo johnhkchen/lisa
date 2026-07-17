@@ -41,9 +41,9 @@ use lisa_core::client::AgentClient;
 use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
     reconcile as reconcile_completion, reduce as reduce_completion, AttemptId, CompletionDeadline,
-    CompletionEvent, CompletionGenerationId, CompletionId, CompletionRejection, CompletionState,
-    CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand,
-    Reconciliation, Retryability,
+    CompletionEvent, CompletionGenerationId, CompletionId, CompletionRejection, CompletionSeal,
+    CompletionSealReceipt, CompletionState, CorrelationId, CurrentLeaseArtifactAdmission,
+    DurableCompletionInputs, EffectCommand, Reconciliation, Retryability,
 };
 use lisa_core::context::PURPOSE_PARAGRAPH;
 use lisa_core::dag::Dag;
@@ -2178,34 +2178,38 @@ impl State {
             ticket_status
         };
 
-        let command = match self.build_completion_command(&completion_key, &ticket_file) {
-            Ok(command) => Some(command),
-            Err(error) => {
-                #[cfg(test)]
-                if self.completion_journal_path.as_os_str().is_empty() {
-                    None
-                } else {
-                    self.log_completion_rejection(
-                        &ticket_id,
-                        &completion_key,
-                        &CompletionRejection::LaunchFailed {
-                            source: LaunchFailure::new(error),
-                        },
-                    );
-                    return false;
-                }
-                #[cfg(not(test))]
-                {
-                    self.log_completion_rejection(
-                        &ticket_id,
-                        &completion_key,
-                        &CompletionRejection::LaunchFailed {
-                            source: LaunchFailure::new(error),
-                        },
-                    );
-                    return false;
+        let command = if self.config.completion_seal == CompletionSeal::Commit {
+            match self.build_completion_command(&completion_key, &ticket_file) {
+                Ok(command) => Some(command),
+                Err(error) => {
+                    #[cfg(test)]
+                    if self.completion_journal_path.as_os_str().is_empty() {
+                        None
+                    } else {
+                        self.log_completion_rejection(
+                            &ticket_id,
+                            &completion_key,
+                            &CompletionRejection::LaunchFailed {
+                                source: LaunchFailure::new(error),
+                            },
+                        );
+                        return false;
+                    }
+                    #[cfg(not(test))]
+                    {
+                        self.log_completion_rejection(
+                            &ticket_id,
+                            &completion_key,
+                            &CompletionRejection::LaunchFailed {
+                                source: LaunchFailure::new(error),
+                            },
+                        );
+                        return false;
+                    }
                 }
             }
+        } else {
+            None
         };
         let correlation = CorrelationId::new(completion_key.to_string());
         let deadline = Self::reconciliation_deadline(now);
@@ -2264,6 +2268,10 @@ impl State {
         #[cfg(test)]
         self.launched_completion_effects.push(effect);
 
+        if self.config.completion_seal == CompletionSeal::Journal {
+            self.complete_pending_journal_seal(&ticket_id);
+            return true;
+        }
         let Some((argv, context)) = command else {
             return true;
         };
@@ -2331,16 +2339,20 @@ impl State {
             Some(ticket) if !ticket.file_path.as_os_str().is_empty() => ticket.file_path.clone(),
             _ => return false,
         };
-        let (argv, context) = match self.build_completion_command(&completion_key, &ticket_file) {
-            Ok(command) => command,
-            Err(error) => {
-                self.log_activity(ActivityEvent::Warning {
-                    message: format!(
-                        "Completion replay could not launch for {ticket_id} correlation {correlation}: {error}"
-                    ),
-                });
-                return false;
+        let command = if self.config.completion_seal == CompletionSeal::Commit {
+            match self.build_completion_command(&completion_key, &ticket_file) {
+                Ok(command) => Some(command),
+                Err(error) => {
+                    self.log_activity(ActivityEvent::Warning {
+                        message: format!(
+                            "Completion replay could not launch for {ticket_id} correlation {correlation}: {error}"
+                        ),
+                    });
+                    return false;
+                }
             }
+        } else {
+            None
         };
 
         self.pending_completions.insert(
@@ -2364,6 +2376,13 @@ impl State {
                 completion_id: completion_key.completion_id().clone(),
             });
 
+        if self.config.completion_seal == CompletionSeal::Journal {
+            self.complete_pending_journal_seal(&ticket_id);
+            return true;
+        }
+        let Some((argv, context)) = command else {
+            return false;
+        };
         self.launch_completion_host_command(&argv, context);
         self.log_activity(ActivityEvent::Info {
             message: format!(
@@ -2554,6 +2573,130 @@ impl State {
         matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 
+    fn complete_pending_journal_seal(&mut self, ticket_id: &str) -> bool {
+        let Some(pending) = self.pending_completions.get(ticket_id).cloned() else {
+            return false;
+        };
+        let ticket_file = match self.dag.get_ticket(&ticket_id.to_string()) {
+            Some(ticket) if !ticket.file_path.as_os_str().is_empty() => ticket.file_path.clone(),
+            _ => return false,
+        };
+        let work_dir = self.config.work_dir.join(ticket_id);
+        match completion_journal::complete_with_journal_seal(
+            &self.project_root,
+            &ticket_file,
+            &work_dir,
+        ) {
+            Ok(receipt) => self.finish_successful_completion(ticket_id, pending, receipt),
+            Err(error) => {
+                self.rebuild_dag();
+                self.log_completion_rejection(
+                    ticket_id,
+                    &pending.completion_key,
+                    &CompletionRejection::LaunchFailed {
+                        source: LaunchFailure::new(format!(
+                            "Lisa could not create the journal seal for {ticket_id}. [{error}]"
+                        )),
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    fn finish_successful_completion(
+        &mut self,
+        ticket_id: &str,
+        pending: PendingCompletion,
+        receipt: CompletionSealReceipt,
+    ) -> bool {
+        if receipt.seal() != self.config.completion_seal {
+            self.rebuild_dag();
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion evidence for {ticket_id} used {} under pinned {} seal; scheduler state remains blocked",
+                    receipt.seal(),
+                    self.config.completion_seal
+                ),
+            });
+            return false;
+        }
+        let durable_done = ticket::scan_tickets(&self.config.ticket_dir)
+            .ok()
+            .and_then(|tickets| tickets.into_iter().find(|ticket| ticket.id == ticket_id))
+            .map(|ticket| ticket.phase == Phase::Done && ticket.status == TicketStatus::Done)
+            .unwrap_or(false);
+        if !durable_done {
+            self.rebuild_dag();
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion {} succeeded for {} but durable Done frontmatter could not be verified; scheduler state remains blocked",
+                    receipt.seal(),
+                    ticket_id
+                ),
+            });
+            return false;
+        }
+
+        let success_message = match &receipt {
+            CompletionSealReceipt::Commit { commit_id } => format!(
+                "Completion commit verified for {} authority {:?} at {}",
+                ticket_id, pending.authority, commit_id
+            ),
+            CompletionSealReceipt::Journal { content_hashes } => format!(
+                "Journal seal verified for {} authority {:?} with {} content hashes",
+                ticket_id,
+                pending.authority,
+                content_hashes.len()
+            ),
+        };
+        let operator_modal_correlation =
+            matches!(pending.source, CompletionSource::OperatorRequested(_))
+                .then(|| pending.completion_key.to_string());
+        if let Err(error) =
+            self.journal_completion_transition(CompletionJournalTransition::Confirmed {
+                key: pending.completion_key,
+                correlation: pending.correlation,
+                receipt,
+            })
+        {
+            self.rebuild_dag();
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion publication succeeded for {ticket_id} but confirmation could not be persisted: {error}; scheduler state remains blocked"
+                ),
+            });
+            return false;
+        }
+
+        if let Some(correlation_id) = operator_modal_correlation {
+            self.show_operator_modal_accepted(ticket_id, correlation_id);
+        }
+        self.pending_completions.remove(ticket_id);
+        self.rebuild_dag();
+
+        self.log_activity(ActivityEvent::PhaseCompleted {
+            ticket_id: ticket_id.to_string(),
+            phase: pending.prior_phase,
+        });
+        self.log_activity(ActivityEvent::TicketPhaseChanged {
+            ticket_id: ticket_id.to_string(),
+            old_phase: pending.prior_phase,
+            new_phase: Phase::Done,
+        });
+        self.log_activity(ActivityEvent::Info {
+            message: success_message,
+        });
+        if let Some(thread) = self.threads.get_mut(ticket_id) {
+            thread.complete();
+        }
+        self.emit_provenance(ticket_id, RunOutcome::Done, false);
+        self.release_completed_slot_for_ticket(&ticket_id.to_string());
+        self.threads.remove(ticket_id);
+        self.schedule_ready_tickets();
+        true
+    }
+
     fn handle_completion_result(
         &mut self,
         ticket_id: &str,
@@ -2739,70 +2882,9 @@ impl State {
         }
 
         let commit_id = String::from_utf8_lossy(&stdout).trim().to_string();
-        let ticket_id_owned = ticket_id.to_string();
-        let durable_done = ticket::scan_tickets(&self.config.ticket_dir)
-            .ok()
-            .and_then(|tickets| tickets.into_iter().find(|ticket| ticket.id == ticket_id))
-            .map(|ticket| ticket.phase == Phase::Done && ticket.status == TicketStatus::Done)
-            .unwrap_or(false);
-        if !durable_done {
-            self.rebuild_dag();
-            self.log_activity(ActivityEvent::Error {
-                message: format!(
-                    "Completion command succeeded for {} but durable Done frontmatter could not be verified; scheduler state remains blocked",
-                    ticket_id
-                ),
-            });
-            return;
-        }
-
-        let operator_modal_correlation =
-            matches!(pending.source, CompletionSource::OperatorRequested(_))
-                .then(|| completion_key.to_string());
-        if let Err(error) =
-            self.journal_completion_transition(CompletionJournalTransition::Confirmed {
-                key: completion_key,
-                correlation,
-                commit_id: commit_id.clone(),
-            })
-        {
-            self.rebuild_dag();
-            self.log_activity(ActivityEvent::Error {
-                message: format!(
-                    "Completion command succeeded for {ticket_id} but confirmation could not be persisted: {error}; scheduler state remains blocked"
-                ),
-            });
-            return;
-        }
-
-        if let Some(correlation_id) = operator_modal_correlation {
-            self.show_operator_modal_accepted(ticket_id, correlation_id);
-        }
-        self.pending_completions.remove(ticket_id);
-        self.rebuild_dag();
-
-        self.log_activity(ActivityEvent::PhaseCompleted {
-            ticket_id: ticket_id.to_string(),
-            phase: pending.prior_phase,
-        });
-        self.log_activity(ActivityEvent::TicketPhaseChanged {
-            ticket_id: ticket_id.to_string(),
-            old_phase: pending.prior_phase,
-            new_phase: Phase::Done,
-        });
-        self.log_activity(ActivityEvent::Info {
-            message: format!(
-                "Completion commit verified for {} authority {:?} at {}",
-                ticket_id, pending.authority, commit_id
-            ),
-        });
-        if let Some(thread) = self.threads.get_mut(ticket_id) {
-            thread.complete();
-        }
-        self.emit_provenance(ticket_id, RunOutcome::Done, false);
-        self.release_completed_slot_for_ticket(&ticket_id_owned);
-        self.threads.remove(ticket_id);
-        self.schedule_ready_tickets();
+        let receipt = CompletionSealReceipt::commit(commit_id)
+            .expect("validated completion commit output must produce a receipt");
+        self.finish_successful_completion(ticket_id, pending, receipt);
     }
 
     fn log_activity(&mut self, event: ActivityEvent) {
@@ -10512,6 +10594,117 @@ mod tests {
             ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
             if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
         )));
+    }
+
+    #[test]
+    fn journal_seal_completes_repo_less_ticket_with_hashes_and_unblocks_dependent() {
+        use lisa_core::provenance::ProvenanceLedgerRecord;
+        use std::fs;
+
+        const PREDECESSOR: &str = "T-JOURNAL";
+        const DEPENDENT: &str = "T-AFTER-JOURNAL";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let tickets_dir = root.join("tickets");
+        let work_dir = root.join("work");
+        let attempt_dir = root.join("attempts");
+        let journal = root.join("completion-journal.jsonl");
+        let ledger = root.join("provenance.jsonl");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join(format!("{PREDECESSOR}.md")),
+            format!(
+                "---\nid: {PREDECESSOR}\ntitle: journal predecessor\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tickets_dir.join(format!("{DEPENDENT}.md")),
+            format!(
+                "---\nid: {DEPENDENT}\ntitle: journal dependent\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [{PREDECESSOR}]\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let mut state = State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir.clone(),
+                work_dir: work_dir.clone(),
+                completion_seal: CompletionSeal::Journal,
+                lisa_bin: None,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            project_root: root.to_path_buf(),
+            git_root: PathBuf::new(),
+            attempt_dir,
+            completion_journal_path: journal.clone(),
+            completion_journal_healthy: true,
+            ledger_path: ledger.clone(),
+            ..State::default()
+        };
+        let mut thread = Thread::new(PREDECESSOR, 42);
+        thread.current_phase = Phase::Review;
+        state.threads.insert(PREDECESSOR.to_string(), thread);
+        let lease = install_current_attempt(&mut state, PREDECESSOR);
+        fs::create_dir_all(state.attempt_work_dir(&lease)).unwrap();
+        write_private_review(&state, &lease);
+        fs::create_dir_all(work_dir.join(PREDECESSOR).join("nested")).unwrap();
+        fs::write(
+            work_dir.join(PREDECESSOR).join("nested/evidence.txt"),
+            "retained evidence\n",
+        )
+        .unwrap();
+
+        assert!(!root.join(".git").exists());
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: PREDECESSOR.to_string(),
+            source_lease: lease,
+        }));
+
+        assert!(!state.pending_completions.contains_key(PREDECESSOR));
+        assert!(!state.threads.contains_key(PREDECESSOR));
+        assert_eq!(
+            state
+                .dag
+                .get_ticket(&PREDECESSOR.to_string())
+                .unwrap()
+                .phase,
+            Phase::Done
+        );
+        assert_eq!(
+            state
+                .dag
+                .get_ticket(&PREDECESSOR.to_string())
+                .unwrap()
+                .status,
+            TicketStatus::Done
+        );
+        assert!(state.dag.all_dependencies_done(&DEPENDENT.to_string()));
+
+        let receipt = state.completion_aggregates[PREDECESSOR]
+            .confirmed_receipt()
+            .unwrap();
+        assert_eq!(receipt.seal(), CompletionSeal::Journal);
+        assert_eq!(receipt.content_hashes().len(), 4);
+        for binding in receipt.content_hashes() {
+            let bytes = fs::read(root.join(binding.path())).unwrap();
+            assert_eq!(binding.sha256(), completion_journal::sha256(&bytes));
+        }
+        let journal_body = fs::read_to_string(&journal).unwrap();
+        assert_eq!(journal_body.matches("\"seal\":\"journal\"").count(), 3);
+        assert!(journal_body.contains("\"content_hashes\""));
+        assert!(!journal_body.contains("\"commit_id\""));
+
+        let records = read_mixed_ledger(&ledger);
+        assert_eq!(records.len(), 1);
+        let ProvenanceLedgerRecord::Execution(record) = &records[0] else {
+            panic!("journal completion must retain execution provenance")
+        };
+        assert_eq!(record.ticket_id, PREDECESSOR);
+        assert_eq!(record.seal, CompletionSeal::Journal);
+        assert_eq!(record.outcome, RunOutcome::Done);
     }
 
     #[test]

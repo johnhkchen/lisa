@@ -11,17 +11,23 @@ use std::fs;
 use std::path::Path;
 
 use lisa_core::completion::{
-    reduce, AttemptId, CompletionDeadline, CompletionEvent, CompletionGenerationId, CompletionId,
-    CompletionSeal, CompletionState, CorrelationId, LaunchFailure, Retryability,
+    reduce, AttemptId, CompletionContentHash, CompletionDeadline, CompletionEvent,
+    CompletionGenerationId, CompletionId, CompletionSeal, CompletionSealReceipt, CompletionState,
+    CorrelationId, LaunchFailure, Retryability,
 };
+use lisa_core::ticket;
 use lisa_core::types::{Phase, TicketId, TicketStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::publication::{PublicationErrors, PublicationPath, RustPublication, TemporaryName};
+use crate::publication::{
+    publication_nonce, PublicationErrors, PublicationPath, RustPublication, TemporaryName,
+};
 
 const LEGACY_SCHEMA_VERSION: u32 = 1;
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const TEMPORARY_PREFIX: &str = ".completion-journal.jsonl.tmp.";
+const TICKET_TEMPORARY_PREFIX: &str = ".journal-completion-ticket.tmp.";
 
 /// One durable completion transition requested by the plugin adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +60,7 @@ pub(crate) enum CompletionJournalTransition {
     Confirmed {
         key: CompletionGenerationId,
         correlation: CorrelationId,
-        commit_id: String,
+        receipt: CompletionSealReceipt,
     },
 }
 
@@ -99,7 +105,7 @@ pub(crate) struct CompletionJournalAggregate {
     state: CompletionState,
     prior_phase: Phase,
     prior_status: TicketStatus,
-    confirmed_commit_id: Option<String>,
+    confirmed_receipt: Option<CompletionSealReceipt>,
     failure_count: u8,
     failure_limit: Option<u8>,
     retries_exhausted: bool,
@@ -142,7 +148,14 @@ impl CompletionJournalAggregate {
 
     #[cfg(test)]
     pub(crate) fn confirmed_commit_id(&self) -> Option<&str> {
-        self.confirmed_commit_id.as_deref()
+        self.confirmed_receipt
+            .as_ref()
+            .and_then(CompletionSealReceipt::commit_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirmed_receipt(&self) -> Option<&CompletionSealReceipt> {
+        self.confirmed_receipt.as_ref()
     }
 
     pub(crate) fn masks_durable_done(&self) -> bool {
@@ -209,7 +222,10 @@ enum JournalRecordBody {
         attempt_id: String,
         generation: u64,
         correlation_id: String,
-        commit_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content_hashes: Vec<CompletionContentHash>,
     },
 }
 
@@ -298,14 +314,25 @@ impl JournalRecord {
             CompletionJournalTransition::Confirmed {
                 key,
                 correlation,
-                commit_id,
-            } => JournalRecordBody::Confirmed {
-                completion_id: key.completion_id().to_string(),
-                attempt_id: key.attempt_id().to_string(),
-                generation: key.generation(),
-                correlation_id: correlation.to_string(),
-                commit_id: commit_id.clone(),
-            },
+                receipt,
+            } => {
+                let (commit_id, content_hashes) = match receipt {
+                    CompletionSealReceipt::Commit { commit_id } => {
+                        (Some(commit_id.clone()), Vec::new())
+                    }
+                    CompletionSealReceipt::Journal { content_hashes } => {
+                        (None, content_hashes.clone())
+                    }
+                };
+                JournalRecordBody::Confirmed {
+                    completion_id: key.completion_id().to_string(),
+                    attempt_id: key.attempt_id().to_string(),
+                    generation: key.generation(),
+                    correlation_id: correlation.to_string(),
+                    commit_id,
+                    content_hashes,
+                }
+            }
         };
         Self {
             schema_version: SCHEMA_VERSION,
@@ -384,10 +411,28 @@ impl JournalRecord {
                 generation,
                 correlation_id,
                 commit_id,
+                content_hashes,
             } => CompletionJournalTransition::Confirmed {
                 key: generation_key(completion_id, attempt_id, generation),
                 correlation: CorrelationId::new(correlation_id),
-                commit_id,
+                receipt: match self.seal {
+                    CompletionSeal::Commit => {
+                        if !content_hashes.is_empty() {
+                            return Err("commit-sealed confirmation must not carry content hashes"
+                                .to_string());
+                        }
+                        CompletionSealReceipt::commit(commit_id.ok_or_else(|| {
+                            "commit-sealed confirmation requires a commit id".to_string()
+                        })?)?
+                    }
+                    CompletionSeal::Journal => {
+                        if commit_id.is_some() {
+                            return Err("journal-sealed confirmation must not carry a commit id"
+                                .to_string());
+                        }
+                        CompletionSealReceipt::journal(content_hashes)?
+                    }
+                },
             },
         };
         Ok((self.seal, transition))
@@ -403,6 +448,179 @@ fn generation_key(
         CompletionId::new(completion_id),
         AttemptId::new(attempt_id),
         generation,
+    )
+}
+
+pub(crate) fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn completion_content_path(project_root: &Path, path: &Path) -> Result<String, String> {
+    let relative = path.strip_prefix(project_root).map_err(|_| {
+        format!(
+            "completion content path {} is outside project root {}",
+            path.display(),
+            project_root.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(format!(
+            "completion content path {} must name a file below project root {}",
+            path.display(),
+            project_root.display()
+        ));
+    }
+    Ok(relative.display().to_string())
+}
+
+fn content_hash(
+    project_root: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<CompletionContentHash, String> {
+    CompletionContentHash::new(completion_content_path(project_root, path)?, sha256(bytes))
+}
+
+fn collect_work_hashes(
+    project_root: &Path,
+    directory: &Path,
+    hashes: &mut Vec<CompletionContentHash>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "cannot enumerate completion artifact directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let mut entries = entries
+        .map(|entry| {
+            entry.map_err(|error| {
+                format!(
+                    "cannot inspect completion artifact entry under {}: {error}",
+                    directory.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "cannot inspect completion artifact {}: {error}",
+                path.display()
+            )
+        })?;
+        if file_type.is_dir() {
+            collect_work_hashes(project_root, &path, hashes)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            let bytes = fs::read(&path).map_err(|error| {
+                format!(
+                    "cannot read and hash completion artifact {}: {error}",
+                    path.display()
+                )
+            })?;
+            hashes.push(content_hash(project_root, &path, &bytes)?);
+        } else {
+            return Err(format!(
+                "cannot hash unsupported completion artifact {}: expected a regular file",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_done_ticket(ticket_file: &Path) -> Result<Vec<u8>, String> {
+    let original = fs::read(ticket_file).map_err(|error| {
+        format!(
+            "cannot read completion ticket {}: {error}",
+            ticket_file.display()
+        )
+    })?;
+    let parent = ticket_file.parent().unwrap_or_else(|| Path::new(""));
+    let prepared_path = parent.join(format!("{TICKET_TEMPORARY_PREFIX}{}", publication_nonce()));
+    fs::write(&prepared_path, original).map_err(|error| {
+        format!(
+            "cannot write completion ticket preparation {}: {error}",
+            prepared_path.display()
+        )
+    })?;
+
+    let prepared = (|| {
+        ticket::update_ticket_done(&prepared_path).map_err(|error| {
+            format!(
+                "cannot prepare completion ticket {}: {error}",
+                ticket_file.display()
+            )
+        })?;
+        fs::read(&prepared_path).map_err(|error| {
+            format!(
+                "cannot read prepared completion ticket {}: {error}",
+                prepared_path.display()
+            )
+        })
+    })();
+    let cleanup = fs::remove_file(&prepared_path).map_err(|error| {
+        format!(
+            "cannot remove completion ticket preparation {}: {error}",
+            prepared_path.display()
+        )
+    });
+    match (prepared, cleanup) {
+        (Ok(bytes), Ok(())) => Ok(bytes),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!("{primary}; cleanup also failed: {cleanup}")),
+    }
+}
+
+fn complete_with_journal_seal_and_publish<F>(
+    project_root: &Path,
+    ticket_file: &Path,
+    work_dir: &Path,
+    publish: F,
+) -> Result<CompletionSealReceipt, String>
+where
+    F: FnOnce(&Path, &[u8]) -> Result<(), String>,
+{
+    let done_ticket = prepare_done_ticket(ticket_file)?;
+    let mut hashes = vec![content_hash(project_root, ticket_file, &done_ticket)?];
+    collect_work_hashes(project_root, work_dir, &mut hashes)?;
+    hashes.sort_by(|left, right| left.path().cmp(right.path()));
+    let receipt = CompletionSealReceipt::journal(hashes)?;
+    publish(ticket_file, &done_ticket)?;
+    Ok(receipt)
+}
+
+/// Hash every retained completion artifact and atomically publish Done ticket bytes.
+pub(crate) fn complete_with_journal_seal(
+    project_root: &Path,
+    ticket_file: &Path,
+    work_dir: &Path,
+) -> Result<CompletionSealReceipt, String> {
+    complete_with_journal_seal_and_publish(
+        project_root,
+        ticket_file,
+        work_dir,
+        |destination, body| {
+            RustPublication {
+                path: PublicationPath {
+                    destination: destination.to_path_buf(),
+                    temporary_name: TemporaryName::Nonce {
+                        prefix: TICKET_TEMPORARY_PREFIX.to_string(),
+                    },
+                },
+                body,
+                errors: PublicationErrors {
+                    write: "cannot write completed ticket temporary",
+                    publish: "cannot publish completed ticket",
+                },
+            }
+            .publish()
+            .map(|_| ())
+        },
     )
 }
 
@@ -568,7 +786,7 @@ fn apply_transition(
                 state: reduced.state,
                 prior_phase,
                 prior_status,
-                confirmed_commit_id: None,
+                confirmed_receipt: None,
                 failure_count: 0,
                 failure_limit: None,
                 retries_exhausted: false,
@@ -597,7 +815,7 @@ fn apply_transition(
                 ));
             }
             aggregate.state = reduced.state;
-            aggregate.confirmed_commit_id = None;
+            aggregate.confirmed_receipt = None;
             aggregate
         }
         CompletionJournalTransition::FailureObserved {
@@ -721,17 +939,18 @@ fn apply_transition(
                 ));
             }
             aggregate.state = reduced.state;
-            aggregate.confirmed_commit_id = None;
+            aggregate.confirmed_receipt = None;
             aggregate
         }
         CompletionJournalTransition::Confirmed {
             key,
             correlation,
-            commit_id,
+            receipt,
         } => {
-            if commit_id.trim().is_empty() {
+            if receipt.seal() != seal {
                 return Err(format!(
-                    "confirmed transition for {ticket_id} requires a commit id"
+                    "confirmed transition for {ticket_id} carries {} evidence under {seal} seal",
+                    receipt.seal()
                 ));
             }
             let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key, seal)?;
@@ -747,7 +966,7 @@ fn apply_transition(
                 ));
             }
             aggregate.state = reduced.state;
-            aggregate.confirmed_commit_id = Some(commit_id);
+            aggregate.confirmed_receipt = Some(receipt);
             aggregate
         }
     };
@@ -802,6 +1021,204 @@ mod tests {
     }
 
     #[test]
+    fn repo_less_journal_seal_hashes_final_ticket_and_every_nested_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let ticket = project.join("tickets/T-JOURNAL.md");
+        let work = project.join("work/T-JOURNAL");
+        fs::create_dir_all(work.join("nested")).unwrap();
+        let original = b"---\nid: T-JOURNAL\nstatus: open\nphase: review\n---\nBody\n";
+        fs::create_dir_all(ticket.parent().unwrap()).unwrap();
+        fs::write(&ticket, original).unwrap();
+        fs::write(work.join("review.md"), b"# Review\n").unwrap();
+        fs::write(work.join("nested/evidence.bin"), [0, 1, 2, 255]).unwrap();
+
+        let receipt = complete_with_journal_seal(project, &ticket, &work).unwrap();
+
+        assert!(!project.join(".git").exists());
+        let done = fs::read(&ticket).unwrap();
+        let done_text = String::from_utf8_lossy(&done);
+        assert!(done_text.contains("status: done"));
+        assert!(done_text.contains("phase: done"));
+        assert_eq!(receipt.seal(), CompletionSeal::Journal);
+        let hashes = receipt.content_hashes();
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(hashes[0].path(), "tickets/T-JOURNAL.md");
+        assert_eq!(hashes[0].sha256(), sha256(&done));
+        assert_eq!(hashes[1].path(), "work/T-JOURNAL/nested/evidence.bin");
+        assert_eq!(
+            hashes[1].sha256(),
+            sha256(&fs::read(work.join("nested/evidence.bin")).unwrap())
+        );
+        assert_eq!(hashes[2].path(), "work/T-JOURNAL/review.md");
+        assert_eq!(
+            hashes[2].sha256(),
+            sha256(&fs::read(work.join("review.md")).unwrap())
+        );
+
+        let sealed_review_hash = hashes[2].sha256().to_string();
+        fs::write(work.join("review.md"), b"# Mutated after seal\n").unwrap();
+        assert_ne!(
+            sealed_review_hash,
+            sha256(&fs::read(work.join("review.md")).unwrap()),
+            "post-seal mutation must make the recorded content hash detectably stale"
+        );
+        assert_eq!(
+            fs::read_dir(ticket.parent().unwrap()).unwrap().count(),
+            1,
+            "journal completion must remove every sibling temporary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_journal_artifact_names_the_path_and_preserves_review_ticket() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let ticket = project.join("tickets/T-UNREADABLE.md");
+        let work = project.join("work/T-UNREADABLE");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(ticket.parent().unwrap()).unwrap();
+        let original = b"---\nid: T-UNREADABLE\nstatus: open\nphase: review\n---\nBody\n";
+        fs::write(&ticket, original).unwrap();
+        let unreadable = work.join("missing-evidence.md");
+        symlink("does-not-exist", &unreadable).unwrap();
+
+        let error = complete_with_journal_seal(project, &ticket, &work).unwrap_err();
+
+        assert!(error.contains("cannot read and hash completion artifact"));
+        assert!(error.contains("missing-evidence.md"));
+        assert_eq!(fs::read(&ticket).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(ticket.parent().unwrap()).unwrap().count(),
+            1,
+            "failed hashing must clean the prepared ticket sibling"
+        );
+    }
+
+    #[test]
+    fn interrupted_ticket_publication_preserves_exact_review_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let ticket = project.join("tickets/T-INTERRUPTED.md");
+        let work = project.join("work/T-INTERRUPTED");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(ticket.parent().unwrap()).unwrap();
+        let original = b"---\nid: T-INTERRUPTED\nstatus: open\nphase: review\n---\nBody\n";
+        fs::write(&ticket, original).unwrap();
+        fs::write(work.join("review.md"), b"# Review\n").unwrap();
+
+        let error = complete_with_journal_seal_and_publish(
+            project,
+            &ticket,
+            &work,
+            |destination, prepared| {
+                assert_eq!(fs::read(destination).unwrap(), original);
+                assert!(String::from_utf8_lossy(prepared).contains("status: done"));
+                Err("hostile interruption before atomic rename".to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "hostile interruption before atomic rename");
+        assert_eq!(fs::read(&ticket).unwrap(), original);
+        assert_eq!(fs::read_dir(ticket.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn journal_confirmation_row_carries_only_journal_hash_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+        let generation = key("T-HASHED", "1", 1);
+        let command = correlation("journal-command");
+        append_with_seal(
+            &path,
+            CompletionSeal::Journal,
+            CompletionJournalTransition::Requested {
+                key: generation.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+            },
+        )
+        .unwrap();
+        append_with_seal(
+            &path,
+            CompletionSeal::Journal,
+            CompletionJournalTransition::CommandInFlight {
+                key: generation.clone(),
+                correlation: command.clone(),
+                deadline: deadline(42),
+            },
+        )
+        .unwrap();
+        let receipt = CompletionSealReceipt::journal(vec![
+            CompletionContentHash::new("tickets/T-HASHED.md", "a".repeat(64)).unwrap(),
+            CompletionContentHash::new("work/T-HASHED/review.md", "b".repeat(64)).unwrap(),
+        ])
+        .unwrap();
+        let confirmed = append_with_seal(
+            &path,
+            CompletionSeal::Journal,
+            CompletionJournalTransition::Confirmed {
+                key: generation,
+                correlation: command,
+                receipt: receipt.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(confirmed.confirmed_receipt(), Some(&receipt));
+        assert_eq!(load(&path).unwrap()["T-HASHED"], confirmed);
+        let confirmed_line = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert!(confirmed_line.contains("\"schema_version\":4"));
+        assert!(confirmed_line.contains("\"seal\":\"journal\""));
+        assert!(confirmed_line.contains("\"content_hashes\""));
+        assert!(confirmed_line.contains("tickets/T-HASHED.md"));
+        assert!(!confirmed_line.contains("\"commit_id\""));
+    }
+
+    #[test]
+    fn schema_three_commit_confirmation_remains_readable_and_invalid_journal_receipt_fails_closed()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"schema_version\":3,\"seal\":\"commit\",\"state\":\"requested\",\"completion_id\":\"T-SCHEMA3\",\"attempt_id\":\"1\",\"generation\":1,\"prior_phase\":\"review\",\"prior_status\":\"open\"}\n",
+                "{\"schema_version\":3,\"seal\":\"commit\",\"state\":\"command-in-flight\",\"completion_id\":\"T-SCHEMA3\",\"attempt_id\":\"1\",\"generation\":1,\"correlation_id\":\"schema3-command\",\"reconciliation_deadline_unix_ms\":42}\n",
+                "{\"schema_version\":3,\"seal\":\"commit\",\"state\":\"confirmed\",\"completion_id\":\"T-SCHEMA3\",\"attempt_id\":\"1\",\"generation\":1,\"correlation_id\":\"schema3-command\",\"commit_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n",
+            ),
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded["T-SCHEMA3"].confirmed_commit_id(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        let invalid = temp.path().join("invalid-journal-receipt.jsonl");
+        fs::write(
+            &invalid,
+            concat!(
+                "{\"schema_version\":4,\"seal\":\"journal\",\"state\":\"requested\",\"completion_id\":\"T-INVALID\",\"attempt_id\":\"1\",\"generation\":1,\"prior_phase\":\"review\",\"prior_status\":\"open\"}\n",
+                "{\"schema_version\":4,\"seal\":\"journal\",\"state\":\"command-in-flight\",\"completion_id\":\"T-INVALID\",\"attempt_id\":\"1\",\"generation\":1,\"correlation_id\":\"invalid-command\",\"reconciliation_deadline_unix_ms\":42}\n",
+                "{\"schema_version\":4,\"seal\":\"journal\",\"state\":\"confirmed\",\"completion_id\":\"T-INVALID\",\"attempt_id\":\"1\",\"generation\":1,\"correlation_id\":\"invalid-command\"}\n",
+            ),
+        )
+        .unwrap();
+        let error = load(&invalid).unwrap_err();
+        assert!(error.contains("journal completion receipt requires content hashes"));
+    }
+
+    #[test]
     fn requested_in_flight_and_confirmed_reconstruct_after_each_restart() {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("journal path ' ; $() `x`");
@@ -850,7 +1267,7 @@ mod tests {
             CompletionJournalTransition::Confirmed {
                 key: generation,
                 correlation: command,
-                commit_id: commit_id.clone(),
+                receipt: CompletionSealReceipt::commit(commit_id.clone()).unwrap(),
             },
         )
         .unwrap();
@@ -861,7 +1278,7 @@ mod tests {
 
         let body = fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 3);
-        assert_eq!(body.matches("\"schema_version\":3").count(), 3);
+        assert_eq!(body.matches("\"schema_version\":4").count(), 3);
         assert_eq!(body.matches("\"seal\":\"commit\"").count(), 3);
         assert_eq!(body.matches("\"state\":\"requested\"").count(), 1);
         assert_eq!(body.matches("\"state\":\"command-in-flight\"").count(), 1);
@@ -1082,7 +1499,7 @@ mod tests {
             CompletionJournalTransition::Confirmed {
                 key: first,
                 correlation: command,
-                commit_id: "c".repeat(40),
+                receipt: CompletionSealReceipt::commit("c".repeat(40)).unwrap(),
             },
         )
         .unwrap();
@@ -1174,7 +1591,7 @@ mod tests {
             CompletionJournalTransition::Confirmed {
                 key: expected.clone(),
                 correlation: correlation("command-b"),
-                commit_id: "b".repeat(40),
+                receipt: CompletionSealReceipt::commit("b".repeat(40)).unwrap(),
             },
         )
         .unwrap_err();
@@ -1256,7 +1673,7 @@ mod tests {
         assert_eq!(requested.seal(), CompletionSeal::Journal);
         let requested_bytes = fs::read(&path).unwrap();
         let requested_json = String::from_utf8_lossy(&requested_bytes);
-        assert!(requested_json.contains("\"schema_version\":3"));
+        assert!(requested_json.contains("\"schema_version\":4"));
         assert!(requested_json.contains("\"seal\":\"journal\""));
 
         let error = append_with_seal(
