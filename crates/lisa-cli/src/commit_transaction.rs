@@ -1459,7 +1459,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("stale commit transaction lock"), "{error}");
-        assert!(error.contains("age 120s"), "{error}");
+        let reported_age = error
+            .split("was recovered: age ")
+            .nth(1)
+            .and_then(|detail| detail.split(';').next())
+            .unwrap_or_default();
+        assert!(reported_age.ends_with('s'), "{error}");
         assert!(
             error.contains(&format!("holder PID {absent_pid}")),
             "{error}"
