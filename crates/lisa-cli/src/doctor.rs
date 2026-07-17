@@ -667,13 +667,15 @@ fn append_completion_seal_report(
     match completion {
         Ok(completion) => {
             append_completion_seal_line(output, completion.seal());
-            if let Some(reason @ lisa_core::completion::CommitSealUnavailable::IdentityMissing) =
-                completion.commit_unavailable()
-            {
+            if let Some(reason) = completion.commit_unavailable() {
                 output.push_str("\n  Reason: ");
                 output.push_str(&reason.to_string());
                 output.push_str(".\n\n");
-                output.push_str(crate::completion_seal::COMMIT_IDENTITY_REMEDIES);
+                output.push_str(
+                    &completion
+                        .commit_unavailable_remedy()
+                        .expect("an unavailable reason always has a remedy"),
+                );
                 output.push('\n');
             }
         }

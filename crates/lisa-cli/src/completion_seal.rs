@@ -9,20 +9,21 @@ use std::process::{Command, Output};
 
 use lisa_core::completion::{
     resolve_completion_seal, CommitSealSupport, CommitSealUnavailable, CompletionSeal,
-    CompletionSealMode, ResolvedCompletionSeal,
+    CompletionSealMode, ResolvedCompletionSeal, IDENTITY_EMAIL_COMMAND, IDENTITY_NAME_COMMAND,
 };
 
-pub(crate) const COMMIT_IDENTITY_REMEDIES: &str = "Configure your own identity:
-  git config user.name \"You\"
-  git config user.email you@example.com
-
-Or rerun `lisa init` and accept the history offer.";
+pub(crate) const REPOSITORY_MISSING_REMEDY: &str =
+    "Run `lisa init` to create project history, then retry.";
+pub(crate) const IDENTITY_INIT_REMEDY: &str = "Or rerun `lisa init` and accept the history offer.";
+pub(crate) const TRANSACTION_UNAVAILABLE_REMEDY: &str =
+    "Repair the named commit-transaction dependency, then rerun `lisa doctor`.";
 
 /// Completion seal and repository fact pinned by one loop-start probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunCompletionSeal {
     resolution: ResolvedCompletionSeal,
     git_root: Option<PathBuf>,
+    identity_init_remedy: bool,
 }
 
 impl RunCompletionSeal {
@@ -36,6 +37,11 @@ impl RunCompletionSeal {
 
     pub(crate) fn commit_unavailable(&self) -> Option<&CommitSealUnavailable> {
         self.resolution.commit_unavailable()
+    }
+
+    pub(crate) fn commit_unavailable_remedy(&self) -> Option<String> {
+        self.commit_unavailable()
+            .map(|reason| remedy_for(reason, self.identity_init_remedy))
     }
 }
 
@@ -70,6 +76,7 @@ pub(crate) const fn visibility_line(seal: CompletionSeal) -> &'static str {
 struct CommitProbeOutcome {
     support: CommitSealSupport,
     git_root: Option<PathBuf>,
+    identity_init_remedy: bool,
 }
 
 #[derive(Debug)]
@@ -100,16 +107,23 @@ where
         CommitProbeOutcome {
             support: CommitSealSupport::Unavailable(CommitSealUnavailable::RepositoryMissing),
             git_root: None,
+            identity_init_remedy: false,
         }
     } else {
         probe(project_root)
     };
 
-    let resolution = resolve_completion_seal(mode, outcome.support)
-        .map_err(|error| format_preflight_failure(error.reason()))?;
+    let CommitProbeOutcome {
+        support,
+        git_root,
+        identity_init_remedy,
+    } = outcome;
+    let resolution = resolve_completion_seal(mode, support)
+        .map_err(|error| format_preflight_failure(error.reason(), identity_init_remedy))?;
     Ok(RunCompletionSeal {
         resolution,
-        git_root: outcome.git_root,
+        git_root,
+        identity_init_remedy,
     })
 }
 
@@ -120,6 +134,7 @@ fn probe_commit_support(project_root: &Path) -> CommitProbeOutcome {
             return CommitProbeOutcome {
                 support: CommitSealSupport::Unavailable(CommitSealUnavailable::RepositoryMissing),
                 git_root: None,
+                identity_init_remedy: false,
             };
         }
     };
@@ -138,6 +153,7 @@ fn probe_commit_support(project_root: &Path) -> CommitProbeOutcome {
                     },
                 ),
                 git_root: None,
+                identity_init_remedy: false,
             };
         }
     };
@@ -145,9 +161,11 @@ fn probe_commit_support(project_root: &Path) -> CommitProbeOutcome {
     let identity = run_git(&git_root, &["config", "--get", "user.email"]);
     if !matches!(identity, Ok(ref output) if !output.stdout.is_empty() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
     {
+        let identity_init_remedy = repository_is_unborn(&git_root);
         return CommitProbeOutcome {
             support: CommitSealSupport::Unavailable(CommitSealUnavailable::IdentityMissing),
             git_root: Some(git_root),
+            identity_init_remedy,
         };
     }
 
@@ -162,6 +180,7 @@ fn probe_commit_support(project_root: &Path) -> CommitProbeOutcome {
                 },
             ),
             git_root: Some(git_root),
+            identity_init_remedy: false,
         };
     }
 
@@ -178,6 +197,7 @@ fn probe_commit_support(project_root: &Path) -> CommitProbeOutcome {
                     },
                 ),
                 git_root: Some(git_root),
+                identity_init_remedy: false,
             };
         }
     };
@@ -192,13 +212,25 @@ fn probe_commit_support(project_root: &Path) -> CommitProbeOutcome {
                 },
             ),
             git_root: Some(git_root),
+            identity_init_remedy: false,
         };
     }
 
     CommitProbeOutcome {
         support: CommitSealSupport::Available,
         git_root: Some(git_root),
+        identity_init_remedy: false,
     }
+}
+
+fn repository_is_unborn(git_root: &Path) -> bool {
+    if run_git(git_root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+        return false;
+    }
+    matches!(
+        run_git(git_root, &["symbolic-ref", "--quiet", "HEAD"]),
+        Ok(output) if !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+    )
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<Output, GitCommandFailure> {
@@ -231,9 +263,29 @@ fn git_failure_detail(failure: &GitCommandFailure) -> String {
     }
 }
 
-fn format_preflight_failure(reason: &CommitSealUnavailable) -> String {
+pub(crate) fn remedy_for(reason: &CommitSealUnavailable, identity_init_remedy: bool) -> String {
+    match reason {
+        CommitSealUnavailable::RepositoryMissing => REPOSITORY_MISSING_REMEDY.to_string(),
+        CommitSealUnavailable::IdentityMissing => {
+            let config = format!(
+                "Configure your own identity:\n  {IDENTITY_NAME_COMMAND}\n  {IDENTITY_EMAIL_COMMAND}"
+            );
+            if identity_init_remedy {
+                format!("{config}\n\n{IDENTITY_INIT_REMEDY}")
+            } else {
+                config
+            }
+        }
+        CommitSealUnavailable::TransactionUnavailable { .. } => {
+            TRANSACTION_UNAVAILABLE_REMEDY.to_string()
+        }
+    }
+}
+
+fn format_preflight_failure(reason: &CommitSealUnavailable, identity_init_remedy: bool) -> String {
+    let remedy = remedy_for(reason, identity_init_remedy);
     format!(
-        "Completion seal preflight failed: [guards].completion = \"commit\" requires commit sealing, but {reason}.\n\n{COMMIT_IDENTITY_REMEDIES}"
+        "Completion seal preflight failed: [guards].completion = \"commit\" requires commit sealing, but {reason}.\n\n{remedy}"
     )
 }
 
@@ -247,6 +299,7 @@ mod tests {
         CommitProbeOutcome {
             support,
             git_root: Some(PathBuf::from("/repo")),
+            identity_init_remedy: false,
         }
     }
 
@@ -290,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_commit_probes_once_and_missing_identity_has_two_line_remedy() {
+    fn explicit_commit_probes_once_and_missing_identity_has_only_valid_born_remedy() {
         let calls = Cell::new(0);
         let error = resolve_for_run_with(Path::new("/project"), CompletionSealMode::Commit, |_| {
             calls.set(calls.get() + 1);
@@ -303,11 +356,52 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(error.contains("Completion seal preflight failed"));
         assert!(error.contains("[guards].completion = \"commit\""));
+        assert!(error.contains(IDENTITY_NAME_COMMAND));
+        assert!(error.contains(IDENTITY_EMAIL_COMMAND));
+        assert!(!error.contains(IDENTITY_INIT_REMEDY));
+        assert!(!error.contains(REPOSITORY_MISSING_REMEDY));
+        assert!(!error.contains(TRANSACTION_UNAVAILABLE_REMEDY));
+    }
+
+    #[test]
+    fn every_unavailable_variant_maps_to_its_own_remedy_set() {
+        let repository = CommitSealUnavailable::RepositoryMissing;
+        let repository_error = format_preflight_failure(&repository, false);
+        assert!(repository_error.contains(REPOSITORY_MISSING_REMEDY));
+        assert!(!repository_error.contains(IDENTITY_NAME_COMMAND));
+        assert!(!repository_error.contains(TRANSACTION_UNAVAILABLE_REMEDY));
+
+        let identity = CommitSealUnavailable::IdentityMissing;
+        let born_remedy = remedy_for(&identity, false);
         assert_eq!(
-            COMMIT_IDENTITY_REMEDIES,
-            "Configure your own identity:\n  git config user.name \"You\"\n  git config user.email you@example.com\n\nOr rerun `lisa init` and accept the history offer."
+            born_remedy,
+            "Configure your own identity:\n  git config user.name \"You\"\n  git config user.email you@example.com"
         );
-        assert!(error.contains(COMMIT_IDENTITY_REMEDIES));
+        assert!(!born_remedy.contains("lisa init"));
+
+        let unborn_remedy = remedy_for(&identity, true);
+        assert_eq!(
+            unborn_remedy,
+            format!("{born_remedy}\n\n{IDENTITY_INIT_REMEDY}")
+        );
+
+        let transaction = CommitSealUnavailable::TransactionUnavailable {
+            detail: "fixture dependency is absent".to_string(),
+        };
+        let transaction_error = format_preflight_failure(&transaction, false);
+        assert!(transaction_error.contains("fixture dependency is absent"));
+        assert!(transaction_error.contains(TRANSACTION_UNAVAILABLE_REMEDY));
+        assert!(!transaction_error.contains(IDENTITY_NAME_COMMAND));
+        assert!(!transaction_error.contains(REPOSITORY_MISSING_REMEDY));
+    }
+
+    #[test]
+    fn cli_and_plugin_identity_commands_are_byte_sourced_from_core() {
+        let remedy = remedy_for(&CommitSealUnavailable::IdentityMissing, true);
+        assert!(lisa_core::completion::HISTORY_IDENTITY_ASK.contains(IDENTITY_NAME_COMMAND));
+        assert!(lisa_core::completion::HISTORY_IDENTITY_ASK.contains(IDENTITY_EMAIL_COMMAND));
+        assert!(remedy.contains(IDENTITY_NAME_COMMAND));
+        assert!(remedy.contains(IDENTITY_EMAIL_COMMAND));
     }
 
     #[test]

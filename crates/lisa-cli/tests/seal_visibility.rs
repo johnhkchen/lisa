@@ -16,7 +16,9 @@ fn write_executable(path: &Path, body: &str) {
 #[derive(Clone, Copy)]
 enum RepositoryFixture {
     Absent,
-    MissingIdentity,
+    UnbornMissingIdentity,
+    BornMissingIdentity,
+    UnbornWithIdentity,
     WithIdentity,
 }
 
@@ -52,7 +54,10 @@ fn run_fixture(command: &str, completion: &str, repository: RepositoryFixture) -
             .unwrap();
         assert!(status.success());
     }
-    if matches!(repository, RepositoryFixture::WithIdentity) {
+    if matches!(
+        repository,
+        RepositoryFixture::UnbornWithIdentity | RepositoryFixture::WithIdentity
+    ) {
         for args in [
             ["config", "user.name", "Seal Fixture"],
             ["config", "user.email", "seal-fixture@example.invalid"],
@@ -65,6 +70,21 @@ fn run_fixture(command: &str, completion: &str, repository: RepositoryFixture) -
                 .unwrap();
             assert!(status.success());
         }
+    }
+    if matches!(repository, RepositoryFixture::BornMissingIdentity) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["commit", "--quiet", "--allow-empty", "-m", "fixture root"])
+            .env("GIT_AUTHOR_NAME", "Fixture Bootstrap")
+            .env("GIT_AUTHOR_EMAIL", "bootstrap@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture Bootstrap")
+            .env("GIT_COMMITTER_EMAIL", "bootstrap@example.invalid")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    if matches!(repository, RepositoryFixture::WithIdentity) {
         let status = Command::new("git")
             .arg("-C")
             .arg(&root)
@@ -141,22 +161,40 @@ fn doctor_and_status_fixture_show_each_resolved_seal_in_plain_language() {
 
 const IDENTITY_REASON: &str =
     "no commit identity is configured (git config user.email did not resolve)";
-const IDENTITY_REMEDIES: &str = "Configure your own identity:
+const IDENTITY_CONFIG_REMEDIES: &str = "Configure your own identity:
   git config user.name \"You\"
-  git config user.email you@example.com
-
-Or rerun `lisa init` and accept the history offer.";
+  git config user.email you@example.com";
+const IDENTITY_INIT_REMEDY: &str = "Or rerun `lisa init` and accept the history offer.";
+const REPOSITORY_REMEDY: &str = "Run `lisa init` to create project history, then retry.";
+const TRANSACTION_REMEDY: &str =
+    "Repair the named commit-transaction dependency, then rerun `lisa doctor`.";
 
 #[test]
-fn doctor_auto_names_missing_identity_and_both_remedies_verbatim() {
-    let output = run_fixture("doctor", "auto", RepositoryFixture::MissingIdentity);
+fn doctor_auto_names_unborn_missing_identity_and_both_valid_remedies_verbatim() {
+    let output = run_fixture("doctor", "auto", RepositoryFixture::UnbornMissingIdentity);
     let stdout = String::from_utf8(output.stdout).unwrap();
 
     assert!(output.status.success(), "doctor failed:\n{stdout}");
     assert!(stdout
         .contains("completion seal: journal-only — finished work is recorded but not undoable"));
     assert!(stdout.contains(IDENTITY_REASON));
-    assert!(stdout.contains(IDENTITY_REMEDIES));
+    assert!(stdout.contains(IDENTITY_CONFIG_REMEDIES));
+    assert!(stdout.contains(IDENTITY_INIT_REMEDY));
+    assert!(!stdout.contains(REPOSITORY_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_REMEDY));
+}
+
+#[test]
+fn doctor_auto_born_missing_identity_prints_only_config_commands_verbatim() {
+    let output = run_fixture("doctor", "auto", RepositoryFixture::BornMissingIdentity);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "doctor failed:\n{stdout}");
+    assert!(stdout.contains(IDENTITY_REASON));
+    assert!(stdout.contains(IDENTITY_CONFIG_REMEDIES));
+    assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
+    assert!(!stdout.contains(REPOSITORY_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_REMEDY));
 }
 
 #[test]
@@ -167,7 +205,8 @@ fn doctor_auto_is_silent_about_identity_when_repository_can_commit() {
     assert!(output.status.success(), "doctor failed:\n{stdout}");
     assert!(stdout.contains("completion seal: commit-sealed — finished work lands as history"));
     assert!(!stdout.contains(IDENTITY_REASON));
-    assert!(!stdout.contains(IDENTITY_REMEDIES));
+    assert!(!stdout.contains(IDENTITY_CONFIG_REMEDIES));
+    assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
 }
 
 #[test]
@@ -179,17 +218,36 @@ fn doctor_auto_without_repository_defers_to_journal_seal_line() {
     assert!(stdout
         .contains("completion seal: journal-only — finished work is recorded but not undoable"));
     assert!(!stdout.contains(IDENTITY_REASON));
-    assert!(!stdout.contains(IDENTITY_REMEDIES));
+    assert!(!stdout.contains(IDENTITY_CONFIG_REMEDIES));
+    assert!(stdout.contains(REPOSITORY_REMEDY));
+    assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_REMEDY));
 }
 
 #[test]
-fn doctor_explicit_commit_uses_shared_missing_identity_hard_failure() {
-    let output = run_fixture("doctor", "commit", RepositoryFixture::MissingIdentity);
+fn doctor_explicit_commit_uses_contextual_missing_identity_hard_failure() {
+    let output = run_fixture("doctor", "commit", RepositoryFixture::BornMissingIdentity);
     let stdout = String::from_utf8(output.stdout).unwrap();
 
     assert!(!output.status.success());
     assert!(stdout.contains("Completion seal preflight failed"));
     assert!(stdout.contains("[guards].completion = \"commit\""));
     assert!(stdout.contains(IDENTITY_REASON));
-    assert!(stdout.contains(IDENTITY_REMEDIES));
+    assert!(stdout.contains(IDENTITY_CONFIG_REMEDIES));
+    assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
+    assert!(!stdout.contains(REPOSITORY_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_REMEDY));
+}
+
+#[test]
+fn doctor_auto_transaction_failure_prints_only_dependency_remedy() {
+    let output = run_fixture("doctor", "auto", RepositoryFixture::UnbornWithIdentity);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "doctor failed:\n{stdout}");
+    assert!(stdout.contains("the commit transaction path is unavailable"));
+    assert!(stdout.contains(TRANSACTION_REMEDY));
+    assert!(!stdout.contains(IDENTITY_CONFIG_REMEDIES));
+    assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
+    assert!(!stdout.contains(REPOSITORY_REMEDY));
 }
