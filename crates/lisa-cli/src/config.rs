@@ -6,6 +6,7 @@ use lisa_core::client::AgentClient;
 use lisa_core::completion::CompletionSealMode;
 use lisa_core::types::PluginConfig;
 
+use crate::detect::{detect_agent_availability, AgentAvailability};
 use crate::runtime::ZellijRuntimeRequest;
 
 /// One operator-facing `.lisa.toml` setting.
@@ -75,7 +76,8 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         section: "agent",
         key: "client",
         default: "\"claude\"",
-        description: "Chooses which coding agent Lisa drives.",
+        description:
+            "Chooses which coding agent Lisa drives. Omit it to detect agents on PATH; claude is the default when both are installed.",
     },
     ConfigKey {
         path: "guards.completion",
@@ -249,6 +251,14 @@ pub struct SchedulingConfig {
     pub provider_caps: Option<std::collections::HashMap<String, usize>>,
 }
 
+/// Why the resolved agent client was selected for this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientResolution {
+    Cli,
+    Config,
+    Detected(AgentAvailability),
+}
+
 /// Fully resolved configuration with all defaults applied.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -265,6 +275,7 @@ pub struct ResolvedConfig {
     pub assignment_ack_timeout_secs: u64,
     pub phase_timeouts: std::collections::HashMap<String, u64>,
     pub client: AgentClient,
+    pub(crate) client_resolution: ClientResolution,
     pub zellij_runtime: ZellijRuntimeRequest,
     /// Configured completion intent. A real loop pins this against its startup
     /// environment exactly once before any scheduler side effects.
@@ -291,11 +302,40 @@ impl Default for ResolvedConfig {
             assignment_ack_timeout_secs: PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
+            client_resolution: ClientResolution::Detected(AgentAvailability::Both),
             zellij_runtime: crate::runtime::default_runtime_request(),
             completion_mode: CompletionSealMode::Auto,
             provider_caps: std::collections::HashMap::new(),
             triage_enabled: PluginConfig::DEFAULT_TRIAGE_ENABLED,
             triage_timeout_secs: PluginConfig::DEFAULT_TRIAGE_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl ResolvedConfig {
+    /// One brand-voiced sentence explaining the selected loop client.
+    pub(crate) fn client_announcement(&self) -> &'static str {
+        match self.client_resolution {
+            ClientResolution::Cli => match self.client {
+                AgentClient::Claude => "Driving Claude — selected by --client.",
+                AgentClient::Codex => "Driving Codex — selected by --client.",
+            },
+            ClientResolution::Config => match self.client {
+                AgentClient::Claude => "Driving Claude — selected in .lisa.toml.",
+                AgentClient::Codex => "Driving Codex — selected in .lisa.toml.",
+            },
+            ClientResolution::Detected(AgentAvailability::Neither) => {
+                "Driving Claude — neither agent is installed; claude is the default."
+            }
+            ClientResolution::Detected(AgentAvailability::ClaudeOnly) => {
+                "Driving Claude — it's the agent installed here."
+            }
+            ClientResolution::Detected(AgentAvailability::CodexOnly) => {
+                "Driving Codex — it's the agent installed here."
+            }
+            ClientResolution::Detected(AgentAvailability::Both) => {
+                "Driving Claude — both agents are installed; claude is the default."
+            }
         }
     }
 }
@@ -321,27 +361,51 @@ pub fn load_config(root: &Path) -> Result<ConfigValidation, String> {
 
 /// Merge config file values with CLI overrides.
 ///
-/// Precedence (lowest to highest): defaults < .lisa.toml < CLI flags.
+/// Precedence (lowest to highest): PATH detection < .lisa.toml < CLI flags.
 pub fn resolve_config(
     config: &LisaConfig,
     cli_max_threads: Option<usize>,
     cli_client: Option<AgentClient>,
 ) -> ResolvedConfig {
+    let availability = if cli_client.is_some() || config.agent.client.is_some() {
+        // Explicit selection wins without consulting the environment.
+        AgentAvailability::Both
+    } else {
+        detect_agent_availability()
+    };
+    resolve_config_with_availability(config, cli_max_threads, cli_client, availability)
+}
+
+fn resolve_config_with_availability(
+    config: &LisaConfig,
+    cli_max_threads: Option<usize>,
+    cli_client: Option<AgentClient>,
+    availability: AgentAvailability,
+) -> ResolvedConfig {
     let defaults = ResolvedConfig::default();
 
-    // Client precedence mirrors max_threads: --client > [agent].client > default.
+    // Client precedence mirrors max_threads: --client > [agent].client > PATH detection.
     // The config value has already been validated by `validate_config`; `.ok()`
-    // is a defensive fallback (an unparseable value degrades to the default
-    // rather than panicking here).
-    let client = cli_client
-        .or_else(|| {
-            config
-                .agent
-                .client
-                .as_deref()
-                .and_then(|s| AgentClient::parse(s).ok())
-        })
-        .unwrap_or(defaults.client);
+    // is a defensive fallback (an unparseable value degrades to the supplied
+    // availability rather than panicking here).
+    let configured_client = config
+        .agent
+        .client
+        .as_deref()
+        .and_then(|s| AgentClient::parse(s).ok());
+    let (client, client_resolution) = if let Some(client) = cli_client {
+        (client, ClientResolution::Cli)
+    } else if let Some(client) = configured_client {
+        (client, ClientResolution::Config)
+    } else {
+        let client = match availability {
+            AgentAvailability::CodexOnly => AgentClient::Codex,
+            AgentAvailability::Neither
+            | AgentAvailability::ClaudeOnly
+            | AgentAvailability::Both => AgentClient::Claude,
+        };
+        (client, ClientResolution::Detected(availability))
+    };
 
     ResolvedConfig {
         project_version: config
@@ -349,6 +413,7 @@ pub fn resolve_config(
             .clone()
             .unwrap_or_else(|| defaults.project_version.clone()),
         client,
+        client_resolution,
         zellij_runtime: match config.runtime.zellij.as_deref() {
             None => crate::runtime::default_runtime_request(),
             Some("managed") => ZellijRuntimeRequest::Managed,
@@ -1348,26 +1413,64 @@ compile = 1800
     }
 
     #[test]
-    fn test_resolve_client_default_is_claude() {
+    fn test_resolve_client_from_detected_availability() {
         let config = LisaConfig::default();
-        let resolved = resolve_config(&config, None, None);
-        assert_eq!(resolved.client, AgentClient::Claude);
+        for (availability, client, announcement) in [
+            (
+                AgentAvailability::Neither,
+                AgentClient::Claude,
+                "Driving Claude — neither agent is installed; claude is the default.",
+            ),
+            (
+                AgentAvailability::ClaudeOnly,
+                AgentClient::Claude,
+                "Driving Claude — it's the agent installed here.",
+            ),
+            (
+                AgentAvailability::CodexOnly,
+                AgentClient::Codex,
+                "Driving Codex — it's the agent installed here.",
+            ),
+            (
+                AgentAvailability::Both,
+                AgentClient::Claude,
+                "Driving Claude — both agents are installed; claude is the default.",
+            ),
+        ] {
+            let resolved = resolve_config_with_availability(&config, None, None, availability);
+            assert_eq!(resolved.client, client);
+            assert_eq!(resolved.client_announcement(), announcement);
+        }
     }
 
     #[test]
     fn test_resolve_client_from_config() {
         let toml_str = "[agent]\nclient = \"codex\"\n";
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
-        let resolved = resolve_config(&config, None, None);
+        let resolved =
+            resolve_config_with_availability(&config, None, None, AgentAvailability::ClaudeOnly);
         assert_eq!(resolved.client, AgentClient::Codex);
+        assert_eq!(
+            resolved.client_announcement(),
+            "Driving Codex — selected in .lisa.toml."
+        );
     }
 
     #[test]
     fn test_resolve_cli_client_overrides_config() {
         let toml_str = "[agent]\nclient = \"codex\"\n";
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
-        let resolved = resolve_config(&config, None, Some(AgentClient::Claude));
+        let resolved = resolve_config_with_availability(
+            &config,
+            None,
+            Some(AgentClient::Claude),
+            AgentAvailability::CodexOnly,
+        );
         assert_eq!(resolved.client, AgentClient::Claude); // CLI wins
+        assert_eq!(
+            resolved.client_announcement(),
+            "Driving Claude — selected by --client."
+        );
     }
 
     #[test]
@@ -1396,13 +1499,15 @@ compile = 1800
 
     #[test]
     fn test_default_config_toml_agent_example_is_inert() {
-        // The [agent] example ships commented, so a fresh config resolves to the
-        // default client (no accidental opt-in).
+        // The [agent] example ships commented, so a fresh config has no
+        // persistent client selection and still follows PATH detection.
         let content = default_config_toml();
         let config: LisaConfig = toml::from_str(&content).unwrap();
         assert_eq!(config.agent.client, None);
-        let resolved = resolve_config(&config, None, None);
-        assert_eq!(resolved.client, AgentClient::Claude);
+        assert!(content.contains("Omit it to detect agents on PATH"));
+        let resolved =
+            resolve_config_with_availability(&config, None, None, AgentAvailability::CodexOnly);
+        assert_eq!(resolved.client, AgentClient::Codex);
     }
 
     #[test]
