@@ -222,6 +222,17 @@ impl fmt::Display for CompletionSealMode {
     }
 }
 
+/// Canonical repository-local command for configuring a completion author name.
+pub const IDENTITY_NAME_COMMAND: &str = "git config user.name \"You\"";
+
+/// Canonical repository-local command for configuring a completion author email.
+pub const IDENTITY_EMAIL_COMMAND: &str = "git config user.email you@example.com";
+
+/// Plain operator ask used when a completion failure may be either unborn
+/// history or a missing identity. The init alternative becomes a complete cure
+/// for unborn repositories because accepted project history persists identity.
+pub const HISTORY_IDENTITY_ASK: &str = "Lisa needs a name for recording finished work. Run: `git config user.name \"You\"` and `git config user.email you@example.com` — or rerun `lisa init` and accept the history offer.";
+
 /// Why the current environment cannot satisfy the commit seal.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CommitSealUnavailable {

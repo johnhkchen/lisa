@@ -43,7 +43,7 @@ use lisa_core::completion::{
     reconcile as reconcile_completion, reduce as reduce_completion, AttemptId, CompletionDeadline,
     CompletionEvent, CompletionGenerationId, CompletionId, CompletionRejection, CompletionSeal,
     CompletionSealReceipt, CompletionState, CorrelationId, CurrentLeaseArtifactAdmission,
-    DurableCompletionInputs, EffectCommand, Reconciliation, Retryability,
+    DurableCompletionInputs, EffectCommand, Reconciliation, Retryability, HISTORY_IDENTITY_ASK,
 };
 use lisa_core::context::PURPOSE_PARAGRAPH;
 use lisa_core::dag::Dag;
@@ -84,8 +84,6 @@ const COMPLETION_RECONCILIATION_TIMEOUT_SECS: u64 = 60;
 
 /// Maximum failed host-command observations for one completion generation.
 const MAX_COMPLETION_FAILURES: u8 = 2;
-
-const HISTORY_IDENTITY_ASK: &str = "Lisa needs a name for recording finished work. Run: `git config user.name \"You\"` and `git config user.email you@example.com` — or rerun `lisa init` and accept the history offer.";
 
 /// Timeout (seconds) for waiting for a `.stopped` signal after phase completion.
 /// If no signal arrives AND the pane has been signal-silent for the wind-down
