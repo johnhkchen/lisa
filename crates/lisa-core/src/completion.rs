@@ -125,6 +125,9 @@ impl CompletionSealReceipt {
         if content_hashes.is_empty() {
             return Err("journal completion receipt requires content hashes".to_string());
         }
+        for binding in &content_hashes {
+            CompletionContentHash::new(binding.path.clone(), binding.sha256.clone())?;
+        }
         for pair in content_hashes.windows(2) {
             if pair[0].path() >= pair[1].path() {
                 return Err(format!(
@@ -1067,6 +1070,10 @@ mod tests {
         assert!(CompletionSealReceipt::journal(Vec::new()).is_err());
         assert!(CompletionSealReceipt::journal(vec![second, first.clone()]).is_err());
         assert!(CompletionSealReceipt::journal(vec![first.clone(), first]).is_err());
+
+        let malformed: CompletionContentHash =
+            serde_json::from_str(r#"{"path":"artifact","sha256":"not-a-sha256"}"#).unwrap();
+        assert!(CompletionSealReceipt::journal(vec![malformed]).is_err());
     }
 
     #[test]
