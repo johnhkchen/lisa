@@ -365,7 +365,7 @@ The generated measured instruction hands the agent the live README install secti
 requires Git to remain absent, and directs it to:
 
 1. install Lisa;
-2. run `lisa init --no-history` in `~/no-git-demo`;
+2. run bare `lisa init` in `~/no-git-demo`, exercising its automatic journal fallback;
 3. set `[agent] client` in `.lisa.toml` to the same authenticated CLI conducting
    the leg (`claude` or `codex`);
 4. run `lisa loop` until `T-NOGIT-001` is Done; and
@@ -433,12 +433,11 @@ else
   echo "FINDING: git absent"
 fi
 
-# Since 0.4.4, init in a repo-less or unborn folder requires an explicit
-# history choice when input is non-interactive (bare `lisa init` errors with
-# the flag instruction — that error is the designed behavior, not a failure).
-# The scripted legs choose --no-history so the journal-seal path is what gets
-# scored; a --with-history variant belongs to the no-Git completion leg below.
-lisa init --no-history
+# Bare init chooses the strongest history mode the machine supports: it keeps
+# project history here when Git is present and falls back to Lisa's journal when
+# it is absent. Use --with-history or --no-history only to force a specific test
+# branch rather than to exercise this default path.
+lisa init
 init_exit=$?
 # validate requires a schedulable board — an empty scaffold correctly errors
 # with "no tickets found" (first exercised in the 2026-07-16 closing leg).

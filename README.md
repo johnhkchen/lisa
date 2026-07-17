@@ -106,14 +106,15 @@ lisa init
 
 This creates the ticket directories and a `CLAUDE.md` tailored to your project.
 
-In a folder that isn't already a repository, `lisa init` offers to keep
-**project history** — undo for finished work, plus a record of what the agents
-did. Accepting sets everything up itself; nothing to configure. In scripts and
-agent-driven runs, pass the choice as a flag:
+In a folder that isn't already a repository, `lisa init` keeps **project
+history** when the machine supports it — undo for finished work, plus a record
+of what the agents did. If it can't, Lisa uses its journal instead and says so.
+Interactive runs still offer the choice. Use the flags only when you want to
+override the automatic decision:
 
 ```bash
-lisa init --with-history   # recommended: finished work is undoable
-lisa init --no-history     # finished work is recorded in Lisa's journal but won't be undoable
+lisa init --with-history   # require history: finished work is undoable
+lisa init --no-history     # force the journal: finished work won't be undoable
 ```
 
 A project already inside a repository is left exactly as found — no offer, no
@@ -346,16 +347,17 @@ docs/
 Scaffold a project for Lisa: creates ticket directories, `CLAUDE.md`, `AGENTS.md` (a pointer to `CLAUDE.md` for the Codex client), RDSPI workflow, hooks, and `.lisa.toml`.
 
 ```bash
-lisa init                 # Initialize current directory
-lisa init --with-history  # Answer the project-history offer: yes (undoable finished work)
-lisa init --no-history    # Answer it: no (journal record only)
+lisa init                 # Initialize with the strongest history mode available
+lisa init --with-history  # Require project history (undoable finished work)
+lisa init --no-history    # Override with a journal record only
 lisa init --dry-run       # Preview what would be created
 lisa init --path ../other-project
 ```
 
-In a folder with no repository, init offers project history (see Quick Start).
-Interactive runs can answer the prompt; scripts and agents must pass
-`--with-history` or `--no-history`. Existing repositories are never modified.
+In a folder with no repository, interactive init offers project history (see
+Quick Start). Without an interactive answer, init keeps history when the machine
+supports it and otherwise uses Lisa's journal. The history flags override that
+decision. Existing repositories are never modified.
 
 Re-running `lisa init` is conservative. Lisa replaces a static workflow or hook
 template only when its exact contents match a known Lisa version; customized,
