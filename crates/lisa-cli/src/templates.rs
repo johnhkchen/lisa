@@ -722,6 +722,9 @@ mod tests {
         assert!(RDSPI_WORKFLOW.contains("review-disposition.json"));
         assert!(RDSPI_WORKFLOW.contains(r#"{"disposition":"pass","reason":null}"#));
         assert!(RDSPI_WORKFLOW.contains(
+            r#"{"disposition":"note","reason":null,"criterion_quote":"<exact disputed criterion>","evidence_citation":"<repository-relative evidence path>","summary":"<plain one-sentence summary>"}"#
+        ));
+        assert!(RDSPI_WORKFLOW.contains(
             r#"{"disposition":"block","reason":"<non-empty actionable reason>","remedy_owner":"<agent|operator|world>","ask":"<one-sentence action>","steps":["<optional exact step>"],"check":"<read-only verification command>"}"#
         ));
         assert!(RDSPI_WORKFLOW
@@ -745,6 +748,8 @@ mod tests {
         assert!(RDSPI_WORKFLOW.contains(
             "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass."
         ));
+        assert!(RDSPI_WORKFLOW.contains("lisa check-disposition <ticket-id>"));
+        assert!(RDSPI_WORKFLOW.contains("Correct every reported issue before finishing Review."));
     }
 
     #[test]

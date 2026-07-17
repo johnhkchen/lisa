@@ -54,6 +54,8 @@ Summarize what changed: files created, modified, or deleted. Evaluate test cover
 
 Alongside `review.md`, write `review-disposition.json` with exactly `{"disposition":"pass","reason":null}` when the work is ready to complete. When it is blocked, write a structured document shaped like `{"disposition":"block","reason":"<non-empty actionable reason>","remedy_owner":"<agent|operator|world>","ask":"<one-sentence action>","steps":["<optional exact step>"],"check":"<read-only verification command>"}`. A pass with a reason, or a block without a non-empty reason, is invalid.
 
+When completed work has a criteria-versus-evidence dispute, use a note shaped like `{"disposition":"note","reason":null,"criterion_quote":"<exact disputed criterion>","evidence_citation":"<repository-relative evidence path>","summary":"<plain one-sentence summary>"}`. A note is only for a disputed criterion backed by cited evidence; use a block when the work itself needs changes.
+
 Choose `remedy_owner` honestly: `agent` when another coding attempt can perform the remedy, `operator` when a person must act, and `world` when external reality must change. Supply a `check` whenever the remedy is externally observable; omit `steps` or `check` only when that field truly does not apply. The check verifies the remedy but must never perform it.
 
 Write the `ask` as one sentence addressed to a person who didn't do the work, naming the action rather than the subsystem. Do not write `no stable Pages artifact has been deployed`; write `Lisa needs the release published; run: just release. Lisa will notice on its own once it's live.`
@@ -61,6 +63,8 @@ Write the `ask` as one sentence addressed to a person who didn't do the work, na
 Write for a bystander: say plainly what they should do. Keep subsystem names, measurements, and other jargon in `reason` or `steps`, not the `ask`. This field disposition is a counter-example; never use it as the `ask`:
 
 > The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.
+
+After writing `review-disposition.json`, run `lisa check-disposition <ticket-id>` with the current ticket ID. Correct every reported issue before finishing Review.
 
 After writing both Review artifacts, remain on the current ticket and wait. Do not edit phase/status, publish completion yourself, or start another ticket. Lisa prepares Done, commits the ticket and work artifacts through the isolated transaction, and confirms that completion commit before releasing the seat or scheduling dependents.
 
