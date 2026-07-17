@@ -721,10 +721,24 @@ mod tests {
         assert!(claude_md.contains("injected into agent context"));
         assert!(RDSPI_WORKFLOW.contains("review-disposition.json"));
         assert!(RDSPI_WORKFLOW.contains(r#"{"disposition":"pass","reason":null}"#));
-        assert!(RDSPI_WORKFLOW
-            .contains(r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#));
+        assert!(RDSPI_WORKFLOW.contains(
+            r#"{"disposition":"block","reason":"<non-empty actionable reason>","remedy_owner":"<agent|operator|world>","ask":"<one-sentence action>","steps":["<optional exact step>"],"check":"<read-only verification command>"}"#
+        ));
         assert!(RDSPI_WORKFLOW
             .contains("A pass with a reason, or a block without a non-empty reason, is invalid."));
+        assert!(RDSPI_WORKFLOW.contains("Choose `remedy_owner` honestly"));
+        assert!(RDSPI_WORKFLOW.contains(
+            "`agent` when another coding attempt can perform the remedy, `operator` when a person must act, and `world` when external reality must change"
+        ));
+        assert!(RDSPI_WORKFLOW
+            .contains("Supply a `check` whenever the remedy is externally observable"));
+        assert!(RDSPI_WORKFLOW.contains(
+            "Write the `ask` as one sentence addressed to a person who didn't do the work, naming the action rather than the subsystem."
+        ));
+        assert!(RDSPI_WORKFLOW.contains("no stable Pages artifact has been deployed"));
+        assert!(RDSPI_WORKFLOW.contains(
+            "Lisa needs the release published; run: just release. Lisa will notice on its own once it's live."
+        ));
     }
 
     #[test]

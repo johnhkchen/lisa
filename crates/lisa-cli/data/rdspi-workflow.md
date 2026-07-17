@@ -50,7 +50,11 @@ Self-assess the completed work. Produce `review.md` (~200 lines).
 
 Summarize what changed: files created, modified, or deleted. Evaluate test coverage and flag gaps. Surface open concerns, TODOs, or known limitations. Flag critical issues that need human attention. This is the handoff document — what a human reviewer needs to understand the work without reading every diff.
 
-Alongside `review.md`, write `review-disposition.json` with exactly one of these JSON shapes: `{"disposition":"pass","reason":null}` when the work is ready to complete, or `{"disposition":"block","reason":"<non-empty actionable reason>"}` when it is not. A pass with a reason, or a block without a non-empty reason, is invalid.
+Alongside `review.md`, write `review-disposition.json` with exactly `{"disposition":"pass","reason":null}` when the work is ready to complete. When it is blocked, write a structured document shaped like `{"disposition":"block","reason":"<non-empty actionable reason>","remedy_owner":"<agent|operator|world>","ask":"<one-sentence action>","steps":["<optional exact step>"],"check":"<read-only verification command>"}`. A pass with a reason, or a block without a non-empty reason, is invalid.
+
+Choose `remedy_owner` honestly: `agent` when another coding attempt can perform the remedy, `operator` when a person must act, and `world` when external reality must change. Supply a `check` whenever the remedy is externally observable; omit `steps` or `check` only when that field truly does not apply. The check verifies the remedy but must never perform it.
+
+Write the `ask` as one sentence addressed to a person who didn't do the work, naming the action rather than the subsystem. Do not write `no stable Pages artifact has been deployed`; write `Lisa needs the release published; run: just release. Lisa will notice on its own once it's live.`
 
 After writing both Review artifacts, remain on the current ticket and wait. Do not edit phase/status, publish completion yourself, or start another ticket. Lisa prepares Done, commits the ticket and work artifacts through the isolated transaction, and confirms that completion commit before releasing the seat or scheduling dependents.
 
