@@ -1,0 +1,74 @@
+#!/bin/sh
+# /cbt/grade — run every acceptance check yourself (never ask the tested
+# agent), compute measurements, and write a filled run record to
+# /tmp/run-record.md. Exit 0 only when every positive and negative holds.
+set -u
+
+say() { printf '%s\n' "$*"; }
+overall=PASS
+note() { say "  $1"; }
+failhard() { overall=FAIL; say "  FAIL: $1"; }
+
+date +%s > /tmp/t.graded
+df -B1 --output=used / | tail -1 > /tmp/disk.after
+
+before_t=$(cat /tmp/t.before 2>/dev/null || echo 0)
+done_t=$(cat /tmp/t.agent-done 2>/dev/null || cat /tmp/t.graded)
+wall=$((done_t - before_t))
+before_d=$(cat /tmp/disk.before 2>/dev/null || echo 0)
+after_d=$(cat /tmp/disk.after)
+disk=$((after_d - before_d))
+disk_mib=$((disk / 1048576))
+
+say "== positives"
+lisa_path=$(bash -lc 'command -v lisa' 2>/dev/null || true)
+if [ -n "$lisa_path" ]; then note "PATH: $lisa_path"; else failhard "lisa not on login PATH"; fi
+
+doctor_out=$(bash -lc 'lisa doctor' 2>&1); doctor_rc=$?
+if [ $doctor_rc -eq 0 ]; then note "doctor exit 0"; else failhard "doctor exit $doctor_rc"; fi
+zellij_line=$(printf '%s\n' "$doctor_out" | grep -m1 zellij || echo "(no zellij line)")
+note "doctor zellij: $zellij_line"
+
+mkdir -p "$HOME/demo" && cd "$HOME/demo"
+git init -q . 2>/dev/null || note "FINDING: git absent or init failed"
+init_rc=1; validate_rc=1; dry_rc=1
+bash -lc 'lisa init' >/dev/null 2>&1 && init_rc=0
+bash -lc 'lisa validate' >/dev/null 2>&1 && validate_rc=0
+bash -lc 'lisa loop --dry-run' >/dev/null 2>&1 && dry_rc=0
+[ $init_rc -eq 0 ] && note "init 0" || failhard "init $init_rc"
+[ $validate_rc -eq 0 ] && note "validate 0" || failhard "validate $validate_rc"
+[ $dry_rc -eq 0 ] && note "dry-run 0" || failhard "dry-run $dry_rc"
+
+say "== bounds"
+[ "$wall" -le 600 ] && note "wall ${wall}s (<=600)" || failhard "wall ${wall}s exceeds 600s"
+[ "$disk_mib" -le 200 ] && note "disk ${disk_mib}MiB (<=200)" || failhard "disk ${disk_mib}MiB exceeds 200MiB"
+
+say "== negatives (success by heroics is a fail)"
+for b in rustc cargo rustup xz gcc cc g++ make; do
+    if command -v "$b" >/dev/null 2>&1; then failhard "$b present"; fi
+done
+[ -d "$HOME/.rustup" ] && failhard "~/.rustup exists"
+[ -d "$HOME/.cargo/registry" ] && failhard "cargo registry exists"
+clones=$(find "$HOME" /tmp -maxdepth 3 -name Cargo.toml 2>/dev/null | grep -v "^$HOME/demo" || true)
+[ -n "$clones" ] && note "FINDING: Cargo.toml present (clone?): $clones"
+
+say "== sudo/apt actions (from apt history)"
+apt_hist=$(grep -h "Commandline:" /var/log/apt/history.log 2>/dev/null | tail -5 || true)
+[ -n "$apt_hist" ] && say "$apt_hist" || note "(no apt actions logged)"
+
+{
+    echo "### Run $(date -u +%F) — scripted grade"
+    sed 's/^/- /' /tmp/leg-meta 2>/dev/null
+    echo "- outcome: $overall"
+    echo "- wall clock: ${wall}s   disk delta: ${disk_mib} MiB (${disk} bytes)"
+    echo "- positives: PATH ${lisa_path:-MISSING}, doctor $doctor_rc, init $init_rc, validate $validate_rc, dry-run $dry_rc"
+    echo "- doctor zellij line: $zellij_line"
+    echo "- apt actions:"
+    printf '%s\n' "${apt_hist:-  (none)}" | sed 's/^/    /'
+    echo "- lisa version: $(bash -lc 'lisa --version' 2>/dev/null || echo unknown)"
+} > /tmp/run-record.md
+
+say ""
+say "== $overall — record written to /tmp/run-record.md"
+say "Host next: just cbt-collect <container-name>"
+[ "$overall" = PASS ]

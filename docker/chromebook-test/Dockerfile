@@ -44,6 +44,13 @@ RUN useradd --create-home --shell /bin/bash tester \
  && chmod 0440 /etc/sudoers.d/tester \
  && visudo --check --file=/etc/sudoers.d/tester
 
+# Operator ritual scripts (prepare/run/grade/tour). Deliberately at /cbt,
+# OFF PATH: the tested agent must not stumble onto the grading rubric.
+# These are for the human running the protocol — never mention them to the
+# agent under test.
+COPY bin/ /cbt/
+RUN chmod 0755 /cbt/*
+
 USER tester
 WORKDIR /home/tester
 

@@ -1,0 +1,47 @@
+#!/bin/sh
+# /cbt/run — record leg identity, stamp the clock, launch the agent with the
+# prepared instruction. Everything after this command is hands-off.
+set -eu
+
+CLI=${1:?usage: /cbt/run claude|codex [model]}
+MODEL=${2:-}
+[ -s /tmp/instruction.txt ] || { echo "run /cbt/prepare first" >&2; exit 1; }
+
+if [ -f /tmp/leg-env ]; then
+    # shellcheck disable=SC1091
+    . /tmp/leg-env
+    export XDG_CACHE_HOME
+fi
+
+case "$CLI" in
+    claude)
+        MODEL=${MODEL:-claude-haiku-4-5-20251001}
+        {
+            echo "cli: claude $(claude --version 2>/dev/null || echo unknown)"
+            echo "model: $MODEL"
+            echo "auth: $(claude auth status --text 2>/dev/null | head -1 || echo unknown)"
+        } >> /tmp/leg-meta
+        date +%s > /tmp/t.before
+        rc=0
+        claude --model "$MODEL" "$(cat /tmp/instruction.txt)" || rc=$?
+        ;;
+    codex)
+        MODEL=${MODEL:-gpt-5.4-mini}
+        {
+            echo "cli: $(codex --version 2>/dev/null || echo unknown)"
+            echo "model: $MODEL"
+            echo "auth: $(codex login status 2>/dev/null | head -1 || echo unknown)"
+        } >> /tmp/leg-meta
+        date +%s > /tmp/t.before
+        rc=0
+        codex -m "$MODEL" "$(cat /tmp/instruction.txt)" || rc=$?
+        ;;
+    *)
+        echo "unknown cli: $CLI (want claude or codex)" >&2
+        exit 2
+        ;;
+esac
+
+date +%s > /tmp/t.agent-done
+echo "agent_exit: $rc" >> /tmp/leg-meta
+echo "Agent exited (rc=$rc). Next: /cbt/grade"

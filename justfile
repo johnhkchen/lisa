@@ -137,6 +137,22 @@ emulate-debian LEG="":
     echo ">>> auth inside:  claude auth login   |   codex login --device-auth"
     exec docker run -it --memory=4g --cpus=2 --name "$name" lisa-chromebook-test bash
 
+# Pull a finished Chromebook-test leg's evidence off a container into the
+# closing-run ticket's work dir: run record, leg metadata, instruction,
+# tour page if present, and a docker-diff summary.
+cbt-collect CONTAINER:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="docs/active/work/T-046-06-03/{{CONTAINER}}"
+    mkdir -p "$dest"
+    for f in run-record.md leg-meta instruction.txt install-section.md; do
+        docker cp "{{CONTAINER}}:/tmp/$f" "$dest/" 2>/dev/null || true
+    done
+    docker cp "{{CONTAINER}}:/home/tester/lisa-tour.html" "$dest/" 2>/dev/null || true
+    docker diff "{{CONTAINER}}" 2>/dev/null | head -100 > "$dest/docker-diff.txt" || true
+    echo "collected into $dest:"
+    ls -la "$dest"
+
 # S-020 interactive-gate dry run (T-020-05): set up an instrumented throwaway
 # project, run lisa loop against it, then print the block/resume evidence on exit.
 gate-test DEST="/tmp/lisa-gate-dryrun":

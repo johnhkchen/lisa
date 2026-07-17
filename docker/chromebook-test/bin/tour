@@ -1,0 +1,29 @@
+#!/bin/sh
+# /cbt/tour — launch the landing-probe rematch with the canonical short
+# prompt. Run this in a FRESH session (ideally a fresh container): a session
+# that already installed lisa answers with scaffolding in context and the
+# comparison means nothing.
+set -eu
+
+CLI=${1:?usage: /cbt/tour claude|codex [model]}
+MODEL=${2:-}
+PROMPT='You just got lisa. Play with it, then make lisa-tour.html so the next person starts faster.'
+
+case "$CLI" in
+    claude)
+        MODEL=${MODEL:-claude-haiku-4-5-20251001}
+        echo "tour: claude $MODEL" >> /tmp/leg-meta 2>/dev/null || true
+        claude --model "$MODEL" "$PROMPT"
+        ;;
+    codex)
+        MODEL=${MODEL:-gpt-5.4-mini}
+        echo "tour: codex $MODEL" >> /tmp/leg-meta 2>/dev/null || true
+        codex -m "$MODEL" "$PROMPT"
+        ;;
+    *)
+        echo "unknown cli: $CLI" >&2
+        exit 2
+        ;;
+esac
+
+echo "Tour done. Grab it on the host: just cbt-collect <container-name>"

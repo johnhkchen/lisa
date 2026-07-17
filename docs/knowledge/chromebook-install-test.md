@@ -29,6 +29,30 @@ Fixture smoke tests are setup checks, not recorded agent legs. T-046-06-02 owns 
 baseline evidence and T-046-06-03 owns the closing evidence. Do not report a preflight
 as either one.
 
+## Scripted ritual (operator tools at `/cbt`)
+
+The fixture image bakes the protocol into four operator scripts so no command
+blocks need copy-pasting. They live at `/cbt` — deliberately **off PATH** so
+the tested agent cannot stumble onto the grading rubric; never mention them to
+the agent under test. The prose sections below remain the authoritative
+protocol; the scripts implement it.
+
+Inside a leg container (after fresh auth):
+
+```
+/cbt/prepare                      # closing leg: live README, instruction A
+/cbt/prepare --pin <SHA>          # baseline-style leg against a pinned README
+/cbt/prepare --seed-old-zellij    # variant: Zellij 0.40.1 in ~/.local/bin
+/cbt/prepare --xdg-cache          # variant: XDG_CACHE_HOME set for the agent
+/cbt/run claude|codex [model]     # stamps clock + identity, launches — then hands off
+/cbt/grade                        # all acceptance checks, writes /tmp/run-record.md
+/cbt/tour claude|codex [model]    # landing-probe rematch (FRESH session only)
+```
+
+On the host, `just cbt-collect <container-name>` copies the run record, leg
+metadata, instruction, tour page, and a docker-diff summary into
+`docs/active/work/T-046-06-03/<container-name>/`.
+
 ## Fixture
 
 The authoritative fixture is `docker/chromebook-test/Dockerfile`:

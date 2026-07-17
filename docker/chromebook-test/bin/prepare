@@ -1,0 +1,74 @@
+#!/bin/sh
+# /cbt/prepare — set up a measured leg: fetch the README, build the
+# instruction, apply optional seeded-failure variants, snapshot disk.
+# Operator tool. Never mention /cbt to the tested agent.
+set -eu
+
+PIN=""
+SEED_OLD_ZELLIJ=0
+XDG_SEED=0
+INSTR=A
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --pin) PIN=$2; shift 2 ;;
+        --seed-old-zellij) SEED_OLD_ZELLIJ=1; shift ;;
+        --xdg-cache) XDG_SEED=1; shift ;;
+        --discovery) INSTR=B; shift ;;
+        *)
+            echo "usage: /cbt/prepare [--pin SHA] [--seed-old-zellij] [--xdg-cache] [--discovery]"
+            echo "  no flags      closing-run leg: live README, instruction A"
+            echo "  --pin SHA     baseline-style leg against a pinned README"
+            echo "  --seed-old-zellij   place Zellij 0.40.1 in ~/.local/bin first"
+            echo "  --xdg-cache   set XDG_CACHE_HOME for the agent session"
+            echo "  --discovery   instruction B (no README handed over)"
+            exit 2 ;;
+    esac
+done
+
+REF=${PIN:-main}
+curl -fsSL "https://raw.githubusercontent.com/johnhkchen/lisa/$REF/README.md" \
+    -o /tmp/lisa-README.md
+awk '/^## Install( Lisa)?$/{f=1} f&&/^## /&&!/^## Install( Lisa)?$/{exit} f{print}' \
+    /tmp/lisa-README.md > /tmp/install-section.md
+[ -s /tmp/install-section.md ] || {
+    echo "FAIL: extracted install section is empty — README heading changed?" >&2
+    exit 1
+}
+
+if [ "$INSTR" = A ]; then
+    {
+        echo "Here are the install instructions from lisa's README:"
+        cat /tmp/install-section.md
+        printf '%s\n' 'Please install lisa on this machine so I can use it. When you are done, `lisa doctor` should pass.'
+    } > /tmp/instruction.txt
+else
+    printf '%s\n' 'Please install lisa (github.com/johnhkchen/lisa) on this machine so I can use it. When you are done, `lisa doctor` should pass.' \
+        > /tmp/instruction.txt
+fi
+
+rm -f /tmp/leg-env
+if [ $SEED_OLD_ZELLIJ = 1 ]; then
+    case "$(uname -m)" in
+        aarch64|arm64) t=aarch64 ;;
+        *) t=x86_64 ;;
+    esac
+    mkdir -p "$HOME/.local/bin"
+    curl -fsSL "https://github.com/zellij-org/zellij/releases/download/v0.40.1/zellij-$t-unknown-linux-musl.tar.gz" |
+        tar -xz -C "$HOME/.local/bin" zellij
+    echo "seeded: $("$HOME/.local/bin/zellij" --version) in ~/.local/bin"
+fi
+if [ $XDG_SEED = 1 ]; then
+    echo "XDG_CACHE_HOME=$HOME/.xdg-cache" > /tmp/leg-env
+    echo "seeded: XDG_CACHE_HOME=$HOME/.xdg-cache (applied at /cbt/run)"
+fi
+
+df -B1 --output=used / | tail -1 > /tmp/disk.before
+{
+    echo "prepared_utc: $(date -u +%FT%TZ)"
+    echo "readme_ref: $REF"
+    echo "instruction: $INSTR"
+    echo "seed_old_zellij: $SEED_OLD_ZELLIJ"
+    echo "xdg_cache_seed: $XDG_SEED"
+} > /tmp/leg-meta
+
+echo "READY. Next: /cbt/run claude|codex [model] — then hands off until it exits."
