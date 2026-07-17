@@ -61,6 +61,107 @@ impl fmt::Display for CompletionSeal {
     }
 }
 
+/// One SHA-256 digest binding a completion receipt to visible file bytes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CompletionContentHash {
+    path: String,
+    sha256: String,
+}
+
+impl CompletionContentHash {
+    /// Build one validated path-to-content binding.
+    pub fn new(path: impl Into<String>, sha256: impl Into<String>) -> Result<Self, String> {
+        let path = path.into();
+        if path.trim().is_empty() {
+            return Err("completion content hash path must not be empty".to_string());
+        }
+        let sha256 = sha256.into();
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "completion content hash for {path} must be 64 lowercase hexadecimal SHA-256 characters"
+            ));
+        }
+        Ok(Self { path, sha256 })
+    }
+
+    /// Borrow the stable project-relative content path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Borrow the lowercase SHA-256 digest.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// Durable evidence supplied by the resolved completion seal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompletionSealReceipt {
+    /// Repository history contains the isolated completion commit.
+    Commit { commit_id: String },
+    /// The completion journal binds every retained content path to its bytes.
+    Journal {
+        content_hashes: Vec<CompletionContentHash>,
+    },
+}
+
+impl CompletionSealReceipt {
+    /// Build commit-sealed evidence.
+    pub fn commit(commit_id: impl Into<String>) -> Result<Self, String> {
+        let commit_id = commit_id.into();
+        if commit_id.trim().is_empty() {
+            return Err("completion commit receipt requires a commit id".to_string());
+        }
+        Ok(Self::Commit { commit_id })
+    }
+
+    /// Build journal-sealed evidence from a sorted, unique content hash set.
+    pub fn journal(content_hashes: Vec<CompletionContentHash>) -> Result<Self, String> {
+        if content_hashes.is_empty() {
+            return Err("journal completion receipt requires content hashes".to_string());
+        }
+        for pair in content_hashes.windows(2) {
+            if pair[0].path() >= pair[1].path() {
+                return Err(format!(
+                    "journal completion content hashes must have unique paths in ascending order: {} then {}",
+                    pair[0].path(),
+                    pair[1].path()
+                ));
+            }
+        }
+        Ok(Self::Journal { content_hashes })
+    }
+
+    /// Return the tier whose evidence this receipt carries.
+    pub const fn seal(&self) -> CompletionSeal {
+        match self {
+            Self::Commit { .. } => CompletionSeal::Commit,
+            Self::Journal { .. } => CompletionSeal::Journal,
+        }
+    }
+
+    /// Borrow the commit identifier when this is commit-sealed evidence.
+    pub fn commit_id(&self) -> Option<&str> {
+        match self {
+            Self::Commit { commit_id } => Some(commit_id),
+            Self::Journal { .. } => None,
+        }
+    }
+
+    /// Borrow the journal hash set, or an empty slice for a commit receipt.
+    pub fn content_hashes(&self) -> &[CompletionContentHash] {
+        match self {
+            Self::Commit { .. } => &[],
+            Self::Journal { content_hashes } => content_hashes,
+        }
+    }
+}
+
 /// Configured completion stance from `.lisa.toml` `[guards].completion`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
@@ -928,6 +1029,44 @@ mod tests {
         let error = CompletionSealMode::parse("best-effort").unwrap_err();
         assert!(error.contains("[guards].completion"));
         assert!(error.contains("auto, commit, journal"));
+    }
+
+    #[test]
+    fn completion_content_hash_requires_a_path_and_lowercase_sha256() {
+        let digest = "0123456789abcdef".repeat(4);
+        let binding = CompletionContentHash::new("docs/work/review.md", &digest).unwrap();
+        assert_eq!(binding.path(), "docs/work/review.md");
+        assert_eq!(binding.sha256(), digest);
+
+        for (path, invalid) in [
+            ("", digest.clone()),
+            ("artifact", "a".repeat(63)),
+            ("artifact", "a".repeat(65)),
+            ("artifact", "A".repeat(64)),
+            ("artifact", "z".repeat(64)),
+        ] {
+            assert!(CompletionContentHash::new(path, invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn completion_seal_receipt_keeps_tier_specific_evidence() {
+        let commit = CompletionSealReceipt::commit("abc123").unwrap();
+        assert_eq!(commit.seal(), CompletionSeal::Commit);
+        assert_eq!(commit.commit_id(), Some("abc123"));
+        assert!(commit.content_hashes().is_empty());
+        assert!(CompletionSealReceipt::commit("  ").is_err());
+
+        let first = CompletionContentHash::new("a/ticket.md", "a".repeat(64)).unwrap();
+        let second = CompletionContentHash::new("b/review.md", "b".repeat(64)).unwrap();
+        let journal = CompletionSealReceipt::journal(vec![first.clone(), second.clone()]).unwrap();
+        assert_eq!(journal.seal(), CompletionSeal::Journal);
+        assert_eq!(journal.commit_id(), None);
+        assert_eq!(journal.content_hashes(), &[first.clone(), second.clone()]);
+
+        assert!(CompletionSealReceipt::journal(Vec::new()).is_err());
+        assert!(CompletionSealReceipt::journal(vec![second, first.clone()]).is_err());
+        assert!(CompletionSealReceipt::journal(vec![first.clone(), first]).is_err());
     }
 
     #[test]
