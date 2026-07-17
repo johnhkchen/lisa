@@ -126,7 +126,9 @@ pub enum ProposalRecordType {
 #[serde(rename_all = "lowercase")]
 pub enum ProposalAction {
     Proposed,
+    Attempted,
     Applied,
+    Failed,
     Dismissed,
 }
 
@@ -272,6 +274,14 @@ pub struct ProposalActionRecord {
     pub actor: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<TriageProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     pub occurred_at: u64,
 }
 
@@ -661,6 +671,10 @@ mod tests {
             action: ProposalAction::Proposed,
             actor: "agent".to_string(),
             proposal: Some(proposal),
+            step_count: None,
+            applied_steps: Vec::new(),
+            failed_step: None,
+            failure_reason: None,
             occurred_at: 12,
         };
         append_triage_transition_record(&path, &attempt).unwrap();
@@ -676,6 +690,71 @@ mod tests {
                 ProvenanceLedgerRecord::TriageTransition(attempt),
                 ProvenanceLedgerRecord::ProposalAction(action),
             ]
+        );
+    }
+
+    #[test]
+    fn proposal_apply_attempt_and_failure_round_trip_with_step_evidence() {
+        use crate::triage::{PreparedStep, TriageProposal};
+
+        let lease = AttemptLease {
+            ticket_id: "T-049-08-02".to_string(),
+            attempt_id: 7,
+        };
+        let proposal = TriageProposal {
+            summary: "The operator can apply the prepared repair.".to_string(),
+            recommendation: "Apply both prepared steps.".to_string(),
+            prepared_steps: vec![PreparedStep::Command {
+                description: "Apply the repair.".to_string(),
+                command: "true".to_string(),
+            }],
+        };
+        let attempted = ProposalActionRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: ProposalRecordType::ProposalAction,
+            ticket_id: lease.ticket_id.clone(),
+            source_attempt_lease: lease.clone(),
+            action: ProposalAction::Attempted,
+            actor: "operator".to_string(),
+            proposal: Some(proposal),
+            step_count: Some(2),
+            applied_steps: Vec::new(),
+            failed_step: None,
+            failure_reason: None,
+            occurred_at: 20,
+        };
+        let failed = ProposalActionRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: ProposalRecordType::ProposalAction,
+            ticket_id: lease.ticket_id.clone(),
+            source_attempt_lease: lease,
+            action: ProposalAction::Failed,
+            actor: "operator".to_string(),
+            proposal: None,
+            step_count: None,
+            applied_steps: vec!["Apply the first repair.".to_string()],
+            failed_step: Some("Apply the second repair.".to_string()),
+            failure_reason: Some("prepared command exited with status 1".to_string()),
+            occurred_at: 21,
+        };
+
+        let attempted_json = serde_json::to_string(&attempted).unwrap();
+        assert!(attempted_json.contains("\"action\":\"attempted\""));
+        assert!(attempted_json.contains("\"step_count\":2"));
+        assert!(!attempted_json.contains("applied_steps"));
+        let failed_json = serde_json::to_string(&failed).unwrap();
+        assert!(failed_json.contains("\"action\":\"failed\""));
+        assert!(failed_json.contains("\"applied_steps\":[\"Apply the first repair.\"]"));
+        assert!(failed_json.contains("\"failed_step\":\"Apply the second repair.\""));
+        assert_eq!(
+            serde_json::from_str::<ProposalActionRecord>(&attempted_json).unwrap(),
+            attempted
+        );
+        assert_eq!(
+            serde_json::from_str::<ProposalActionRecord>(&failed_json).unwrap(),
+            failed
         );
     }
 

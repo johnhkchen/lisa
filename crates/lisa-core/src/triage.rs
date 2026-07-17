@@ -95,6 +95,7 @@ impl TriageProposal {
 pub enum ProposalState {
     Pending,
     Applied,
+    Failed,
     Dismissed,
 }
 
@@ -246,5 +247,27 @@ mod tests {
         stored.state = ProposalState::Dismissed;
         write_stored_proposal(&path, &stored).unwrap();
         assert_eq!(read_stored_proposal(&path).unwrap(), Some(stored));
+    }
+
+    #[test]
+    fn failed_stored_proposal_round_trips_as_terminal_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TRIAGE_PROPOSAL_FILE);
+        let stored = StoredTriageProposal {
+            ticket_id: "T-049-08-02".to_string(),
+            source_attempt_lease: AttemptLease {
+                ticket_id: "T-049-08-02".to_string(),
+                attempt_id: 2,
+            },
+            state: ProposalState::Failed,
+            proposal: proposal(),
+        };
+
+        write_stored_proposal(&path, &stored).unwrap();
+
+        assert_eq!(read_stored_proposal(&path).unwrap(), Some(stored));
+        assert!(fs::read_to_string(path)
+            .unwrap()
+            .contains("\"state\": \"failed\""));
     }
 }

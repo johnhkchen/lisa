@@ -4,11 +4,13 @@
 //! disposition carries the human ask and optional verification check after the
 //! scheduler has released the attempt that produced it.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::disposition::{parse_review_disposition, RemedyOwner, ReviewDisposition};
+use crate::provenance::{ParkingTransitionType, ProvenanceLedgerRecord};
 use crate::triage::{read_stored_proposal, ProposalState, TriageProposal, TRIAGE_PROPOSAL_FILE};
-use crate::types::{Ticket, TicketStatus};
+use crate::types::{AttemptLease, Ticket, TicketStatus};
 
 /// Plain lead shown when an older block has no structured human ask.
 pub const LEGACY_BLOCK_ASK: &str = "This ticket needs a decision from you. The reviewer's note is below — you can paste it to your coding agent.";
@@ -77,6 +79,30 @@ pub struct ParkedRemedy {
     pub proposal: Option<TriageProposal>,
 }
 
+/// Read the latest current Park lease per ticket from the mixed provenance ledger.
+///
+/// This is an observational correlation aid, not scheduling authority. Missing or
+/// malformed ledger data simply cannot establish a current Park lease.
+pub fn latest_park_attempt_leases(ledger_path: &Path) -> HashMap<String, AttemptLease> {
+    let Ok(ledger) = std::fs::read_to_string(ledger_path) else {
+        return HashMap::new();
+    };
+    let mut latest = HashMap::new();
+    for record in ledger
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
+    {
+        if let ProvenanceLedgerRecord::ParkingTransition(record) = record {
+            if record.record_type == ParkingTransitionType::Park {
+                latest.insert(record.ticket_id, record.attempt_lease);
+            } else {
+                latest.remove(&record.ticket_id);
+            }
+        }
+    }
+    latest
+}
+
 /// Collect valid canonical remedies for tickets durably parked by status.
 ///
 /// Missing, invalid, or passing dispositions do not manufacture remedy data.
@@ -84,7 +110,9 @@ pub struct ParkedRemedy {
 pub fn collect_parked_remedies<'a>(
     tickets: impl IntoIterator<Item = &'a Ticket>,
     work_dir: &Path,
+    ledger_path: &Path,
 ) -> Vec<ParkedRemedy> {
+    let park_attempts = latest_park_attempt_leases(ledger_path);
     let mut remedies: Vec<_> = tickets
         .into_iter()
         .filter(|ticket| ticket.status == TicketStatus::Blocked)
@@ -112,7 +140,9 @@ pub fn collect_parked_remedies<'a>(
                     .ok()
                     .flatten()
                     .filter(|stored| {
-                        stored.ticket_id == ticket.id && stored.state == ProposalState::Pending
+                        stored.ticket_id == ticket.id
+                            && stored.state == ProposalState::Pending
+                            && park_attempts.get(&ticket.id) == Some(&stored.source_attempt_lease)
                     })
                     .map(|stored| stored.proposal);
             Some(ParkedRemedy {
@@ -134,6 +164,10 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::completion::CompletionSeal;
+    use crate::provenance::{
+        append_parking_transition_record, ParkingTransitionRecord, SCHEMA_VERSION,
+    };
 
     const FIELD_ASK: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
 
@@ -192,6 +226,35 @@ mod tests {
         fs::write(ticket_work.join("review-disposition.json"), document).unwrap();
     }
 
+    fn write_parking_transition(
+        ledger: &Path,
+        ticket_id: &str,
+        attempt_id: u64,
+        record_type: ParkingTransitionType,
+    ) {
+        append_parking_transition_record(
+            ledger,
+            &ParkingTransitionRecord {
+                schema_version: SCHEMA_VERSION,
+                seal: CompletionSeal::Commit,
+                record_type,
+                ticket_id: ticket_id.to_string(),
+                attempt_lease: AttemptLease {
+                    ticket_id: ticket_id.to_string(),
+                    attempt_id,
+                },
+                remedy_owner: RemedyOwner::Operator,
+                retry_count: None,
+                retry_limit: None,
+                recheck_eligible: false,
+                started_at: 1,
+                ended_at: 1,
+                wall_clock_secs: 0,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn collects_structured_operator_and_world_remedies_in_ticket_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -212,7 +275,7 @@ mod tests {
         ];
 
         assert_eq!(
-            collect_parked_remedies(&tickets, &work),
+            collect_parked_remedies(&tickets, &work, &dir.path().join("provenance.jsonl")),
             vec![
                 ParkedRemedy {
                     ticket_id: "T-001".to_string(),
@@ -246,7 +309,7 @@ mod tests {
         let tickets = vec![ticket("T-LEGACY", TicketStatus::Blocked)];
 
         assert_eq!(
-            collect_parked_remedies(&tickets, &work),
+            collect_parked_remedies(&tickets, &work, &dir.path().join("provenance.jsonl")),
             vec![ParkedRemedy {
                 ticket_id: "T-LEGACY".to_string(),
                 remedy_owner: RemedyOwner::Operator,
@@ -276,7 +339,10 @@ mod tests {
             ticket("T-MISSING", TicketStatus::Blocked),
         ];
 
-        assert!(collect_parked_remedies(&tickets, &work).is_empty());
+        assert!(
+            collect_parked_remedies(&tickets, &work, &dir.path().join("provenance.jsonl"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -313,15 +379,48 @@ mod tests {
             proposal: proposal.clone(),
         };
         write_stored_proposal(&path, &stored).unwrap();
+        let ledger = dir.path().join("provenance.jsonl");
+        write_parking_transition(&ledger, "T-PROPOSAL", 3, ParkingTransitionType::Park);
 
-        let remedies =
-            collect_parked_remedies([&ticket("T-PROPOSAL", TicketStatus::Blocked)], &work);
+        let remedies = collect_parked_remedies(
+            [&ticket("T-PROPOSAL", TicketStatus::Blocked)],
+            &work,
+            &ledger,
+        );
         assert_eq!(remedies[0].proposal, Some(proposal));
 
+        stored.source_attempt_lease.attempt_id = 2;
+        write_stored_proposal(&path, &stored).unwrap();
+        let remedies = collect_parked_remedies(
+            [&ticket("T-PROPOSAL", TicketStatus::Blocked)],
+            &work,
+            &ledger,
+        );
+        assert_eq!(remedies[0].proposal, None);
+
+        stored.source_attempt_lease.attempt_id = 3;
         stored.state = ProposalState::Dismissed;
         write_stored_proposal(&path, &stored).unwrap();
-        let remedies =
-            collect_parked_remedies([&ticket("T-PROPOSAL", TicketStatus::Blocked)], &work);
+        let remedies = collect_parked_remedies(
+            [&ticket("T-PROPOSAL", TicketStatus::Blocked)],
+            &work,
+            &ledger,
+        );
         assert_eq!(remedies[0].proposal, None);
+    }
+
+    #[test]
+    fn latest_unpark_removes_the_current_park_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("provenance.jsonl");
+        write_parking_transition(&ledger, "T-PROPOSAL", 3, ParkingTransitionType::Park);
+        assert_eq!(
+            latest_park_attempt_leases(&ledger)["T-PROPOSAL"].attempt_id,
+            3
+        );
+
+        write_parking_transition(&ledger, "T-PROPOSAL", 3, ParkingTransitionType::Unpark);
+
+        assert!(latest_park_attempt_leases(&ledger).is_empty());
     }
 }
