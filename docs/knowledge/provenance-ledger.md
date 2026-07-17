@@ -8,14 +8,14 @@ never race agent-owned ticket fields. `.lisa/` gitignores only `signals/`, so
 the ledger is **committable learning data** that can be queried across runs.
 
 Schema owner: `crates/lisa-core/src/provenance.rs`. Current
-`schema_version`: **5**.
+`schema_version`: **6**.
 
 ## Execution record shape
 
 One JSON object per line. Example:
 
 ```json
-{"schema_version":5,"seal":"commit","ticket_id":"T-027-01","attempt_lease":{"ticket_id":"T-027-01","attempt_id":2},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}
+{"schema_version":6,"seal":"commit","ticket_id":"T-027-01","attempt_lease":{"ticket_id":"T-027-01","attempt_id":2},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}
 ```
 
 ## Field table
@@ -104,12 +104,12 @@ end before an agent provider owns the attempt.
 Example:
 
 ```json
-{"schema_version":5,"seal":"journal","record_type":"assignment-transition","ticket_id":"T-040-02-01","attempt_lease":{"ticket_id":"T-040-02-01","attempt_id":7},"pane_id":12,"provider":"openai","state":"delivery-failed","reason":"provider did not acknowledge the bounded chat assignment","started_at":1752000000,"ended_at":1752000030,"wall_clock_secs":30}
+{"schema_version":6,"seal":"journal","record_type":"assignment-transition","ticket_id":"T-040-02-01","attempt_lease":{"ticket_id":"T-040-02-01","attempt_id":7},"pane_id":12,"provider":"openai","state":"delivery-failed","reason":"provider did not acknowledge the bounded chat assignment","started_at":1752000000,"ended_at":1752000030,"wall_clock_secs":30}
 ```
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `schema_version` | int | `3` for the generation that introduced this shape; current writers stamp `5`. |
+| `schema_version` | int | `3` for the generation that introduced this shape; current writers stamp `6`. |
 | `seal` | enum | Completion tier in effect; missing on pre-ladder rows means `commit`. |
 | `record_type` | enum | Always `assignment-transition`. |
 | `ticket_id` | string | Ticket whose assignment was attempted. |
@@ -134,7 +134,7 @@ emission is implemented by its dependent ticket.
 Example:
 
 ```json
-{"schema_version":5,"seal":"commit","record_type":"unpark","ticket_id":"T-048-01-02","attempt_lease":{"ticket_id":"T-048-01-02","attempt_id":4},"remedy_owner":"world","started_at":1752700000,"ended_at":1752700125,"wall_clock_secs":125}
+{"schema_version":6,"seal":"commit","record_type":"unpark","ticket_id":"T-048-01-02","attempt_lease":{"ticket_id":"T-048-01-02","attempt_id":4},"remedy_owner":"world","started_at":1752700000,"ended_at":1752700125,"wall_clock_secs":125}
 ```
 
 | Field | Type | Meaning |
@@ -214,7 +214,9 @@ ORDER BY 1, 2;
 `schema_version` lets readers branch as the schema grows. Version 2 added the
 required execution `attempt_lease`, `authoritative`, and `fenced` fields.
 Version 3 added assignment-transition rows. Version 4 added park/unpark rows
-and the shared remedy-owner classification. Version-1 rows remain valid
+and the shared remedy-owner classification. Version 5 added bounded blocked
+retry fields. Version 6 added the completion `seal`; its default keeps rows
+from versions 1–5 classified as commit-sealed pre-ladder history. Version-1 rows remain valid
 append-only history but predate attempt attribution; readers of a mixed ledger
 must branch on version and shape rather than inventing leases.
 

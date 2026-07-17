@@ -36,7 +36,7 @@ use crate::types::AttemptLease;
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -391,7 +391,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":5"));
+        assert!(json.contains("\"schema_version\":6"));
         assert!(json.contains("\"seal\":\"commit\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
@@ -409,7 +409,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":5"));
+        assert!(json.contains("\"schema_version\":6"));
         assert!(json.contains("\"seal\":\"journal\""));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
@@ -449,7 +449,7 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
-            assert!(json.contains("\"schema_version\":5"));
+            assert!(json.contains("\"schema_version\":6"));
             assert!(json.contains("\"seal\":\"journal\""));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",
@@ -581,12 +581,12 @@ mod tests {
         assert_eq!(
             rows[2],
             ProvenanceLedgerRecord::ParkingTransition(park),
-            "the schema-v5 park line is recognized as parking evidence"
+            "the current-schema park line is recognized as parking evidence"
         );
         assert_eq!(
             rows[3],
             ProvenanceLedgerRecord::ParkingTransition(unpark.clone()),
-            "the schema-v5 unpark line is recognized as parking evidence"
+            "the current-schema unpark line is recognized as parking evidence"
         );
         let ProvenanceLedgerRecord::ParkingTransition(replayed) = &rows[3] else {
             panic!("expected an unpark transition")

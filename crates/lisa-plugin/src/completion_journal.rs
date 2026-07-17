@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::publication::{PublicationErrors, PublicationPath, RustPublication, TemporaryName};
 
-const SCHEMA_VERSION: u32 = 1;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const TEMPORARY_PREFIX: &str = ".completion-journal.jsonl.tmp.";
 
 /// One durable completion transition requested by the plugin adapter.
@@ -237,9 +238,9 @@ impl JournalRecord {
     }
 
     fn into_transition(self) -> Result<(CompletionSeal, CompletionJournalTransition), String> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !(LEGACY_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(format!(
-                "unsupported completion journal schema version {} (expected {SCHEMA_VERSION})",
+                "unsupported completion journal schema version {} (expected {LEGACY_SCHEMA_VERSION} or {SCHEMA_VERSION})",
                 self.schema_version
             ));
         }
@@ -685,7 +686,8 @@ mod tests {
 
         let body = fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 3);
-        assert_eq!(body.matches("\"schema_version\":1").count(), 3);
+        assert_eq!(body.matches("\"schema_version\":2").count(), 3);
+        assert_eq!(body.matches("\"seal\":\"commit\"").count(), 3);
         assert_eq!(body.matches("\"state\":\"requested\"").count(), 1);
         assert_eq!(body.matches("\"state\":\"command-in-flight\"").count(), 1);
         assert_eq!(
@@ -959,7 +961,9 @@ mod tests {
         .unwrap();
         assert_eq!(requested.seal(), CompletionSeal::Journal);
         let requested_bytes = fs::read(&path).unwrap();
-        assert!(String::from_utf8_lossy(&requested_bytes).contains("\"seal\":\"journal\""));
+        let requested_json = String::from_utf8_lossy(&requested_bytes);
+        assert!(requested_json.contains("\"schema_version\":2"));
+        assert!(requested_json.contains("\"seal\":\"journal\""));
 
         let error = append_with_seal(
             &path,
