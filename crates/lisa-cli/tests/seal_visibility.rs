@@ -13,6 +13,21 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+fn lisa_command(root: &Path, home: &Path, bin: &Path, subcommand: &str) -> Command {
+    let mut paths = vec![bin.to_path_buf()];
+    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lisa"));
+    command
+        .env("PATH", env::join_paths(paths).unwrap())
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg(subcommand)
+        .arg("--path")
+        .arg(root);
+    command
+}
+
 #[derive(Clone, Copy)]
 enum RepositoryFixture {
     Absent,
@@ -103,17 +118,7 @@ fn run_fixture(command: &str, completion: &str, repository: RepositoryFixture) -
         "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
     );
 
-    let mut paths = vec![bin];
-    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-
-    Command::new(env!("CARGO_BIN_EXE_lisa"))
-        .arg(command)
-        .args(["--path", root.to_str().unwrap()])
-        .env("PATH", env::join_paths(paths).unwrap())
-        .env("HOME", home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap()
+    lisa_command(&root, &home, &bin, command).output().unwrap()
 }
 
 fn assert_seal_line(command: &str, mode: &str, repository: RepositoryFixture, expected: &str) {
@@ -166,6 +171,7 @@ const IDENTITY_CONFIG_REMEDIES: &str = "Configure your own identity:
   git config user.email you@example.com";
 const IDENTITY_INIT_REMEDY: &str = "Or rerun `lisa init` and accept the history offer.";
 const REPOSITORY_REMEDY: &str = "Run `lisa init` to create project history, then retry.";
+const TRANSACTION_HISTORY_REMEDY: &str = "Run `lisa init` and accept the history offer to create the missing project-history dependency, then retry.";
 const TRANSACTION_REMEDY: &str =
     "Repair the named commit-transaction dependency, then rerun `lisa doctor`.";
 
@@ -181,6 +187,7 @@ fn doctor_auto_names_unborn_missing_identity_and_both_valid_remedies_verbatim() 
     assert!(stdout.contains(IDENTITY_CONFIG_REMEDIES));
     assert!(stdout.contains(IDENTITY_INIT_REMEDY));
     assert!(!stdout.contains(REPOSITORY_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_HISTORY_REMEDY));
     assert!(!stdout.contains(TRANSACTION_REMEDY));
 }
 
@@ -194,6 +201,7 @@ fn doctor_auto_born_missing_identity_prints_only_config_commands_verbatim() {
     assert!(stdout.contains(IDENTITY_CONFIG_REMEDIES));
     assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
     assert!(!stdout.contains(REPOSITORY_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_HISTORY_REMEDY));
     assert!(!stdout.contains(TRANSACTION_REMEDY));
 }
 
@@ -207,6 +215,7 @@ fn doctor_auto_is_silent_about_identity_when_repository_can_commit() {
     assert!(!stdout.contains(IDENTITY_REASON));
     assert!(!stdout.contains(IDENTITY_CONFIG_REMEDIES));
     assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_HISTORY_REMEDY));
 }
 
 #[test]
@@ -221,6 +230,7 @@ fn doctor_auto_without_repository_defers_to_journal_seal_line() {
     assert!(!stdout.contains(IDENTITY_CONFIG_REMEDIES));
     assert!(stdout.contains(REPOSITORY_REMEDY));
     assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_HISTORY_REMEDY));
     assert!(!stdout.contains(TRANSACTION_REMEDY));
 }
 
@@ -236,6 +246,7 @@ fn doctor_explicit_commit_uses_contextual_missing_identity_hard_failure() {
     assert!(stdout.contains(IDENTITY_CONFIG_REMEDIES));
     assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
     assert!(!stdout.contains(REPOSITORY_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_HISTORY_REMEDY));
     assert!(!stdout.contains(TRANSACTION_REMEDY));
 }
 
@@ -246,8 +257,106 @@ fn doctor_auto_transaction_failure_prints_only_dependency_remedy() {
 
     assert!(output.status.success(), "doctor failed:\n{stdout}");
     assert!(stdout.contains("the commit transaction path is unavailable"));
-    assert!(stdout.contains(TRANSACTION_REMEDY));
+    assert!(stdout.contains(TRANSACTION_HISTORY_REMEDY));
+    assert!(!stdout.contains(TRANSACTION_REMEDY));
     assert!(!stdout.contains(IDENTITY_CONFIG_REMEDIES));
     assert!(!stdout.contains(IDENTITY_INIT_REMEDY));
     assert!(!stdout.contains(REPOSITORY_REMEDY));
+}
+
+#[test]
+fn born_identity_commands_printed_by_doctor_cure_a_completion_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(root.join("CLAUDE.md"), "# Identity cure fixture\n").unwrap();
+    fs::write(
+        root.join("docs/active/tickets/T-FIXTURE.md"),
+        "---\nid: T-FIXTURE\ntitle: identity cure fixture\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nFixture\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".lisa.toml"),
+        format!(
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n\n[guards]\ncompletion = \"auto\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+
+    assert!(Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["commit", "--quiet", "--allow-empty", "-m", "fixture root"])
+        .env("GIT_AUTHOR_NAME", "Fixture Bootstrap")
+        .env("GIT_AUTHOR_EMAIL", "bootstrap@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture Bootstrap")
+        .env("GIT_COMMITTER_EMAIL", "bootstrap@example.invalid")
+        .status()
+        .unwrap()
+        .success());
+
+    write_executable(
+        &bin.join("zellij"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; fi\nexit 0\n",
+    );
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
+    );
+
+    let before = lisa_command(&root, &home, &bin, "doctor").output().unwrap();
+    let before_stdout = String::from_utf8(before.stdout).unwrap();
+    assert!(before_stdout.contains(IDENTITY_REASON));
+    assert!(before_stdout.contains(IDENTITY_CONFIG_REMEDIES));
+    assert!(!before_stdout.contains(IDENTITY_INIT_REMEDY));
+
+    for args in [
+        ["config", "user.name", "You"],
+        ["config", "user.email", "you@example.com"],
+    ] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fs::write(root.join("completion-marker.txt"), "finished\n").unwrap();
+    let completion = lisa_command(&root, &home, &bin, "commit-ticket")
+        .args([
+            "--ticket-id",
+            "T-FIXTURE",
+            "--message",
+            "Complete identity cure fixture",
+            "--include",
+            "completion-marker.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        completion.status.success(),
+        "completion failed:\n{}",
+        String::from_utf8_lossy(&completion.stderr)
+    );
+
+    let after = lisa_command(&root, &home, &bin, "doctor").output().unwrap();
+    let after_stdout = String::from_utf8(after.stdout).unwrap();
+    assert!(after.status.success(), "doctor failed:\n{after_stdout}");
+    assert!(after_stdout.contains("completion seal: commit-sealed"));
+    assert!(!after_stdout.contains(IDENTITY_REASON));
 }
