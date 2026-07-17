@@ -8,14 +8,14 @@ never race agent-owned ticket fields. `.lisa/` gitignores only `signals/`, so
 the ledger is **committable learning data** that can be queried across runs.
 
 Schema owner: `crates/lisa-core/src/provenance.rs`. Current
-`schema_version`: **4**.
+`schema_version`: **5**.
 
 ## Execution record shape
 
 One JSON object per line. Example:
 
 ```json
-{"schema_version":2,"ticket_id":"T-027-01","attempt_lease":{"ticket_id":"T-027-01","attempt_id":2},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}
+{"schema_version":5,"seal":"commit","ticket_id":"T-027-01","attempt_lease":{"ticket_id":"T-027-01","attempt_id":2},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"codex","provider":"openai","model":null},"actual":{"method":"codex","provider":"openai","model":null},"started_at":1719800000,"ended_at":1719800600,"wall_clock_secs":600,"tokens_in":12000,"tokens_out":3400,"cost_usd":null,"concurrency_at_spawn":3,"pane_id":2}
 ```
 
 ## Field table
@@ -23,6 +23,7 @@ One JSON object per line. Example:
 | Field | Type | Nullable | Meaning |
 |-------|------|----------|---------|
 | `schema_version` | int | no | Record schema version (bump on shape change). |
+| `seal` | enum | no | `commit` or `journal`, identifying the completion durability tier in effect. Missing on pre-ladder rows means `commit`. |
 | `ticket_id` | string | no | The ticket this run worked on. Retries reuse the id → multiple records. |
 | `attempt_lease` | object | no | Exact `{ticket_id, attempt_id}` lease stamped on this execution attempt. |
 | `outcome` | enum | no | `done` \| `failed` \| `timed-out`. |
@@ -103,12 +104,13 @@ end before an agent provider owns the attempt.
 Example:
 
 ```json
-{"schema_version":3,"record_type":"assignment-transition","ticket_id":"T-040-02-01","attempt_lease":{"ticket_id":"T-040-02-01","attempt_id":7},"pane_id":12,"provider":"openai","state":"delivery-failed","reason":"provider did not acknowledge the bounded chat assignment","started_at":1752000000,"ended_at":1752000030,"wall_clock_secs":30}
+{"schema_version":5,"seal":"journal","record_type":"assignment-transition","ticket_id":"T-040-02-01","attempt_lease":{"ticket_id":"T-040-02-01","attempt_id":7},"pane_id":12,"provider":"openai","state":"delivery-failed","reason":"provider did not acknowledge the bounded chat assignment","started_at":1752000000,"ended_at":1752000030,"wall_clock_secs":30}
 ```
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `schema_version` | int | `3` for the generation that introduced this shape; current writers stamp `4`. |
+| `schema_version` | int | `3` for the generation that introduced this shape; current writers stamp `5`. |
+| `seal` | enum | Completion tier in effect; missing on pre-ladder rows means `commit`. |
 | `record_type` | enum | Always `assignment-transition`. |
 | `ticket_id` | string | Ticket whose assignment was attempted. |
 | `attempt_lease` | object | Exact `{ticket_id, attempt_id}` assignment lease. |
@@ -132,12 +134,13 @@ emission is implemented by its dependent ticket.
 Example:
 
 ```json
-{"schema_version":4,"record_type":"unpark","ticket_id":"T-048-01-02","attempt_lease":{"ticket_id":"T-048-01-02","attempt_id":4},"remedy_owner":"world","started_at":1752700000,"ended_at":1752700125,"wall_clock_secs":125}
+{"schema_version":5,"seal":"commit","record_type":"unpark","ticket_id":"T-048-01-02","attempt_lease":{"ticket_id":"T-048-01-02","attempt_id":4},"remedy_owner":"world","started_at":1752700000,"ended_at":1752700125,"wall_clock_secs":125}
 ```
 
 | Field | Type | Meaning |
 |-------|------|---------|
 | `schema_version` | int | `4` for parking-transition rows. |
+| `seal` | enum | Completion tier in effect; missing on pre-ladder rows means `commit`. |
 | `record_type` | enum | `park` or `unpark`. |
 | `ticket_id` | string | Ticket entering or leaving parked state. |
 | `attempt_lease` | object | Exact attempt associated with the transition. |
@@ -155,6 +158,9 @@ Historical execution rows have no `record_type`. Assignment and parking rows
 have distinct required discriminators and fields. Core exposes the untagged
 `ProvenanceLedgerRecord` enum to replay all three shapes without rewriting old
 lines.
+
+All three row shapes deserialize an absent `seal` as `commit`. Such rows are
+pre-ladder history produced when commit sealing was the only completion path.
 
 Readers interested in execution metrics must filter for execution fields (for
 example, `outcome`) rather than assuming every JSONL row is an execution.

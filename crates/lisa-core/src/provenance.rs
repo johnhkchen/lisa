@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::AgentClient;
+use crate::completion::CompletionSeal;
 use crate::disposition::RemedyOwner;
 use crate::types::AttemptLease;
 
@@ -114,6 +115,10 @@ pub enum AssignmentState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvenanceRecord {
     pub schema_version: u32,
+    /// Completion durability tier in effect for this attempt. Missing on
+    /// pre-ladder rows, which are commit-sealed by construction.
+    #[serde(default)]
+    pub seal: CompletionSeal,
     pub ticket_id: String,
     /// Exact execution attempt that produced this terminal record.
     pub attempt_lease: AttemptLease,
@@ -154,6 +159,9 @@ pub struct ProvenanceRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentTransitionRecord {
     pub schema_version: u32,
+    /// Completion durability tier in effect for this attempt.
+    #[serde(default)]
+    pub seal: CompletionSeal,
     pub record_type: ProvenanceRecordType,
     pub ticket_id: String,
     pub attempt_lease: AttemptLease,
@@ -174,6 +182,9 @@ pub struct AssignmentTransitionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParkingTransitionRecord {
     pub schema_version: u32,
+    /// Completion durability tier in effect for this attempt.
+    #[serde(default)]
+    pub seal: CompletionSeal,
     pub record_type: ParkingTransitionType,
     pub ticket_id: String,
     pub attempt_lease: AttemptLease,
@@ -288,6 +299,7 @@ mod tests {
     fn sample() -> ProvenanceRecord {
         ProvenanceRecord {
             schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
             ticket_id: "T-027-01".to_string(),
             attempt_lease: AttemptLease::mint("T-027-01", None).unwrap(),
             outcome: RunOutcome::Done,
@@ -309,6 +321,7 @@ mod tests {
     fn sample_assignment_transition() -> AssignmentTransitionRecord {
         AssignmentTransitionRecord {
             schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Journal,
             record_type: ProvenanceRecordType::AssignmentTransition,
             ticket_id: "T-040-02-01".to_string(),
             attempt_lease: AttemptLease {
@@ -328,6 +341,7 @@ mod tests {
     fn sample_parking_transition(record_type: ParkingTransitionType) -> ParkingTransitionRecord {
         ParkingTransitionRecord {
             schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Journal,
             record_type,
             ticket_id: "T-048-01-02".to_string(),
             attempt_lease: AttemptLease {
@@ -378,6 +392,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
         assert!(json.contains("\"schema_version\":5"));
+        assert!(json.contains("\"seal\":\"commit\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
         assert!(json.contains("\"authoritative\":true"));
@@ -395,6 +410,7 @@ mod tests {
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
         assert!(json.contains("\"schema_version\":5"));
+        assert!(json.contains("\"seal\":\"journal\""));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
         assert!(json.contains("\"pane_id\":12"));
@@ -434,6 +450,7 @@ mod tests {
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
             assert!(json.contains("\"schema_version\":5"));
+            assert!(json.contains("\"seal\":\"journal\""));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",
                 serde_json::to_string(&record_type).unwrap()
@@ -488,6 +505,7 @@ mod tests {
         let raw = r#"{"schema_version":4,"record_type":"park","ticket_id":"T-048-01-02","attempt_lease":{"ticket_id":"T-048-01-02","attempt_id":4},"remedy_owner":"operator","started_at":1752700000,"ended_at":1752700125,"wall_clock_secs":125}"#;
         let record: ParkingTransitionRecord = serde_json::from_str(raw).unwrap();
         assert_eq!(record.schema_version, 4);
+        assert_eq!(record.seal, CompletionSeal::Commit);
         assert_eq!(record.retry_count, None);
         assert_eq!(record.retry_limit, None);
         assert!(!record.recheck_eligible);
@@ -529,6 +547,7 @@ mod tests {
         assert_eq!(legacy.attempt_lease.attempt_id, 2);
         assert_eq!(legacy.outcome, RunOutcome::Done);
         assert!(legacy.authoritative);
+        assert_eq!(legacy.seal, CompletionSeal::Commit);
 
         let mut transition = sample_assignment_transition();
         transition.schema_version = 3;
@@ -578,6 +597,13 @@ mod tests {
         assert_eq!(replayed.started_at, 1_752_700_000);
         assert_eq!(replayed.ended_at, 1_752_700_125);
         assert_eq!(replayed.wall_clock_secs, 125);
+    }
+
+    #[test]
+    fn pre_ladder_assignment_rows_default_to_commit_sealed() {
+        let raw = r#"{"schema_version":3,"record_type":"assignment-transition","ticket_id":"T-040-02-01","attempt_lease":{"ticket_id":"T-040-02-01","attempt_id":7},"pane_id":12,"provider":"openai","state":"delivery-failed","reason":"legacy","started_at":1,"ended_at":2,"wall_clock_secs":1}"#;
+        let record: AssignmentTransitionRecord = serde_json::from_str(raw).unwrap();
+        assert_eq!(record.seal, CompletionSeal::Commit);
     }
 
     #[test]
