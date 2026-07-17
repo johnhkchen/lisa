@@ -76,8 +76,10 @@ Lisa runs as a [Zellij](https://zellij.dev/) plugin. It reads your tickets, comp
 Each ticket goes through six phases: Research, Design, Structure, Plan, Implement, Review. Every phase produces a short artifact (~200 lines) that serves as both a review checkpoint and crash recovery. If a session dies mid-work, the latest artifact plus the ticket is enough to seed a new session at the right phase.
 
 Lisa keeps the trail reviewable: an append-only attempt ledger records each run,
-the completion journal ties finished tickets to commits, and each ticket keeps
-its work documents.
+the completion journal seals every finished ticket — to a commit where the
+project keeps history, or to tamper-evident content hashes where it doesn't —
+and each ticket keeps its work documents. `lisa doctor` and `lisa status` name
+which seal is in effect in plain words.
 
 ## Prerequisites
 
@@ -103,6 +105,19 @@ lisa init
 ```
 
 This creates the ticket directories and a `CLAUDE.md` tailored to your project.
+
+In a folder that isn't already a repository, `lisa init` offers to keep
+**project history** — undo for finished work, plus a record of what the agents
+did. Accepting sets everything up itself; nothing to configure. In scripts and
+agent-driven runs, pass the choice as a flag:
+
+```bash
+lisa init --with-history   # recommended: finished work is undoable
+lisa init --no-history     # finished work is recorded in Lisa's journal but won't be undoable
+```
+
+A project already inside a repository is left exactly as found — no offer, no
+changes.
 
 Create a ticket in `docs/active/tickets/`:
 
@@ -174,6 +189,9 @@ max_threads = 2
 | `dirs.work` | `docs/active/work` | Where phase artifacts are written |
 | `scheduling.max_threads` | `2` | Maximum concurrent agent sessions |
 | `agent.client` | `claude` | Which agent client the loop drives (`claude` or `codex`) |
+| `guards.completion` | `auto` | How finished work is sealed: `auto` picks the strongest seal the project supports, `commit` requires history and fails hard without it, `journal` records hash-stamped journal entries only |
+| `triage.enabled` | `true` | When a ticket parks needing a decision, let an agent read the blocker first and attach a plain suggestion with prepared steps |
+| `triage.timeout_secs` | `120` | How long that triage pass may run before Lisa gives up on it (the park itself is never delayed) |
 
 ## Codex client (experimental)
 
@@ -275,11 +293,21 @@ the same isolated transaction. The seat is released, provenance is published,
 and dependents become eligible only after Lisa receives and verifies that commit
 receipt.
 
-If the completion transaction fails, Lisa fails closed: it keeps the ticket in
-Review, retains the provider seat, leaves dependents blocked, and surfaces the
-Git error. Repair the reported exact-path conflict or repository condition; a
-later stop/idle signal or manual completion action can retry without sweeping
-foreign staged work into the ticket.
+If the completion transaction fails, Lisa fails closed — and bounded: a failure
+only an operator can fix is retried a small fixed number of times, then the
+ticket parks under **Waiting on you** with one plain sentence naming what to do
+(the full technical detail stays in the journal). No completion failure can
+churn silently, and none leaves a state you can't recover from the dashboard or
+`lisa unblock`.
+
+Projects without history don't lose the seal — they get a different one. Where
+a repository exists, finished work is **commit-sealed** exactly as above. Where
+none exists (and you declined the history offer), completion is
+**journal-sealed**: gated on the same review verdict plus SHA-256 hashes of the
+ticket and every work artifact, fail-closed and tamper-evident, just not
+undoable. The tier is pinned once per run, recorded on every ledger row, and
+never switches silently — `lisa doctor` and `lisa status` say which one you
+have.
 
 ### Scheduling
 
@@ -318,10 +346,16 @@ docs/
 Scaffold a project for Lisa: creates ticket directories, `CLAUDE.md`, `AGENTS.md` (a pointer to `CLAUDE.md` for the Codex client), RDSPI workflow, hooks, and `.lisa.toml`.
 
 ```bash
-lisa init              # Initialize current directory
-lisa init --dry-run    # Preview what would be created
+lisa init                 # Initialize current directory
+lisa init --with-history  # Answer the project-history offer: yes (undoable finished work)
+lisa init --no-history    # Answer it: no (journal record only)
+lisa init --dry-run       # Preview what would be created
 lisa init --path ../other-project
 ```
+
+In a folder with no repository, init offers project history (see Quick Start).
+Interactive runs can answer the prompt; scripts and agents must pass
+`--with-history` or `--no-history`. Existing repositories are never modified.
 
 Re-running `lisa init` is conservative. Lisa replaces a static workflow or hook
 template only when its exact contents match a known Lisa version; customized,
@@ -360,7 +394,11 @@ lisa loop --dry-run              # Show what would launch without starting
 
 ### `lisa status`
 
-Inspect the DAG offline: tickets, dependencies, execution waves, and scheduling readiness.
+Inspect the DAG offline: tickets, dependencies, execution waves, and scheduling
+readiness. Anything that needs your decision appears first under **Waiting on
+you**, each with one plain sentence you can act on (or paste to your coding
+agent). Reviewer observations that didn't stop the work appear under **Notes
+for you**. The completion-seal line says how finished work is being recorded.
 
 ```bash
 lisa status
@@ -369,11 +407,43 @@ lisa status
 ### `lisa doctor`
 
 Check the selected agent (`claude` or `codex`, per `.lisa.toml`) and the Zellij
-runtime Lisa will use. When Codex is selected, this also prepares directory
-trust for unattended `codex exec`.
+runtime Lisa will use, and report which completion seal the project resolves —
+including the exact fix when commit sealing is configured but unavailable. When
+Codex is selected, this also prepares directory trust for unattended
+`codex exec`.
 
 ```bash
 lisa doctor
+```
+
+### `lisa unblock`
+
+Re-open a parked ticket after you've handled its ask. Lisa runs the blocker's
+own check first and tells you if the fix isn't in place yet.
+
+```bash
+lisa unblock T-001-01
+```
+
+### `lisa notes`
+
+Read and clear the **Notes for you** queue — reviewer observations filed
+against finished work that kept moving.
+
+```bash
+lisa notes              # List unread notes
+lisa notes ack T-001-01 # Mark a ticket's note as read
+```
+
+### `lisa proposal`
+
+When a parked ticket carries a first-responder suggestion, apply its prepared
+steps or dismiss it. Both are recorded. Applying runs exactly the steps shown
+in `lisa status` — read them there first.
+
+```bash
+lisa proposal apply T-001-01
+lisa proposal dismiss T-001-01
 ```
 
 ### `lisa setup-guide`

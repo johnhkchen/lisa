@@ -433,7 +433,12 @@ else
   echo "FINDING: git absent"
 fi
 
-lisa init
+# Since 0.4.4, init in a repo-less or unborn folder requires an explicit
+# history choice when input is non-interactive (bare `lisa init` errors with
+# the flag instruction — that error is the designed behavior, not a failure).
+# The scripted legs choose --no-history so the journal-seal path is what gets
+# scored; a --with-history variant belongs to the no-Git completion leg below.
+lisa init --no-history
 init_exit=$?
 # validate requires a schedulable board — an empty scaffold correctly errors
 # with "no tickets found" (first exercised in the 2026-07-16 closing leg).
