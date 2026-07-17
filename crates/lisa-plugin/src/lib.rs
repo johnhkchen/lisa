@@ -26,7 +26,10 @@ use adapter::{
     SpawnContext,
 };
 use assignment::{write_assignment, AssignmentRef};
-use completion_journal::{CompletionJournalAggregate, CompletionJournalTransition};
+use completion_journal::{
+    CompletionFailureClass, CompletionJournalAggregate, CompletionJournalTransition,
+    FailureConsequence,
+};
 use deadline::{
     AcknowledgementInput, DeadlineEvaluator, HealthInput, ReviewInput, SessionAction, SessionInput,
     StaleInput, SystemClock, TransitionAction, TransitionInput, TransitionPolicy,
@@ -38,9 +41,9 @@ use lisa_core::client::AgentClient;
 use lisa_core::completion::LaunchFailure;
 use lisa_core::completion::{
     reconcile as reconcile_completion, reduce as reduce_completion, AttemptId, CompletionDeadline,
-    CompletionEvent, CompletionGenerationId, CompletionId, CompletionRejection, CompletionSeal,
-    CompletionState, CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs,
-    EffectCommand, Reconciliation, Retryability,
+    CompletionEvent, CompletionGenerationId, CompletionId, CompletionRejection, CompletionState,
+    CorrelationId, CurrentLeaseArtifactAdmission, DurableCompletionInputs, EffectCommand,
+    Reconciliation, Retryability,
 };
 use lisa_core::context::PURPOSE_PARAGRAPH;
 use lisa_core::dag::Dag;
@@ -71,6 +74,11 @@ const POLL_INTERVAL_SECS: f64 = 5.0;
 /// Absolute window shared by the initial completion command and every
 /// same-generation reconciliation replay.
 const COMPLETION_RECONCILIATION_TIMEOUT_SECS: u64 = 60;
+
+/// Maximum failed host-command observations for one completion generation.
+const MAX_COMPLETION_FAILURES: u8 = 2;
+
+const HISTORY_IDENTITY_ASK: &str = "Lisa needs a name for recording finished work. Run: `git config user.name \"You\"` and `git config user.email you@example.com` — or rerun `lisa init` and accept the history offer.";
 
 /// Timeout (seconds) for waiting for a `.stopped` signal after phase completion.
 /// If no signal arrives AND the pane has been signal-silent for the wind-down
@@ -445,6 +453,91 @@ enum ReviewBlockAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionFailureAction {
+    Retry,
+    WaitForDeadline,
+    Park,
+}
+
+fn classify_completion_failure(detail: &str) -> CompletionFailureClass {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("does not have any commits yet")
+        || detail.contains("author identity unknown")
+        || detail.contains("please tell me who you are")
+        || detail.contains("unable to auto-detect email address")
+        || detail.contains("empty ident name")
+    {
+        CompletionFailureClass::OperatorHistoryOrIdentity
+    } else if detail.contains("lock")
+        && (detail.contains("stale")
+            || detail.contains("dead process")
+            || detail.contains("no such process"))
+    {
+        CompletionFailureClass::OperatorStaleLock
+    } else if detail.contains("permission denied")
+        || detail.contains("read-only file system")
+        || detail.contains("insufficient permission")
+        || detail.contains("repository is not writable")
+        || detail.contains("unable to write")
+        || detail.contains("could not write")
+    {
+        CompletionFailureClass::OperatorRepositoryUnwritable
+    } else if (detail.contains("index.lock") && detail.contains("another git process"))
+        || detail.contains("resource temporarily unavailable")
+        || detail.contains("temporarily locked")
+    {
+        CompletionFailureClass::TransientContention
+    } else {
+        CompletionFailureClass::Unrecognized
+    }
+}
+
+fn completion_failure_action(
+    class: CompletionFailureClass,
+    failure_count: u8,
+) -> CompletionFailureAction {
+    match class {
+        CompletionFailureClass::OperatorHistoryOrIdentity
+        | CompletionFailureClass::OperatorRepositoryUnwritable
+        | CompletionFailureClass::OperatorStaleLock
+            if failure_count < MAX_COMPLETION_FAILURES =>
+        {
+            CompletionFailureAction::Retry
+        }
+        CompletionFailureClass::OperatorHistoryOrIdentity
+        | CompletionFailureClass::OperatorRepositoryUnwritable
+        | CompletionFailureClass::OperatorStaleLock
+        | CompletionFailureClass::Unrecognized
+        | CompletionFailureClass::DeadlineExpired => CompletionFailureAction::Park,
+        CompletionFailureClass::TransientContention if failure_count < MAX_COMPLETION_FAILURES => {
+            CompletionFailureAction::Retry
+        }
+        CompletionFailureClass::TransientContention => CompletionFailureAction::WaitForDeadline,
+    }
+}
+
+fn completion_failure_ask(class: CompletionFailureClass, ticket_id: &str) -> Option<String> {
+    match class {
+        CompletionFailureClass::OperatorHistoryOrIdentity => {
+            Some(HISTORY_IDENTITY_ASK.to_string())
+        }
+        CompletionFailureClass::OperatorRepositoryUnwritable => Some(format!(
+            "Lisa cannot write finished work in this repository. Make it writable, then run: `lisa unblock {ticket_id}`."
+        )),
+        CompletionFailureClass::OperatorStaleLock => Some(format!(
+            "Lisa found an old lock blocking finished work. Remove `.lisa-commit.lock`, then run: `lisa unblock {ticket_id}`."
+        )),
+        CompletionFailureClass::DeadlineExpired => Some(format!(
+            "Lisa could not confirm whether finished work was recorded. Check the repository, then run: `lisa unblock {ticket_id}`."
+        )),
+        CompletionFailureClass::Unrecognized => None,
+        CompletionFailureClass::TransientContention => Some(format!(
+            "Lisa is waiting for another repository operation to finish before retrying {ticket_id}."
+        )),
+    }
+}
+
 fn review_block_action(owner: RemedyOwner, retries_consumed: u8) -> ReviewBlockAction {
     match owner {
         RemedyOwner::Agent if retries_consumed < MAX_AGENT_BLOCK_RETRIES => {
@@ -618,6 +711,7 @@ struct PendingCompletion {
     completion_key: CompletionGenerationId,
     correlation: CorrelationId,
     deadline: CompletionDeadline,
+    #[allow(dead_code)]
     is_reconciliation_replay: bool,
     prior_phase: Phase,
     prior_status: TicketStatus,
@@ -1681,7 +1775,10 @@ impl State {
             scanned.phase = pending.prior_phase;
             scanned.status = pending.prior_status;
         } else if let Some(aggregate) = self.completion_aggregates.get(&scanned.id) {
-            if aggregate.masks_durable_done() {
+            if aggregate.masks_durable_done()
+                && scanned.status != TicketStatus::Blocked
+                && (scanned.phase == Phase::Done || scanned.status == TicketStatus::Done)
+            {
                 scanned.phase = aggregate.prior_phase();
                 scanned.status = aggregate.prior_status();
             }
@@ -1693,14 +1790,20 @@ impl State {
     /// pre-load native fixtures and repositories without a journal compatible.
     fn reconciliation_state(&self, ticket_id: &str) -> CompletionState {
         if let Some(aggregate) = self.completion_aggregates.get(ticket_id) {
-            if matches!(aggregate.state(), CompletionState::Confirmed)
-                && self
-                    .dag
-                    .get_ticket(&ticket_id.to_string())
+            let durable_ticket = self.dag.get_ticket(&ticket_id.to_string());
+            if (matches!(aggregate.state(), CompletionState::Confirmed)
+                && durable_ticket
                     .map(|ticket| {
                         ticket.phase != Phase::Done || ticket.status != TicketStatus::Done
                     })
-                    .unwrap_or(false)
+                    .unwrap_or(false))
+                || (matches!(
+                    aggregate.state(),
+                    CompletionState::Rejected {
+                        retryability: Retryability::ActionRequired,
+                        ..
+                    }
+                ) && durable_ticket.is_some_and(|ticket| ticket.status == TicketStatus::Open))
             {
                 CompletionState::Eligible
             } else {
@@ -1827,9 +1930,17 @@ impl State {
                         correlation,
                         deadline,
                     } => {
+                        if self
+                            .completion_aggregates
+                            .get(&ticket_id)
+                            .is_some_and(CompletionJournalAggregate::retries_exhausted)
+                        {
+                            return false;
+                        }
                         return self.replay_in_flight_completion(
                             ticket_id,
-                            source_lease,
+                            CompletionSource::Reconcile,
+                            CompletionAuthority::Attempt(source_lease),
                             correlation,
                             deadline,
                         );
@@ -1899,7 +2010,15 @@ impl State {
                 // Event-driven sources preserve their existing semantics:
                 // ObservedDone still enters the isolated transaction rather
                 // than treating externally edited frontmatter as confirmation.
-                let state = self.reconciliation_state(&ticket_id);
+                let state = match self.reconciliation_state(&ticket_id) {
+                    CompletionState::Rejected {
+                        retryability: Retryability::ActionRequired,
+                        ..
+                    } if matches!(source, CompletionSource::OperatorRequested(_)) => {
+                        CompletionState::Eligible
+                    }
+                    state => state,
+                };
                 let attempt_id = match authority.as_ref() {
                     Some(CompletionAuthority::Attempt(lease)) => lease.attempt_id.to_string(),
                     Some(CompletionAuthority::Operator) => "operator".to_string(),
@@ -2161,22 +2280,37 @@ impl State {
     fn replay_in_flight_completion(
         &mut self,
         ticket_id: TicketId,
-        source_lease: AttemptLease,
+        source: CompletionSource,
+        authority: CompletionAuthority,
         correlation: CorrelationId,
         deadline: CompletionDeadline,
     ) -> bool {
         if self.pending_completions.contains_key(&ticket_id) {
             return false;
         }
-        if !self.review_lease_is_current(&ticket_id, &source_lease) {
+        let authority_is_current = match &authority {
+            CompletionAuthority::Attempt(lease) => self.review_lease_is_current(&ticket_id, lease),
+            CompletionAuthority::Operator => {
+                matches!(source, CompletionSource::OperatorRequested(_))
+            }
+        };
+        if !authority_is_current {
             return false;
         }
 
         let (completion_key, prior_phase, prior_status) =
             match self.completion_aggregates.get(&ticket_id) {
                 Some(aggregate)
-                    if aggregate.completion_key().attempt_id().as_str()
-                        == source_lease.attempt_id.to_string()
+                    if !aggregate.retries_exhausted()
+                        && match &authority {
+                            CompletionAuthority::Attempt(lease) => {
+                                aggregate.completion_key().attempt_id().as_str()
+                                    == lease.attempt_id.to_string()
+                            }
+                            CompletionAuthority::Operator => {
+                                aggregate.completion_key().attempt_id().as_str() == "operator"
+                            }
+                        }
                         && matches!(
                             aggregate.state(),
                             CompletionState::CommandInFlight {
@@ -2218,8 +2352,8 @@ impl State {
                 is_reconciliation_replay: true,
                 prior_phase,
                 prior_status,
-                source: CompletionSource::Reconcile,
-                authority: CompletionAuthority::Attempt(source_lease),
+                source,
+                authority,
             },
         );
 
@@ -2241,6 +2375,133 @@ impl State {
 
     /// End an unresolved generation in a durable, named state once its shared
     /// reconciliation window has elapsed.
+    fn park_failed_completion(
+        &mut self,
+        ticket_id: &str,
+        completion_key: CompletionGenerationId,
+        correlation: Option<CorrelationId>,
+        technical_reason: String,
+        class: CompletionFailureClass,
+        retry_progress: Option<(u8, u8)>,
+    ) -> bool {
+        let (prior_phase, ticket_file) = match (
+            self.completion_aggregates.get(ticket_id),
+            self.dag.get_ticket(&ticket_id.to_string()),
+        ) {
+            (Some(aggregate), Some(ticket))
+                if aggregate.completion_key() == &completion_key
+                    && !ticket.file_path.as_os_str().is_empty() =>
+            {
+                (aggregate.prior_phase(), ticket.file_path.clone())
+            }
+            _ => return false,
+        };
+        if let Err(error) =
+            self.journal_completion_transition(CompletionJournalTransition::Rejected {
+                key: completion_key.clone(),
+                correlation,
+                reason: technical_reason.clone(),
+                retryability: Retryability::ActionRequired,
+            })
+        {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion for {ticket_id} could not be parked because its rejection was not persisted: {error}"
+                ),
+            });
+            return false;
+        }
+
+        let ask =
+            completion_failure_ask(class, ticket_id).unwrap_or_else(|| technical_reason.clone());
+        let disposition = match completion_failure_ask(class, ticket_id) {
+            Some(structured_ask) => serde_json::json!({
+                "disposition": "block",
+                "reason": technical_reason.clone(),
+                "remedy_owner": "operator",
+                "ask": structured_ask,
+            }),
+            None => serde_json::json!({
+                "disposition": "block",
+                "reason": technical_reason.clone(),
+            }),
+        };
+        let disposition_bytes = match serde_json::to_vec(&disposition) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Completion for {ticket_id} is waiting, but its recovery ask could not be serialized: {error}"
+                    ),
+                });
+                return false;
+            }
+        };
+        let disposition_path = self
+            .config
+            .work_dir
+            .join(ticket_id)
+            .join("review-disposition.json");
+        if let Err(error) = (RustPublication {
+            path: PublicationPath {
+                destination: disposition_path,
+                temporary_name: TemporaryName::Nonce {
+                    prefix: ".review-disposition.json.tmp.".to_string(),
+                },
+            },
+            body: &disposition_bytes,
+            errors: PublicationErrors {
+                write: "cannot write completion recovery disposition",
+                publish: "cannot publish completion recovery disposition",
+            },
+        })
+        .publish()
+        {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion for {ticket_id} is waiting, but its recovery ask could not be published: {error}"
+                ),
+            });
+            return false;
+        }
+
+        if let Err(error) = ticket::update_ticket_phase(&ticket_file, prior_phase) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion for {ticket_id} is waiting, but Review state could not be restored: {error}"
+                ),
+            });
+            return false;
+        }
+        if let Err(error) = ticket::update_ticket_status(&ticket_file, TicketStatus::Blocked) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Completion for {ticket_id} is waiting, but blocked status could not be written: {error}"
+                ),
+            });
+            return false;
+        }
+
+        let parked_at = std::time::SystemTime::now();
+        self.emit_review_block_transition(
+            ticket_id,
+            RemedyOwner::Operator,
+            ParkingTransitionType::Park,
+            retry_progress,
+            false,
+            parked_at,
+        );
+        self.pending_completions.remove(ticket_id);
+        self.release_slot_for_ticket(&ticket_id.to_string());
+        self.threads.remove(ticket_id);
+        self.finish_up_sent.remove(ticket_id);
+        self.rebuild_dag();
+        self.log_activity(ActivityEvent::Info {
+            message: format!("{ask} [{technical_reason}]"),
+        });
+        true
+    }
+
     fn expire_in_flight_completion(
         &mut self,
         ticket_id: &str,
@@ -2265,32 +2526,14 @@ impl State {
             "completion reconciliation deadline {} exceeded for correlation {correlation}",
             deadline.unix_millis()
         );
-        if let Err(error) =
-            self.journal_completion_transition(CompletionJournalTransition::Rejected {
-                key: completion_key.clone(),
-                correlation: Some(correlation),
-                reason: reason.clone(),
-                retryability: Retryability::ActionRequired,
-            })
-        {
-            self.log_activity(ActivityEvent::Error {
-                message: format!(
-                    "Completion reconciliation for {ticket_id} remains in-flight because deadline rejection could not be persisted: {error}"
-                ),
-            });
-            return false;
-        }
-
-        self.pending_completions.remove(ticket_id);
-        self.rebuild_dag();
-        self.log_completion_rejection(
+        self.park_failed_completion(
             ticket_id,
-            &completion_key,
-            &CompletionRejection::LaunchFailed {
-                source: LaunchFailure::new(reason),
-            },
-        );
-        true
+            completion_key,
+            Some(correlation),
+            reason,
+            CompletionFailureClass::DeadlineExpired,
+            None,
+        )
     }
 
     /// The single host-command crossing used by both a new effect and an
@@ -2376,33 +2619,63 @@ impl State {
         if exit_code != Some(0) || !Self::is_commit_id(&stdout) {
             let detail = String::from_utf8_lossy(&stderr);
             let failure = format!(
-                    "Completion commit failed for {} authority {:?} ({:?}, exit {:?}): {}. Ticket remains recoverable for retry",
-                    ticket_id,
-                    pending.authority,
-                    pending.source,
-                    exit_code,
-                    if detail.trim().is_empty() {
-                        "no error output"
-                    } else {
-                        detail.trim()
-                    }
-                );
-            if pending.is_reconciliation_replay {
+                "Completion commit failed for {} authority {:?} ({:?}, exit {:?}): {}",
+                ticket_id,
+                pending.authority,
+                pending.source,
+                exit_code,
+                if detail.trim().is_empty() {
+                    "no error output"
+                } else {
+                    detail.trim()
+                }
+            );
+            let Some(aggregate) = self.completion_aggregates.get(ticket_id) else {
+                if let Err(error) =
+                    self.journal_completion_transition(CompletionJournalTransition::Rejected {
+                        key: completion_key.clone(),
+                        correlation: Some(correlation),
+                        reason: failure.clone(),
+                        retryability: Retryability::Retryable,
+                    })
+                {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "Completion result for {ticket_id} remains in-flight because failure could not be persisted: {error}"
+                        ),
+                    });
+                    return;
+                }
                 self.pending_completions.remove(ticket_id);
-                self.log_activity(ActivityEvent::Warning {
-                    message: format!(
-                        "{failure}; replay remains bounded by reconciliation deadline {}",
-                        pending.deadline.unix_millis()
-                    ),
-                });
+                self.rebuild_dag();
+                self.log_completion_rejection(
+                    ticket_id,
+                    &completion_key,
+                    &CompletionRejection::LaunchFailed {
+                        source: LaunchFailure::new(format!(
+                            "Lisa could not record finished work. [{failure}. Ticket remains recoverable for retry]"
+                        )),
+                    },
+                );
                 return;
-            }
+            };
+            let failure_count = aggregate.failure_count().saturating_add(1);
+            let class = classify_completion_failure(detail.trim());
+            let action = completion_failure_action(class, failure_count);
+            let consequence = match action {
+                CompletionFailureAction::Retry => FailureConsequence::RetryScheduled,
+                CompletionFailureAction::WaitForDeadline => FailureConsequence::RetryExhausted,
+                CompletionFailureAction::Park => FailureConsequence::Park,
+            };
             if let Err(error) =
-                self.journal_completion_transition(CompletionJournalTransition::Rejected {
+                self.journal_completion_transition(CompletionJournalTransition::FailureObserved {
                     key: completion_key.clone(),
-                    correlation: Some(correlation),
+                    correlation: correlation.clone(),
                     reason: failure.clone(),
-                    retryability: Retryability::Retryable,
+                    class,
+                    failure_count,
+                    failure_limit: MAX_COMPLETION_FAILURES,
+                    consequence,
                 })
             {
                 self.log_activity(ActivityEvent::Error {
@@ -2412,15 +2685,56 @@ impl State {
                 });
                 return;
             }
-            self.pending_completions.remove(ticket_id);
-            self.rebuild_dag();
+            let ask = completion_failure_ask(class, ticket_id).unwrap_or_else(|| failure.clone());
+            let surface_detail = if ask == failure {
+                ask
+            } else {
+                format!("{ask} [{failure}]")
+            };
             self.log_completion_rejection(
                 ticket_id,
                 &completion_key,
                 &CompletionRejection::LaunchFailed {
-                    source: LaunchFailure::new(failure),
+                    source: LaunchFailure::new(surface_detail),
                 },
             );
+            match action {
+                CompletionFailureAction::Retry => {
+                    self.pending_completions.remove(ticket_id);
+                    if !self.replay_in_flight_completion(
+                        ticket_id.to_string(),
+                        pending.source,
+                        pending.authority,
+                        correlation,
+                        pending.deadline,
+                    ) {
+                        self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "Completion retry {failure_count}/{MAX_COMPLETION_FAILURES} could not launch for {ticket_id}"
+                            ),
+                        });
+                    }
+                }
+                CompletionFailureAction::WaitForDeadline => {
+                    self.pending_completions.remove(ticket_id);
+                    self.log_activity(ActivityEvent::Info {
+                        message: format!(
+                            "Completion retries exhausted for {ticket_id} ({failure_count}/{MAX_COMPLETION_FAILURES}); waiting for reconciliation deadline {}",
+                            pending.deadline.unix_millis()
+                        ),
+                    });
+                }
+                CompletionFailureAction::Park => {
+                    self.park_failed_completion(
+                        ticket_id,
+                        completion_key,
+                        Some(correlation),
+                        failure,
+                        class,
+                        Some((failure_count, MAX_COMPLETION_FAILURES)),
+                    );
+                }
+            }
             return;
         }
 
@@ -8105,6 +8419,7 @@ pub extern "C" fn host_run_plugin_command() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lisa_core::completion::CompletionSeal;
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
 
     #[allow(dead_code)]
@@ -8867,6 +9182,45 @@ mod tests {
         )
         .unwrap();
         write_passing_review_disposition(state, lease);
+    }
+
+    fn completion_failure_fixture(
+        ticket_id: &str,
+    ) -> (State, AttemptLease, tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let tickets_dir = root.join("tickets");
+        let work_dir = root.join("work");
+        let journal = root.join("completion-journal.jsonl");
+        let ledger = root.join("provenance.jsonl");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        std::fs::write(
+            tickets_dir.join(format!("{ticket_id}.md")),
+            format!(
+                "---\nid: {ticket_id}\ntitle: bounded completion failure\ntype: bug\nstatus: open\npriority: critical\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+        let (mut state, lease) = review_timeout_state(
+            ticket_id,
+            tickets_dir,
+            work_dir,
+            root.to_path_buf(),
+            root.to_path_buf(),
+            journal.clone(),
+        );
+        state.ledger_path = ledger.clone();
+        state.attempt_dir = root.join("attempts");
+        let mut slot = fresh_slot(42, None);
+        slot.ticket_id = Some(ticket_id.to_string());
+        slot.attempt_lease = Some(lease.clone());
+        state.agent_slots.push(slot);
+        state
+            .seat_assignments
+            .insert(42, SeatAssignmentState::Owned);
+        std::fs::create_dir_all(state.attempt_work_dir(&lease)).unwrap();
+        write_private_review(&state, &lease);
+        (state, lease, dir, journal, ledger)
     }
 
     fn assert_no_finish_up(state: &State, ticket_id: &str) {
@@ -17965,7 +18319,7 @@ owned\n\
     }
 
     #[test]
-    fn review_timeout_preserves_retryable_command_failure() {
+    fn review_timeout_preserves_bounded_command_retry() {
         use std::fs;
 
         const TICKET_ID: &str = "T-TIMEOUT-RETRY";
@@ -18006,26 +18360,23 @@ owned\n\
             TICKET_ID,
             Some(1),
             Vec::new(),
-            b"nested identity unavailable".to_vec(),
+            b"Author identity unknown".to_vec(),
         );
 
-        assert!(!state.pending_completions.contains_key(TICKET_ID));
+        assert!(state.pending_completions.contains_key(TICKET_ID));
         assert!(state.threads.contains_key(TICKET_ID));
         assert_eq!(state.current_leases.get(TICKET_ID), Some(&lease));
         assert!(matches!(
             state.completion_aggregates[TICKET_ID].state(),
-            CompletionState::Rejected {
-                reason: CompletionRejection::LaunchFailed { source },
-                retryability: Retryability::Retryable,
-            } if source.message().contains("nested identity unavailable")
-                && source.message().contains("recoverable for retry")
+            CompletionState::CommandInFlight { .. }
         ));
+        assert_eq!(state.completion_aggregates[TICKET_ID].failure_count(), 1);
         let rejection = correlated_launch_failure(&state, TICKET_ID, &completion_key);
         assert!(matches!(
             rejection,
             ActivityEvent::CompletionRejected { detail, .. }
-                if detail.contains("nested identity unavailable")
-                    && detail.contains("recoverable for retry")
+                if detail.starts_with(HISTORY_IDENTITY_ASK)
+                    && detail.contains("Author identity unknown")
         ));
         assert_rejection_renders_unchanged(rejection);
 
@@ -18033,11 +18384,238 @@ owned\n\
         assert_no_finish_up(&state, TICKET_ID);
         assert!(matches!(
             state.reconciliation_state(TICKET_ID),
-            CompletionState::Rejected {
-                retryability: Retryability::Retryable,
-                ..
-            }
+            CompletionState::CommandInFlight { .. }
         ));
+    }
+
+    #[test]
+    fn completion_failure_classifier_is_conservative_and_asks_are_plain() {
+        let cases = [
+            (
+                "fatal: your current branch 'main' does not have any commits yet",
+                CompletionFailureClass::OperatorHistoryOrIdentity,
+            ),
+            (
+                "Author identity unknown; Please tell me who you are.",
+                CompletionFailureClass::OperatorHistoryOrIdentity,
+            ),
+            (
+                "fatal: unable to write new index file: Permission denied",
+                CompletionFailureClass::OperatorRepositoryUnwritable,
+            ),
+            (
+                "stale .lisa-commit.lock belongs to a dead process",
+                CompletionFailureClass::OperatorStaleLock,
+            ),
+            (
+                "Unable to create .git/index.lock: another git process seems to be running",
+                CompletionFailureClass::TransientContention,
+            ),
+            (
+                "fatal: unexpected ref transaction",
+                CompletionFailureClass::Unrecognized,
+            ),
+        ];
+        for (detail, expected) in cases {
+            assert_eq!(classify_completion_failure(detail), expected, "{detail}");
+        }
+        assert_eq!(
+            completion_failure_ask(CompletionFailureClass::OperatorHistoryOrIdentity, "T-ASK")
+                .as_deref(),
+            Some(HISTORY_IDENTITY_ASK)
+        );
+        for class in [
+            CompletionFailureClass::OperatorHistoryOrIdentity,
+            CompletionFailureClass::OperatorRepositoryUnwritable,
+            CompletionFailureClass::OperatorStaleLock,
+        ] {
+            assert_eq!(
+                completion_failure_action(class, 1),
+                CompletionFailureAction::Retry
+            );
+            assert_eq!(
+                completion_failure_action(class, 2),
+                CompletionFailureAction::Park
+            );
+            let ask = completion_failure_ask(class, "T-ASK").unwrap();
+            assert!(ask.starts_with("Lisa"));
+            assert!(!ask.contains("AttemptLease"));
+        }
+        assert_eq!(
+            completion_failure_action(CompletionFailureClass::TransientContention, 2),
+            CompletionFailureAction::WaitForDeadline
+        );
+        assert_eq!(
+            completion_failure_action(CompletionFailureClass::Unrecognized, 1),
+            CompletionFailureAction::Park
+        );
+    }
+
+    #[test]
+    fn history_and_identity_failures_retry_to_bound_then_park_and_unpark() {
+        for (ticket_id, failure) in [
+            (
+                "T-UNBORN",
+                "fatal: your current branch 'main' does not have any commits yet",
+            ),
+            ("T-IDENTITY", "Author identity unknown"),
+        ] {
+            let (mut state, lease, _dir, journal, ledger) = completion_failure_fixture(ticket_id);
+            assert!(state.dispatch_completion(CompletionInput::Reconcile {
+                ticket_id: ticket_id.to_string(),
+                source_lease: lease,
+            }));
+
+            state.handle_completion_result(
+                ticket_id,
+                Some(1),
+                Vec::new(),
+                failure.as_bytes().to_vec(),
+            );
+            assert!(state.pending_completions.contains_key(ticket_id));
+            assert_eq!(state.completion_aggregates[ticket_id].failure_count(), 1);
+            assert!(state.threads.contains_key(ticket_id));
+
+            state.handle_completion_result(
+                ticket_id,
+                Some(1),
+                Vec::new(),
+                failure.as_bytes().to_vec(),
+            );
+            assert!(!state.pending_completions.contains_key(ticket_id));
+            assert!(!state.threads.contains_key(ticket_id));
+            assert!(state.agent_slots[0].ticket_id.is_none());
+            let ticket = ticket::scan_tickets(&state.config.ticket_dir)
+                .unwrap()
+                .into_iter()
+                .find(|ticket| ticket.id == ticket_id)
+                .unwrap();
+            assert_eq!(ticket.phase, Phase::Review);
+            assert_eq!(ticket.status, TicketStatus::Blocked);
+            assert!(matches!(
+                parse_review_disposition(
+                    state
+                        .config
+                        .work_dir
+                        .join(ticket_id)
+                        .join("review-disposition.json")
+                ),
+                ReviewDisposition::Block {
+                    reason,
+                    remedy_owner: RemedyOwner::Operator,
+                    ask,
+                    unstructured: false,
+                    ..
+                } if reason.contains(failure) && ask == HISTORY_IDENTITY_ASK
+            ));
+            let body = std::fs::read_to_string(&journal).unwrap();
+            assert_eq!(body.matches("\"state\":\"failure-observed\"").count(), 2);
+            assert!(body.contains("\"failure_count\":1,\"failure_limit\":2"));
+            assert!(body.contains("\"failure_count\":2,\"failure_limit\":2"));
+            assert_eq!(body.matches(failure).count(), 3);
+
+            let records = read_mixed_ledger(&ledger);
+            let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
+                panic!("expected Park provenance")
+            };
+            assert_eq!(park.record_type, ParkingTransitionType::Park);
+            assert_eq!(park.retry_count, Some(2));
+            assert_eq!(park.retry_limit, Some(2));
+
+            ticket::update_ticket_status(&ticket.file_path, TicketStatus::Open).unwrap();
+            state.rebuild_dag();
+            assert_eq!(
+                state.reconciliation_state(ticket_id),
+                CompletionState::Eligible
+            );
+            state.reconcile_unpark_transitions();
+            let records = read_mixed_ledger(&ledger);
+            let ProvenanceLedgerRecord::ParkingTransition(unpark) = &records[1] else {
+                panic!("expected Unpark provenance")
+            };
+            assert_eq!(unpark.record_type, ParkingTransitionType::Unpark);
+            assert_eq!(unpark.retry_count, Some(2));
+            assert_eq!(unpark.retry_limit, Some(2));
+        }
+    }
+
+    #[test]
+    fn transient_completion_failure_exhausts_launches_without_immediate_park() {
+        const TICKET_ID: &str = "T-CONTENTION";
+        let (mut state, lease, _dir, journal, ledger) = completion_failure_fixture(TICKET_ID);
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease.clone(),
+        }));
+        let failure = b"Unable to create .git/index.lock: another git process seems to be running";
+
+        state.handle_completion_result(TICKET_ID, Some(1), Vec::new(), failure.to_vec());
+        assert!(state.pending_completions.contains_key(TICKET_ID));
+        assert_eq!(state.launched_completion_effects.len(), 2);
+        state.handle_completion_result(TICKET_ID, Some(1), Vec::new(), failure.to_vec());
+
+        assert!(!state.pending_completions.contains_key(TICKET_ID));
+        assert!(state.threads.contains_key(TICKET_ID));
+        assert!(matches!(
+            state.completion_aggregates[TICKET_ID].state(),
+            CompletionState::CommandInFlight { .. }
+        ));
+        assert!(state.completion_aggregates[TICKET_ID].retries_exhausted());
+        assert_eq!(state.launched_completion_effects.len(), 2);
+        assert!(!ledger.exists());
+        assert!(!state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease,
+        }));
+        assert_eq!(state.launched_completion_effects.len(), 2);
+        let body = std::fs::read_to_string(journal).unwrap();
+        assert!(body.contains("\"consequence\":\"retry-exhausted\""));
+        assert!(!body.contains("\"state\":\"rejected\""));
+    }
+
+    #[test]
+    fn unrecognized_completion_failure_parks_with_raw_unstructured_ask() {
+        const TICKET_ID: &str = "T-UNKNOWN-GIT";
+        let (mut state, lease, _dir, journal, ledger) = completion_failure_fixture(TICKET_ID);
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: lease,
+        }));
+        state.handle_completion_result(
+            TICKET_ID,
+            Some(1),
+            Vec::new(),
+            b"fatal: a surprising ref failure".to_vec(),
+        );
+
+        assert!(!state.threads.contains_key(TICKET_ID));
+        let disposition = parse_review_disposition(
+            state
+                .config
+                .work_dir
+                .join(TICKET_ID)
+                .join("review-disposition.json"),
+        );
+        assert!(matches!(
+            disposition,
+            ReviewDisposition::Block {
+                reason,
+                ask,
+                remedy_owner: RemedyOwner::Operator,
+                unstructured: true,
+                ..
+            } if ask == reason && reason.contains("fatal: a surprising ref failure")
+        ));
+        let body = std::fs::read_to_string(journal).unwrap();
+        assert_eq!(body.matches("\"state\":\"failure-observed\"").count(), 1);
+        assert!(body.contains("\"class\":\"unrecognized\""));
+        let records = read_mixed_ledger(&ledger);
+        let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
+            panic!("expected Park provenance")
+        };
+        assert_eq!(park.record_type, ParkingTransitionType::Park);
+        assert_eq!(park.retry_count, Some(1));
+        assert_eq!(park.retry_limit, Some(2));
     }
 
     #[test]
@@ -21780,7 +22358,6 @@ owned\n\
             },
             initial_time + std::time::Duration::from_secs(1),
         ));
-        assert!(restarted.pending_completions[TICKET_ID].is_reconciliation_replay);
         assert_eq!(
             restarted.pending_completions[TICKET_ID].completion_key,
             original_pending.completion_key
@@ -21854,13 +22431,14 @@ owned\n\
     }
 
     #[test]
-    fn reconciliation_deadline_ends_action_required_without_infinite_replay() {
+    fn reconciliation_deadline_parks_and_ordinary_unpark_restores_eligibility() {
         const TICKET_ID: &str = "T-DEADLINE";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let tickets_dir = root.join("docs/active/tickets");
         let work_dir = root.join("docs/active/work");
         let journal = root.join(".lisa/completion-journal.jsonl");
+        let ledger = root.join(".lisa/provenance.jsonl");
         std::fs::create_dir_all(&tickets_dir).unwrap();
         std::fs::create_dir_all(&work_dir).unwrap();
         let ticket_path = tickets_dir.join(format!("{TICKET_ID}.md"));
@@ -21880,6 +22458,7 @@ owned\n\
             journal.clone(),
         );
         state.attempt_dir = root.join(".lisa/attempts");
+        state.ledger_path = ledger.clone();
         std::fs::create_dir_all(state.attempt_work_dir(&lease)).unwrap();
         write_private_review(&state, &lease);
         let initial_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
@@ -21918,8 +22497,33 @@ owned\n\
         assert_eq!(
             state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().phase,
             Phase::Review,
-            "uncertain Done bytes remain masked after terminal reconciliation timeout"
+            "uncertain Done bytes are restored to Review before parking"
         );
+        assert_eq!(
+            state.dag.get_ticket(&TICKET_ID.to_string()).unwrap().status,
+            TicketStatus::Blocked
+        );
+        assert!(!state.threads.contains_key(TICKET_ID));
+        assert!(matches!(
+            parse_review_disposition(
+                state
+                    .config
+                    .work_dir
+                    .join(TICKET_ID)
+                    .join("review-disposition.json")
+            ),
+            ReviewDisposition::Block {
+                remedy_owner: RemedyOwner::Operator,
+                ask,
+                unstructured: false,
+                ..
+            } if ask.starts_with("Lisa could not confirm whether finished work was recorded.")
+        ));
+        let records = read_mixed_ledger(&ledger);
+        let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
+            panic!("expected deadline Park provenance")
+        };
+        assert_eq!(park.record_type, ParkingTransitionType::Park);
         assert_eq!(state.launched_completion_effects.len(), 1);
         assert_eq!(
             std::fs::read_to_string(&journal).unwrap().lines().count(),
@@ -21945,6 +22549,38 @@ owned\n\
         assert_eq!(
             std::fs::read_to_string(&journal).unwrap().lines().count(),
             3
+        );
+
+        ticket::update_ticket_status(&ticket_path, TicketStatus::Open).unwrap();
+        state.rebuild_dag();
+        assert_eq!(
+            state.reconciliation_state(TICKET_ID),
+            CompletionState::Eligible
+        );
+        state.reconcile_unpark_transitions();
+        let records = read_mixed_ledger(&ledger);
+        let ProvenanceLedgerRecord::ParkingTransition(unpark) = &records[1] else {
+            panic!("expected deadline Unpark provenance")
+        };
+        assert_eq!(unpark.record_type, ParkingTransitionType::Unpark);
+
+        let mut replacement = Thread::new(TICKET_ID, 43);
+        replacement.current_phase = Phase::Review;
+        state.threads.insert(TICKET_ID.to_string(), replacement);
+        let replacement_lease = install_current_attempt(&mut state, TICKET_ID);
+        assert_eq!(replacement_lease.attempt_id, 2);
+        std::fs::create_dir_all(state.attempt_work_dir(&replacement_lease)).unwrap();
+        write_private_review(&state, &replacement_lease);
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET_ID.to_string(),
+            source_lease: replacement_lease,
+        }));
+        assert_eq!(
+            state.completion_aggregates[TICKET_ID]
+                .completion_key()
+                .attempt_id()
+                .as_str(),
+            "2"
         );
     }
 

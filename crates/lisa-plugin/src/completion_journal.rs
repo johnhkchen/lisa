@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::publication::{PublicationErrors, PublicationPath, RustPublication, TemporaryName};
 
 const LEGACY_SCHEMA_VERSION: u32 = 1;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const TEMPORARY_PREFIX: &str = ".completion-journal.jsonl.tmp.";
 
 /// One durable completion transition requested by the plugin adapter.
@@ -35,6 +35,15 @@ pub(crate) enum CompletionJournalTransition {
         key: CompletionGenerationId,
         correlation: CorrelationId,
         deadline: CompletionDeadline,
+    },
+    FailureObserved {
+        key: CompletionGenerationId,
+        correlation: CorrelationId,
+        reason: String,
+        class: CompletionFailureClass,
+        failure_count: u8,
+        failure_limit: u8,
+        consequence: FailureConsequence,
     },
     Rejected {
         key: CompletionGenerationId,
@@ -54,10 +63,32 @@ impl CompletionJournalTransition {
         match self {
             Self::Requested { key, .. }
             | Self::CommandInFlight { key, .. }
+            | Self::FailureObserved { key, .. }
             | Self::Rejected { key, .. }
             | Self::Confirmed { key, .. } => key,
         }
     }
+}
+
+/// Conservative adapter classification retained with every failed command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CompletionFailureClass {
+    OperatorHistoryOrIdentity,
+    OperatorRepositoryUnwritable,
+    OperatorStaleLock,
+    TransientContention,
+    Unrecognized,
+    DeadlineExpired,
+}
+
+/// Scheduler consequence paired with one bounded failed command observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FailureConsequence {
+    RetryScheduled,
+    RetryExhausted,
+    Park,
 }
 
 /// Latest typed state reconstructed for one completion/ticket aggregate.
@@ -69,6 +100,9 @@ pub(crate) struct CompletionJournalAggregate {
     prior_phase: Phase,
     prior_status: TicketStatus,
     confirmed_commit_id: Option<String>,
+    failure_count: u8,
+    failure_limit: Option<u8>,
+    retries_exhausted: bool,
 }
 
 impl CompletionJournalAggregate {
@@ -91,6 +125,19 @@ impl CompletionJournalAggregate {
 
     pub(crate) fn prior_status(&self) -> TicketStatus {
         self.prior_status
+    }
+
+    pub(crate) fn failure_count(&self) -> u8 {
+        self.failure_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_limit(&self) -> Option<u8> {
+        self.failure_limit
+    }
+
+    pub(crate) fn retries_exhausted(&self) -> bool {
+        self.retries_exhausted
     }
 
     #[cfg(test)]
@@ -137,6 +184,17 @@ enum JournalRecordBody {
         correlation_id: String,
         #[serde(default)]
         reconciliation_deadline_unix_ms: Option<u64>,
+    },
+    FailureObserved {
+        completion_id: String,
+        attempt_id: String,
+        generation: u64,
+        correlation_id: String,
+        reason: String,
+        class: CompletionFailureClass,
+        failure_count: u8,
+        failure_limit: u8,
+        consequence: FailureConsequence,
     },
     Rejected {
         completion_id: String,
@@ -205,6 +263,25 @@ impl JournalRecord {
                 correlation_id: correlation.to_string(),
                 reconciliation_deadline_unix_ms: Some(deadline.unix_millis()),
             },
+            CompletionJournalTransition::FailureObserved {
+                key,
+                correlation,
+                reason,
+                class,
+                failure_count,
+                failure_limit,
+                consequence,
+            } => JournalRecordBody::FailureObserved {
+                completion_id: key.completion_id().to_string(),
+                attempt_id: key.attempt_id().to_string(),
+                generation: key.generation(),
+                correlation_id: correlation.to_string(),
+                reason: reason.clone(),
+                class: *class,
+                failure_count: *failure_count,
+                failure_limit: *failure_limit,
+                consequence: *consequence,
+            },
             CompletionJournalTransition::Rejected {
                 key,
                 correlation,
@@ -240,7 +317,7 @@ impl JournalRecord {
     fn into_transition(self) -> Result<(CompletionSeal, CompletionJournalTransition), String> {
         if !(LEGACY_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(format!(
-                "unsupported completion journal schema version {} (expected {LEGACY_SCHEMA_VERSION} or {SCHEMA_VERSION})",
+                "unsupported completion journal schema version {} (expected {LEGACY_SCHEMA_VERSION} through {SCHEMA_VERSION})",
                 self.schema_version
             ));
         }
@@ -268,6 +345,25 @@ impl JournalRecord {
                 deadline: CompletionDeadline::from_unix_millis(
                     reconciliation_deadline_unix_ms.unwrap_or(0),
                 ),
+            },
+            JournalRecordBody::FailureObserved {
+                completion_id,
+                attempt_id,
+                generation,
+                correlation_id,
+                reason,
+                class,
+                failure_count,
+                failure_limit,
+                consequence,
+            } => CompletionJournalTransition::FailureObserved {
+                key: generation_key(completion_id, attempt_id, generation),
+                correlation: CorrelationId::new(correlation_id),
+                reason,
+                class,
+                failure_count,
+                failure_limit,
+                consequence,
             },
             JournalRecordBody::Rejected {
                 completion_id,
@@ -473,6 +569,9 @@ fn apply_transition(
                 prior_phase,
                 prior_status,
                 confirmed_commit_id: None,
+                failure_count: 0,
+                failure_limit: None,
+                retries_exhausted: false,
             }
         }
         CompletionJournalTransition::CommandInFlight {
@@ -499,6 +598,82 @@ fn apply_transition(
             }
             aggregate.state = reduced.state;
             aggregate.confirmed_commit_id = None;
+            aggregate
+        }
+        CompletionJournalTransition::FailureObserved {
+            key,
+            correlation,
+            reason,
+            class: _,
+            failure_count,
+            failure_limit,
+            consequence,
+        } => {
+            let mut aggregate = matching_aggregate(aggregates, &ticket_id, &key, seal)?;
+            let CompletionState::CommandInFlight {
+                correlation: expected,
+                ..
+            } = &aggregate.state
+            else {
+                return Err(format!(
+                    "cannot observe a command failure for completion {ticket_id} from state {:?}",
+                    aggregate.state
+                ));
+            };
+            if expected != &correlation {
+                return Err(format!(
+                    "completion failure correlation mismatch for {ticket_id}: expected {expected}, got {correlation}"
+                ));
+            }
+            if reason.trim().is_empty() {
+                return Err(format!(
+                    "completion failure observation for {ticket_id} requires a reason"
+                ));
+            }
+            if failure_limit == 0 {
+                return Err(format!(
+                    "completion failure observation for {ticket_id} requires a positive limit"
+                ));
+            }
+            let expected_count = aggregate.failure_count.saturating_add(1);
+            if failure_count != expected_count {
+                return Err(format!(
+                    "completion failure count for {ticket_id} must be {expected_count}, got {failure_count}"
+                ));
+            }
+            if aggregate
+                .failure_limit
+                .is_some_and(|prior| prior != failure_limit)
+            {
+                return Err(format!(
+                    "completion failure limit changed for {ticket_id}: expected {}, got {failure_limit}",
+                    aggregate.failure_limit.unwrap_or_default()
+                ));
+            }
+            if failure_count > failure_limit {
+                return Err(format!(
+                    "completion failure count {failure_count} exceeds limit {failure_limit} for {ticket_id}"
+                ));
+            }
+            match consequence {
+                FailureConsequence::RetryScheduled if failure_count >= failure_limit => {
+                    return Err(format!(
+                        "completion retry for {ticket_id} cannot be scheduled at exhausted count {failure_count}/{failure_limit}"
+                    ));
+                }
+                FailureConsequence::RetryExhausted if failure_count != failure_limit => {
+                    return Err(format!(
+                        "completion retries for {ticket_id} can only be exhausted at {failure_limit}, got {failure_count}"
+                    ));
+                }
+                _ => {}
+            }
+            aggregate.failure_count = failure_count;
+            aggregate.failure_limit = Some(failure_limit);
+            aggregate.retries_exhausted = matches!(
+                consequence,
+                FailureConsequence::RetryExhausted | FailureConsequence::Park
+            );
             aggregate
         }
         CompletionJournalTransition::Rejected {
@@ -686,7 +861,7 @@ mod tests {
 
         let body = fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 3);
-        assert_eq!(body.matches("\"schema_version\":2").count(), 3);
+        assert_eq!(body.matches("\"schema_version\":3").count(), 3);
         assert_eq!(body.matches("\"seal\":\"commit\"").count(), 3);
         assert_eq!(body.matches("\"state\":\"requested\"").count(), 1);
         assert_eq!(body.matches("\"state\":\"command-in-flight\"").count(), 1);
@@ -698,6 +873,125 @@ mod tests {
         assert_eq!(body.matches("\"state\":\"confirmed\"").count(), 1);
         assert!(body.ends_with('\n'));
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_command_observations_are_bounded_durable_and_restart_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+        let generation = key("T-FAIL", "9", 1);
+        let command = correlation("bounded-command");
+        append(
+            &path,
+            CompletionJournalTransition::Requested {
+                key: generation.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            CompletionJournalTransition::CommandInFlight {
+                key: generation.clone(),
+                correlation: command.clone(),
+                deadline: deadline(60_000),
+            },
+        )
+        .unwrap();
+
+        let retry = append(
+            &path,
+            CompletionJournalTransition::FailureObserved {
+                key: generation.clone(),
+                correlation: command.clone(),
+                reason: "index is busy".to_string(),
+                class: CompletionFailureClass::TransientContention,
+                failure_count: 1,
+                failure_limit: 2,
+                consequence: FailureConsequence::RetryScheduled,
+            },
+        )
+        .unwrap();
+        assert_eq!(retry.failure_count(), 1);
+        assert_eq!(retry.failure_limit(), Some(2));
+        assert!(!retry.retries_exhausted());
+        assert!(matches!(
+            retry.state(),
+            CompletionState::CommandInFlight { .. }
+        ));
+
+        let exhausted = append(
+            &path,
+            CompletionJournalTransition::FailureObserved {
+                key: generation,
+                correlation: command,
+                reason: "index is still busy".to_string(),
+                class: CompletionFailureClass::TransientContention,
+                failure_count: 2,
+                failure_limit: 2,
+                consequence: FailureConsequence::RetryExhausted,
+            },
+        )
+        .unwrap();
+        assert_eq!(exhausted.failure_count(), 2);
+        assert_eq!(exhausted.failure_limit(), Some(2));
+        assert!(exhausted.retries_exhausted());
+        assert_eq!(load(&path).unwrap().get("T-FAIL"), Some(&exhausted));
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert_eq!(body.matches("\"state\":\"failure-observed\"").count(), 2);
+        assert!(body.contains("\"failure_count\":1,\"failure_limit\":2"));
+        assert!(body.contains("\"failure_count\":2,\"failure_limit\":2"));
+        assert!(body.contains("\"consequence\":\"retry-exhausted\""));
+    }
+
+    #[test]
+    fn failure_observation_rejects_skips_limit_changes_and_overrun() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+        let generation = key("T-BAD-FAIL", "1", 1);
+        let command = correlation("command");
+        append(
+            &path,
+            CompletionJournalTransition::Requested {
+                key: generation.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            CompletionJournalTransition::CommandInFlight {
+                key: generation.clone(),
+                correlation: command.clone(),
+                deadline: deadline(60_000),
+            },
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        for (count, limit, consequence) in [
+            (2, 2, FailureConsequence::RetryExhausted),
+            (1, 1, FailureConsequence::RetryScheduled),
+            (3, 2, FailureConsequence::Park),
+        ] {
+            assert!(append(
+                &path,
+                CompletionJournalTransition::FailureObserved {
+                    key: generation.clone(),
+                    correlation: command.clone(),
+                    reason: "invalid sequence".to_string(),
+                    class: CompletionFailureClass::Unrecognized,
+                    failure_count: count,
+                    failure_limit: limit,
+                    consequence,
+                },
+            )
+            .is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
     }
 
     #[test]
@@ -962,7 +1256,7 @@ mod tests {
         assert_eq!(requested.seal(), CompletionSeal::Journal);
         let requested_bytes = fs::read(&path).unwrap();
         let requested_json = String::from_utf8_lossy(&requested_bytes);
-        assert!(requested_json.contains("\"schema_version\":2"));
+        assert!(requested_json.contains("\"schema_version\":3"));
         assert!(requested_json.contains("\"seal\":\"journal\""));
 
         let error = append_with_seal(
