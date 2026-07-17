@@ -12,8 +12,11 @@ use lisa_core::completion::{
     CompletionSealMode, ResolvedCompletionSeal,
 };
 
-const IDENTITY_REMEDY: &str =
-    "  git config user.name \"You\"\n  git config user.email you@example.com";
+pub(crate) const COMMIT_IDENTITY_REMEDIES: &str = "Configure your own identity:
+  git config user.name \"You\"
+  git config user.email you@example.com
+
+Or rerun `lisa init` and accept the history offer.";
 
 /// Completion seal and repository fact pinned by one loop-start probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +32,10 @@ impl RunCompletionSeal {
 
     pub(crate) fn git_root(&self) -> Option<&Path> {
         self.git_root.as_deref()
+    }
+
+    pub(crate) fn commit_unavailable(&self) -> Option<&CommitSealUnavailable> {
+        self.resolution.commit_unavailable()
     }
 }
 
@@ -226,7 +233,7 @@ fn git_failure_detail(failure: &GitCommandFailure) -> String {
 
 fn format_preflight_failure(reason: &CommitSealUnavailable) -> String {
     format!(
-        "Completion seal preflight failed: [guards].completion = \"commit\" requires commit sealing, but {reason}.\n\nConfigure the identity used for finished work:\n{IDENTITY_REMEDY}"
+        "Completion seal preflight failed: [guards].completion = \"commit\" requires commit sealing, but {reason}.\n\n{COMMIT_IDENTITY_REMEDIES}"
     )
 }
 
@@ -254,6 +261,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(commit.seal(), CompletionSeal::Commit);
         assert_eq!(commit.git_root(), Some(Path::new("/repo")));
+        assert_eq!(commit.commit_unavailable(), None);
 
         let journal = resolve_for_run_with(Path::new("/project"), CompletionSealMode::Auto, |_| {
             outcome(CommitSealSupport::Unavailable(
@@ -263,7 +271,7 @@ mod tests {
         .unwrap();
         assert_eq!(journal.seal(), CompletionSeal::Journal);
         assert_eq!(
-            journal.resolution.commit_unavailable(),
+            journal.commit_unavailable(),
             Some(&CommitSealUnavailable::RepositoryMissing)
         );
     }
@@ -295,8 +303,11 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(error.contains("Completion seal preflight failed"));
         assert!(error.contains("[guards].completion = \"commit\""));
-        assert!(error.contains("git config user.name \"You\""));
-        assert!(error.contains("git config user.email you@example.com"));
+        assert_eq!(
+            COMMIT_IDENTITY_REMEDIES,
+            "Configure your own identity:\n  git config user.name \"You\"\n  git config user.email you@example.com\n\nOr rerun `lisa init` and accept the history offer."
+        );
+        assert!(error.contains(COMMIT_IDENTITY_REMEDIES));
     }
 
     #[test]

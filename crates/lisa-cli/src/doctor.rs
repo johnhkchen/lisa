@@ -573,8 +573,7 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     let validation = config::load_config(root)?;
     let resolved_config = config::resolve_config(&validation.config, None, None);
     let client = resolved_config.client;
-    let completion_seal =
-        crate::completion_seal::resolve_for_inspection(root, resolved_config.completion_mode);
+    let completion = crate::completion_seal::resolve_for_run(root, resolved_config.completion_mode);
 
     let checks = build_checks(client);
     let mut reports = vec![CheckReport {
@@ -594,7 +593,7 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
         output.push_str("\n\nChecking project...\n\n");
         output.push_str(&format!("{}\n", project_report));
     }
-    append_completion_seal_report(&mut output, completion_seal);
+    append_completion_seal_report(&mut output, &completion);
     reports.push(project_report);
 
     // Clean stale Zellij plugin cache
@@ -643,17 +642,43 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
 
     println!("{}", output);
 
-    if has_failures(&reports) {
+    if has_failures(&reports) || completion.is_err() {
         Err("Some required dependencies are unavailable or unsupported.".to_string())
     } else {
         Ok(())
     }
 }
 
-fn append_completion_seal_report(output: &mut String, seal: lisa_core::completion::CompletionSeal) {
-    output.push_str("\n\nChecking completion...\n\n  ");
+fn append_completion_seal_line(output: &mut String, seal: lisa_core::completion::CompletionSeal) {
+    output.push_str("  ");
     output.push_str(crate::completion_seal::visibility_line(seal));
     output.push('\n');
+}
+
+fn append_completion_seal_report(
+    output: &mut String,
+    completion: &Result<crate::completion_seal::RunCompletionSeal, String>,
+) {
+    output.push_str("\n\nChecking completion...\n\n");
+    match completion {
+        Ok(completion) => {
+            append_completion_seal_line(output, completion.seal());
+            if let Some(reason @ lisa_core::completion::CommitSealUnavailable::IdentityMissing) =
+                completion.commit_unavailable()
+            {
+                output.push_str("\n  Reason: ");
+                output.push_str(&reason.to_string());
+                output.push_str(".\n\n");
+                output.push_str(crate::completion_seal::COMMIT_IDENTITY_REMEDIES);
+                output.push('\n');
+            }
+        }
+        Err(error) => {
+            output.push_str("  ");
+            output.push_str(error);
+            output.push('\n');
+        }
+    }
 }
 
 #[cfg(test)]
@@ -986,12 +1011,12 @@ mod tests {
             ),
         ] {
             let mut output = String::new();
-            append_completion_seal_report(&mut output, seal);
+            append_completion_seal_line(&mut output, seal);
             assert!(output.contains(expected));
         }
 
         let mut journal = String::new();
-        append_completion_seal_report(&mut journal, lisa_core::completion::CompletionSeal::Journal);
+        append_completion_seal_line(&mut journal, lisa_core::completion::CompletionSeal::Journal);
         assert!(!journal.to_ascii_lowercase().contains("git"));
     }
 

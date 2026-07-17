@@ -13,7 +13,14 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
-fn run_fixture(command: &str, completion: &str) -> Output {
+#[derive(Clone, Copy)]
+enum RepositoryFixture {
+    Absent,
+    MissingIdentity,
+    WithIdentity,
+}
+
+fn run_fixture(command: &str, completion: &str, repository: RepositoryFixture) -> Output {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     let bin = temp.path().join("bin");
@@ -37,6 +44,36 @@ fn run_fixture(command: &str, completion: &str) -> Output {
     )
     .unwrap();
 
+    if !matches!(repository, RepositoryFixture::Absent) {
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    if matches!(repository, RepositoryFixture::WithIdentity) {
+        for args in [
+            ["config", "user.name", "Seal Fixture"],
+            ["config", "user.email", "seal-fixture@example.invalid"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["commit", "--quiet", "--allow-empty", "-m", "fixture root"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     write_executable(
         &bin.join("zellij"),
         "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; fi\nexit 0\n",
@@ -54,12 +91,13 @@ fn run_fixture(command: &str, completion: &str) -> Output {
         .args(["--path", root.to_str().unwrap()])
         .env("PATH", env::join_paths(paths).unwrap())
         .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap()
 }
 
-fn assert_seal_line(command: &str, mode: &str, expected: &str) {
-    let output = run_fixture(command, mode);
+fn assert_seal_line(command: &str, mode: &str, repository: RepositoryFixture, expected: &str) {
+    let output = run_fixture(command, mode, repository);
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{command} failed:\n{stdout}");
     let line = stdout
@@ -75,16 +113,83 @@ fn assert_seal_line(command: &str, mode: &str, expected: &str) {
 
 #[test]
 fn doctor_and_status_fixture_show_each_resolved_seal_in_plain_language() {
-    for command in ["doctor", "status"] {
+    assert_seal_line(
+        "doctor",
+        "commit",
+        RepositoryFixture::WithIdentity,
+        "completion seal: commit-sealed — finished work lands as history",
+    );
+    assert_seal_line(
+        "doctor",
+        "journal",
+        RepositoryFixture::Absent,
+        "completion seal: journal-only — finished work is recorded but not undoable",
+    );
+    for mode in ["commit", "journal"] {
         assert_seal_line(
-            command,
-            "commit",
-            "completion seal: commit-sealed — finished work lands as history",
-        );
-        assert_seal_line(
-            command,
-            "journal",
-            "completion seal: journal-only — finished work is recorded but not undoable",
+            "status",
+            mode,
+            RepositoryFixture::Absent,
+            if mode == "commit" {
+                "completion seal: commit-sealed — finished work lands as history"
+            } else {
+                "completion seal: journal-only — finished work is recorded but not undoable"
+            },
         );
     }
+}
+
+const IDENTITY_REASON: &str =
+    "no commit identity is configured (git config user.email did not resolve)";
+const IDENTITY_REMEDIES: &str = "Configure your own identity:
+  git config user.name \"You\"
+  git config user.email you@example.com
+
+Or rerun `lisa init` and accept the history offer.";
+
+#[test]
+fn doctor_auto_names_missing_identity_and_both_remedies_verbatim() {
+    let output = run_fixture("doctor", "auto", RepositoryFixture::MissingIdentity);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "doctor failed:\n{stdout}");
+    assert!(stdout
+        .contains("completion seal: journal-only — finished work is recorded but not undoable"));
+    assert!(stdout.contains(IDENTITY_REASON));
+    assert!(stdout.contains(IDENTITY_REMEDIES));
+}
+
+#[test]
+fn doctor_auto_is_silent_about_identity_when_repository_can_commit() {
+    let output = run_fixture("doctor", "auto", RepositoryFixture::WithIdentity);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "doctor failed:\n{stdout}");
+    assert!(stdout.contains("completion seal: commit-sealed — finished work lands as history"));
+    assert!(!stdout.contains(IDENTITY_REASON));
+    assert!(!stdout.contains(IDENTITY_REMEDIES));
+}
+
+#[test]
+fn doctor_auto_without_repository_defers_to_journal_seal_line() {
+    let output = run_fixture("doctor", "auto", RepositoryFixture::Absent);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success(), "doctor failed:\n{stdout}");
+    assert!(stdout
+        .contains("completion seal: journal-only — finished work is recorded but not undoable"));
+    assert!(!stdout.contains(IDENTITY_REASON));
+    assert!(!stdout.contains(IDENTITY_REMEDIES));
+}
+
+#[test]
+fn doctor_explicit_commit_uses_shared_missing_identity_hard_failure() {
+    let output = run_fixture("doctor", "commit", RepositoryFixture::MissingIdentity);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(!output.status.success());
+    assert!(stdout.contains("Completion seal preflight failed"));
+    assert!(stdout.contains("[guards].completion = \"commit\""));
+    assert!(stdout.contains(IDENTITY_REASON));
+    assert!(stdout.contains(IDENTITY_REMEDIES));
 }
