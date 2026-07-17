@@ -9,12 +9,16 @@ use std::path::Path;
 use crate::disposition::{parse_review_disposition, RemedyOwner, ReviewDisposition};
 use crate::types::{Ticket, TicketStatus};
 
+/// Plain lead shown when an older block has no structured human ask.
+pub const LEGACY_BLOCK_ASK: &str = "This ticket needs a decision from you. The reviewer's note is below — you can paste it to your coding agent.";
+
 /// The small remedy projection needed by status, dashboard, and unblock UX.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedRemedy {
     pub ticket_id: String,
     pub remedy_owner: RemedyOwner,
     pub ask: String,
+    pub reason: String,
     pub check: Option<String>,
 }
 
@@ -33,18 +37,26 @@ pub fn collect_parked_remedies<'a>(
             let disposition =
                 parse_review_disposition(work_dir.join(&ticket.id).join("review-disposition.json"));
             let ReviewDisposition::Block {
+                reason,
                 remedy_owner,
                 ask,
                 check,
+                unstructured,
                 ..
             } = disposition
             else {
                 return None;
             };
+            let ask = if unstructured {
+                LEGACY_BLOCK_ASK.to_string()
+            } else {
+                ask
+            };
             Some(ParkedRemedy {
                 ticket_id: ticket.id.clone(),
                 remedy_owner,
                 ask,
+                reason,
                 check,
             })
         })
@@ -97,12 +109,14 @@ mod tests {
                     ticket_id: "T-001".to_string(),
                     remedy_owner: RemedyOwner::Operator,
                     ask: "Run the checkout test.".to_string(),
+                    reason: "manual test missing".to_string(),
                     check: None,
                 },
                 ParkedRemedy {
                     ticket_id: "T-002".to_string(),
                     remedy_owner: RemedyOwner::World,
                     ask: "Wait for the release link.".to_string(),
+                    reason: "release missing".to_string(),
                     check: Some("test -f release".to_string()),
                 },
             ]
@@ -110,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_block_uses_the_parser_operator_fallback() {
+    fn legacy_block_gets_a_plain_ask_and_preserves_the_raw_reason() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         write_disposition(
@@ -125,7 +139,8 @@ mod tests {
             vec![ParkedRemedy {
                 ticket_id: "T-LEGACY".to_string(),
                 remedy_owner: RemedyOwner::Operator,
-                ask: "  Run the old test.  ".to_string(),
+                ask: LEGACY_BLOCK_ASK.to_string(),
+                reason: "  Run the old test.  ".to_string(),
                 check: None,
             }]
         );

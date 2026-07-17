@@ -166,6 +166,7 @@ pub struct ParkedThread {
 pub struct WaitingItem {
     pub ticket_id: String,
     pub ask: String,
+    pub reason: String,
     pub checks_on_own: bool,
 }
 
@@ -442,7 +443,7 @@ fn render_separator(width: usize) -> String {
 // Waiting on you
 // =============================================================================
 
-/// Render the ask-only surface for durable operator/world-owned parks.
+/// Render the plain ask before the reviewer's raw note for durable parks.
 fn render_waiting_on_you(state: &PluginState, output: &mut Vec<String>) {
     if state.waiting_items.is_empty() {
         return;
@@ -456,6 +457,7 @@ fn render_waiting_on_you(state: &PluginState, output: &mut Vec<String>) {
             ""
         };
         output.push(format!("{}  {}{}", item.ticket_id, item.ask, suffix));
+        output.push(format!("       Reviewer's note: {}", item.reason));
     }
     output.push(String::new());
 }
@@ -1746,11 +1748,13 @@ mod tests {
                 WaitingItem {
                     ticket_id: "T-ASK".to_string(),
                     ask: "Run the checkout test exactly once.".to_string(),
+                    reason: "The checkout evidence is missing.".to_string(),
                     checks_on_own: false,
                 },
                 WaitingItem {
                     ticket_id: "T-WORLD".to_string(),
                     ask: "Wait for the release link.".to_string(),
+                    reason: "The release has not reached the mirror.".to_string(),
                     checks_on_own: true,
                 },
             ],
@@ -1763,10 +1767,37 @@ mod tests {
         let full = output.join("\n");
         assert!(full.contains("Waiting on you"));
         assert!(full.contains("T-ASK  Run the checkout test exactly once."));
+        assert!(full.contains("Reviewer's note: The checkout evidence is missing."));
         assert!(full.contains("T-WORLD  Wait for the release link. — Lisa checks on its own."));
+        assert!(full.contains("Reviewer's note: The release has not reached the mirror."));
         assert!(!full.contains("operator"));
         assert!(!full.contains("remedy_owner"));
-        assert!(!full.contains("engineering-only reason"));
+    }
+
+    #[test]
+    fn legacy_field_block_never_puts_the_raw_reason_first() {
+        const FIELD_REASON: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
+        let state = PluginState {
+            waiting_items: vec![WaitingItem {
+                ticket_id: "T-046-06-03".to_string(),
+                ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
+                reason: FIELD_REASON.to_string(),
+                checks_on_own: false,
+            }],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+
+        render_waiting_on_you(&state, &mut output);
+
+        assert_eq!(output.len(), 4);
+        assert_eq!(
+            output[1],
+            format!("T-046-06-03  {}", lisa_core::parking::LEGACY_BLOCK_ASK)
+        );
+        assert!(!output[1].contains(FIELD_REASON));
+        assert_eq!(output[2], format!("       Reviewer's note: {FIELD_REASON}"));
+        assert!(output[3].is_empty());
     }
 
     #[test]
@@ -1782,6 +1813,7 @@ mod tests {
             waiting_items: vec![WaitingItem {
                 ticket_id: "T-ASK".to_string(),
                 ask: "Run the release test.".to_string(),
+                reason: "The release evidence is missing.".to_string(),
                 checks_on_own: false,
             }],
             alerts: vec![HealthAlert {

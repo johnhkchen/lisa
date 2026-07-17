@@ -9,13 +9,16 @@ use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
 fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
     remedies
         .iter()
-        .filter_map(|remedy| match remedy.remedy_owner {
-            RemedyOwner::Operator => Some(format!("{}  {}", remedy.ticket_id, remedy.ask)),
-            RemedyOwner::World => Some(format!(
-                "{}  {} — Lisa checks on its own.",
-                remedy.ticket_id, remedy.ask
-            )),
-            RemedyOwner::Agent => None,
+        .flat_map(|remedy| {
+            let lead = match remedy.remedy_owner {
+                RemedyOwner::Operator => format!("{}  {}", remedy.ticket_id, remedy.ask),
+                RemedyOwner::World => format!(
+                    "{}  {} — Lisa checks on its own.",
+                    remedy.ticket_id, remedy.ask
+                ),
+                RemedyOwner::Agent => return Vec::new(),
+            };
+            vec![lead, format!("       Reviewer's note: {}", remedy.reason)]
         })
         .collect()
 }
@@ -334,18 +337,21 @@ mod tests {
                 ticket_id: "T-001".to_string(),
                 remedy_owner: RemedyOwner::Operator,
                 ask: "Run the checkout test exactly once.".to_string(),
+                reason: "The checkout evidence is missing.".to_string(),
                 check: None,
             },
             ParkedRemedy {
                 ticket_id: "T-002".to_string(),
                 remedy_owner: RemedyOwner::World,
                 ask: "Wait for the release link.".to_string(),
+                reason: "The release has not reached the mirror.".to_string(),
                 check: Some("test -f release".to_string()),
             },
             ParkedRemedy {
                 ticket_id: "T-003".to_string(),
                 remedy_owner: RemedyOwner::Agent,
                 ask: "Agent retry exhausted.".to_string(),
+                reason: "The agent can retry this work.".to_string(),
                 check: None,
             },
         ];
@@ -354,8 +360,33 @@ mod tests {
             waiting_on_you_lines(&remedies),
             vec![
                 "T-001  Run the checkout test exactly once.",
+                "       Reviewer's note: The checkout evidence is missing.",
                 "T-002  Wait for the release link. — Lisa checks on its own.",
+                "       Reviewer's note: The release has not reached the mirror.",
             ]
         );
+    }
+
+    #[test]
+    fn legacy_field_block_leads_with_the_standard_plain_ask() {
+        const FIELD_REASON: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
+        let remedies = vec![ParkedRemedy {
+            ticket_id: "T-046-06-03".to_string(),
+            remedy_owner: RemedyOwner::Operator,
+            ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
+            reason: FIELD_REASON.to_string(),
+            check: None,
+        }];
+
+        let lines = waiting_on_you_lines(&remedies);
+
+        assert_eq!(
+            lines,
+            vec![
+                format!("T-046-06-03  {}", lisa_core::parking::LEGACY_BLOCK_ASK),
+                format!("       Reviewer's note: {FIELD_REASON}"),
+            ]
+        );
+        assert!(!lines[0].contains(FIELD_REASON));
     }
 }

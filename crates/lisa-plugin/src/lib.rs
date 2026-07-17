@@ -8380,11 +8380,13 @@ impl State {
                     RemedyOwner::Operator => Some(ui::WaitingItem {
                         ticket_id: remedy.ticket_id,
                         ask: remedy.ask,
+                        reason: remedy.reason,
                         checks_on_own: false,
                     }),
                     RemedyOwner::World => Some(ui::WaitingItem {
                         ticket_id: remedy.ticket_id,
                         ask: remedy.ask,
+                        reason: remedy.reason,
                         checks_on_own: true,
                     }),
                     RemedyOwner::Agent => None,
@@ -9191,6 +9193,7 @@ mod tests {
             vec![ui::WaitingItem {
                 ticket_id: "T-ASK".to_string(),
                 ask: "Run the checkout test.".to_string(),
+                reason: "engineering reason".to_string(),
                 checks_on_own: false,
             }]
         );
@@ -9324,7 +9327,8 @@ mod tests {
             state.to_ui_state().waiting_items,
             vec![ui::WaitingItem {
                 ticket_id: TICKET_ID.to_string(),
-                ask: FIELD_REASON.to_string(),
+                ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
+                reason: FIELD_REASON.to_string(),
                 checks_on_own: false,
             }]
         );
