@@ -172,6 +172,15 @@ pub struct WaitingItem {
     pub proposal: Option<TriageProposal>,
 }
 
+/// One durable completion note reduced to dashboard display data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteItem {
+    pub ticket_id: String,
+    pub summary: String,
+    pub criterion_quote: String,
+    pub evidence_citation: String,
+}
+
 /// Type of health alert for the attention banner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlertType {
@@ -378,6 +387,7 @@ pub struct PluginState {
     pub active_threads: Vec<ActiveThread>,
     pub parked_threads: Vec<ParkedThread>,
     pub waiting_items: Vec<WaitingItem>,
+    pub note_items: Vec<NoteItem>,
     pub activity_log: Vec<ActivityEntry>,
     pub alerts: Vec<HealthAlert>,
     pub slots: Vec<SlotInfo>,
@@ -398,6 +408,7 @@ impl Default for PluginState {
             active_threads: Vec::new(),
             parked_threads: Vec::new(),
             waiting_items: Vec::new(),
+            note_items: Vec::new(),
             activity_log: Vec::new(),
             alerts: Vec::new(),
             slots: Vec::new(),
@@ -475,6 +486,24 @@ fn render_waiting_on_you(state: &PluginState, output: &mut Vec<String>) {
             output.push(format!("{}  {}{}", item.ticket_id, item.ask, suffix));
         }
         output.push(format!("       Reviewer's note: {}", item.reason));
+    }
+    output.push(String::new());
+}
+
+/// Render deferred informational notes distinctly from urgent parked work.
+fn render_notes_for_you(state: &PluginState, output: &mut Vec<String>) {
+    if state.note_items.is_empty() {
+        return;
+    }
+
+    output.push(format!(
+        "{BOLD}{CYAN}Notes for you ({}){RESET}",
+        state.note_items.len()
+    ));
+    for item in &state.note_items {
+        output.push(format!("{}  {}", item.ticket_id, item.summary));
+        output.push(format!("       Criterion: “{}”", item.criterion_quote));
+        output.push(format!("       Evidence: {}", item.evidence_citation));
     }
     output.push(String::new());
 }
@@ -1238,6 +1267,9 @@ fn render_operations_view(
     // Durable parked asks are the first operational content.
     render_waiting_on_you(state, output);
 
+    // Informational notes follow urgent asks but never gate operations.
+    render_notes_for_you(state, output);
+
     // Attention banner (review gate + health alerts)
     render_attention_banner(state, width, output);
 
@@ -1688,6 +1720,7 @@ mod tests {
             }],
             parked_threads: vec![],
             waiting_items: vec![],
+            note_items: vec![],
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(30),
@@ -1825,6 +1858,73 @@ mod tests {
         let mut output = Vec::new();
         render_waiting_on_you(&PluginState::default(), &mut output);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn notes_section_leads_with_summary_then_citations() {
+        let state = PluginState {
+            note_items: vec![NoteItem {
+                ticket_id: "T-046-06-03".to_string(),
+                summary: "The recorded measurement and criterion text disagree.".to_string(),
+                criterion_quote: "approximately 200 MiB".to_string(),
+                evidence_citation: "review.md#measurement".to_string(),
+            }],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+
+        render_notes_for_you(&state, &mut output);
+
+        assert!(output[0].contains("Notes for you (1)"));
+        assert_eq!(
+            output[1],
+            "T-046-06-03  The recorded measurement and criterion text disagree."
+        );
+        assert_eq!(output[2], "       Criterion: “approximately 200 MiB”");
+        assert_eq!(output[3], "       Evidence: review.md#measurement");
+        assert!(output[4].is_empty());
+    }
+
+    #[test]
+    fn notes_section_is_empty_without_active_notes() {
+        let mut output = Vec::new();
+        render_notes_for_you(&PluginState::default(), &mut output);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn notes_are_distinct_from_urgent_waiting_and_precede_operations() {
+        let state = PluginState {
+            waiting_items: vec![WaitingItem {
+                ticket_id: "T-WAIT".to_string(),
+                ask: "Run the release check.".to_string(),
+                reason: "Release evidence is absent.".to_string(),
+                checks_on_own: false,
+                proposal: None,
+            }],
+            note_items: vec![NoteItem {
+                ticket_id: "T-NOTE".to_string(),
+                summary: "The criterion text differs from the measurement.".to_string(),
+                criterion_quote: "200 MiB".to_string(),
+                evidence_citation: "review.md#size".to_string(),
+            }],
+            alerts: vec![HealthAlert {
+                ticket_id: "T-FAILED".to_string(),
+                alert_type: AlertType::Failed,
+                detail: "Session failed".to_string(),
+                suggested_actions: vec![],
+            }],
+            ..PluginState::default()
+        };
+
+        let full = render_dashboard_lines(&state, 80, 50).join("\n");
+        let waiting = full.find("Waiting on you").unwrap();
+        let notes = full.find("Notes for you").unwrap();
+        let attention = full.find("ATTENTION NEEDED").unwrap();
+        let threads = full.find("Threads").unwrap();
+        assert!(waiting < notes);
+        assert!(notes < attention);
+        assert!(notes < threads);
     }
 
     #[test]
@@ -2492,6 +2592,7 @@ mod tests {
                 slot_number: 2,
             }],
             waiting_items: Vec::new(),
+            note_items: Vec::new(),
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(50),

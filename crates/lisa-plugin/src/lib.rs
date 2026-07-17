@@ -6691,7 +6691,8 @@ impl State {
                         ProvenanceLedgerRecord::AssignmentTransition(_)
                         | ProvenanceLedgerRecord::ParkingTransition(_)
                         | ProvenanceLedgerRecord::TriageTransition(_)
-                        | ProvenanceLedgerRecord::ProposalAction(_) => None,
+                        | ProvenanceLedgerRecord::ProposalAction(_)
+                        | ProvenanceLedgerRecord::NoteAcknowledgment(_) => None,
                     })
                     .collect()
             })
@@ -8741,6 +8742,18 @@ impl State {
                 })
                 .collect();
 
+        let note_items: Vec<ui::NoteItem> =
+            lisa_core::notes::collect_notes(&self.completion_journal_path, &self.ledger_path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| ui::NoteItem {
+                    ticket_id: entry.key.ticket_id,
+                    summary: entry.note.summary().to_string(),
+                    criterion_quote: entry.note.criterion_quote().to_string(),
+                    evidence_citation: entry.note.evidence_citation().to_string(),
+                })
+                .collect();
+
         let activity_log: Vec<ui::ActivityEntry> = self
             .activity_log
             .iter()
@@ -8893,6 +8906,7 @@ impl State {
             active_threads,
             parked_threads,
             waiting_items,
+            note_items,
             activity_log,
             alerts,
             slots,
@@ -9726,6 +9740,115 @@ mod tests {
                 proposal: None,
             }]
         );
+    }
+
+    #[test]
+    fn dashboard_note_reloads_and_acknowledgment_has_zero_scheduler_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let journal = dir.path().join("completion-journal.jsonl");
+        let ledger = dir.path().join("provenance.jsonl");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        std::fs::write(
+            tickets_dir.join("T-NOTE.md"),
+            "---\nid: T-NOTE\ntitle: note source\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nFixture\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tickets_dir.join("T-NEXT.md"),
+            "---\nid: T-NEXT\ntitle: dependent\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [T-NOTE]\n---\n\nFixture\n",
+        )
+        .unwrap();
+        let note = DispositionNote::new(
+            "approximately 200 MiB",
+            "review.md#measurement",
+            "The recorded measurement and criterion text disagree.",
+        )
+        .unwrap();
+        let key = CompletionGenerationId::new(
+            CompletionId::new("T-NOTE"),
+            AttemptId::new("attempt-note"),
+            1,
+        );
+        let correlation = CorrelationId::new("note-correlation");
+        completion_journal::append_with_seal(
+            &journal,
+            CompletionSeal::Commit,
+            CompletionJournalTransition::Requested {
+                key: key.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+                note: Some(note.clone()),
+            },
+        )
+        .unwrap();
+        completion_journal::append_with_seal(
+            &journal,
+            CompletionSeal::Commit,
+            CompletionJournalTransition::CommandInFlight {
+                key: key.clone(),
+                correlation: correlation.clone(),
+                deadline: CompletionDeadline::from_unix_millis(42),
+            },
+        )
+        .unwrap();
+        completion_journal::append_with_seal(
+            &journal,
+            CompletionSeal::Commit,
+            CompletionJournalTransition::Confirmed {
+                key,
+                correlation,
+                receipt: CompletionSealReceipt::commit("a".repeat(40)).unwrap(),
+                note: Some(note),
+            },
+        )
+        .unwrap();
+
+        let make_state = || State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            completion_journal_path: journal.clone(),
+            ledger_path: ledger.clone(),
+            ..State::default()
+        };
+        let mut first = make_state();
+        first.restore_completion_journal();
+        assert_eq!(first.to_ui_state().note_items.len(), 1);
+        drop(first);
+
+        let mut restarted = make_state();
+        restarted.restore_completion_journal();
+        assert_eq!(
+            restarted.to_ui_state().note_items,
+            vec![ui::NoteItem {
+                ticket_id: "T-NOTE".to_string(),
+                summary: "The recorded measurement and criterion text disagree.".to_string(),
+                criterion_quote: "approximately 200 MiB".to_string(),
+                evidence_citation: "review.md#measurement".to_string(),
+            }]
+        );
+        let ready_before = restarted.dag.get_ready_tickets();
+        let tickets_before = std::fs::read_dir(&tickets_dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let aggregate_before = restarted.completion_aggregates["T-NOTE"].clone();
+
+        lisa_core::notes::acknowledge_note(&journal, &ledger, "T-NOTE").unwrap();
+
+        assert!(restarted.to_ui_state().note_items.is_empty());
+        assert_eq!(restarted.dag.get_ready_tickets(), ready_before);
+        assert!(restarted.threads.is_empty());
+        assert!(restarted.agent_slots.is_empty());
+        assert_eq!(restarted.completion_aggregates["T-NOTE"], aggregate_before);
+        for (path, bytes) in tickets_before {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(read_mixed_ledger(&ledger)
+            .iter()
+            .all(|row| !matches!(row, ProvenanceLedgerRecord::ParkingTransition(_))));
     }
 
     fn attach_review_block_attempt(
