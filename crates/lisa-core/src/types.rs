@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::client::AgentClient;
+use crate::completion::CompletionSeal;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -621,6 +622,12 @@ pub struct PluginConfig {
     #[serde(default)]
     pub git_root: PathBuf,
 
+    /// Completion tier resolved and pinned by the native loop launcher.
+    /// Defaults to commit for legacy layouts so an absent or malformed runtime
+    /// value can never silently weaken today's completion gate.
+    #[serde(default)]
+    pub completion_seal: CompletionSeal,
+
     /// Directory containing ticket files (default: "docs/active/tickets")
     pub ticket_dir: PathBuf,
 
@@ -729,6 +736,7 @@ impl PluginConfig {
     pub fn new() -> Self {
         Self {
             git_root: PathBuf::new(),
+            completion_seal: CompletionSeal::Commit,
             ticket_dir: PathBuf::from(Self::DEFAULT_TICKET_DIR),
             story_dir: PathBuf::from(Self::DEFAULT_STORY_DIR),
             work_dir: PathBuf::from(Self::DEFAULT_WORK_DIR),
@@ -752,6 +760,12 @@ impl PluginConfig {
 
         if let Some(git_root) = config.get("git_root") {
             result.git_root = PathBuf::from(git_root);
+        }
+
+        if let Some(completion_seal) = config.get("completion_seal") {
+            if let Ok(seal) = CompletionSeal::parse(completion_seal) {
+                result.completion_seal = seal;
+            }
         }
 
         if let Some(ticket_dir) = config.get("ticket_dir") {
@@ -1560,6 +1574,26 @@ mod tests {
             PluginConfig::from_config_map(&map).git_root,
             PathBuf::from("/repo")
         );
+    }
+
+    #[test]
+    fn test_config_completion_seal_is_pinned_or_fails_closed_to_commit() {
+        assert_eq!(PluginConfig::new().completion_seal, CompletionSeal::Commit);
+
+        for (raw, expected) in [
+            ("commit", CompletionSeal::Commit),
+            ("journal", CompletionSeal::Journal),
+            ("auto", CompletionSeal::Commit),
+            ("bogus", CompletionSeal::Commit),
+        ] {
+            let mut map = BTreeMap::new();
+            map.insert("completion_seal".to_string(), raw.to_string());
+            assert_eq!(
+                PluginConfig::from_config_map(&map).completion_seal,
+                expected,
+                "runtime value {raw:?}"
+            );
+        }
     }
 
     #[test]

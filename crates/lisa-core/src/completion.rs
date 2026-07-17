@@ -7,9 +7,205 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::disposition::ReviewDisposition;
+
+/// The durable guard that authorizes a ticket's completion.
+///
+/// `Commit` is Lisa's existing atomic Git transaction. `Journal` is the
+/// lesser, explicitly labelled seal whose mechanics are implemented by the
+/// journal-completion work. `Auto` is deliberately absent: it is configuration
+/// intent, never a runtime seal.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CompletionSeal {
+    /// Finished work is made durable in repository history.
+    #[default]
+    Commit,
+    /// Finished work is made durable in the completion journal.
+    Journal,
+}
+
+impl CompletionSeal {
+    /// Stable accepted runtime seal names.
+    pub const VALID: [&'static str; 2] = ["commit", "journal"];
+
+    /// Return the stable lowercase representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Journal => "journal",
+        }
+    }
+
+    /// Parse a runtime seal without accepting configured-only `auto`.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "commit" => Ok(Self::Commit),
+            "journal" => Ok(Self::Journal),
+            other => Err(format!(
+                "unknown completion seal {other:?}; expected one of: {}",
+                Self::VALID.join(", ")
+            )),
+        }
+    }
+}
+
+impl fmt::Display for CompletionSeal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Configured completion stance from `.lisa.toml` `[guards].completion`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CompletionSealMode {
+    /// Select the strongest completion seal supported at loop startup.
+    #[default]
+    Auto,
+    /// Require the existing atomic repository transaction without fallback.
+    Commit,
+    /// Deliberately use the journal seal even when commit support is available.
+    Journal,
+}
+
+impl CompletionSealMode {
+    /// Stable accepted configuration values.
+    pub const VALID: [&'static str; 3] = ["auto", "commit", "journal"];
+
+    /// Return the stable lowercase representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Commit => "commit",
+            Self::Journal => "journal",
+        }
+    }
+
+    /// Parse one configured completion stance.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "commit" => Ok(Self::Commit),
+            "journal" => Ok(Self::Journal),
+            other => Err(format!(
+                "unknown [guards].completion value {other:?}; expected one of: {}",
+                Self::VALID.join(", ")
+            )),
+        }
+    }
+
+    /// Return the requested runtime tier when the stance is explicit.
+    pub const fn explicit_seal(self) -> Option<CompletionSeal> {
+        match self {
+            Self::Auto => None,
+            Self::Commit => Some(CompletionSeal::Commit),
+            Self::Journal => Some(CompletionSeal::Journal),
+        }
+    }
+}
+
+impl fmt::Display for CompletionSealMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why the current environment cannot satisfy the commit seal.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CommitSealUnavailable {
+    /// The project is not inside a discoverable repository.
+    #[error("no repository is present")]
+    RepositoryMissing,
+    /// Git cannot resolve the commit identity required by the transaction.
+    #[error("no commit identity is configured (git config user.email did not resolve)")]
+    IdentityMissing,
+    /// A prerequisite of the existing isolated transaction is unavailable.
+    #[error("the commit transaction path is unavailable: {detail}")]
+    TransactionUnavailable {
+        /// Concise diagnostic from the failed transaction prerequisite.
+        detail: String,
+    },
+}
+
+/// Result of probing whether the existing commit transaction is satisfiable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitSealSupport {
+    /// All startup prerequisites for the commit transaction are available.
+    Available,
+    /// The strongest seal cannot be used for the retained typed reason.
+    Unavailable(CommitSealUnavailable),
+}
+
+/// One immutable completion-seal decision pinned for a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCompletionSeal {
+    seal: CompletionSeal,
+    commit_unavailable: Option<CommitSealUnavailable>,
+}
+
+impl ResolvedCompletionSeal {
+    /// Return the pinned runtime tier.
+    pub const fn seal(&self) -> CompletionSeal {
+        self.seal
+    }
+
+    /// Return why auto selected journal, if it did.
+    ///
+    /// Deliberately configured journal has no unavailable reason.
+    pub fn commit_unavailable(&self) -> Option<&CommitSealUnavailable> {
+        self.commit_unavailable.as_ref()
+    }
+}
+
+/// Explicit commit was requested in an environment that cannot satisfy it.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("required commit completion seal is unavailable: {reason}")]
+pub struct CompletionSealResolutionError {
+    reason: CommitSealUnavailable,
+}
+
+impl CompletionSealResolutionError {
+    /// Borrow the exact unsatisfied prerequisite.
+    pub fn reason(&self) -> &CommitSealUnavailable {
+        &self.reason
+    }
+}
+
+/// Pin the completion seal selected by configured intent and probed support.
+pub fn resolve_completion_seal(
+    mode: CompletionSealMode,
+    support: CommitSealSupport,
+) -> Result<ResolvedCompletionSeal, CompletionSealResolutionError> {
+    match (mode, support) {
+        (CompletionSealMode::Journal, _) => Ok(ResolvedCompletionSeal {
+            seal: CompletionSeal::Journal,
+            commit_unavailable: None,
+        }),
+        (CompletionSealMode::Auto | CompletionSealMode::Commit, CommitSealSupport::Available) => {
+            Ok(ResolvedCompletionSeal {
+                seal: CompletionSeal::Commit,
+                commit_unavailable: None,
+            })
+        }
+        (CompletionSealMode::Auto, CommitSealSupport::Unavailable(reason)) => {
+            Ok(ResolvedCompletionSeal {
+                seal: CompletionSeal::Journal,
+                commit_unavailable: Some(reason),
+            })
+        }
+        (CompletionSealMode::Commit, CommitSealSupport::Unavailable(reason)) => {
+            Err(CompletionSealResolutionError { reason })
+        }
+    }
+}
 
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -702,6 +898,94 @@ mod tests {
 
     fn deadline(value: u64) -> CompletionDeadline {
         CompletionDeadline::from_unix_millis(value)
+    }
+
+    fn unavailable(reason: CommitSealUnavailable) -> CommitSealSupport {
+        CommitSealSupport::Unavailable(reason)
+    }
+
+    #[test]
+    fn completion_seal_strings_separate_configured_intent_from_runtime_tiers() {
+        assert_eq!(CompletionSeal::default(), CompletionSeal::Commit);
+        assert_eq!(CompletionSeal::parse("commit"), Ok(CompletionSeal::Commit));
+        assert_eq!(
+            CompletionSeal::parse("journal"),
+            Ok(CompletionSeal::Journal)
+        );
+        assert!(CompletionSeal::parse("auto")
+            .unwrap_err()
+            .contains("commit, journal"));
+
+        assert_eq!(CompletionSealMode::default(), CompletionSealMode::Auto);
+        for (raw, expected) in [
+            ("auto", CompletionSealMode::Auto),
+            ("commit", CompletionSealMode::Commit),
+            ("journal", CompletionSealMode::Journal),
+        ] {
+            assert_eq!(CompletionSealMode::parse(raw), Ok(expected));
+            assert_eq!(expected.to_string(), raw);
+        }
+        let error = CompletionSealMode::parse("best-effort").unwrap_err();
+        assert!(error.contains("[guards].completion"));
+        assert!(error.contains("auto, commit, journal"));
+    }
+
+    #[test]
+    fn auto_pins_commit_only_when_the_transaction_is_supported() {
+        let resolved =
+            resolve_completion_seal(CompletionSealMode::Auto, CommitSealSupport::Available)
+                .unwrap();
+
+        assert_eq!(resolved.seal(), CompletionSeal::Commit);
+        assert_eq!(resolved.commit_unavailable(), None);
+    }
+
+    #[test]
+    fn auto_pins_journal_and_retains_each_unavailable_environment_reason() {
+        let reasons = [
+            CommitSealUnavailable::RepositoryMissing,
+            CommitSealUnavailable::IdentityMissing,
+            CommitSealUnavailable::TransactionUnavailable {
+                detail: "HEAD is unborn".to_string(),
+            },
+        ];
+
+        for reason in reasons {
+            let resolved =
+                resolve_completion_seal(CompletionSealMode::Auto, unavailable(reason.clone()))
+                    .unwrap();
+            assert_eq!(resolved.seal(), CompletionSeal::Journal);
+            assert_eq!(resolved.commit_unavailable(), Some(&reason));
+        }
+    }
+
+    #[test]
+    fn explicit_commit_succeeds_or_returns_the_exact_hard_failure() {
+        let resolved =
+            resolve_completion_seal(CompletionSealMode::Commit, CommitSealSupport::Available)
+                .unwrap();
+        assert_eq!(resolved.seal(), CompletionSeal::Commit);
+
+        let reason = CommitSealUnavailable::IdentityMissing;
+        let error =
+            resolve_completion_seal(CompletionSealMode::Commit, unavailable(reason.clone()))
+                .unwrap_err();
+        assert_eq!(error.reason(), &reason);
+        assert!(error
+            .to_string()
+            .contains("required commit completion seal"));
+    }
+
+    #[test]
+    fn explicit_journal_is_honored_without_recording_an_automatic_fallback() {
+        for support in [
+            CommitSealSupport::Available,
+            unavailable(CommitSealUnavailable::IdentityMissing),
+        ] {
+            let resolved = resolve_completion_seal(CompletionSealMode::Journal, support).unwrap();
+            assert_eq!(resolved.seal(), CompletionSeal::Journal);
+            assert_eq!(resolved.commit_unavailable(), None);
+        }
     }
 
     #[test]
