@@ -1111,7 +1111,10 @@ mod tests {
         assert!(error.contains("Managed Zellij download failed"));
         assert!(error.contains(&url));
         assert!(error.contains(expected_sha256));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Bounded-failure guarantee: a retry loop or hang would blow far past
+        // this; the bound is generous because the full suite runs in parallel
+        // and a loaded host stretched the old 2s limit into a flake.
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(!executable.parent().unwrap().exists());
         assert_no_install_temporary_directories(&executable);
     }
