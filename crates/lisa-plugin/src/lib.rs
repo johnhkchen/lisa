@@ -5459,9 +5459,11 @@ impl State {
                 ended_at: ended,
                 wall_clock_secs: ended.saturating_sub(park.started_at),
             };
+            // The durable open status starts a fresh scheduling episode even
+            // when best-effort provenance cannot be appended.
+            self.agent_block_retries.remove(&park.ticket_id);
             match provenance::append_parking_transition_record(&self.ledger_path, &unpark) {
                 Ok(()) => {
-                    self.agent_block_retries.remove(&park.ticket_id);
                     self.log_activity(ActivityEvent::Info {
                         message: format!(
                             "Unparked {} after {}s; status open restored ordinary DAG eligibility",
