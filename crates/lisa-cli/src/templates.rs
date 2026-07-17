@@ -220,7 +220,8 @@ pub(crate) const LEGACY_ON_ACK_HOOKS: &[&str] = &[];
 
 /// Gitignore content for `.lisa/` runtime state. Signal files and per-provider
 /// usage/session artifacts are machine-owned and must never enter the project DAG.
-pub const LISA_GITIGNORE: &str = "signals/\nattempts/\nclaude/\ncodex/\n";
+pub const LISA_GITIGNORE: &str =
+    "signals/\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\n";
 
 /// The `AGENTS.md` pointer file scaffolded by `lisa init`.
 ///
@@ -283,22 +284,23 @@ pub(crate) const LEGACY_ON_NOTIFY_HOOKS: &[&str] = &[];
 
 /// Command for the catch-all (matcher-less) `Notification` hook that fires the
 /// user-owned `on-notify` hook for permission/attention payloads. POSIX `sh`
-/// only (no jq, no bashisms). It exits early when the user has not opted in,
-/// reads the payload from stdin once, skips `idle_prompt` payloads (already
-/// handled by on-idle.sh + the plugin), and otherwise invokes the user hook
-/// with LISA_EVENT/LISA_REASON set inline.
-const NOTIFY_ATTENTION_COMMAND: &str = "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$PWD\" .lisa/hooks/on-notify attention \"$in\" ;; esac";
+/// only (no jq, no bashisms). It reads the payload from stdin once, skips
+/// `idle_prompt` payloads (already handled by on-idle.sh + the plugin), records
+/// the fact that an interactive gate fired, and then invokes the user hook when
+/// the operator opted in. Payload text is never retained in the run ledger.
+const NOTIFY_ATTENTION_COMMAND: &str = r#"in=$(cat); case "$in" in *idle_prompt*) : ;; *) mkdir -p .lisa; printf '%s\n' '{"event":"manual-intervention","kind":"permission"}' >> .lisa/run-events.jsonl; if test -x .lisa/hooks/on-notify; then printf '%s' "$in" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT="$PWD" .lisa/hooks/on-notify attention "$in"; fi ;; esac"#;
 
 /// Command for the `PreToolUse[AskUserQuestion]` hook. POSIX `sh` only (no jq,
 /// no bashisms). It (1) **unconditionally** writes `pane-$LISA_PANE_ID.awaiting`
 /// so the plugin can suppress injection while the agent is blocked on a question
 /// (consumed in T-020-03; harmless unread file until then), and (2) best-effort
-/// extracts the first question text and fires the opt-in `on-notify attention`
-/// with `LISA_REASON=question`. Only the notify dispatch is `test -x`-gated — the
-/// signal write must work even when the user never enabled `on-notify`. A question
+/// records a payload-free question event, extracts the first question text, and
+/// fires the opt-in `on-notify attention` with `LISA_REASON=question`. Only the
+/// notify dispatch is `test -x`-gated — signal and event writes must work even
+/// when the user never enabled `on-notify`. A question
 /// containing an escaped `\"` truncates the greedy-free `[^"]*` capture; that
 /// degrades to the generic detail, never a hard failure (design Q3).
-const NOTIFY_QUESTION_COMMAND: &str = "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); test -x .lisa/hooks/on-notify && printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$PWD\" LISA_QUESTION_HEADER=\"$hdr\" .lisa/hooks/on-notify attention \"$q\"";
+const NOTIFY_QUESTION_COMMAND: &str = r#"mkdir -p .lisa/signals; [ -n "$LISA_PANE_ID" ] && date -u +%Y-%m-%dT%H:%M:%SZ > ".lisa/signals/pane-$LISA_PANE_ID.awaiting"; printf '%s\n' '{"event":"manual-intervention","kind":"question"}' >> .lisa/run-events.jsonl; in=$(cat); q=$(printf '%s' "$in" | sed -n 's/.*"question":[ ]*"\([^"]*\)".*/\1/p'); [ -z "$q" ] && q="agent is asking a question"; hdr=$(printf '%s' "$in" | sed -n 's/.*"header":[ ]*"\([^"]*\)".*/\1/p'); if test -x .lisa/hooks/on-notify; then printf '%s' "$in" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT="$PWD" LISA_QUESTION_HEADER="$hdr" .lisa/hooks/on-notify attention "$q"; fi"#;
 
 /// Generate .claude/settings.local.json with Stop, SessionStart, UserPromptSubmit, Notification
 /// (idle_prompt + catch-all attention), PostToolUse heartbeat, and
@@ -306,92 +308,7 @@ const NOTIFY_QUESTION_COMMAND: &str = "mkdir -p .lisa/signals; [ -n \"$LISA_PANE
 /// Hook commands use `test -x` guards so they succeed silently if the scripts
 /// haven't been created yet (e.g. settings.local.json exists before `lisa init`).
 pub fn settings_local_json() -> String {
-    r#"{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "AskUserQuestion",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); test -x .lisa/hooks/on-notify && printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$PWD\" LISA_QUESTION_HEADER=\"$hdr\" .lisa/hooks/on-notify attention \"$q\""
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "startup",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "clear",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "idle_prompt",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$PWD\" .lisa/hooks/on-notify attention \"$in\" ;; esac"
-          }
-        ]
-      }
-    ]
-  }
-}
-"#
-    .to_string()
+    merge_hooks(r#"{"hooks":{}}"#).expect("empty Lisa settings template is valid JSON")
 }
 
 /// Generate `.codex/hooks.json` for the native interactive Codex adapter.
@@ -482,7 +399,18 @@ fn ensure_hook(
     // Commands may be bare paths (".lisa/hooks/on-stop.sh") or guarded
     // ("test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh").
     // Match on the script filename to handle both forms.
-    let script_path = command.rsplit("&& ").next().unwrap_or(command).trim();
+    let script_path = [
+        ".lisa/hooks/on-notify",
+        ".lisa/hooks/on-stop.sh",
+        ".lisa/hooks/on-start.sh",
+        ".lisa/hooks/on-clear.sh",
+        ".lisa/hooks/on-idle.sh",
+        ".lisa/hooks/on-heartbeat.sh",
+        ".lisa/hooks/on-ack.sh",
+    ]
+    .into_iter()
+    .find(|path| command.contains(path))
+    .unwrap_or_else(|| command.rsplit("&& ").next().unwrap_or(command).trim());
 
     // Find the matching entry index (if any)
     let found_idx = match matcher {
@@ -1085,6 +1013,7 @@ mod tests {
         assert!(json.contains(r#""type": "command""#));
         // Catch-all attention Notification binding (alongside idle_prompt).
         assert!(json.contains("on-notify"));
+        assert!(json.contains(".lisa/run-events.jsonl"));
         // The generated JSON must embed the exact catch-all command and parse cleanly.
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
@@ -1160,6 +1089,8 @@ mod tests {
         assert!(LISA_GITIGNORE.contains("signals/"));
         assert!(LISA_GITIGNORE.contains("claude/"));
         assert!(LISA_GITIGNORE.contains("codex/"));
+        assert!(LISA_GITIGNORE.contains("run-events.jsonl"));
+        assert!(LISA_GITIGNORE.contains("run-baseline.json"));
     }
 
     #[test]
@@ -1344,6 +1275,74 @@ mod tests {
         // (iii) No question key at all -> empty extraction -> hook falls back to generic.
         let none = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
         assert_eq!(extract_question_via_sed(none), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interaction_hooks_retain_payload_free_gate_facts() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let question_payload = r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"secret question text","header":"Choice"}]}}"#;
+        let mut question = Command::new("/bin/sh")
+            .args(["-c", NOTIFY_QUESTION_COMMAND])
+            .current_dir(root.path())
+            .env("LISA_PANE_ID", "7")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        question
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(question_payload.as_bytes())
+            .unwrap();
+        assert!(question.wait().unwrap().success());
+
+        let mut permission = Command::new("/bin/sh")
+            .args(["-c", NOTIFY_ATTENTION_COMMAND])
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        permission
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"permission payload is also secret")
+            .unwrap();
+        assert!(permission.wait().unwrap().success());
+
+        let events = fs::read_to_string(root.path().join(".lisa/run-events.jsonl")).unwrap();
+        assert_eq!(events.lines().count(), 2);
+        assert!(events.contains(r#"{"event":"manual-intervention","kind":"question"}"#));
+        assert!(events.contains(r#"{"event":"manual-intervention","kind":"permission"}"#));
+        assert!(!events.contains("secret"));
+        assert!(root.path().join(".lisa/signals/pane-7.awaiting").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_notification_does_not_record_a_permission_gate() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh")
+            .args(["-c", NOTIFY_ATTENTION_COMMAND])
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        command
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"idle_prompt")
+            .unwrap();
+        assert!(command.wait().unwrap().success());
+        assert!(!root.path().join(".lisa/run-events.jsonl").exists());
     }
 
     #[test]

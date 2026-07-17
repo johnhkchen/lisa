@@ -11,6 +11,7 @@ pub fn run_status(root: &Path) -> Result<(), String> {
         Err(_) => config::ResolvedConfig::default(),
     };
     let ticket_dir_rel = resolved.ticket_dir.clone();
+    let work_dir_rel = resolved.work_dir.clone();
 
     let ticket_dir = root.join(&ticket_dir_rel);
     if !ticket_dir.exists() {
@@ -30,7 +31,7 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     }
 
     // Build DAG
-    let dag = Dag::from_tickets(tickets).map_err(|e| match e {
+    let dag = Dag::from_tickets(tickets.clone()).map_err(|e| match e {
         DagError::MissingDependency {
             ticket_id,
             missing_dep,
@@ -135,6 +136,8 @@ pub fn run_status(root: &Path) -> Result<(), String> {
         ready_sorted.sort();
         println!("Ready to schedule: {}", ready_sorted.join(", "));
     }
+
+    crate::run_summary::print_run_summary(root, &tickets, Path::new(&work_dir_rel))?;
 
     Ok(())
 }

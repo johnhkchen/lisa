@@ -48,7 +48,8 @@ fn embedded_wasm_error() -> String {
     )
 }
 
-/// Run the lisa loop: write embedded WASM, generate layout, exec zellij.
+/// Run the lisa loop: write embedded WASM, generate a layout, run Zellij, and
+/// report the final board state when the session exits.
 ///
 /// In dry-run mode, scans tickets, builds the DAG, and prints what would happen
 /// without writing files or launching zellij.
@@ -71,7 +72,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     }
 
     // Freeze one configured runtime decision before any launch side effects.
-    // The resulting path is the exact executable reported by doctor and exec'd
+    // The resulting path is the exact executable reported by doctor and run
     // below; managed and pinned modes never fall back to PATH.
     let zellij_runtime = crate::runtime::resolve_zellij_runtime(&config.zellij_runtime)?;
 
@@ -161,8 +162,18 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     }
     println!();
 
-    // Exec zellij (replaces this process)
-    exec_zellij(&zellij_runtime.path, root, &layout_path)
+    crate::run_summary::record_run_baseline(root)?;
+    let status = run_zellij(&zellij_runtime.path, root, &layout_path)?;
+
+    let tickets = lisa_core::ticket::scan_tickets(&root.join(&config.ticket_dir))
+        .map_err(|error| format!("Failed to scan tickets after Lisa loop: {error}"))?;
+    crate::run_summary::print_run_summary(root, &tickets, Path::new(&config.work_dir))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("zellij exited with status: {status}"))
+    }
 }
 
 /// Dry-run mode: scan tickets, build DAG, print summary.
@@ -413,31 +424,14 @@ fn generate_layout(
     )
 }
 
-#[cfg(unix)]
-fn exec_zellij(zellij_path: &Path, root: &Path, layout_path: &Path) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-
-    let err = zellij_command(zellij_path, root, layout_path).exec();
-
-    // exec() only returns on error
-    Err(format!(
-        "Failed to exec Zellij at {}: {}",
-        zellij_path.display(),
-        err
-    ))
-}
-
-#[cfg(not(unix))]
-fn exec_zellij(zellij_path: &Path, root: &Path, layout_path: &Path) -> Result<(), String> {
-    let status = zellij_command(zellij_path, root, layout_path)
+fn run_zellij(
+    zellij_path: &Path,
+    root: &Path,
+    layout_path: &Path,
+) -> Result<std::process::ExitStatus, String> {
+    zellij_command(zellij_path, root, layout_path)
         .status()
-        .map_err(|e| format!("Failed to run Zellij at {}: {}", zellij_path.display(), e))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("zellij exited with status: {}", status))
-    }
+        .map_err(|error| format!("Failed to run Zellij at {}: {error}", zellij_path.display()))
 }
 
 fn zellij_command(zellij_path: &Path, root: &Path, layout_path: &Path) -> Command {
