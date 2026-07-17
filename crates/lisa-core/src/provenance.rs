@@ -1,7 +1,7 @@
 //! Execution-provenance ledger: append-only JSONL learning data.
 //!
 //! The ledger contains terminal execution [`ProvenanceRecord`] rows,
-//! pre-ownership [`AssignmentTransitionRecord`] rows, and park/unpark
+//! pre-ownership [`AssignmentTransitionRecord`] rows, and block retry/park/unpark
 //! [`ParkingTransitionRecord`] rows. Use [`ProvenanceLedgerRecord`] to read a
 //! ledger containing all three shapes. Terminal execution rows are written by
 //! the plugin *after* the attempt ends
@@ -35,7 +35,7 @@ use crate::types::AttemptLease;
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -87,10 +87,11 @@ pub enum ProvenanceRecordType {
     AssignmentTransition,
 }
 
-/// Explicit JSON-level kind for a transition into or out of parked state.
+/// Explicit JSON-level kind for bounded blocked-work recovery and parking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ParkingTransitionType {
+    Retry,
     Park,
     Unpark,
 }
@@ -166,7 +167,7 @@ pub struct AssignmentTransitionRecord {
     pub wall_clock_secs: u64,
 }
 
-/// One attempt-scoped transition into or out of parked state.
+/// One attempt-scoped blocked-work retry or transition into/out of parked state.
 ///
 /// Timestamps are UTC epoch seconds. The interval fields let an unpark row
 /// carry queryable stranded time without joining separate point events.
@@ -177,9 +178,23 @@ pub struct ParkingTransitionRecord {
     pub ticket_id: String,
     pub attempt_lease: AttemptLease,
     pub remedy_owner: RemedyOwner,
+    /// One-based retry ordinal for a bounded agent-owned retry, or the final
+    /// consumed count on its park row. Absent for owners that park immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u8>,
+    /// Configured per-loop retry bound paired with [`Self::retry_count`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<u8>,
+    /// True only when external reality may later be probed for a remedy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recheck_eligible: bool,
     pub started_at: u64,
     pub ended_at: u64,
     pub wall_clock_secs: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A row read from a potentially mixed-version, mixed-shape provenance ledger.
@@ -320,6 +335,9 @@ mod tests {
                 attempt_id: 4,
             },
             remedy_owner: RemedyOwner::Operator,
+            retry_count: None,
+            retry_limit: None,
+            recheck_eligible: false,
             started_at: 1_752_700_000,
             ended_at: 1_752_700_125,
             wall_clock_secs: 125,
@@ -359,7 +377,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":4"));
+        assert!(json.contains("\"schema_version\":5"));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
         assert!(json.contains("\"authoritative\":true"));
@@ -376,7 +394,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":4"));
+        assert!(json.contains("\"schema_version\":5"));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
         assert!(json.contains("\"pane_id\":12"));
@@ -415,7 +433,7 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
-            assert!(json.contains("\"schema_version\":4"));
+            assert!(json.contains("\"schema_version\":5"));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",
                 serde_json::to_string(&record_type).unwrap()
@@ -424,6 +442,9 @@ mod tests {
                 json.contains("\"attempt_lease\":{\"ticket_id\":\"T-048-01-02\",\"attempt_id\":4}")
             );
             assert!(json.contains("\"remedy_owner\":\"operator\""));
+            assert!(!json.contains("\"retry_count\""));
+            assert!(!json.contains("\"retry_limit\""));
+            assert!(!json.contains("\"recheck_eligible\""));
             assert!(json.contains("\"started_at\":1752700000"));
             assert!(json.contains("\"ended_at\":1752700125"));
             assert!(json.contains("\"wall_clock_secs\":125"));
@@ -434,12 +455,52 @@ mod tests {
     }
 
     #[test]
+    fn block_retry_and_world_recheck_fields_are_explicit_and_round_trip() {
+        let mut retry = sample_parking_transition(ParkingTransitionType::Retry);
+        retry.remedy_owner = RemedyOwner::Agent;
+        retry.retry_count = Some(2);
+        retry.retry_limit = Some(2);
+        let retry_json = serde_json::to_string(&retry).unwrap();
+        assert!(retry_json.contains("\"record_type\":\"retry\""));
+        assert!(retry_json.contains("\"remedy_owner\":\"agent\""));
+        assert!(retry_json.contains("\"retry_count\":2"));
+        assert!(retry_json.contains("\"retry_limit\":2"));
+        assert!(!retry_json.contains("\"recheck_eligible\""));
+        assert_eq!(
+            serde_json::from_str::<ParkingTransitionRecord>(&retry_json).unwrap(),
+            retry
+        );
+
+        let mut world = sample_parking_transition(ParkingTransitionType::Park);
+        world.remedy_owner = RemedyOwner::World;
+        world.recheck_eligible = true;
+        let world_json = serde_json::to_string(&world).unwrap();
+        assert!(world_json.contains("\"record_type\":\"park\""));
+        assert!(world_json.contains("\"recheck_eligible\":true"));
+        assert_eq!(
+            serde_json::from_str::<ParkingTransitionRecord>(&world_json).unwrap(),
+            world
+        );
+    }
+
+    #[test]
+    fn schema_four_parking_rows_default_additive_block_policy_fields() {
+        let raw = r#"{"schema_version":4,"record_type":"park","ticket_id":"T-048-01-02","attempt_lease":{"ticket_id":"T-048-01-02","attempt_id":4},"remedy_owner":"operator","started_at":1752700000,"ended_at":1752700125,"wall_clock_secs":125}"#;
+        let record: ParkingTransitionRecord = serde_json::from_str(raw).unwrap();
+        assert_eq!(record.schema_version, 4);
+        assert_eq!(record.retry_count, None);
+        assert_eq!(record.retry_limit, None);
+        assert!(!record.recheck_eligible);
+    }
+
+    #[test]
     fn parking_transitions_append_and_replay_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/provenance.jsonl");
         let park = sample_parking_transition(ParkingTransitionType::Park);
         let mut unpark = sample_parking_transition(ParkingTransitionType::Unpark);
         unpark.remedy_owner = RemedyOwner::World;
+        unpark.recheck_eligible = true;
 
         append_parking_transition_record(&path, &park).unwrap();
         append_parking_transition_record(&path, &unpark).unwrap();
@@ -474,6 +535,7 @@ mod tests {
         let park = sample_parking_transition(ParkingTransitionType::Park);
         let mut unpark = sample_parking_transition(ParkingTransitionType::Unpark);
         unpark.remedy_owner = RemedyOwner::World;
+        unpark.recheck_eligible = true;
         let ledger = format!(
             "{}\n{}\n{}\n{}\n",
             SCHEMA_V2_EXECUTION_JSON,
@@ -500,18 +562,19 @@ mod tests {
         assert_eq!(
             rows[2],
             ProvenanceLedgerRecord::ParkingTransition(park),
-            "the schema-v4 park line is recognized as parking evidence"
+            "the schema-v5 park line is recognized as parking evidence"
         );
         assert_eq!(
             rows[3],
             ProvenanceLedgerRecord::ParkingTransition(unpark.clone()),
-            "the schema-v4 unpark line is recognized as parking evidence"
+            "the schema-v5 unpark line is recognized as parking evidence"
         );
         let ProvenanceLedgerRecord::ParkingTransition(replayed) = &rows[3] else {
             panic!("expected an unpark transition")
         };
         assert_eq!(replayed.attempt_lease.attempt_id, 4);
         assert_eq!(replayed.remedy_owner, RemedyOwner::World);
+        assert!(replayed.recheck_eligible);
         assert_eq!(replayed.started_at, 1_752_700_000);
         assert_eq!(replayed.ended_at, 1_752_700_125);
         assert_eq!(replayed.wall_clock_secs, 125);
