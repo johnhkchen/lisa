@@ -739,6 +739,12 @@ mod tests {
         assert!(RDSPI_WORKFLOW.contains(
             "Lisa needs the release published; run: just release. Lisa will notice on its own once it's live."
         ));
+        assert!(RDSPI_WORKFLOW.contains(
+            "Write for a bystander: say plainly what they should do. Keep subsystem names, measurements, and other jargon in `reason` or `steps`, not the `ask`."
+        ));
+        assert!(RDSPI_WORKFLOW.contains(
+            "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass."
+        ));
     }
 
     #[test]
