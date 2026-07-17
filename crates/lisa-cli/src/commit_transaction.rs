@@ -6,14 +6,16 @@
 
 use fs2::FileExt;
 use lisa_core::completion::CompletionGenerationId;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -119,31 +121,48 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let output = run_git_output_at(root, alternate_index, operation, args)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(git_status_error(operation, &output))
+    }
+}
+
+fn run_git_output_at<I, S>(
+    root: &Path,
+    alternate_index: Option<&Path>,
+    operation: &str,
+    args: I,
+) -> Result<Output, CommitTransactionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = Command::new("git");
     command.arg("-C").arg(root).args(args);
     if let Some(index) = alternate_index {
         command.env("GIT_INDEX_FILE", index);
     }
 
-    let output = command.output().map_err(|e| {
+    command.output().map_err(|e| {
         CommitTransactionError::new(format!(
             "failed to run Git while attempting to {operation}: {e}"
         ))
-    })?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(CommitTransactionError::new(format!(
-            "Git failed to {operation} (status {}): {}",
-            output.status,
-            if stderr.is_empty() {
-                "no stderr output"
-            } else {
-                &stderr
-            }
-        )))
-    }
+    })
+}
+
+fn git_status_error(operation: &str, output: &Output) -> CommitTransactionError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    CommitTransactionError::new(format!(
+        "Git failed to {operation} (status {}): {}",
+        output.status,
+        if stderr.is_empty() {
+            "no stderr output"
+        } else {
+            &stderr
+        }
+    ))
 }
 
 fn output_string(operation: &str, output: &Output) -> Result<String, CommitTransactionError> {
@@ -244,58 +263,322 @@ fn completion_repo_relative_path(
         })
 }
 
+const COMMIT_LOCK_FILE: &str = ".lisa-commit.lock";
+const COMMIT_GUARD_FILE: &str = "lisa-commit.guard";
+const COMMIT_LOCK_OWNER_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransactionLockOwner {
+    schema_version: u32,
+    pid: u32,
+    acquired_unix_ms: u64,
+}
+
+impl TransactionLockOwner {
+    fn current() -> Result<Self, CommitTransactionError> {
+        let acquired_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| CommitTransactionError::new(format!("system clock is before epoch: {e}")))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| CommitTransactionError::new("system time does not fit lock metadata"))?;
+        Ok(Self {
+            schema_version: COMMIT_LOCK_OWNER_SCHEMA_VERSION,
+            pid: std::process::id(),
+            acquired_unix_ms,
+        })
+    }
+
+    fn age_ms(&self) -> u64 {
+        unix_time_ms().saturating_sub(self.acquired_unix_ms)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessPresence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+fn process_presence(pid: u32) -> ProcessPresence {
+    let Ok(pid) = i32::try_from(pid) else {
+        return ProcessPresence::Unknown;
+    };
+    if pid <= 0 {
+        return ProcessPresence::Unknown;
+    }
+
+    // SAFETY: kill(pid, 0) sends no signal and is the standard Unix liveness
+    // probe. It only inspects whether the process exists and is signalable.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return ProcessPresence::Present;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ProcessPresence::Absent,
+        Some(libc::EPERM) => ProcessPresence::Present,
+        _ => ProcessPresence::Unknown,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_presence(_pid: u32) -> ProcessPresence {
+    ProcessPresence::Unknown
+}
+
+fn read_lock_owner(file: &mut File) -> Result<Option<TransactionLockOwner>, io::Error> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut body = String::new();
+    file.read_to_string(&mut body)?;
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(body.trim()).ok())
+}
+
+fn write_lock_owner(
+    file: &mut File,
+    owner: &TransactionLockOwner,
+) -> Result<(), CommitTransactionError> {
+    file.set_len(0).map_err(|e| {
+        CommitTransactionError::new(format!("cannot truncate commit lock metadata: {e}"))
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| {
+        CommitTransactionError::new(format!("cannot seek commit lock metadata: {e}"))
+    })?;
+    serde_json::to_writer(&mut *file, owner).map_err(|e| {
+        CommitTransactionError::new(format!("cannot serialize commit lock metadata: {e}"))
+    })?;
+    file.write_all(b"\n").map_err(|e| {
+        CommitTransactionError::new(format!("cannot write commit lock metadata: {e}"))
+    })?;
+    file.sync_data()
+        .map_err(|e| CommitTransactionError::new(format!("cannot flush commit lock metadata: {e}")))
+}
+
+fn format_lock_age(age_ms: u64) -> String {
+    if age_ms >= 1_000 {
+        format!("{}s", age_ms / 1_000)
+    } else {
+        format!("{age_ms}ms")
+    }
+}
+
 struct TransactionLock {
-    file: File,
+    guard_file: File,
+    marker_file: File,
+    guard_path: PathBuf,
     path: PathBuf,
-    locked: bool,
+    guard_locked: bool,
+    marker_locked: bool,
+    owns_marker: bool,
 }
 
 impl TransactionLock {
-    fn acquire(root: &Path) -> Result<Self, CommitTransactionError> {
-        let path = root.join(".lisa-commit.lock");
-        let file = OpenOptions::new()
+    fn acquire(root: &Path, git_dir: &Path) -> Result<Self, CommitTransactionError> {
+        let guard_path = git_dir.join(COMMIT_GUARD_FILE);
+        let guard_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&guard_path)
+            .map_err(|e| {
+                CommitTransactionError::new(format!(
+                    "cannot open commit transaction guard {}: {e}",
+                    guard_path.display()
+                ))
+            })?;
+        guard_file.try_lock_exclusive().map_err(|e| {
+            CommitTransactionError::new(format!(
+                "commit transaction is temporarily locked by a live holder (guard {}): {e}",
+                guard_path.display()
+            ))
+        })?;
+
+        let path = root.join(COMMIT_LOCK_FILE);
+        let marker_existed = path.exists();
+        let mut marker_file = match OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|e| {
-                CommitTransactionError::new(format!(
-                    "cannot open commit transaction lock {}: {e}",
+        {
+            Ok(file) => file,
+            Err(primary) => {
+                let unlock = FileExt::unlock(&guard_file);
+                return Err(CommitTransactionError::new(match unlock {
+                    Ok(()) => format!(
+                        "cannot open commit transaction lock {}: {primary}",
+                        path.display()
+                    ),
+                    Err(cleanup) => format!(
+                        "cannot open commit transaction lock {}: {primary}; guard cleanup also failed: {cleanup}",
+                        path.display()
+                    ),
+                }));
+            }
+        };
+
+        if let Err(primary) = marker_file.try_lock_exclusive() {
+            let owner = read_lock_owner(&mut marker_file).ok().flatten();
+            let owner_detail = owner.map_or_else(
+                || "live holder did not publish readable owner metadata".to_string(),
+                |owner| {
+                    format!(
+                        "live holder PID {} (age {})",
+                        owner.pid,
+                        format_lock_age(owner.age_ms())
+                    )
+                },
+            );
+            let unlock = FileExt::unlock(&guard_file);
+            return Err(CommitTransactionError::new(match unlock {
+                Ok(()) => format!(
+                    "cannot acquire commit transaction lock {}: {primary}; {owner_detail}; lock was not stolen",
                     path.display()
-                ))
-            })?;
-        file.try_lock_exclusive().map_err(|e| {
-            CommitTransactionError::new(format!(
-                "cannot acquire commit transaction lock {}: {e}",
-                path.display()
-            ))
-        })?;
-        Ok(Self {
-            file,
+                ),
+                Err(cleanup) => format!(
+                    "cannot acquire commit transaction lock {}: {primary}; {owner_detail}; lock was not stolen; guard cleanup also failed: {cleanup}",
+                    path.display()
+                ),
+            }));
+        }
+
+        let mut lock = Self {
+            guard_file,
+            marker_file,
+            guard_path,
             path,
-            locked: true,
-        })
+            guard_locked: true,
+            marker_locked: true,
+            owns_marker: true,
+        };
+
+        if marker_existed {
+            let owner = read_lock_owner(&mut lock.marker_file).ok().flatten();
+            let modified_age_ms = lock
+                .marker_file
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .and_then(|age| age.as_millis().try_into().ok())
+                .unwrap_or(0);
+            match owner {
+                Some(owner) if process_presence(owner.pid) == ProcessPresence::Absent => {
+                    let detail = format!(
+                        "stale commit transaction lock {} was recovered: age {}; recorded holder PID {} is absent (no such process)",
+                        lock.path.display(),
+                        format_lock_age(owner.age_ms()),
+                        owner.pid
+                    );
+                    return match lock.finish() {
+                        Ok(()) => Err(CommitTransactionError::new(detail)),
+                        Err(cleanup) => Err(CommitTransactionError::new(format!(
+                            "{detail}; stale-lock cleanup also failed: {cleanup}"
+                        ))),
+                    };
+                }
+                Some(owner) => {
+                    lock.owns_marker = false;
+                    let detail = format!(
+                        "commit transaction lock {} records holder PID {} (age {}), which is not proven absent; lock was not stolen",
+                        lock.path.display(),
+                        owner.pid,
+                        format_lock_age(owner.age_ms())
+                    );
+                    return match lock.finish() {
+                        Ok(()) => Err(CommitTransactionError::new(detail)),
+                        Err(cleanup) => Err(CommitTransactionError::new(format!(
+                            "{detail}; lock cleanup also failed: {cleanup}"
+                        ))),
+                    };
+                }
+                None => {
+                    let detail = format!(
+                        "stale commit transaction lock {} was recovered: age {}; no recorded holder is present",
+                        lock.path.display(),
+                        format_lock_age(modified_age_ms)
+                    );
+                    return match lock.finish() {
+                        Ok(()) => Err(CommitTransactionError::new(detail)),
+                        Err(cleanup) => Err(CommitTransactionError::new(format!(
+                            "{detail}; stale-lock cleanup also failed: {cleanup}"
+                        ))),
+                    };
+                }
+            }
+        }
+
+        if let Err(primary) = TransactionLockOwner::current()
+            .and_then(|owner| write_lock_owner(&mut lock.marker_file, &owner))
+        {
+            return match lock.finish() {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(CommitTransactionError::new(format!(
+                    "{primary}; lock cleanup also failed: {cleanup}"
+                ))),
+            };
+        }
+
+        Ok(lock)
     }
 
     fn finish(&mut self) -> Result<(), CommitTransactionError> {
-        if self.locked {
-            FileExt::unlock(&self.file).map_err(|e| {
-                CommitTransactionError::new(format!(
-                    "cannot release commit transaction lock {}: {e}",
-                    self.path.display()
-                ))
-            })?;
-            self.locked = false;
+        let mut errors = Vec::new();
+        if self.owns_marker {
+            if let Err(error) = fs::remove_file(&self.path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    errors.push(format!(
+                        "cannot remove commit transaction lock {}: {error}",
+                        self.path.display()
+                    ));
+                }
+            }
+            self.owns_marker = false;
         }
-        Ok(())
+        if self.marker_locked {
+            if let Err(error) = FileExt::unlock(&self.marker_file) {
+                errors.push(format!(
+                    "cannot release commit transaction lock {}: {error}",
+                    self.path.display()
+                ));
+            }
+            self.marker_locked = false;
+        }
+        if self.guard_locked {
+            if let Err(error) = FileExt::unlock(&self.guard_file) {
+                errors.push(format!(
+                    "cannot release commit transaction guard {}: {error}",
+                    self.guard_path.display()
+                ));
+            }
+            self.guard_locked = false;
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CommitTransactionError::new(errors.join("; ")))
+        }
     }
 }
 
 impl Drop for TransactionLock {
     fn drop(&mut self) {
-        if self.locked {
-            let _ = FileExt::unlock(&self.file);
+        if self.owns_marker || self.marker_locked || self.guard_locked {
+            let _ = self.finish();
         }
     }
 }
@@ -439,6 +722,11 @@ fn run_transaction_body(
     includes: &[PathBuf],
     alternate_index: &Path,
 ) -> Result<CommitTransactionResult, CommitTransactionError> {
+    if head_is_unborn(repo)? {
+        return Err(CommitTransactionError::new(
+            "Git failed to resolve HEAD for ticket commit: the current branch does not have any commits yet",
+        ));
+    }
     let head = repo.git(
         None,
         "resolve HEAD",
@@ -622,10 +910,49 @@ fn completion_commit_message(message: &str, key: &CompletionGenerationId) -> Str
     format!("{}\n\n{}", message.trim_end(), completion_key_marker(key))
 }
 
+fn head_is_unborn(repo: &Repository) -> Result<bool, CommitTransactionError> {
+    let symbolic = run_git_output_at(
+        &repo.root,
+        None,
+        "inspect symbolic HEAD",
+        [
+            OsStr::new("symbolic-ref"),
+            OsStr::new("--quiet"),
+            OsStr::new("HEAD"),
+        ],
+    )?;
+    if !symbolic.status.success() {
+        return match symbolic.status.code() {
+            Some(1) => Ok(false),
+            _ => Err(git_status_error("inspect symbolic HEAD", &symbolic)),
+        };
+    }
+    let head_ref = output_string("inspect symbolic HEAD", &symbolic)?;
+    let exists = run_git_output_at(
+        &repo.root,
+        None,
+        "inspect current branch history",
+        [
+            OsStr::new("show-ref"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new(&head_ref),
+        ],
+    )?;
+    match exists.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(git_status_error("inspect current branch history", &exists)),
+    }
+}
+
 fn discover_completion_commit(
     repo: &Repository,
     key: &CompletionGenerationId,
 ) -> Result<Option<String>, CommitTransactionError> {
+    if head_is_unborn(repo)? {
+        return Ok(None);
+    }
     let marker = completion_key_marker(key);
     let candidates = repo.git(
         None,
@@ -688,7 +1015,7 @@ fn commit_ticket_with_key(
     }
     let includes = normalize_includes(request.includes.clone())?;
     let repo = Repository::discover(&request.repo_root)?;
-    let mut lock = TransactionLock::acquire(&repo.root)?;
+    let mut lock = TransactionLock::acquire(&repo.root, &repo.git_dir)?;
     let discovered = match completion_key {
         Some(key) => match discover_completion_commit(&repo, key) {
             Ok(discovered) => discovered,
@@ -910,6 +1237,14 @@ mod tests {
             self.git(["commit", "--quiet", "-m", "base"]);
         }
 
+        fn assert_no_commit_lock(&self) {
+            assert!(
+                !self.root().join(COMMIT_LOCK_FILE).exists(),
+                "{} remained after transaction",
+                COMMIT_LOCK_FILE
+            );
+        }
+
         fn request(&self, includes: &[&str]) -> CommitTransactionRequest {
             CommitTransactionRequest {
                 repo_root: self.root().to_path_buf(),
@@ -1036,6 +1371,7 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with("lisa-ticket-index-")));
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1058,6 +1394,7 @@ mod tests {
                 .stdout,
             stage.stdout
         );
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1067,14 +1404,17 @@ mod tests {
         repo.base_commit();
         repo.write("ticket.txt", "changed\n");
 
-        let lock_path = repo.root().join(".lisa-commit.lock");
-        let lock = OpenOptions::new()
+        let lock_path = repo.root().join(COMMIT_LOCK_FILE);
+        let mut lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(lock_path)
+            .open(&lock_path)
             .unwrap();
+        let owner = TransactionLockOwner::current().unwrap();
+        write_lock_owner(&mut lock, &owner).unwrap();
+        let before = fs::read(&lock_path).unwrap();
         lock.try_lock_exclusive().unwrap();
 
         let error = commit_ticket(repo.request(&["ticket.txt"]))
@@ -1084,7 +1424,53 @@ mod tests {
             error.contains("cannot acquire commit transaction lock"),
             "{error}"
         );
+        assert!(error.contains("live holder PID"), "{error}");
+        assert!(error.contains("lock was not stolen"), "{error}");
+        assert_eq!(fs::read(&lock_path).unwrap(), before);
         FileExt::unlock(&lock).unwrap();
+        fs::remove_file(lock_path).unwrap();
+    }
+
+    #[test]
+    fn stale_commit_lock_names_age_and_absent_holder_then_recovers() {
+        let repo = GitRepo::new();
+        repo.write("ticket.txt", "base\n");
+        repo.base_commit();
+        repo.write("ticket.txt", "changed\n");
+
+        let mut exited = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let absent_pid = exited.id();
+        assert!(exited.wait().unwrap().success());
+        assert_eq!(process_presence(absent_pid), ProcessPresence::Absent);
+
+        let owner = TransactionLockOwner {
+            schema_version: COMMIT_LOCK_OWNER_SCHEMA_VERSION,
+            pid: absent_pid,
+            acquired_unix_ms: unix_time_ms().saturating_sub(120_000),
+        };
+        let lock_path = repo.root().join(COMMIT_LOCK_FILE);
+        fs::write(
+            &lock_path,
+            format!("{}\n", serde_json::to_string(&owner).unwrap()),
+        )
+        .unwrap();
+
+        let error = commit_ticket(repo.request(&["ticket.txt"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stale commit transaction lock"), "{error}");
+        assert!(error.contains("age 120s"), "{error}");
+        assert!(
+            error.contains(&format!("holder PID {absent_pid}")),
+            "{error}"
+        );
+        assert!(error.contains("absent (no such process)"), "{error}");
+        assert!(error.contains("was recovered"), "{error}");
+        repo.assert_no_commit_lock();
+
+        let result = commit_ticket(repo.request(&["ticket.txt"])).unwrap();
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), result.commit_id);
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1099,6 +1485,7 @@ mod tests {
             .to_string();
         assert!(error.contains("has no changes"), "{error}");
         assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1130,6 +1517,7 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("lisa-ticket-index-")
         }));
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1208,6 +1596,7 @@ mod tests {
                 .stdout,
             foreign_before.stdout
         );
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1252,6 +1641,7 @@ mod tests {
             repo.git_string(["show", "HEAD:docs/root-sentinel.md"]),
             "root docs remain untouched"
         );
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1282,6 +1672,7 @@ mod tests {
             original.as_bytes()
         );
         assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1311,6 +1702,7 @@ mod tests {
             original
         );
         assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head);
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1348,6 +1740,45 @@ mod tests {
                 .stdout,
             foreign_before.stdout
         );
+        repo.assert_no_commit_lock();
+    }
+
+    #[test]
+    fn unborn_completion_history_is_none_then_reaches_head_precondition() {
+        let repo = GitRepo::new();
+        let ticket = "docs/active/tickets/T-NEW-01.md";
+        let work_dir = "docs/active/work/T-NEW-01";
+        let original = "---\nid: T-NEW-01\ntitle: new repository\ntype: task\nstatus: open\npriority: high\nphase: review\n---\nBody\n";
+        repo.write(ticket, original);
+        repo.write(&format!("{work_dir}/review.md"), "# Review\n");
+
+        let repository = Repository::discover(repo.root()).unwrap();
+        let key = completion_key("T-NEW-01", "1", 1);
+        assert!(head_is_unborn(&repository).unwrap());
+        assert_eq!(discover_completion_commit(&repository, &key).unwrap(), None);
+
+        let error = complete_ticket(CompleteTicketRequest {
+            repo_root: repo.root().to_path_buf(),
+            ticket_id: "T-NEW-01".to_string(),
+            message: "Complete T-NEW-01".to_string(),
+            ticket_file: PathBuf::from(ticket),
+            work_dir: PathBuf::from(work_dir),
+            completion_key: key,
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("resolve HEAD for ticket commit"), "{error}");
+        assert!(error.contains("does not have any commits yet"), "{error}");
+        assert!(
+            !error.contains("discover prior completion commit"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.root().join(ticket)).unwrap(),
+            original
+        );
+        repo.assert_no_commit_lock();
     }
 
     #[test]
@@ -1433,5 +1864,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(replay_after_different.commit_id, first.commit_id);
+        repo.assert_no_commit_lock();
     }
 }
