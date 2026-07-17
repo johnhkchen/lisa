@@ -1391,14 +1391,8 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         });
     }
 
-    // 9. Must have at least one ticket
+    // 9. A clean empty board is valid, but has no schedulable work yet.
     if scan.tickets.is_empty() {
-        diagnostics.push(ValidationDiagnostic {
-            path: format!("{}/", ticket_dir_rel),
-            category: "readiness",
-            message: "no tickets found. Create at least one ticket file.".to_string(),
-            severity: Severity::Error,
-        });
         return ValidationResult {
             diagnostics,
             ticket_count,
@@ -1498,6 +1492,13 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
         Ok(validation) => config::resolve_config(&validation.config, None, None),
         Err(_) => config::ResolvedConfig::default(),
     };
+    if result.ticket_count == 0 {
+        println!(
+            "No tickets yet. A ticket is a Markdown file that tells Lisa what work to schedule; put one in {}/, then run `lisa validate` again.",
+            resolved.ticket_dir.trim_end_matches('/')
+        );
+        return Ok(());
+    }
     let timeout_str = if resolved.session_timeout_secs == 0 {
         "disabled".to_string()
     } else {
@@ -1544,10 +1545,12 @@ fn print_diagnostics(result: &ValidationResult) -> Result<(), String> {
             count
         ))
     } else {
-        println!(
-            "All checks passed. {} tickets, {} ready, DAG valid. Run `lisa loop` to start.",
-            result.ticket_count, result.ready_count
-        );
+        if result.ticket_count > 0 {
+            println!(
+                "All checks passed. {} tickets, {} ready, DAG valid. Run `lisa loop` to start.",
+                result.ticket_count, result.ready_count
+            );
+        }
         Ok(())
     }
 }
