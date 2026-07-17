@@ -297,7 +297,7 @@ create_fixture() {
     local scenario=$1
     local root="$RUN_ROOT/$scenario"
     mkdir -p "$root/bin" "$root/evidence" "$root/home"
-    "$LISA_BIN" init --path "$root" >/dev/null
+    "$LISA_BIN" init --path "$root" --no-history >/dev/null
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories"
     cat > "$root/.lisa.toml" <<'TOML'
 version = "0.4.0"

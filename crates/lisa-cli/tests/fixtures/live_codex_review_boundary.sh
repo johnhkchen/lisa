@@ -263,7 +263,7 @@ create_fixture() {
     root=$(mktemp -d "$FIXTURE_PARENT/lisa-field-$kind.XXXXXX")
     root=$(cd "$root" && pwd -P)
     printf '%s\n' "$root" >> "$EVIDENCE_DIR/fixture-roots.txt"
-    "$lisa_bin" init --path "$root" > "$EVIDENCE_DIR/$kind-init.log"
+    "$lisa_bin" init --path "$root" --no-history > "$EVIDENCE_DIR/$kind-init.log"
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories" \
         "$root/docs/active/work/$PRIMARY_TICKET_ID" \
         "$root/docs/active/work/$SUCCESSOR_TICKET_ID"

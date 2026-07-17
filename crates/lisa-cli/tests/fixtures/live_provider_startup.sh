@@ -220,7 +220,7 @@ create_fixture() {
     root=$(mktemp -d "$FIXTURE_PARENT/lisa-live-$provider.XXXXXX")
     root=$(cd "$root" && pwd -P)
     printf '%s\n' "$root" >> "$EVIDENCE_DIR/fixture-roots.txt"
-    "$LISA_BIN" init --path "$root" > "$EVIDENCE_DIR/$provider-first/init.log"
+    "$LISA_BIN" init --path "$root" --no-history > "$EVIDENCE_DIR/$provider-first/init.log"
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories"
     cat > "$root/.lisa.toml" <<'TOML'
 version = "0.4.0"

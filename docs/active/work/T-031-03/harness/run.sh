@@ -61,7 +61,7 @@ git config user.email lisa-atomic-harness@example.invalid
 git config user.name "Lisa atomic harness"
 
 printf '[package]\nname = "atomic-provider-fixture"\nversion = "0.1.0"\nedition = "2021"\n' > Cargo.toml
-"$LISA" init > "$EVIDENCE/init.txt"
+"$LISA" init --no-history > "$EVIDENCE/init.txt"
 # The transaction lock is a reusable repository-local inode. Projects normally
 # ignore it; make that contract explicit in this fixture baseline.
 printf '.lisa-commit.lock\n' > .gitignore
