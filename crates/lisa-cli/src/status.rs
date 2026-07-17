@@ -114,7 +114,11 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     let tickets = lisa_core::ticket::scan_tickets(&ticket_dir)
         .map_err(|e| format!("Failed to scan tickets: {}", e))?;
 
-    let parked_remedies = collect_parked_remedies(tickets.iter(), &root.join(&work_dir_rel));
+    let parked_remedies = collect_parked_remedies(
+        tickets.iter(),
+        &root.join(&work_dir_rel),
+        &root.join(".lisa/provenance.jsonl"),
+    );
     print_waiting_on_you(&parked_remedies);
     let notes = collect_notes(
         &root.join(".lisa/completion-journal.jsonl"),

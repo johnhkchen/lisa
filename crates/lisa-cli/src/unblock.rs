@@ -56,7 +56,11 @@ pub fn run_unblock(root: &Path, ticket_id: &str) -> Result<UnblockOutcome, Strin
         )));
     }
 
-    let mut remedies = collect_parked_remedies(std::iter::once(ticket), &work_dir);
+    let mut remedies = collect_parked_remedies(
+        std::iter::once(ticket),
+        &work_dir,
+        &root.join(".lisa/provenance.jsonl"),
+    );
     let Some(remedy) = remedies.pop() else {
         return Ok(UnblockOutcome::Declined(format!(
             "I couldn't find what {ticket_id} is waiting for."
@@ -91,7 +95,11 @@ pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
     let work_dir = root.join(&resolved.work_dir);
     let tickets = ticket::scan_tickets(&ticket_dir)
         .map_err(|error| format!("Could not read the ticket board: {error}"))?;
-    let remedies = collect_parked_remedies(tickets.iter(), &work_dir);
+    let remedies = collect_parked_remedies(
+        tickets.iter(),
+        &work_dir,
+        &root.join(".lisa/provenance.jsonl"),
+    );
     let mut reopened = Vec::new();
 
     for remedy in remedies {
