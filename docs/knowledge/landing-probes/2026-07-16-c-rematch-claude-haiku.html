@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lisa Tour — Getting Started Guide</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #1a1a1a;
+            background: linear-gradient(135deg, #f5f5f5 0%, #e8e8e8 100%);
+            padding: 20px;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            body {
+                color: #e8e8e8;
+                background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+            }
+            .container {
+                background: #2a2a2a;
+                border-color: #444;
+            }
+            .nav-item.active, .nav-item:hover {
+                background: #444;
+            }
+            .section {
+                border-color: #444;
+            }
+            code {
+                background: #1a1a1a;
+                color: #a8ff60;
+            }
+            .artifact-box {
+                background: #1a1a1a;
+                border-color: #444;
+            }
+            .phase-card {
+                background: #333;
+                border-color: #555;
+            }
+            .flow-arrow {
+                color: #666;
+            }
+            pre {
+                background: #1a1a1a;
+                border-color: #444;
+                color: #a8ff60;
+            }
+            .ticket-example {
+                background: #1a1a1a;
+                border-color: #444;
+            }
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+            overflow: hidden;
+            display: flex;
+            min-height: 100vh;
+        }
+
+        .sidebar {
+            width: 250px;
+            background: #f9f9f9;
+            border-right: 1px solid #ddd;
+            padding: 20px;
+            overflow-y: auto;
+            position: sticky;
+            top: 0;
+            height: 100vh;
+        }
+
+        .sidebar-title {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: #999;
+            margin-bottom: 12px;
+            margin-top: 16px;
+        }
+
+        .sidebar-title:first-child {
+            margin-top: 0;
+        }
+
+        .nav-item {
+            padding: 10px 12px;
+            margin-bottom: 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+            color: #555;
+        }
+
+        .nav-item:hover {
+            background: #eee;
+            color: #333;
+        }
+
+        .nav-item.active {
+            background: #007bff;
+            color: white;
+        }
+
+        .content {
+            flex: 1;
+            padding: 40px;
+            overflow-y: auto;
+        }
+
+        .section {
+            margin-bottom: 40px;
+            padding-bottom: 40px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .section:last-child {
+            border-bottom: none;
+        }
+
+        h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
+            color: #007bff;
+        }
+
+        h2 {
+            font-size: 24px;
+            margin-top: 30px;
+            margin-bottom: 16px;
+            color: #333;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #007bff;
+        }
+
+        h3 {
+            font-size: 18px;
+            margin-top: 20px;
+            margin-bottom: 12px;
+            color: #555;
+        }
+
+        p {
+            margin-bottom: 12px;
+            color: #666;
+        }
+
+        code {
+            background: #f5f5f5;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+            color: #d73a49;
+        }
+
+        pre {
+            background: #f5f5f5;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 12px;
+            overflow-x: auto;
+            margin: 12px 0;
+            font-size: 13px;
+            color: #d73a49;
+            font-family: 'Monaco', 'Courier New', monospace;
+        }
+
+        .highlight {
+            background: #fffacd;
+            padding: 2px 4px;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .highlight {
+                background: #5a5500;
+            }
+        }
+
+        ul, ol {
+            margin-left: 20px;
+            margin-bottom: 12px;
+        }
+
+        li {
+            margin-bottom: 6px;
+        }
+
+        .artifact-box {
+            background: #f0f7ff;
+            border-left: 4px solid #007bff;
+            padding: 12px;
+            margin: 12px 0;
+            border-radius: 2px;
+        }
+
+        .phase-card {
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .phase-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+        }
+
+        .phase-number {
+            background: #007bff;
+            color: white;
+            border-radius: 50%;
+            width: 28px;
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: bold;
+            margin-right: 12px;
+            flex-shrink: 0;
+        }
+
+        .phase-description {
+            color: #666;
+            font-size: 13px;
+        }
+
+        .flow {
+            display: flex;
+            align-items: center;
+            margin: 20px 0;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .flow-item {
+            background: #007bff;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .flow-arrow {
+            color: #999;
+            font-size: 16px;
+        }
+
+        .ticket-example {
+            background: #f5f5f5;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 16px;
+            margin: 12px 0;
+            font-size: 13px;
+            font-family: 'Monaco', 'Courier New', monospace;
+        }
+
+        .warning {
+            background: #ffe8e8;
+            border-left: 4px solid #ff6b6b;
+            padding: 12px;
+            border-radius: 2px;
+            margin: 12px 0;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .warning {
+                background: #5a2828;
+                border-left-color: #ff6b6b;
+            }
+        }
+
+        .success {
+            background: #e8ffe8;
+            border-left: 4px solid #52c41a;
+            padding: 12px;
+            border-radius: 2px;
+            margin: 12px 0;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .success {
+                background: #2a5a2a;
+                border-left-color: #52c41a;
+            }
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 12px 0;
+        }
+
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+
+        th {
+            background: #f5f5f5;
+            font-weight: 600;
+            color: #333;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            th {
+                background: #333;
+            }
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 4px;
+        }
+
+        .badge-required {
+            background: #ff6b6b;
+            color: white;
+        }
+
+        .badge-optional {
+            background: #ffa940;
+            color: white;
+        }
+
+        .directoryTree {
+            background: #f5f5f5;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 12px;
+            margin: 12px 0;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 12px;
+            color: #666;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .directoryTree {
+                background: #1a1a1a;
+                border-color: #444;
+                color: #a8a8a8;
+            }
+        }
+
+        .command-box {
+            background: #f5f5f5;
+            border-left: 4px solid #007bff;
+            padding: 12px;
+            margin: 12px 0;
+            border-radius: 2px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .command-box {
+                background: #1a1a1a;
+                border-left-color: #007bff;
+                color: #a8ff60;
+            }
+        }
+
+        .toc {
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 16px;
+            margin: 16px 0;
+        }
+
+        .toc a {
+            color: #007bff;
+            text-decoration: none;
+            display: block;
+            padding: 4px 0;
+        }
+
+        .toc a:hover {
+            text-decoration: underline;
+        }
+
+        .intro-box {
+            background: linear-gradient(135deg, #007bff 0%, #0056b3 100%);
+            color: white;
+            padding: 24px;
+            border-radius: 4px;
+            margin-bottom: 24px;
+        }
+
+        .intro-box h1 {
+            color: white;
+            margin: 0;
+        }
+
+        .intro-box p {
+            color: #e8f4ff;
+            margin-bottom: 0;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                width: 100%;
+                height: auto;
+                position: static;
+                border-right: none;
+                border-bottom: 1px solid #ddd;
+                padding: 12px;
+            }
+
+            .content {
+                padding: 24px;
+            }
+
+            h1 {
+                font-size: 24px;
+            }
+
+            h2 {
+                font-size: 18px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div style="font-weight: 600; font-size: 16px; margin-bottom: 20px; color: #007bff;">Lisa Tour</div>
+
+            <div class="sidebar-title">Getting Started</div>
+            <div class="nav-item active" onclick="scrollToSection('intro')">Introduction</div>
+            <div class="nav-item" onclick="scrollToSection('what-is')">What is Lisa?</div>
+            <div class="nav-item" onclick="scrollToSection('key-concepts')">Key Concepts</div>
+
+            <div class="sidebar-title">The RDSPI Workflow</div>
+            <div class="nav-item" onclick="scrollToSection('rdspi-overview')">Workflow Overview</div>
+            <div class="nav-item" onclick="scrollToSection('research')">Research</div>
+            <div class="nav-item" onclick="scrollToSection('design')">Design</div>
+            <div class="nav-item" onclick="scrollToSection('structure')">Structure</div>
+            <div class="nav-item" onclick="scrollToSection('plan')">Plan</div>
+            <div class="nav-item" onclick="scrollToSection('implement')">Implement</div>
+            <div class="nav-item" onclick="scrollToSection('review')">Review</div>
+
+            <div class="sidebar-title">Project Structure</div>
+            <div class="nav-item" onclick="scrollToSection('directory-layout')">Directory Layout</div>
+            <div class="nav-item" onclick="scrollToSection('ticket-format')">Ticket Format</div>
+            <div class="nav-item" onclick="scrollToSection('work-artifacts')">Work Artifacts</div>
+
+            <div class="sidebar-title">Practical Guide</div>
+            <div class="nav-item" onclick="scrollToSection('getting-started')">Getting Started</div>
+            <div class="nav-item" onclick="scrollToSection('commands')">Common Commands</div>
+            <div class="nav-item" onclick="scrollToSection('faq')">FAQ</div>
+        </div>
+
+        <div class="content">
+            <div id="intro" class="section intro-box">
+                <h1>Lisa: Agent-Driven Ticket Workflow</h1>
+                <p>Welcome to Lisa! This guide will help you understand and work with the ticket-based agent orchestration system. Lisa automates coding work through a structured Research–Design–Structure–Plan–Implement–Review workflow.</p>
+            </div>
+
+            <div id="what-is" class="section">
+                <h2>What is Lisa?</h2>
+                <p>Lisa is a ticket-driven system that runs coding agents (like Claude Code or Codex) through a structured workflow. Instead of manually approving every step, you create a ticket, and Lisa automatically guides the agent through six phases of work:</p>
+                <ol>
+                    <li><strong>Research</strong> — Map the codebase</li>
+                    <li><strong>Design</strong> — Explore options and decide</li>
+                    <li><strong>Structure</strong> — Define file-level changes</li>
+                    <li><strong>Plan</strong> — Sequence implementation steps</li>
+                    <li><strong>Implement</strong> — Execute the plan</li>
+                    <li><strong>Review</strong> — Self-assess and hand off</li>
+                </ol>
+                <p>Each phase produces a reviewable artifact (~200 lines) that captures the work at that stage. This creates a durable, auditable record and makes it easy to resume work if a session is interrupted.</p>
+            </div>
+
+            <div id="key-concepts" class="section">
+                <h2>Key Concepts</h2>
+                <h3>Tickets</h3>
+                <p>A ticket is a markdown file with YAML frontmatter that describes a unit of work. Tickets live in <code>docs/active/tickets/</code> and track metadata like status, phase, priority, and dependencies.</p>
+
+                <h3>Phases</h3>
+                <p>Every ticket progresses through all six phases in order. <span class="highlight">No phases are skipped</span>—even for small changes. This ensures consistent, high-quality work and produces a complete record.</p>
+
+                <h3>Work Artifacts</h3>
+                <p>Each phase produces an artifact (a markdown file) that lives in <code>docs/active/work/{ticket-id}/</code>. These artifacts are the deliverables of each phase and serve as the input for the next phase.</p>
+
+                <h3>Dependencies</h3>
+                <p>Tickets can depend on other tickets. Lisa computes the dependency DAG and spawns parallel threads for tickets whose dependencies are satisfied. Multiple agents can work concurrently on different tickets.</p>
+
+                <h3>Isolated Transactions</h3>
+                <p>When agents commit code changes, they use <code>lisa commit-ticket</code> with an isolated Git index. This ensures that unrelated staged changes aren't accidentally committed with ticket work.</p>
+            </div>
+
+            <div id="rdspi-overview" class="section">
+                <h2>The RDSPI Workflow Overview</h2>
+                <div class="flow">
+                    <div class="flow-item">Research</div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-item">Design</div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-item">Structure</div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-item">Plan</div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-item">Implement</div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-item">Review</div>
+                </div>
+
+                <div class="artifact-box">
+                    <strong>Key Principle:</strong> Each phase produces a ~200 line artifact. This is a forcing function for structured thinking—enough to be thorough, short enough to review quickly. All six phases always run, regardless of ticket size.
+                </div>
+
+                <h3>High-Leverage Phases</h3>
+                <p>Research and Design artifacts are the best return on review time. Reviewing ~200 lines of research or design catches problems before they become thousands of lines of wrong code. A comprehensive design document can prevent costly implementation mistakes.</p>
+            </div>
+
+            <div id="research" class="section">
+                <h2>Phase 1: Research</h2>
+                <div class="phase-card">
+                    <div class="phase-title">
+                        <div class="phase-number">1</div>
+                        Map the codebase
+                    </div>
+                    <p class="phase-description">Produce a descriptive, ~200-line document that captures what exists, where it lives, how it connects, and what constraints or assumptions apply.</p>
+                </div>
+
+                <h3>What to Include</h3>
+                <ul>
+                    <li>Relevant files, modules, and components</li>
+                    <li>How they connect (imports, dependencies, data flow)</li>
+                    <li>Existing patterns and conventions</li>
+                    <li>Constraints and assumptions</li>
+                    <li>Architecture and boundaries</li>
+                </ul>
+
+                <h3>What to Avoid</h3>
+                <ul>
+                    <li>Proposals or solutions</li>
+                    <li>Prescriptive recommendations</li>
+                    <li>Design decisions</li>
+                </ul>
+
+                <div class="artifact-box">
+                    <strong>Artifact:</strong> <code>docs/active/work/{ticket-id}/research.md</code>
+                </div>
+
+                <div class="success">
+                    <strong>💡 Why it matters:</strong> A thorough research phase prevents misunderstandings and grounds the design in reality. It answers "what exists?" before tackling "what should we build?"
+                </div>
+            </div>
+
+            <div id="design" class="section">
+                <h2>Phase 2: Design</h2>
+                <div class="phase-card">
+                    <div class="phase-title">
+                        <div class="phase-number">2</div>
+                        Explore options and decide
+                    </div>
+                    <p class="phase-description">Enumerate viable approaches, assess each against the research, choose one, and explain the rationale. Document what was rejected and why.</p>
+                </div>
+
+                <h3>What to Include</h3>
+                <ul>
+                    <li>Multiple viable approaches (at least 2–3)</li>
+                    <li>Tradeoffs of each approach (complexity, performance, maintainability)</li>
+                    <li>How each approach fits with the existing codebase (grounded in research)</li>
+                    <li>A clear decision with rationale</li>
+                    <li>What was rejected and why</li>
+                </ul>
+
+                <h3>Critical Principle</h3>
+                <div class="warning">
+                    <strong>⚠️ The design decision must be grounded in the research, not assumptions.</strong> If the research doesn't support a choice, go back and deepen the research. Never design in a vacuum.
+                </div>
+
+                <div class="artifact-box">
+                    <strong>Artifact:</strong> <code>docs/active/work/{ticket-id}/design.md</code>
+                </div>
+            </div>
+
+            <div id="structure" class="section">
+                <h2>Phase 3: Structure</h2>
+                <div class="phase-card">
+                    <div class="phase-title">
+                        <div class="phase-number">3</div>
+                        Define file-level changes
+                    </div>
+                    <p class="phase-description">Specify which files are created, modified, or deleted. Define module boundaries, public interfaces, and internal organization. This is the blueprint—not code, but the shape of the code.</p>
+                </div>
+
+                <h3>What to Include</h3>
+                <ul>
+                    <li>List of files to create, modify, or delete</li>
+                    <li>Module boundaries and public interfaces</li>
+                    <li>Internal organization of each module</li>
+                    <li>The ordering of changes (where it matters)</li>
+                    <li>Any architectural constraints or decisions</li>
+                </ul>
+
+                <h3>Example</h3>
+                <pre>
+Files to modify:
+- src/api/auth.ts (add new token refresh logic)
+- src/middleware/session.ts (integrate new token handler)
+- tests/auth.test.ts (add tests for token refresh)
+
+New files:
+- src/api/token-refresh.ts (core refresh implementation)
+
+Deleted files:
+- src/api/legacy-auth.ts (replaced by auth.ts)
+                </pre>
+
+                <div class="artifact-box">
+                    <strong>Artifact:</strong> <code>docs/active/work/{ticket-id}/structure.md</code>
+                </div>
+            </div>
+
+            <div id="plan" class="section">
+                <h2>Phase 4: Plan</h2>
+                <div class="phase-card">
+                    <div class="phase-title">
+                        <div class="phase-number">4</div>
+                        Sequence implementation steps
+                    </div>
+                    <p class="phase-description">Break the work into ordered steps that can be executed and verified independently. Define the testing strategy and specify what each step produces.</p>
+                </div>
+
+                <h3>What to Include</h3>
+                <ul>
+                    <li>Ordered implementation steps (usually 5–15 steps)</li>
+                    <li>What each step produces (files, code changes, tests)</li>
+                    <li>Which steps can be verified independently</li>
+                    <li>Testing strategy (unit tests, integration tests, manual verification)</li>
+                    <li>Verification criteria for completion</li>
+                    <li>Any dependencies between steps</li>
+                </ul>
+
+                <h3>Example</h3>
+                <pre>
+Step 1: Create src/api/token-refresh.ts with core logic
+  - Verify: Unit tests pass, logic is sound
+
+Step 2: Add token refresh handler to src/api/auth.ts
+  - Verify: Old and new logic coexist, no regressions
+
+Step 3: Integrate into src/middleware/session.ts
+  - Verify: Integration tests pass, middleware still works
+
+Step 4: Delete src/api/legacy-auth.ts (old code)
+  - Verify: Build succeeds, no broken imports
+
+Step 5: Add end-to-end tests
+  - Verify: Full flow works in test environment
+                </pre>
+
+                <div class="artifact-box">
+                    <strong>Artifact:</strong> <code>docs/active/work/{ticket-id}/plan.md</code>
+                </div>
+            </div>
+
+            <div id="implement" class="section">
+                <h2>Phase 5: Implement</h2>
+                <div class="phase-card">
+                    <div class="phase-title">
+                        <div class="phase-number">5</div>
+                        Execute the plan
+                    </div>
+                    <p class="phase-description">Follow the plan step by step. For each meaningful unit of work, run <code>lisa commit-ticket</code> with an isolated index. Track progress in <code>progress.md</code>.</p>
+                </div>
+
+                <h3>Key Rules</h3>
+                <ul>
+                    <li><strong>Use <code>lisa commit-ticket</code></strong> for all ticket-owned code changes. Never use ordinary <code>git add</code> or <code>git commit</code>.</li>
+                    <li><strong>Specify paths exactly</strong> with the <code>--include</code> flag. Pass only files owned by this ticket.</li>
+                    <li><strong>Commit atomic units</strong> that can be reviewed and verified independently.</li>
+                    <li><strong>Update <code>progress.md</code></strong> as you go, tracking completed steps, remaining work, and any plan deviations.</li>
+                    <li><strong>Document deviations</strong> if the plan needs adjustment. Explain why and proceed.</li>
+                </ul>
+
+                <h3>Command Example</h3>
+                <div class="command-box">
+lisa commit-ticket --ticket-id T-001 \
+  --message "Add token refresh logic" \
+  --include src/api/token-refresh.ts \
+  --include tests/auth.test.ts
+                </div>
+
+                <div class="warning">
+                    <strong>⚠️ Before Review:</strong> Ensure every ticket-owned source change is committed through <code>lisa commit-ticket</code>. No staged, modified, or untracked files should remain.
+                </div>
+
+                <div class="artifact-box">
+                    <strong>Artifact:</strong> <code>docs/active/work/{ticket-id}/progress.md</code>
+                </div>
+            </div>
+
+            <div id="review" class="section">
+                <h2>Phase 6: Review</h2>
+                <div class="phase-card">
+                    <div class="phase-title">
+                        <div class="phase-number">6</div>
+                        Self-assess and hand off
+                    </div>
+                    <p class="phase-description">Write two documents: <code>review.md</code> (a summary of changes and concerns) and <code>review-disposition.json</code> (a structured pass/block decision).</p>
+                </div>
+
+                <h3>review.md Content</h3>
+                <ul>
+                    <li>Summary of what changed (files created, modified, deleted)</li>
+                    <li>Test coverage and any gaps</li>
+                    <li>Open concerns, TODOs, or known limitations</li>
+                    <li>Critical issues that need human attention</li>
+                    <li>Recommendations for follow-up work</li>
+                </ul>
+
+                <h3>review-disposition.json</h3>
+                <p>A structured document that signals whether the work is ready to complete or blocked:</p>
+
+                <h4>Pass (Ready to Complete)</h4>
+                <pre>
+{
+  "disposition": "pass",
+  "reason": null
+}
+                </pre>
+
+                <h4>Block (Work Cannot Complete)</h4>
+                <pre>
+{
+  "disposition": "block",
+  "reason": "Actionable reason for blocking",
+  "remedy_owner": "agent|operator|world",
+  "ask": "One sentence describing the action needed",
+  "steps": ["optional exact step"],
+  "check": "read-only verification command"
+}
+                </pre>
+
+                <h3>Choosing remedy_owner</h3>
+                <table>
+                    <tr>
+                        <th>Owner</th>
+                        <th>When to Use</th>
+                        <th>Example</th>
+                    </tr>
+                    <tr>
+                        <td><code>agent</code></td>
+                        <td>Another coding attempt can fix it</td>
+                        <td>Tests are failing; need to fix implementation</td>
+                    </tr>
+                    <tr>
+                        <td><code>operator</code></td>
+                        <td>A person must act</td>
+                        <td>Need API keys configured; need manual deployment</td>
+                    </tr>
+                    <tr>
+                        <td><code>world</code></td>
+                        <td>External reality must change</td>
+                        <td>Waiting for another team to publish a library</td>
+                    </tr>
+                </table>
+
+                <h3>After Writing Review</h3>
+                <div class="warning">
+                    <strong>⚠️ Important:</strong> After writing <code>review.md</code> and <code>review-disposition.json</code>, remain on the current ticket and wait. Do not edit phase/status, publish completion yourself, or start another ticket. Lisa will detect the artifacts, prepare the final commit, and confirm completion before releasing the seat.
+                </div>
+
+                <div class="artifact-box">
+                    <strong>Artifacts:</strong>
+                    <ul>
+                        <li><code>docs/active/work/{ticket-id}/review.md</code></li>
+                        <li><code>docs/active/work/{ticket-id}/review-disposition.json</code></li>
+                    </ul>
+                </div>
+            </div>
+
+            <div id="directory-layout" class="section">
+                <h2>Directory Layout</h2>
+                <p>Here's the structure of a Lisa project:</p>
+
+                <div class="directoryTree">
+demo/
+├── .lisa/                          # Lisa runtime directory
+│   ├── hooks/                      # Event hooks (on-start.sh, on-idle.sh, etc.)
+│   └── signals/                    # Internal signals (created at runtime)
+├── .lisa.toml                      # Lisa configuration
+├── CLAUDE.md                       # Agent context (shared by all agents)
+├── AGENTS.md                       # Agent context for Codex
+├── docs/
+│   ├── active/
+│   │   ├── tickets/                # Ticket files
+│   │   │   ├── T-001.md
+│   │   │   ├── T-002.md
+│   │   │   └── ...
+│   │   ├── stories/                # Story files (optional)
+│   │   │   └── S-001.md
+│   │   └── work/                   # Work artifacts (one dir per ticket)
+│   │       ├── T-001/
+│   │       │   ├── research.md
+│   │       │   ├── design.md
+│   │       │   ├── structure.md
+│   │       │   ├── plan.md
+│   │       │   ├── progress.md
+│   │       │   ├── review.md
+│   │       │   └── review-disposition.json
+│   │       ├── T-002/
+│   │       └── ...
+│   └── knowledge/
+│       └── rdspi-workflow.md       # Workflow definition (injected into agent context)
+├── src/                            # Your project source code
+└── ...
+                </div>
+            </div>
+
+            <div id="ticket-format" class="section">
+                <h2>Ticket Format</h2>
+                <p>Tickets are markdown files with YAML frontmatter. They live in <code>docs/active/tickets/</code>.</p>
+
+                <div class="ticket-example">
+---
+id: T-024-03
+story: S-024
+title: migrate-climate-calls
+type: task
+status: open
+priority: high
+phase: ready
+depends_on: [T-024-01, T-024-02]
+---
+
+## Context
+
+Description of the work and why it matters.
+
+## Acceptance Criteria
+
+- Concrete, verifiable condition 1
+- Concrete, verifiable condition 2
+                </div>
+
+                <h3>Field Reference</h3>
+                <table>
+                    <tr>
+                        <th>Field</th>
+                        <th>Type</th>
+                        <th>Description</th>
+                    </tr>
+                    <tr>
+                        <td><code>id</code></td>
+                        <td>string</td>
+                        <td>Unique ticket identifier (e.g., T-024-03) <span class="badge badge-required">required</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>story</code></td>
+                        <td>string</td>
+                        <td>Parent story ID (e.g., S-024) <span class="badge badge-optional">optional</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>title</code></td>
+                        <td>string</td>
+                        <td>Kebab-case short name <span class="badge badge-required">required</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>type</code></td>
+                        <td>enum</td>
+                        <td><code>task</code> | <code>bug</code> | <code>spike</code> <span class="badge badge-required">required</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>status</code></td>
+                        <td>enum</td>
+                        <td><code>open</code> | <code>in-progress</code> | <code>review</code> | <code>done</code> | <code>blocked</span></code> <span class="badge badge-required">required</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>priority</code></td>
+                        <td>enum</td>
+                        <td><code>critical</code> | <code>high</code> | <code>medium</code> | <code>low</code> <span class="badge badge-required">required</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>phase</code></td>
+                        <td>enum</td>
+                        <td><code>ready</code> | <code>research</code> | <code>design</code> | <code>structure</code> | <code>plan</code> | <code>implement</code> | <code>review</code> | <code>done</code> <span class="badge badge-required">required</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>depends_on</code></td>
+                        <td>array</td>
+                        <td>List of ticket IDs that must complete first <span class="badge badge-optional">optional</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>blocks</code></td>
+                        <td>array</td>
+                        <td>Computed automatically from <code>depends_on</code>; do not edit <span class="badge badge-optional">optional</span></td>
+                    </tr>
+                </table>
+
+                <h3>Important Notes</h3>
+                <ul>
+                    <li><strong>Phase field:</strong> Lisa automatically updates this as artifacts are completed. Do not edit it manually.</li>
+                    <li><strong>Status field:</strong> This tracks human workflow state. Lisa uses phase to track agent progress.</li>
+                    <li><strong>Dependencies:</strong> Lisa computes the DAG and respects dependencies. List all blocking tickets in <code>depends_on</code>.</li>
+                </ul>
+            </div>
+
+            <div id="work-artifacts" class="section">
+                <h2>Work Artifacts</h2>
+                <p>Each ticket has a work directory at <code>docs/active/work/{ticket-id}/</code>. Artifacts are created as each phase completes:</p>
+
+                <h3>Six Artifacts (One Per Phase)</h3>
+                <ol>
+                    <li><strong>research.md</strong> — Codebase map (~200 lines)</li>
+                    <li><strong>design.md</strong> — Option exploration and decision (~200 lines)</li>
+                    <li><strong>structure.md</strong> — File-level blueprint (~200 lines)</li>
+                    <li><strong>plan.md</strong> — Implementation steps (~200 lines)</li>
+                    <li><strong>progress.md</strong> — Progress tracking during implementation</li>
+                    <li><strong>review.md</strong> — Self-assessment (~200 lines)</li>
+                    <li><strong>review-disposition.json</strong> — Pass/block decision (structured)</li>
+                </ol>
+
+                <h3>Artifact File Naming</h3>
+                <p>Use consistent, descriptive names:</p>
+                <ul>
+                    <li><code>research.md</code> — Always this name</li>
+                    <li><code>design.md</code> — Always this name</li>
+                    <li><code>structure.md</code> — Always this name</li>
+                    <li><code>plan.md</code> — Always this name</li>
+                    <li><code>progress.md</code> — Updated during implementation</li>
+                    <li><code>review.md</code> — Always this name</li>
+                    <li><code>review-disposition.json</code> — Always this name</li>
+                </ul>
+
+                <h3>Artifact Purpose</h3>
+                <p>Artifacts serve multiple purposes:</p>
+                <ul>
+                    <li><strong>Human review:</strong> Each artifact is ~200 lines and reviewable at a glance</li>
+                    <li><strong>Session recovery:</strong> If a session crashes, the latest artifact + ticket is enough to resume</li>
+                    <li><strong>Audit trail:</strong> The complete workflow is recorded in these documents</li>
+                    <li><strong>Feedback loop:</strong> Reviewers can approve, request changes, or block based on artifacts</li>
+                </ul>
+            </div>
+
+            <div id="getting-started" class="section">
+                <h2>Getting Started</h2>
+
+                <h3>Step 1: Understand the Project</h3>
+                <ol>
+                    <li>Read <code>CLAUDE.md</code> for the project context and conventions</li>
+                    <li>Review <code>.lisa.toml</code> for Lisa configuration</li>
+                    <li>Explore the existing tickets in <code>docs/active/tickets/</code></li>
+                </ol>
+
+                <h3>Step 2: Create a Ticket</h3>
+                <ol>
+                    <li>Write a new ticket file in <code>docs/active/tickets/</code></li>
+                    <li>Use the ticket format described above</li>
+                    <li>Set <code>phase: ready</code> to signal it's ready for work</li>
+                    <li>Add to the ticket board (git commit + push if using a remote)</li>
+                </ol>
+
+                <h3>Step 3: Run Lisa</h3>
+                <ol>
+                    <li>Start Lisa (command depends on your setup—check <code>.lisa.toml</code> for runtime config)</li>
+                    <li>Lisa will schedule the ticket and spawn an agent to work on it</li>
+                    <li>The agent will progress through all six phases</li>
+                </ol>
+
+                <h3>Step 4: Review Artifacts</h3>
+                <ol>
+                    <li>As each artifact is completed, review it for quality and correctness</li>
+                    <li>Provide feedback in the ticket or work directory</li>
+                    <li>Lisa will wait for human approval or adjustment before continuing</li>
+                </ol>
+
+                <h3>Step 5: Verify Completion</h3>
+                <ol>
+                    <li>Once the Review phase completes, Lisa publishes the work</li>
+                    <li>Verify that code changes are committed and tests pass</li>
+                    <li>Mark the ticket as done</li>
+                </ol>
+
+                <div class="success">
+                    <strong>✓ Tip:</strong> Start with a small, well-defined ticket to familiarize yourself with the workflow. The smoke ticket <code>T-001</code> is a good first example.
+                </div>
+            </div>
+
+            <div id="commands" class="section">
+                <h2>Common Commands</h2>
+
+                <h3>Commit a Meaningful Unit During Implementation</h3>
+                <div class="command-box">
+lisa commit-ticket --ticket-id T-001 \
+  --message "Implement feature X" \
+  --include src/feature.ts \
+  --include tests/feature.test.ts
+                </div>
+
+                <h3>Check Ticket Status</h3>
+                <div class="command-box">
+cat docs/active/tickets/T-001.md
+                </div>
+
+                <h3>View Work Artifacts</h3>
+                <div class="command-box">
+ls -la docs/active/work/T-001/
+cat docs/active/work/T-001/research.md
+                </div>
+
+                <h3>List All Tickets</h3>
+                <div class="command-box">
+ls -la docs/active/tickets/
+                </div>
+
+                <h3>Check Lisa Configuration</h3>
+                <div class="command-box">
+cat .lisa.toml
+                </div>
+
+                <h3>View Hooks</h3>
+                <div class="command-box">
+ls -la .lisa/hooks/
+                </div>
+
+                <h3>Install Lisa (if needed)</h3>
+                <p>Check the project documentation or ask your team lead for the correct installation method. Lisa is typically installed as a binary and configured via <code>.lisa.toml</code>.</p>
+            </div>
+
+            <div id="faq" class="section">
+                <h2>Frequently Asked Questions</h2>
+
+                <h3>Q: Why do all six phases always run?</h3>
+                <p><strong>A:</strong> Because discipline around process prevents bugs later. Research and Design are the highest-leverage phases for catching problems early. Even "small" changes benefit from structured thinking. Skipping phases degrades context and creates inconsistent records.</p>
+
+                <h3>Q: Why ~200 lines per artifact?</h3>
+                <p><strong>A:</strong> It's a forcing function. Long enough to be thorough, short enough to review in 10 minutes. It encourages structured thinking and makes the work digestible for humans.</p>
+
+                <h3>Q: What if I need to deviate from the plan during implementation?</h3>
+                <p><strong>A:</strong> Document the deviation in <code>progress.md</code>. Explain what changed and why. Continue with the implementation. Reviewers will see the deviation and can ask questions.</p>
+
+                <h3>Q: Can multiple agents work on different tickets in parallel?</h3>
+                <p><strong>A:</strong> Yes! Lisa respects ticket dependencies. If ticket A depends on ticket B, Lisa waits for B to complete before starting A. Otherwise, multiple agents work concurrently on different tickets.</p>
+
+                <h3>Q: What if a session crashes during implementation?</h3>
+                <p><strong>A:</strong> The latest artifact plus the ticket is enough information to resume at the correct phase. Source code changes are committed through <code>lisa commit-ticket</code>, so they're durable. Restart the session and continue.</p>
+
+                <h3>Q: How do I know when a ticket is ready to review?</h3>
+                <p><strong>A:</strong> When the agent reaches the Review phase and produces <code>review.md</code> and <code>review-disposition.json</code>. The disposition document will indicate pass or block. If it's a block, the remedy is specified.</p>
+
+                <h3>Q: Can I edit the phase field manually?</h3>
+                <p><strong>A:</strong> No. Lisa updates the phase field automatically as artifacts are completed. Editing it manually will confuse Lisa. Let the process drive the phase.</p>
+
+                <h3>Q: What does "remedy_owner: world" mean?</h3>
+                <p><strong>A:</strong> It means external reality must change before the work can complete. For example, waiting for another team to publish a library, or waiting for an infrastructure change. The Review document will specify what to wait for and how to verify it.</p>
+
+                <h3>Q: How do I handle dependencies between tickets?</h3>
+                <p><strong>A:</strong> Use the <code>depends_on</code> field in the ticket frontmatter. List the IDs of all tickets that must complete before this one starts. Lisa computes the DAG and respects these dependencies.</p>
+
+                <h3>Q: Can I have tickets that modify the same files?</h3>
+                <p><strong>A:</strong> Only if there's an explicit dependency edge. If two tickets modify the same files without one depending on the other, that's a missing dependency in your DAG. Add the dependency to avoid merge conflicts.</p>
+
+                <h3>Q: What happens if lisa commit-ticket fails?</h3>
+                <p><strong>A:</strong> The commit didn't happen. Check the error, fix the issue, stage the changes again, and retry the <code>lisa commit-ticket</code> command. Never use ordinary <code>git commit</code>.</p>
+            </div>
+
+            <div id="conclusion" class="section">
+                <h2>Next Steps</h2>
+                <p>You're now ready to work with Lisa! Here's what to do:</p>
+                <ol>
+                    <li>Read <code>CLAUDE.md</code> in this project for context-specific guidance</li>
+                    <li>Review the existing tickets in <code>docs/active/tickets/</code></li>
+                    <li>Try working on a small ticket to get familiar with the workflow</li>
+                    <li>Follow the six phases and produce artifacts at each step</li>
+                    <li>Let Lisa handle the orchestration while you focus on quality</li>
+                </ol>
+
+                <div class="success">
+                    <strong>💡 Remember:</strong> The RDSPI workflow is designed to make work systematic, reviewable, and auditable. Trust the process. Each phase is a checkpoint that catches problems early.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function scrollToSection(id) {
+            const element = document.getElementById(id);
+            const navItems = document.querySelectorAll('.nav-item');
+            navItems.forEach(item => item.classList.remove('active'));
+            event.target.classList.add('active');
+            element.scrollIntoView({ behavior: 'smooth' });
+        }
+    </script>
+</body>
+</html>

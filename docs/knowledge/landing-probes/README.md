@@ -44,6 +44,7 @@ loop-built), lisa version and surface state, and the container/fixture.
 |---|---|---|---|---|---|---|---|
 | `2026-07-16-a-direct-codex-mini.html` | gpt-5.4-mini, direct tour | lisa 0.3.0 | no | no | no | no | Concluded Lisa is a ticket-graph tool; "coding agent" absent from the entire page; zero fabrication. |
 | `2026-07-16-b-loop-built-claude.html` | Claude Code via `lisa loop` 3-ticket chain | lisa 0.3.0 + zellij 0.44.3 | **yes** | no | partial | no | Headline names Claude Code agents + concurrency; footer cites work-doc transcripts (the evidence instinct, unprompted); title tag still quotes the `--help` mechanism line; no babysitting framing anywhere. |
+| `2026-07-16-c-rematch-claude-haiku.html` | claude-haiku-4-5, direct tour | lisa 0.4.3 (purpose-first copy + injected context) | **yes** | **yes** | **yes** | **yes** | "runs coding agents (like Claude Code or Codex)… Instead of manually approving every step" in the intro; "durable, auditable record" named; RDSPI explained after purpose. Deviation: ran in the post-leg xdg container (fresh session, non-fresh filesystem) — next entry should restore the fresh-container condition. |
 
 Confound note on the first pair: both model class *and* method changed between
 run a and run b, so their delta is directional, not attributable. Future runs
