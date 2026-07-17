@@ -1533,9 +1533,13 @@ impl State {
     /// observable check. The native command independently repeats this filter
     /// before it executes anything.
     fn has_observable_world_park(&self) -> bool {
-        lisa_core::parking::collect_parked_remedies(self.dag.tickets(), &self.config.work_dir)
-            .into_iter()
-            .any(|remedy| remedy.remedy_owner == RemedyOwner::World && remedy.check.is_some())
+        lisa_core::parking::collect_parked_remedies(
+            self.dag.tickets(),
+            &self.config.work_dir,
+            &self.ledger_path,
+        )
+        .into_iter()
+        .any(|remedy| remedy.remedy_owner == RemedyOwner::World && remedy.check.is_some())
     }
 
     /// Launch at most one asynchronous native recheck at the scheduler's
@@ -1716,8 +1720,11 @@ impl State {
         }
         let latest_parks = self.latest_parking_transitions();
         let attempted = self.latest_triage_transitions();
-        let remedies =
-            lisa_core::parking::collect_parked_remedies(self.dag.tickets(), &self.config.work_dir);
+        let remedies = lisa_core::parking::collect_parked_remedies(
+            self.dag.tickets(),
+            &self.config.work_dir,
+            &self.ledger_path,
+        );
         let mut launched = 0;
 
         for remedy in remedies {
@@ -1875,6 +1882,10 @@ impl State {
             action: ProposalAction::Proposed,
             actor: "agent".to_string(),
             proposal: Some(proposal.clone()),
+            step_count: None,
+            applied_steps: Vec::new(),
+            failed_step: None,
+            failure_reason: None,
             occurred_at: provenance::system_time_to_epoch(std::time::SystemTime::now()),
         };
         if let Err(error) = provenance::append_proposal_action_record(&self.ledger_path, &action) {
@@ -8718,27 +8729,30 @@ impl State {
             })
             .collect();
 
-        let waiting_items: Vec<ui::WaitingItem> =
-            lisa_core::parking::collect_parked_remedies(self.dag.tickets(), &self.config.work_dir)
-                .into_iter()
-                .filter_map(|remedy| match remedy.remedy_owner {
-                    RemedyOwner::Operator => Some(ui::WaitingItem {
-                        ticket_id: remedy.ticket_id,
-                        ask: remedy.ask,
-                        reason: remedy.reason,
-                        checks_on_own: false,
-                        proposal: remedy.proposal,
-                    }),
-                    RemedyOwner::World => Some(ui::WaitingItem {
-                        ticket_id: remedy.ticket_id,
-                        ask: remedy.ask,
-                        reason: remedy.reason,
-                        checks_on_own: true,
-                        proposal: remedy.proposal,
-                    }),
-                    RemedyOwner::Agent => None,
-                })
-                .collect();
+        let waiting_items: Vec<ui::WaitingItem> = lisa_core::parking::collect_parked_remedies(
+            self.dag.tickets(),
+            &self.config.work_dir,
+            &self.ledger_path,
+        )
+        .into_iter()
+        .filter_map(|remedy| match remedy.remedy_owner {
+            RemedyOwner::Operator => Some(ui::WaitingItem {
+                ticket_id: remedy.ticket_id,
+                ask: remedy.ask,
+                reason: remedy.reason,
+                checks_on_own: false,
+                proposal: remedy.proposal,
+            }),
+            RemedyOwner::World => Some(ui::WaitingItem {
+                ticket_id: remedy.ticket_id,
+                ask: remedy.ask,
+                reason: remedy.reason,
+                checks_on_own: true,
+                proposal: remedy.proposal,
+            }),
+            RemedyOwner::Agent => None,
+        })
+        .collect();
 
         let note_items: Vec<ui::NoteItem> =
             lisa_core::notes::collect_notes(&self.completion_journal_path, &self.ledger_path)
@@ -9554,6 +9568,7 @@ mod tests {
         let remedies = lisa_core::parking::collect_parked_remedies(
             state.dag.tickets(),
             &state.config.work_dir,
+            &state.ledger_path,
         );
         let proposal = remedies[0].proposal.as_ref().unwrap();
         assert!(proposal.summary.contains("criteria"));
@@ -9563,6 +9578,74 @@ mod tests {
         assert!(ledger.contains("\"record_type\":\"proposal-action\""));
         assert!(ledger.contains("\"action\":\"proposed\""));
         assert!(ledger.contains("\"state\":\"proposed\""));
+    }
+
+    #[test]
+    fn proposal_suppresses_triage_only_for_the_current_park_lease() {
+        fn write_pending_proposal(state: &State, attempt_id: u64) {
+            write_stored_proposal(
+                &state
+                    .config
+                    .work_dir
+                    .join("T-046-06-03/triage-proposal.json"),
+                &StoredTriageProposal {
+                    ticket_id: "T-046-06-03".to_string(),
+                    source_attempt_lease: AttemptLease {
+                        ticket_id: "T-046-06-03".to_string(),
+                        attempt_id,
+                    },
+                    state: ProposalState::Pending,
+                    proposal: TriageProposal {
+                        summary: "The current criterion conflicts with the evidence.".to_string(),
+                        recommendation: "Apply the prepared amendment.".to_string(),
+                        prepared_steps: vec![lisa_core::triage::PreparedStep::Command {
+                            description: "Apply the amendment.".to_string(),
+                            command: "true".to_string(),
+                        }],
+                    },
+                },
+            )
+            .unwrap();
+        }
+
+        let matching_dir = tempfile::tempdir().unwrap();
+        let mut matching = operator_triage_state(matching_dir.path(), true);
+        write_pending_proposal(&matching, 1);
+        assert_eq!(matching.request_operator_triage(), 0);
+        assert!(matching.triage_in_flight.is_empty());
+
+        let stale_dir = tempfile::tempdir().unwrap();
+        let mut stale = operator_triage_state(stale_dir.path(), true);
+        write_pending_proposal(&stale, 1);
+        provenance::append_parking_transition_record(
+            &stale.ledger_path,
+            &ParkingTransitionRecord {
+                schema_version: provenance::SCHEMA_VERSION,
+                seal: CompletionSeal::Commit,
+                record_type: ParkingTransitionType::Park,
+                ticket_id: "T-046-06-03".to_string(),
+                attempt_lease: AttemptLease {
+                    ticket_id: "T-046-06-03".to_string(),
+                    attempt_id: 2,
+                },
+                remedy_owner: RemedyOwner::Operator,
+                retry_count: None,
+                retry_limit: None,
+                recheck_eligible: false,
+                started_at: 20,
+                ended_at: 20,
+                wall_clock_secs: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stale.request_operator_triage(), 1);
+        assert_eq!(
+            stale.triage_in_flight["T-046-06-03"]
+                .source_attempt_lease
+                .attempt_id,
+            2
+        );
     }
 
     #[test]
