@@ -72,9 +72,11 @@ const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 6] = [
 Usage: lisa init [OPTIONS]
 
 Options:
-      --dry-run      Show what would be done without making changes
-      --path <PATH>  Path to the project root (defaults to current directory) [default: .]
-  -h, --help         Print help
+      --dry-run       Show what would be done without making changes
+      --with-history  Bring project history along for undo and a record of finished work
+      --no-history    Continue without project history
+      --path <PATH>   Path to the project root (defaults to current directory) [default: .]
+  -h, --help          Print help
 
 Example: lisa init --path ./my-project
 "#,

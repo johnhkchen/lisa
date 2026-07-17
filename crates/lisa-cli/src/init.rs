@@ -1,11 +1,41 @@
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use crate::config;
 use crate::detect::{detect_project, DetectedProject};
 use crate::templates;
+
+const HISTORY_OFFER: &str = "Bring project history along? Finished work can be undone, and you'll have a record of what the agents did. [Y/n] ";
+const HISTORY_DECLINED: &str = "Continuing without project history: finished work will be recorded in Lisa's journal but won't be undoable.";
+const HISTORY_NAME: &str = "Lisa (project history)";
+const HISTORY_EMAIL: &str = "lisa@project";
+const HISTORY_COMMIT_MESSAGE: &str = "Start project history";
+
+/// The operator's requested project-history behavior for `lisa init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryPreference {
+    Ask,
+    WithHistory,
+    NoHistory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepositoryState {
+    Missing,
+    Unborn { root: PathBuf },
+    Born,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryAction {
+    None,
+    CreateRepository,
+    CreateInitialCommit { root: PathBuf },
+    Decline,
+}
 
 /// Update or insert the `version = "..."` line in a .lisa.toml string.
 fn update_version_in_toml(existing: &str, new_version: &str) -> String {
@@ -556,23 +586,284 @@ struct FileMutation {
     path: PathBuf,
 }
 
+fn repository_state(root: &Path) -> Result<RepositoryState, String> {
+    let repository = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .env("LC_ALL", "C")
+        .output();
+    let repository = match repository {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RepositoryState::Missing);
+        }
+        Err(error) => return Err(format!("Could not inspect project history: {error}")),
+    };
+    if !repository.status.success() {
+        let stderr = String::from_utf8_lossy(&repository.stderr);
+        if stderr.to_ascii_lowercase().contains("not a git repository") {
+            return Ok(RepositoryState::Missing);
+        }
+        return Err(history_command_failure(
+            "inspect existing project history",
+            repository,
+        ));
+    }
+
+    let raw_root = String::from_utf8_lossy(&repository.stdout)
+        .trim()
+        .to_string();
+    if raw_root.is_empty() {
+        return Err("Could not inspect project history: command returned no result".to_string());
+    }
+    let repository_root = PathBuf::from(raw_root);
+    let head = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&repository_root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .map_err(|error| format!("Could not inspect project history: {error}"))?;
+    if head.status.success() {
+        return Ok(RepositoryState::Born);
+    }
+
+    let symbolic_head = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&repository_root)
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .output()
+        .map_err(|error| format!("Could not inspect project history: {error}"))?;
+    if symbolic_head.status.success() && !symbolic_head.stdout.is_empty() {
+        Ok(RepositoryState::Unborn {
+            root: repository_root,
+        })
+    } else {
+        Err(history_command_failure(
+            "inspect the existing project-history branch",
+            head,
+        ))
+    }
+}
+
+fn history_command_failure(action: &str, output: std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("Could not {action}: command exited with {}", output.status)
+    } else {
+        format!("Could not {action}: {stderr}")
+    }
+}
+
+fn run_history_command(command: &mut ProcessCommand, action: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not {action}: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(history_command_failure(action, output))
+    }
+}
+
+fn history_command_stdout(command: &mut ProcessCommand, action: &str) -> Result<String, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not {action}: {error}"))?;
+    if !output.status.success() {
+        return Err(history_command_failure(action, output));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        Err(format!("Could not {action}: command returned no result"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn set_history_identity(command: &mut ProcessCommand) {
+    command
+        .env("GIT_AUTHOR_NAME", HISTORY_NAME)
+        .env("GIT_AUTHOR_EMAIL", HISTORY_EMAIL)
+        .env("GIT_COMMITTER_NAME", HISTORY_NAME)
+        .env("GIT_COMMITTER_EMAIL", HISTORY_EMAIL);
+}
+
+fn create_initial_history_commit(repository_root: &Path) -> Result<(), String> {
+    let mut empty_tree = ProcessCommand::new("git");
+    empty_tree.arg("-C").arg(repository_root).args(["mktree"]);
+    let empty_tree = history_command_stdout(&mut empty_tree, "prepare empty project history")?;
+
+    let mut commit = ProcessCommand::new("git");
+    commit.arg("-C").arg(repository_root).args([
+        "commit-tree",
+        &empty_tree,
+        "-m",
+        HISTORY_COMMIT_MESSAGE,
+    ]);
+    set_history_identity(&mut commit);
+    let commit = history_command_stdout(&mut commit, "start project history")?;
+
+    let mut advance_head = ProcessCommand::new("git");
+    let missing_head = "0".repeat(commit.len());
+    advance_head.arg("-C").arg(repository_root).args([
+        "update-ref",
+        "HEAD",
+        &commit,
+        &missing_head,
+    ]);
+    run_history_command(&mut advance_head, "make project history ready")
+}
+
+fn initialize_project_history(root: &Path) -> Result<(), String> {
+    let mut initialize = ProcessCommand::new("git");
+    initialize.args(["init", "--quiet"]).arg(root);
+    run_history_command(&mut initialize, "prepare project history")?;
+
+    let mut name = ProcessCommand::new("git");
+    name.arg("-C")
+        .arg(root)
+        .args(["config", "--local", "user.name", HISTORY_NAME]);
+    run_history_command(&mut name, "set the project-history name")?;
+
+    let mut email = ProcessCommand::new("git");
+    email
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--local", "user.email", HISTORY_EMAIL]);
+    run_history_command(&mut email, "set the project-history email")?;
+
+    create_initial_history_commit(root)
+}
+
+fn prompt_for_history(input: &mut impl BufRead, out: &mut impl Write) -> Result<bool, String> {
+    loop {
+        write!(out, "{HISTORY_OFFER}")
+            .map_err(|error| format!("Failed to write the project-history offer: {error}"))?;
+        out.flush()
+            .map_err(|error| format!("Failed to show the project-history offer: {error}"))?;
+
+        let mut answer = String::new();
+        let bytes = input
+            .read_line(&mut answer)
+            .map_err(|error| format!("Failed to read the project-history choice: {error}"))?;
+        if bytes == 0 {
+            return Err("No project-history choice was received".to_string());
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => {
+                writeln!(out, "Please answer yes or no.")
+                    .map_err(|error| format!("Failed to write init output: {error}"))?;
+            }
+        }
+    }
+}
+
+fn resolve_history_action(
+    state: RepositoryState,
+    preference: HistoryPreference,
+    dry_run: bool,
+    interactive: bool,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<HistoryAction, String> {
+    if state == RepositoryState::Born {
+        return Ok(HistoryAction::None);
+    }
+
+    if dry_run && preference == HistoryPreference::Ask {
+        write_init_line(out, format_args!("{HISTORY_OFFER}"))?;
+        write_init_line(
+            out,
+            format_args!("Dry run: choose --with-history or --no-history when making changes."),
+        )?;
+        return Ok(HistoryAction::None);
+    }
+
+    let accepted = match preference {
+        HistoryPreference::WithHistory => true,
+        HistoryPreference::NoHistory => false,
+        HistoryPreference::Ask if interactive => prompt_for_history(input, out)?,
+        HistoryPreference::Ask => {
+            return Err(
+                "Choose --with-history or --no-history when input is not interactive".to_string(),
+            );
+        }
+    };
+
+    if !accepted {
+        return Ok(HistoryAction::Decline);
+    }
+
+    Ok(match state {
+        RepositoryState::Missing => HistoryAction::CreateRepository,
+        RepositoryState::Unborn { root } => HistoryAction::CreateInitialCommit { root },
+        RepositoryState::Born => HistoryAction::None,
+    })
+}
+
 fn write_init_line(out: &mut impl Write, args: fmt::Arguments<'_>) -> Result<(), String> {
     writeln!(out, "{args}").map_err(|e| format!("Failed to write init output: {e}"))
 }
 
 /// Execute the init command, writing user-facing output to stdout.
-pub fn run_init(root: &Path, dry_run: bool) -> Result<(), String> {
+pub fn run_init(
+    root: &Path,
+    dry_run: bool,
+    history_preference: HistoryPreference,
+) -> Result<(), String> {
+    let stdin = io::stdin();
     let stdout = io::stdout();
+    let interactive = stdin.is_terminal();
+    let mut input = stdin.lock();
     let mut out = stdout.lock();
-    run_init_with_writer(root, dry_run, &mut out)
+    run_init_with_io(
+        root,
+        dry_run,
+        history_preference,
+        interactive,
+        &mut input,
+        &mut out,
+    )
 }
 
 /// Internal init entry point with injectable output for end-to-end reporting
 /// tests. Planning remains complete before any filesystem mutation.
+#[cfg(test)]
 fn run_init_with_writer(root: &Path, dry_run: bool, out: &mut impl Write) -> Result<(), String> {
+    let mut input = io::Cursor::new(Vec::<u8>::new());
+    run_init_with_io(
+        root,
+        dry_run,
+        HistoryPreference::NoHistory,
+        false,
+        &mut input,
+        out,
+    )
+}
+
+fn run_init_with_io(
+    root: &Path,
+    dry_run: bool,
+    history_preference: HistoryPreference,
+    interactive: bool,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<(), String> {
     if !root.exists() {
         return Err(format!("Path does not exist: {}", root.display()));
     }
+
+    let history_action = resolve_history_action(
+        repository_state(root)?,
+        history_preference,
+        dry_run,
+        interactive,
+        input,
+        out,
+    )?;
 
     // Step 1: Detect project type
     let project = detect_project(root);
@@ -604,11 +895,40 @@ fn run_init_with_writer(root: &Path, dry_run: bool, out: &mut impl Write) -> Res
 
     // Step 4: Dry run stops here
     if dry_run {
+        match history_action {
+            HistoryAction::CreateRepository | HistoryAction::CreateInitialCommit { .. } => {
+                write_init_line(out, format_args!("Project history would be included."))?;
+            }
+            HistoryAction::Decline => {
+                write_init_line(out, format_args!("{HISTORY_DECLINED}"))?;
+            }
+            HistoryAction::None => {}
+        }
         write_init_line(out, format_args!("Dry run complete. No changes made."))?;
         return Ok(());
     }
 
-    // Step 5: Execute
+    // Step 5: Establish the requested history boundary before writing scaffold
+    // files. The initial commit always has an explicitly empty tree.
+    match history_action {
+        HistoryAction::CreateRepository => {
+            initialize_project_history(root)?;
+            write_init_line(out, format_args!("Project history is ready."))?;
+            write_init_line(out, format_args!(""))?;
+        }
+        HistoryAction::CreateInitialCommit { root } => {
+            create_initial_history_commit(&root)?;
+            write_init_line(out, format_args!("Project history is ready."))?;
+            write_init_line(out, format_args!(""))?;
+        }
+        HistoryAction::Decline => {
+            write_init_line(out, format_args!("{HISTORY_DECLINED}"))?;
+            write_init_line(out, format_args!(""))?;
+        }
+        HistoryAction::None => {}
+    }
+
+    // Step 6: Execute the scaffold plan.
     let mut mutations = Vec::new();
     for action in &actions {
         match action {
@@ -1207,6 +1527,103 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn project_history_copy_names_benefits_without_mechanism_jargon() {
+        let offer = HISTORY_OFFER.to_ascii_lowercase();
+        assert!(offer.contains("undone"));
+        assert!(offer.contains("record of what the agents did"));
+        assert!(!offer.contains("git"));
+        assert!(!HISTORY_DECLINED.to_ascii_lowercase().contains("git"));
+        assert!(HISTORY_DECLINED
+            .contains("finished work will be recorded in Lisa's journal but won't be undoable"));
+    }
+
+    #[test]
+    fn project_history_prompt_accepts_defaults_and_retries_invalid_answers() {
+        for answer in ["\n", "y\n", "YES\n"] {
+            let mut input = io::Cursor::new(answer.as_bytes());
+            let mut output = Vec::new();
+            assert!(prompt_for_history(&mut input, &mut output).unwrap());
+            assert_eq!(String::from_utf8(output).unwrap(), HISTORY_OFFER);
+        }
+
+        let mut input = io::Cursor::new(b"later\nno\n");
+        let mut output = Vec::new();
+        assert!(!prompt_for_history(&mut input, &mut output).unwrap());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches(HISTORY_OFFER).count(), 2);
+        assert!(output.contains("Please answer yes or no."));
+    }
+
+    #[test]
+    fn project_history_prompt_rejects_end_of_input() {
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = prompt_for_history(&mut input, &mut output).unwrap_err();
+        assert_eq!(error, "No project-history choice was received");
+    }
+
+    #[test]
+    fn noninteractive_init_requires_an_explicit_history_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = run_init_with_io(
+            dir.path(),
+            false,
+            HistoryPreference::Ask,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.contains("--with-history"));
+        assert!(error.contains("--no-history"));
+        assert!(!dir.path().join(".git").exists());
+        assert!(!dir.path().join("CLAUDE.md").exists());
+    }
+
+    #[test]
+    fn dry_run_describes_history_choice_without_mutating_or_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_init_with_io(
+            dir.path(),
+            true,
+            HistoryPreference::WithHistory,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Project history would be included."));
+        assert!(output.contains("Dry run complete. No changes made."));
+        assert!(!output.contains(HISTORY_OFFER));
+        assert!(!dir.path().join(".git").exists());
+
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_init_with_io(
+            dir.path(),
+            true,
+            HistoryPreference::Ask,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let offer_line = output
+            .lines()
+            .find(|line| line.contains("Bring project history along?"))
+            .unwrap();
+        assert!(!offer_line.to_ascii_lowercase().contains("git"));
+        assert!(output.contains("choose --with-history or --no-history"));
+        assert!(!dir.path().join(".git").exists());
+    }
+
+    #[test]
     fn test_plan_init_actions_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let project = detect_project(dir.path());
@@ -1288,7 +1705,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_init(dir.path(), true);
+        let result = run_init(dir.path(), true, HistoryPreference::NoHistory);
         assert!(result.is_ok());
 
         // Dry run should not create any files
@@ -1306,7 +1723,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_init(dir.path(), false);
+        let result = run_init(dir.path(), false, HistoryPreference::NoHistory);
         assert!(result.is_ok());
 
         // Should create all directories and files
@@ -1425,7 +1842,7 @@ mod tests {
         // Create CLAUDE.md with custom content
         fs::write(dir.path().join("CLAUDE.md"), "my custom content").unwrap();
 
-        let result = run_init(dir.path(), false);
+        let result = run_init(dir.path(), false, HistoryPreference::NoHistory);
         assert!(result.is_ok());
 
         // Original CLAUDE.md should be preserved
@@ -1445,7 +1862,7 @@ mod tests {
         // A user-authored AGENTS.md must be preserved (skip-if-exists, like CLAUDE.md).
         fs::write(dir.path().join("AGENTS.md"), "my custom agents content").unwrap();
 
-        let result = run_init(dir.path(), false);
+        let result = run_init(dir.path(), false, HistoryPreference::NoHistory);
         assert!(result.is_ok());
 
         let agents_md = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
@@ -1468,7 +1885,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_init(dir.path(), false);
+        let result = run_init(dir.path(), false, HistoryPreference::NoHistory);
         assert!(result.is_ok());
 
         // .lisa.toml should now have version, but preserve original content
@@ -1865,7 +2282,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
 
-        let result = run_init(dir.path(), false);
+        let result = run_init(dir.path(), false, HistoryPreference::NoHistory);
         assert!(result.is_ok());
 
         // The unknown hook must remain byte-for-byte unchanged.
@@ -2496,7 +2913,7 @@ depends_on: [T-999]
             workflow.as_bytes()
         );
 
-        run_init(dir.path(), false).unwrap();
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
 
         for (path, content) in preserved_fixtures {
             assert_eq!(
@@ -2596,7 +3013,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        run_init(dir.path(), false).unwrap();
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.path().join(".lisa/hooks/on-stop.sh")).unwrap(),
@@ -2923,7 +3340,7 @@ depends_on: [T-999]
         .unwrap();
 
         // Run init
-        let init_result = run_init(dir.path(), false);
+        let init_result = run_init(dir.path(), false, HistoryPreference::NoHistory);
         assert!(init_result.is_ok());
 
         // Add a ready ticket
@@ -2948,7 +3365,7 @@ depends_on: [T-999]
             "[package]\nname = \"codex-project\"\n",
         )
         .unwrap();
-        run_init(dir.path(), false).unwrap();
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
         fs::write(
             dir.path().join(".lisa.toml"),
             format!(
@@ -2975,7 +3392,7 @@ depends_on: [T-999]
             "[package]\nname = \"codex-project\"\n",
         )
         .unwrap();
-        run_init(dir.path(), false).unwrap();
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
         fs::write(
             dir.path().join(".lisa.toml"),
             format!(
@@ -3004,7 +3421,7 @@ depends_on: [T-999]
         .unwrap();
 
         // Run init
-        let init_result = run_init(dir.path(), false);
+        let init_result = run_init(dir.path(), false, HistoryPreference::NoHistory);
         assert!(init_result.is_ok());
 
         // Add a ready ticket

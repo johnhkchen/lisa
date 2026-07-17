@@ -54,6 +54,14 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Bring project history along for undo and a record of finished work
+        #[arg(long, conflicts_with = "no_history")]
+        with_history: bool,
+
+        /// Continue without project history
+        #[arg(long, conflicts_with = "with_history")]
+        no_history: bool,
+
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
@@ -432,9 +440,21 @@ fn main() {
                 }
             }
         }
-        Commands::Init { dry_run, path } => {
+        Commands::Init {
+            dry_run,
+            with_history,
+            no_history,
+            path,
+        } => {
             let path = resolve_path(&path);
-            if let Err(e) = init::run_init(&path, dry_run) {
+            let history = if with_history {
+                init::HistoryPreference::WithHistory
+            } else if no_history {
+                init::HistoryPreference::NoHistory
+            } else {
+                init::HistoryPreference::Ask
+            };
+            if let Err(e) = init::run_init(&path, dry_run, history) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
