@@ -19,6 +19,11 @@ targets = [
 # break the README one-command install at extraction time (T-046-03-03).
 unix-archive = ".tar.gz"
 packages = ["lisa-cli"]
+# lisa-plugin is a wasm32-wasip1 cdylib; a workspace-unified cargo build drags
+# it into dist's native targets, and static musl cannot produce cdylibs
+# (v0.4.0 release run 29549642275). Precise builds keep dist's cargo
+# invocations scoped to the distable package only.
+precise-builds = true
 github-build-setup = "../build-setup.yml"
 install-path = "~/.local/bin"
 install-success-msg = "Lisa is ready in ~/.local/bin. Open a new shell, then run lisa doctor."
