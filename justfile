@@ -142,7 +142,7 @@ emulate-debian LEG="":
 cbt-regrade CONTAINER:
     docker start {{CONTAINER}} > /dev/null
     docker cp docker/chromebook-test/bin/grade {{CONTAINER}}:/cbt/grade
-    docker exec -it {{CONTAINER}} /cbt/grade
+    docker exec {{CONTAINER}} /cbt/grade
 
 # Pull a finished Chromebook-test leg's evidence off a container into the
 # closing-run ticket's work dir: run record, leg metadata, instruction,
