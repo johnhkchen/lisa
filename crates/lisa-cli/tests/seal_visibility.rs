@@ -3,7 +3,7 @@
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn write_executable(path: &Path, body: &str) {
@@ -119,6 +119,64 @@ fn run_fixture(command: &str, completion: &str, repository: RepositoryFixture) -
     );
 
     lisa_command(&root, &home, &bin, command).output().unwrap()
+}
+
+fn cure_fixture(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(name);
+    let bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(root.join("CLAUDE.md"), "# Remedy cure fixture\n").unwrap();
+    fs::write(
+        root.join("docs/active/tickets/T-FIXTURE.md"),
+        "---\nid: T-FIXTURE\ntitle: remedy cure fixture\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nFixture\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".lisa.toml"),
+        format!(
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n\n[guards]\ncompletion = \"auto\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("zellij"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; fi\nexit 0\n",
+    );
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
+    );
+    (temp, root, bin, home)
+}
+
+fn assert_completion_cured(root: &Path, home: &Path, bin: &Path, message: &str) {
+    fs::write(root.join("completion-marker.txt"), "finished\n").unwrap();
+    let completion = lisa_command(root, home, bin, "commit-ticket")
+        .args([
+            "--ticket-id",
+            "T-FIXTURE",
+            "--message",
+            message,
+            "--include",
+            "completion-marker.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        completion.status.success(),
+        "completion failed:\n{}",
+        String::from_utf8_lossy(&completion.stderr)
+    );
+
+    let after = lisa_command(root, home, bin, "doctor").output().unwrap();
+    let after_stdout = String::from_utf8(after.stdout).unwrap();
+    assert!(after.status.success(), "doctor failed:\n{after_stdout}");
+    assert!(after_stdout.contains("completion seal: commit-sealed"));
 }
 
 fn assert_seal_line(command: &str, mode: &str, repository: RepositoryFixture, expected: &str) {
@@ -266,28 +324,7 @@ fn doctor_auto_transaction_failure_prints_only_dependency_remedy() {
 
 #[test]
 fn born_identity_commands_printed_by_doctor_cure_a_completion_commit() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    let bin = temp.path().join("bin");
-    let home = temp.path().join("home");
-    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
-    fs::create_dir_all(&bin).unwrap();
-    fs::create_dir_all(&home).unwrap();
-    fs::write(root.join("CLAUDE.md"), "# Identity cure fixture\n").unwrap();
-    fs::write(
-        root.join("docs/active/tickets/T-FIXTURE.md"),
-        "---\nid: T-FIXTURE\ntitle: identity cure fixture\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nFixture\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join(".lisa.toml"),
-        format!(
-            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n\n[guards]\ncompletion = \"auto\"\n",
-            env!("CARGO_PKG_VERSION")
-        ),
-    )
-    .unwrap();
-
+    let (_temp, root, bin, home) = cure_fixture("identity-cure");
     assert!(Command::new("git")
         .args(["init", "--quiet"])
         .arg(&root)
@@ -305,15 +342,6 @@ fn born_identity_commands_printed_by_doctor_cure_a_completion_commit() {
         .status()
         .unwrap()
         .success());
-
-    write_executable(
-        &bin.join("zellij"),
-        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; fi\nexit 0\n",
-    );
-    write_executable(
-        &bin.join("claude"),
-        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
-    );
 
     let before = lisa_command(&root, &home, &bin, "doctor").output().unwrap();
     let before_stdout = String::from_utf8(before.stdout).unwrap();
@@ -336,27 +364,63 @@ fn born_identity_commands_printed_by_doctor_cure_a_completion_commit() {
             .success());
     }
 
-    fs::write(root.join("completion-marker.txt"), "finished\n").unwrap();
-    let completion = lisa_command(&root, &home, &bin, "commit-ticket")
-        .args([
-            "--ticket-id",
-            "T-FIXTURE",
-            "--message",
-            "Complete identity cure fixture",
-            "--include",
-            "completion-marker.txt",
-        ])
+    assert_completion_cured(&root, &home, &bin, "Complete identity cure fixture");
+}
+
+#[test]
+fn repository_remedy_printed_by_doctor_cures_a_completion_commit() {
+    let (_temp, root, bin, home) = cure_fixture("repository-cure");
+    let before = lisa_command(&root, &home, &bin, "doctor").output().unwrap();
+    let before_stdout = String::from_utf8(before.stdout).unwrap();
+    assert!(before_stdout.contains("Reason: no repository is present."));
+    assert!(before_stdout.contains(REPOSITORY_REMEDY));
+    assert!(!before_stdout.contains(IDENTITY_CONFIG_REMEDIES));
+
+    let init = lisa_command(&root, &home, &bin, "init").output().unwrap();
+    assert!(
+        init.status.success(),
+        "init failed:\n{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert_completion_cured(&root, &home, &bin, "Complete repository cure fixture");
+}
+
+#[test]
+fn unborn_transaction_remedy_printed_by_doctor_cures_a_completion_commit() {
+    let (_temp, root, bin, home) = cure_fixture("transaction-cure");
+    assert!(Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
+    for args in [
+        ["config", "user.name", "Seal Fixture"],
+        ["config", "user.email", "seal-fixture@example.invalid"],
+    ] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    let before = lisa_command(&root, &home, &bin, "doctor").output().unwrap();
+    let before_stdout = String::from_utf8(before.stdout).unwrap();
+    assert!(before_stdout.contains("the commit transaction path is unavailable"));
+    assert!(before_stdout.contains(TRANSACTION_HISTORY_REMEDY));
+    assert!(!before_stdout.contains(IDENTITY_CONFIG_REMEDIES));
+
+    let init = lisa_command(&root, &home, &bin, "init")
+        .arg("--with-history")
         .output()
         .unwrap();
     assert!(
-        completion.status.success(),
-        "completion failed:\n{}",
-        String::from_utf8_lossy(&completion.stderr)
+        init.status.success(),
+        "init failed:\n{}",
+        String::from_utf8_lossy(&init.stderr)
     );
-
-    let after = lisa_command(&root, &home, &bin, "doctor").output().unwrap();
-    let after_stdout = String::from_utf8(after.stdout).unwrap();
-    assert!(after.status.success(), "doctor failed:\n{after_stdout}");
-    assert!(after_stdout.contains("completion seal: commit-sealed"));
-    assert!(!after_stdout.contains(IDENTITY_REASON));
+    assert_completion_cured(&root, &home, &bin, "Complete transaction cure fixture");
 }
