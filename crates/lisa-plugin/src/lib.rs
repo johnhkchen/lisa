@@ -48,7 +48,9 @@ use lisa_core::completion::{
 use lisa_core::context::PURPOSE_PARAGRAPH;
 use lisa_core::dag::Dag;
 use lisa_core::diagnostics;
-use lisa_core::disposition::{parse_review_disposition, RemedyOwner, ReviewDisposition};
+use lisa_core::disposition::{
+    parse_review_disposition, DispositionNote, RemedyOwner, ReviewDisposition,
+};
 use lisa_core::provenance::{
     self, AssignmentState, AssignmentTransitionRecord, ParkingTransitionRecord,
     ParkingTransitionType, ProvenanceLedgerRecord, ProvenanceRecord, ProvenanceRecordType, Route,
@@ -717,6 +719,7 @@ struct PendingCompletion {
     prior_status: TicketStatus,
     source: CompletionSource,
     authority: CompletionAuthority,
+    completion_note: Option<DispositionNote>,
 }
 
 /// How an idle pane can satisfy an incoming provider request.
@@ -1585,7 +1588,7 @@ impl State {
         &mut self,
         ticket_id: &str,
         source_lease: Option<&AttemptLease>,
-    ) -> Result<(), CompletionRejection> {
+    ) -> Result<Option<DispositionNote>, CompletionRejection> {
         const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
 
         match self.admit_artifact(ticket_id, source_lease, DISPOSITION_ARTIFACT) {
@@ -1607,7 +1610,10 @@ impl State {
 
     /// Evaluate the canonical E-040 Review verdict without claiming an
     /// attempt's private artifact authority.
-    fn passing_review_disposition(&self, ticket_id: &str) -> Result<(), CompletionRejection> {
+    fn passing_review_disposition(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<DispositionNote>, CompletionRejection> {
         const DISPOSITION_ARTIFACT: &str = "review-disposition.json";
         let disposition_path = self
             .config
@@ -1615,7 +1621,8 @@ impl State {
             .join(ticket_id)
             .join(DISPOSITION_ARTIFACT);
         match parse_review_disposition(disposition_path) {
-            ReviewDisposition::Pass => Ok(()),
+            ReviewDisposition::Pass => Ok(None),
+            ReviewDisposition::Note(note) => Ok(Some(note)),
             ReviewDisposition::Block { reason, .. } => {
                 Err(CompletionRejection::DispositionBlocked { reason })
             }
@@ -1744,18 +1751,19 @@ impl State {
         ticket_id: &str,
         lease: &AttemptLease,
         correlation: &CompletionGenerationId,
-    ) -> bool {
+    ) -> Option<Option<DispositionNote>> {
         if !self.review_lease_is_current(ticket_id, lease) {
             self.reject_stale_lease(ticket_id, correlation, lease.attempt_id.to_string());
-            return false;
+            return None;
         }
 
-        if let Err(rejection) = self.admit_passing_review(ticket_id, Some(lease)) {
-            self.log_completion_rejection(ticket_id, correlation, &rejection);
-            return false;
+        match self.admit_passing_review(ticket_id, Some(lease)) {
+            Ok(note) => Some(note),
+            Err(rejection) => {
+                self.log_completion_rejection(ticket_id, correlation, &rejection);
+                None
+            }
         }
-
-        true
     }
 
     /// Restore the durable completion aggregate before initial DAG authority is
@@ -1936,7 +1944,7 @@ impl State {
         now: std::time::SystemTime,
     ) -> bool {
         let now = Self::completion_time(now);
-        let (ticket_id, source, authority, effect) = match input {
+        let (ticket_id, source, authority, effect, completion_note) = match input {
             CompletionInput::Reconcile {
                 ticket_id,
                 source_lease,
@@ -1955,6 +1963,10 @@ impl State {
                 }
 
                 let durable_inputs = self.review_completion_inputs(&ticket_id, &source_lease);
+                let completion_note = match &durable_inputs.disposition {
+                    ReviewDisposition::Note(note) => Some(note.clone()),
+                    _ => None,
+                };
                 let state = self.reconciliation_state(&ticket_id);
                 let effect = match reconcile_completion(&durable_inputs, &state, now) {
                     Reconciliation::Effect(effect) => Some(effect),
@@ -1990,6 +2002,7 @@ impl State {
                     CompletionSource::Reconcile,
                     Some(CompletionAuthority::Attempt(source_lease)),
                     effect,
+                    completion_note,
                 )
             }
             input => {
@@ -2062,17 +2075,26 @@ impl State {
                 let correlation =
                     Self::completion_correlation(completion_id.clone(), attempt_id.clone());
 
+                let mut completion_note = None;
                 if matches!(source, CompletionSource::OperatorRequested(_)) {
-                    if let Err(rejection) = self.passing_review_disposition(&ticket_id) {
-                        self.log_completion_rejection(&ticket_id, &correlation, &rejection);
-                        return false;
+                    match self.passing_review_disposition(&ticket_id) {
+                        Ok(note) => completion_note = note,
+                        Err(rejection) => {
+                            self.log_completion_rejection(&ticket_id, &correlation, &rejection);
+                            return false;
+                        }
                     }
                 }
 
                 if let Some(review_lease) = review_lease.as_ref() {
-                    if !self.admit_correlated_review(&ticket_id, review_lease, &correlation) {
-                        return false;
-                    }
+                    completion_note = match self.admit_correlated_review(
+                        &ticket_id,
+                        review_lease,
+                        &correlation,
+                    ) {
+                        Some(note) => note,
+                        None => return false,
+                    };
                 }
 
                 let event = CompletionEvent::Request {
@@ -2086,14 +2108,19 @@ impl State {
                         return false;
                     }
                 };
-                (ticket_id, source, authority, effect)
+                (ticket_id, source, authority, effect, completion_note)
             }
         };
 
         match effect {
-            Some(effect) => {
-                self.execute_completion_effect(effect, ticket_id, source, authority, now)
-            }
+            Some(effect) => self.execute_completion_effect(
+                effect,
+                ticket_id,
+                source,
+                authority,
+                completion_note,
+                now,
+            ),
             None => false,
         }
     }
@@ -2106,6 +2133,7 @@ impl State {
         ticket_id: TicketId,
         source: CompletionSource,
         authority: Option<CompletionAuthority>,
+        completion_note: Option<DispositionNote>,
         now: CompletionDeadline,
     ) -> bool {
         let (effect_attempt_id, effect_completion_id) = match &effect {
@@ -2252,6 +2280,7 @@ impl State {
                 key: completion_key.clone(),
                 prior_phase,
                 prior_status,
+                note: completion_note.clone(),
             })
         {
             self.log_completion_rejection(
@@ -2295,6 +2324,7 @@ impl State {
                 prior_status,
                 source,
                 authority,
+                completion_note,
             },
         );
 
@@ -2399,6 +2429,11 @@ impl State {
                 prior_status,
                 source,
                 authority,
+                completion_note: self
+                    .completion_aggregates
+                    .get(&ticket_id)
+                    .and_then(CompletionJournalAggregate::completion_note)
+                    .cloned(),
             },
         );
 
@@ -2688,9 +2723,10 @@ impl State {
                 .then(|| pending.completion_key.to_string());
         if let Err(error) =
             self.journal_completion_transition(CompletionJournalTransition::Confirmed {
-                key: pending.completion_key,
-                correlation: pending.correlation,
+                key: pending.completion_key.clone(),
+                correlation: pending.correlation.clone(),
                 receipt,
+                note: pending.completion_note.clone(),
             })
         {
             self.rebuild_dag();
@@ -2723,7 +2759,7 @@ impl State {
         if let Some(thread) = self.threads.get_mut(ticket_id) {
             thread.complete();
         }
-        self.emit_provenance(ticket_id, RunOutcome::Done, false);
+        self.emit_provenance_with_note(ticket_id, RunOutcome::Done, false, pending.completion_note);
         self.release_completed_slot_for_ticket(&ticket_id.to_string());
         self.threads.remove(ticket_id);
         self.schedule_ready_tickets();
@@ -6214,6 +6250,16 @@ impl State {
     /// swallowed (never fatal to the loop). A no-op when `ledger_path` is unset
     /// (native tests that don't exercise the ledger).
     fn emit_provenance(&mut self, ticket_id: &str, outcome: RunOutcome, fenced: bool) -> bool {
+        self.emit_provenance_with_note(ticket_id, outcome, fenced, None)
+    }
+
+    fn emit_provenance_with_note(
+        &mut self,
+        ticket_id: &str,
+        outcome: RunOutcome,
+        fenced: bool,
+        completion_note: Option<DispositionNote>,
+    ) -> bool {
         if self.ledger_path.as_os_str().is_empty() {
             return false;
         }
@@ -6246,6 +6292,7 @@ impl State {
         let record = ProvenanceRecord {
             schema_version: provenance::SCHEMA_VERSION,
             seal: self.config.completion_seal,
+            completion_note,
             ticket_id: ticket_id.to_string(),
             attempt_lease,
             outcome,
@@ -6770,7 +6817,9 @@ impl State {
         inputs.artifact_admission.is_some()
             && matches!(
                 inputs.disposition,
-                ReviewDisposition::Pass | ReviewDisposition::Block { .. }
+                ReviewDisposition::Pass
+                    | ReviewDisposition::Note(_)
+                    | ReviewDisposition::Block { .. }
             )
     }
 
@@ -6803,7 +6852,7 @@ impl State {
         }
 
         match parse_review_disposition(&disposition_path) {
-            ReviewDisposition::Pass => None,
+            ReviewDisposition::Pass | ReviewDisposition::Note(_) => None,
             ReviewDisposition::Block { reason, .. } => Some((
                 format!("Review blocked: {reason}"),
                 vec![
@@ -8886,6 +8935,23 @@ mod tests {
 
     fn write_passing_review_disposition(state: &State, lease: &AttemptLease) {
         write_review_disposition(state, lease, r#"{"disposition":"pass","reason":null}"#);
+    }
+
+    fn t046_completion_note() -> DispositionNote {
+        DispositionNote::new(
+            "approximately 200 MiB",
+            "docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md",
+            "The 225 MiB measurement supports completion while the written gate is stale.",
+        )
+        .unwrap()
+    }
+
+    fn write_t046_note_disposition(state: &State, lease: &AttemptLease) {
+        write_review_disposition(
+            state,
+            lease,
+            r#"{"disposition":"note","reason":null,"criterion_quote":"approximately 200 MiB","evidence_citation":"docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md","summary":"The 225 MiB measurement supports completion while the written gate is stale."}"#,
+        );
     }
 
     fn write_block_policy_ticket(tickets_dir: &Path, ticket_id: &str, phase: Phase) {
@@ -11202,7 +11268,12 @@ mod tests {
         state.threads.insert(PREDECESSOR.to_string(), thread);
         let lease = install_current_attempt(&mut state, PREDECESSOR);
         fs::create_dir_all(state.attempt_work_dir(&lease)).unwrap();
-        write_private_review(&state, &lease);
+        fs::write(
+            state.attempt_work_dir(&lease).join("review.md"),
+            "# Review\nReady with a criteria note.\n",
+        )
+        .unwrap();
+        write_t046_note_disposition(&state, &lease);
         fs::create_dir_all(work_dir.join(PREDECESSOR).join("nested")).unwrap();
         fs::write(
             work_dir.join(PREDECESSOR).join("nested/evidence.txt"),
@@ -11239,6 +11310,10 @@ mod tests {
         let receipt = state.completion_aggregates[PREDECESSOR]
             .confirmed_receipt()
             .unwrap();
+        assert_eq!(
+            state.completion_aggregates[PREDECESSOR].completion_note(),
+            Some(&t046_completion_note())
+        );
         assert_eq!(receipt.seal(), CompletionSeal::Journal);
         assert_eq!(receipt.content_hashes().len(), 4);
         for binding in receipt.content_hashes() {
@@ -11248,6 +11323,7 @@ mod tests {
         let journal_body = fs::read_to_string(&journal).unwrap();
         assert_eq!(journal_body.matches("\"seal\":\"journal\"").count(), 3);
         assert!(journal_body.contains("\"content_hashes\""));
+        assert!(journal_body.contains("\"criterion_quote\":\"approximately 200 MiB\""));
         assert!(!journal_body.contains("\"commit_id\""));
 
         let records = read_mixed_ledger(&ledger);
@@ -11258,6 +11334,13 @@ mod tests {
         assert_eq!(record.ticket_id, PREDECESSOR);
         assert_eq!(record.seal, CompletionSeal::Journal);
         assert_eq!(record.outcome, RunOutcome::Done);
+        assert_eq!(
+            record.completion_note.as_ref(),
+            Some(&t046_completion_note())
+        );
+        assert!(records
+            .iter()
+            .all(|record| !matches!(record, ProvenanceLedgerRecord::ParkingTransition(_))));
     }
 
     #[test]
@@ -11543,6 +11626,12 @@ mod tests {
             ),
             ("pass", r#"{"disposition":"pass","reason":null}"#, true, ""),
             (
+                "note",
+                r#"{"disposition":"note","reason":null,"criterion_quote":"approximately 200 MiB","evidence_citation":"docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md","summary":"The 225 MiB measurement supports completion while the written gate is stale."}"#,
+                true,
+                "",
+            ),
+            (
                 "invalid",
                 r#"{"disposition":"pass","reason":"contradictory"}"#,
                 false,
@@ -11601,7 +11690,7 @@ mod tests {
             assert_eq!(
                 state.pending_completions.contains_key("T-REVIEW"),
                 should_request,
-                "{case}: only Pass may request completion"
+                "{case}: only an authorizing disposition may request completion"
             );
             let thread = state.threads.get("T-REVIEW").unwrap();
             assert_eq!(thread.current_phase, Phase::Review, "{case}");
@@ -15161,7 +15250,7 @@ mod tests {
             "# Review\n\nThe claimed Codex attempt is ready to complete.\n",
         )
         .unwrap();
-        write_passing_review_disposition(&state, &predecessor_lease);
+        write_t046_note_disposition(&state, &predecessor_lease);
 
         state.check_artifact_advances();
         let pending = state.pending_completions[PREDECESSOR].clone();
@@ -15211,6 +15300,7 @@ mod tests {
         let aggregate = &state.completion_aggregates[PREDECESSOR];
         assert_eq!(aggregate.completion_key(), &pending.completion_key);
         assert_eq!(aggregate.state(), &CompletionState::Confirmed);
+        assert_eq!(aggregate.completion_note(), Some(&t046_completion_note()));
         assert_eq!(
             aggregate.confirmed_commit_id(),
             Some(String::from_utf8_lossy(&commit_id).as_ref())
@@ -15253,6 +15343,10 @@ mod tests {
             predecessor_lease.clone()
         );
         assert_eq!(completion_records[0].outcome, RunOutcome::Done);
+        assert_eq!(
+            completion_records[0].completion_note.as_ref(),
+            Some(&t046_completion_note())
+        );
         assert!(completion_records[0].authoritative);
         assert!(!completion_records[0].fenced);
         println!(
@@ -21845,6 +21939,7 @@ owned\n\
         let a_without_usage = ProvenanceRecord {
             schema_version: provenance::SCHEMA_VERSION,
             seal: CompletionSeal::Commit,
+            completion_note: None,
             ticket_id: TICKET_A.to_string(),
             attempt_lease: AttemptLease {
                 ticket_id: TICKET_A.to_string(),
@@ -22074,6 +22169,7 @@ owned\n\
             let current = ProvenanceRecord {
                 schema_version: provenance::SCHEMA_VERSION,
                 seal: CompletionSeal::Commit,
+                completion_note: None,
                 ticket_id: ticket_id.clone(),
                 attempt_lease: AttemptLease {
                     ticket_id: ticket_id.clone(),
@@ -22206,6 +22302,7 @@ owned\n\
         let current = ProvenanceRecord {
             schema_version: provenance::SCHEMA_VERSION,
             seal: CompletionSeal::Commit,
+            completion_note: None,
             ticket_id: "T-CDX-01".to_string(),
             attempt_lease: AttemptLease {
                 ticket_id: "T-CDX-01".to_string(),
@@ -22547,6 +22644,7 @@ owned\n\
                 prior_status: TicketStatus::Review,
                 source: CompletionSource::Artifact,
                 authority: CompletionAuthority::Attempt(predecessor.clone()),
+                completion_note: None,
             },
         );
         state.handle_completion_result("T-CDX-01", Some(0), vec![b'a'; 40], Vec::new());
@@ -22586,6 +22684,7 @@ owned\n\
                 prior_status: TicketStatus::Review,
                 source: CompletionSource::Artifact,
                 authority: CompletionAuthority::Attempt(replacement.clone()),
+                completion_note: None,
             },
         );
         state.check_session_timeouts();

@@ -62,6 +62,7 @@ mod tests {
         ProvenanceRecord {
             schema_version: SCHEMA_VERSION,
             seal: CompletionSeal::Commit,
+            completion_note: None,
             ticket_id: ticket_id.to_string(),
             attempt_lease: AttemptLease {
                 ticket_id: ticket_id.to_string(),

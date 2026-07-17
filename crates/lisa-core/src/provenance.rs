@@ -30,6 +30,7 @@ use serde_json::Value;
 
 use crate::client::AgentClient;
 use crate::completion::CompletionSeal;
+use crate::disposition::DispositionNote;
 use crate::disposition::RemedyOwner;
 use crate::types::AttemptLease;
 
@@ -119,6 +120,9 @@ pub struct ProvenanceRecord {
     /// pre-ladder rows, which are commit-sealed by construction.
     #[serde(default)]
     pub seal: CompletionSeal,
+    /// Criteria-versus-evidence note admitted with a successful completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_note: Option<DispositionNote>,
     pub ticket_id: String,
     /// Exact execution attempt that produced this terminal record.
     pub attempt_lease: AttemptLease,
@@ -300,6 +304,7 @@ mod tests {
         ProvenanceRecord {
             schema_version: SCHEMA_VERSION,
             seal: CompletionSeal::Commit,
+            completion_note: None,
             ticket_id: "T-027-01".to_string(),
             attempt_lease: AttemptLease::mint("T-027-01", None).unwrap(),
             outcome: RunOutcome::Done,
@@ -401,6 +406,29 @@ mod tests {
         // Round-trips back to an equal record.
         let back: ProvenanceRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, sample());
+    }
+
+    #[test]
+    fn completion_note_round_trips_and_legacy_rows_default_to_none() {
+        let mut record = sample();
+        record.completion_note = Some(
+            DispositionNote::new(
+                "approximately 200 MiB",
+                "docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md",
+                "The 225 MiB measurement supports completion while the written gate is stale.",
+            )
+            .unwrap(),
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"completion_note\""));
+        assert!(json.contains("\"criterion_quote\":\"approximately 200 MiB\""));
+        assert_eq!(
+            serde_json::from_str::<ProvenanceRecord>(&json).unwrap(),
+            record
+        );
+
+        let legacy: ProvenanceRecord = serde_json::from_str(SCHEMA_V2_EXECUTION_JSON).unwrap();
+        assert_eq!(legacy.completion_note, None);
     }
 
     #[test]

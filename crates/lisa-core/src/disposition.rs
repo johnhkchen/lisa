@@ -165,12 +165,13 @@ fn validate_document(document: Value) -> ReviewDisposition {
 
 fn validate_note_structure(object: &mut serde_json::Map<String, Value>) -> ReviewDisposition {
     let note = (|| {
-        DispositionNote::new(
+        let note = DispositionNote::new(
             non_empty_string(object.remove("criterion_quote")?)?,
             non_empty_string(object.remove("evidence_citation")?)?,
             non_empty_string(object.remove("summary")?)?,
         )
-        .ok()
+        .ok()?;
+        object.is_empty().then_some(note)
     })();
 
     match note {
@@ -300,6 +301,7 @@ mod tests {
             r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","evidence_citation":" ","summary":"The criterion is stale."}"#,
             r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","evidence_citation":"docs/evidence.md","summary":" "}"#,
             r#"{"disposition":"note","reason":"work is questionable","criterion_quote":"criterion","evidence_citation":"docs/evidence.md","summary":"The criterion is stale."}"#,
+            r#"{"disposition":"note","reason":null,"criterion_quote":"criterion","evidence_citation":"docs/evidence.md","summary":"The criterion is stale.","work_complaint":"The implementation looks risky."}"#,
         ] {
             assert_invalid(parse_document(document));
         }

@@ -15,6 +15,7 @@ use lisa_core::completion::{
     CompletionGenerationId, CompletionId, CompletionSeal, CompletionSealReceipt, CompletionState,
     CorrelationId, LaunchFailure, Retryability,
 };
+use lisa_core::disposition::DispositionNote;
 use lisa_core::ticket;
 use lisa_core::types::{Phase, TicketId, TicketStatus};
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,7 @@ use crate::publication::{
 };
 
 const LEGACY_SCHEMA_VERSION: u32 = 1;
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const TEMPORARY_PREFIX: &str = ".completion-journal.jsonl.tmp.";
 const TICKET_TEMPORARY_PREFIX: &str = ".journal-completion-ticket.tmp.";
 
@@ -36,6 +37,7 @@ pub(crate) enum CompletionJournalTransition {
         key: CompletionGenerationId,
         prior_phase: Phase,
         prior_status: TicketStatus,
+        note: Option<DispositionNote>,
     },
     CommandInFlight {
         key: CompletionGenerationId,
@@ -61,6 +63,7 @@ pub(crate) enum CompletionJournalTransition {
         key: CompletionGenerationId,
         correlation: CorrelationId,
         receipt: CompletionSealReceipt,
+        note: Option<DispositionNote>,
     },
 }
 
@@ -106,6 +109,7 @@ pub(crate) struct CompletionJournalAggregate {
     prior_phase: Phase,
     prior_status: TicketStatus,
     confirmed_receipt: Option<CompletionSealReceipt>,
+    completion_note: Option<DispositionNote>,
     failure_count: u8,
     failure_limit: Option<u8>,
     retries_exhausted: bool,
@@ -158,6 +162,10 @@ impl CompletionJournalAggregate {
         self.confirmed_receipt.as_ref()
     }
 
+    pub(crate) fn completion_note(&self) -> Option<&DispositionNote> {
+        self.completion_note.as_ref()
+    }
+
     pub(crate) fn masks_durable_done(&self) -> bool {
         matches!(
             self.state,
@@ -189,6 +197,8 @@ enum JournalRecordBody {
         generation: u64,
         prior_phase: Phase,
         prior_status: TicketStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<DispositionNote>,
     },
     CommandInFlight {
         completion_id: String,
@@ -226,6 +236,8 @@ enum JournalRecordBody {
         commit_id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         content_hashes: Vec<CompletionContentHash>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<DispositionNote>,
     },
 }
 
@@ -261,12 +273,14 @@ impl JournalRecord {
                 key,
                 prior_phase,
                 prior_status,
+                note,
             } => JournalRecordBody::Requested {
                 completion_id: key.completion_id().to_string(),
                 attempt_id: key.attempt_id().to_string(),
                 generation: key.generation(),
                 prior_phase: *prior_phase,
                 prior_status: *prior_status,
+                note: note.clone(),
             },
             CompletionJournalTransition::CommandInFlight {
                 key,
@@ -315,6 +329,7 @@ impl JournalRecord {
                 key,
                 correlation,
                 receipt,
+                note,
             } => {
                 let (commit_id, content_hashes) = match receipt {
                     CompletionSealReceipt::Commit { commit_id } => {
@@ -331,6 +346,7 @@ impl JournalRecord {
                     correlation_id: correlation.to_string(),
                     commit_id,
                     content_hashes,
+                    note: note.clone(),
                 }
             }
         };
@@ -355,10 +371,12 @@ impl JournalRecord {
                 generation,
                 prior_phase,
                 prior_status,
+                note,
             } => CompletionJournalTransition::Requested {
                 key: generation_key(completion_id, attempt_id, generation),
                 prior_phase,
                 prior_status,
+                note,
             },
             JournalRecordBody::CommandInFlight {
                 completion_id,
@@ -412,6 +430,7 @@ impl JournalRecord {
                 correlation_id,
                 commit_id,
                 content_hashes,
+                note,
             } => CompletionJournalTransition::Confirmed {
                 key: generation_key(completion_id, attempt_id, generation),
                 correlation: CorrelationId::new(correlation_id),
@@ -433,6 +452,7 @@ impl JournalRecord {
                         CompletionSealReceipt::journal(content_hashes)?
                     }
                 },
+                note,
             },
         };
         Ok((self.seal, transition))
@@ -744,6 +764,7 @@ fn apply_transition(
             key,
             prior_phase,
             prior_status,
+            note,
         } => {
             if let Some(aggregate) = aggregates.get(&ticket_id) {
                 if aggregate.completion_key == key && aggregate.seal != seal {
@@ -787,6 +808,7 @@ fn apply_transition(
                 prior_phase,
                 prior_status,
                 confirmed_receipt: None,
+                completion_note: note,
                 failure_count: 0,
                 failure_limit: None,
                 retries_exhausted: false,
@@ -946,6 +968,7 @@ fn apply_transition(
             key,
             correlation,
             receipt,
+            note,
         } => {
             if receipt.seal() != seal {
                 return Err(format!(
@@ -967,6 +990,11 @@ fn apply_transition(
             }
             aggregate.state = reduced.state;
             aggregate.confirmed_receipt = Some(receipt);
+            if note != aggregate.completion_note {
+                return Err(format!(
+                    "confirmed transition for {ticket_id} changed its admitted completion note"
+                ));
+            }
             aggregate
         }
     };
@@ -1140,6 +1168,7 @@ mod tests {
                 key: generation.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Open,
+                note: None,
             },
         )
         .unwrap();
@@ -1165,6 +1194,7 @@ mod tests {
                 key: generation,
                 correlation: command,
                 receipt: receipt.clone(),
+                note: None,
             },
         )
         .unwrap();
@@ -1177,11 +1207,62 @@ mod tests {
             .last()
             .unwrap()
             .to_string();
-        assert!(confirmed_line.contains("\"schema_version\":4"));
+        assert!(confirmed_line.contains("\"schema_version\":5"));
         assert!(confirmed_line.contains("\"seal\":\"journal\""));
         assert!(confirmed_line.contains("\"content_hashes\""));
         assert!(confirmed_line.contains("tickets/T-HASHED.md"));
         assert!(!confirmed_line.contains("\"commit_id\""));
+    }
+
+    #[test]
+    fn admitted_note_is_stable_across_request_confirmation_and_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+        let generation = key("T-046-06-03", "1", 1);
+        let command = correlation("note-command");
+        let note = DispositionNote::new(
+            "approximately 200 MiB",
+            "docs/active/work/T-046-06-03/cbt-0716-210943-closing-codex/run-record.md",
+            "The 225 MiB measurement supports completion while the written gate is stale.",
+        )
+        .unwrap();
+        append(
+            &path,
+            CompletionJournalTransition::Requested {
+                key: generation.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+                note: Some(note.clone()),
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            CompletionJournalTransition::CommandInFlight {
+                key: generation.clone(),
+                correlation: command.clone(),
+                deadline: deadline(42),
+            },
+        )
+        .unwrap();
+        let confirmed = append(
+            &path,
+            CompletionJournalTransition::Confirmed {
+                key: generation,
+                correlation: command,
+                receipt: CompletionSealReceipt::commit("a".repeat(40)).unwrap(),
+                note: Some(note.clone()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(confirmed.completion_note(), Some(&note));
+        assert_eq!(load(&path).unwrap()["T-046-06-03"], confirmed);
+        let body = fs::read_to_string(&path).unwrap();
+        assert_eq!(body.matches("\"completion_note\"").count(), 0);
+        assert_eq!(body.matches("\"note\"").count(), 2);
+        assert_eq!(body.matches("\"criterion_quote\"").count(), 2);
+        assert_eq!(body.matches("\"evidence_citation\"").count(), 2);
     }
 
     #[test]
@@ -1232,6 +1313,7 @@ mod tests {
                 key: generation.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::InProgress,
+                note: None,
             },
         )
         .unwrap();
@@ -1268,6 +1350,7 @@ mod tests {
                 key: generation,
                 correlation: command,
                 receipt: CompletionSealReceipt::commit(commit_id.clone()).unwrap(),
+                note: None,
             },
         )
         .unwrap();
@@ -1278,7 +1361,7 @@ mod tests {
 
         let body = fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 3);
-        assert_eq!(body.matches("\"schema_version\":4").count(), 3);
+        assert_eq!(body.matches("\"schema_version\":5").count(), 3);
         assert_eq!(body.matches("\"seal\":\"commit\"").count(), 3);
         assert_eq!(body.matches("\"state\":\"requested\"").count(), 1);
         assert_eq!(body.matches("\"state\":\"command-in-flight\"").count(), 1);
@@ -1304,6 +1387,7 @@ mod tests {
                 key: generation.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Open,
+                note: None,
             },
         )
         .unwrap();
@@ -1375,6 +1459,7 @@ mod tests {
                 key: generation.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Open,
+                note: None,
             },
         )
         .unwrap();
@@ -1424,6 +1509,7 @@ mod tests {
                 key: first.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Open,
+                note: None,
             },
         )
         .unwrap();
@@ -1462,6 +1548,7 @@ mod tests {
                 key: second.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Open,
+                note: None,
             },
         )
         .unwrap();
@@ -1482,6 +1569,7 @@ mod tests {
                 key: first.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Review,
+                note: None,
             },
         )
         .unwrap();
@@ -1500,6 +1588,7 @@ mod tests {
                 key: first,
                 correlation: command,
                 receipt: CompletionSealReceipt::commit("c".repeat(40)).unwrap(),
+                note: None,
             },
         )
         .unwrap();
@@ -1511,6 +1600,7 @@ mod tests {
                 key: reset_attempt.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Review,
+                note: None,
             },
         )
         .unwrap();
@@ -1558,6 +1648,7 @@ mod tests {
                 key: expected.clone(),
                 prior_phase: Phase::Implement,
                 prior_status: TicketStatus::InProgress,
+                note: None,
             },
         )
         .unwrap();
@@ -1592,6 +1683,7 @@ mod tests {
                 key: expected.clone(),
                 correlation: correlation("command-b"),
                 receipt: CompletionSealReceipt::commit("b".repeat(40)).unwrap(),
+                note: None,
             },
         )
         .unwrap_err();
@@ -1604,6 +1696,7 @@ mod tests {
                 key: expected,
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Open,
+                note: None,
             },
         )
         .unwrap_err();
@@ -1667,13 +1760,14 @@ mod tests {
                 key: generation.clone(),
                 prior_phase: Phase::Review,
                 prior_status: TicketStatus::Review,
+                note: None,
             },
         )
         .unwrap();
         assert_eq!(requested.seal(), CompletionSeal::Journal);
         let requested_bytes = fs::read(&path).unwrap();
         let requested_json = String::from_utf8_lossy(&requested_bytes);
-        assert!(requested_json.contains("\"schema_version\":4"));
+        assert!(requested_json.contains("\"schema_version\":5"));
         assert!(requested_json.contains("\"seal\":\"journal\""));
 
         let error = append_with_seal(
