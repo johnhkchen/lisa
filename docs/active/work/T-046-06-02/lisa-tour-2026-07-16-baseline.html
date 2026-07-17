@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lisa | DAG-driven task scheduling</title>
+  <style>
+    :root {
+      --bg: #0f1220;
+      --panel: #171b2e;
+      --panel-2: #1f2540;
+      --text: #eef1ff;
+      --muted: #b9c0e0;
+      --accent: #7dd3fc;
+      --accent-2: #fca5a5;
+      --ok: #86efac;
+      --warn: #fde68a;
+      --code: #0b1020;
+      --border: rgba(255, 255, 255, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font: 16px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(125, 211, 252, 0.12), transparent 30%),
+        radial-gradient(circle at top right, rgba(250, 204, 21, 0.08), transparent 28%),
+        linear-gradient(180deg, #090b13 0%, var(--bg) 100%);
+    }
+
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 40px 20px 72px;
+    }
+
+    .hero {
+      padding: 32px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -80px -80px auto;
+      width: 220px;
+      height: 220px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(125, 211, 252, 0.16), transparent 68%);
+      pointer-events: none;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.15;
+      margin: 0 0 12px;
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 6vw, 4.6rem);
+      letter-spacing: -0.04em;
+      max-width: 12ch;
+    }
+
+    .lede {
+      max-width: 72ch;
+      color: var(--muted);
+      margin: 12px 0 0;
+      font-size: 1.05rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .cta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px 16px;
+      border-radius: 999px;
+      text-decoration: none;
+      font-weight: 700;
+      border: 1px solid var(--border);
+      transition: transform 140ms ease, background-color 140ms ease, border-color 140ms ease;
+    }
+
+    .button:hover {
+      transform: translateY(-1px);
+    }
+
+    .button.primary {
+      background: linear-gradient(180deg, rgba(125, 211, 252, 0.96), rgba(56, 189, 248, 0.88));
+      color: #08101b;
+      border-color: transparent;
+    }
+
+    .button.secondary {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .pill {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 7px 12px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    section {
+      margin-top: 28px;
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.04);
+      backdrop-filter: blur(8px);
+    }
+
+    p, li {
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+
+    .card {
+      padding: 18px;
+      border-radius: 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+    }
+
+    .card strong {
+      color: var(--text);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+    }
+
+    th, td {
+      text-align: left;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .cmd {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    pre {
+      margin: 14px 0 0;
+      padding: 16px;
+      border-radius: 16px;
+      background: var(--code);
+      color: #d7def8;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.95em;
+    }
+
+    .note {
+      border-left: 4px solid var(--warn);
+      padding: 14px 16px;
+      background: rgba(253, 230, 138, 0.08);
+      border-radius: 12px;
+      margin-top: 16px;
+    }
+
+    .good {
+      border-left: 4px solid var(--ok);
+      background: rgba(134, 239, 172, 0.08);
+    }
+
+    .bad {
+      border-left: 4px solid var(--accent-2);
+      background: rgba(252, 165, 165, 0.08);
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 18px;
+    }
+
+    @media (max-width: 800px) {
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .pathline {
+      color: var(--accent);
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="hero">
+      <h1>Lisa turns tickets into a schedulable DAG</h1>
+      <p class="lede">
+        Lisa scaffolds the project, validates the workflow, and schedules tickets in dependency order.
+        This page is a landing page for the tool, built from real CLI output and the actual Lisa-managed
+        project under <code class="pathline">/home/tester/lisa-tour-project</code>.
+      </p>
+      <div class="meta">
+        <span class="pill">Version seen: <code>lisa 0.3.0</code></span>
+        <span class="pill">Project path: <code>/home/tester/lisa-tour-project</code></span>
+        <span class="pill">Ticket chain: <code>capture</code> → <code>build</code> → <code>synthesize</code></span>
+      </div>
+      <div class="cta">
+        <a class="button primary" href="#real-output">See real output</a>
+        <a class="button secondary" href="#ticket-chain">Inspect the ticket chain</a>
+      </div>
+    </header>
+
+    <section>
+      <h2>Why Lisa exists</h2>
+      <div class="grid">
+        <div class="card">
+          <strong>Creates the project skeleton</strong>
+          <p>It generates <code>CLAUDE.md</code>, <code>.lisa.toml</code>, hooks, a workflow doc, and the active/archive directories.</p>
+        </div>
+        <div class="card">
+          <strong>Validates the setup</strong>
+          <p>It checks that the expected files exist, the config parses, and the ticket graph is sane.</p>
+        </div>
+        <div class="card">
+          <strong>Schedules by dependency</strong>
+          <p>It reads ticket frontmatter, builds a DAG, and shows which tickets are ready to run in parallel.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>What ships</h2>
+      <table>
+        <tr>
+          <th>Command</th>
+          <th>What it does</th>
+        </tr>
+        <tr>
+          <td><span class="cmd">lisa doctor</span></td>
+          <td>Checks dependencies like <code>zellij</code> and <code>claude</code>.</td>
+        </tr>
+        <tr>
+          <td><span class="cmd">lisa init</span></td>
+          <td>Scaffolds the Lisa project structure in the target directory.</td>
+        </tr>
+        <tr>
+          <td><span class="cmd">lisa validate</span></td>
+          <td>Verifies the scaffold and ticket DAG.</td>
+        </tr>
+        <tr>
+          <td><span class="cmd">lisa status</span></td>
+          <td>Prints the DAG state, waves, and what is ready now.</td>
+        </tr>
+        <tr>
+          <td><span class="cmd">lisa setup-guide</span></td>
+          <td>Prints a longer, LLM-friendly walkthrough for the current project.</td>
+        </tr>
+        <tr>
+          <td><span class="cmd">lisa loop</span></td>
+          <td>Launches the interactive scheduler experience inside zellij.</td>
+        </tr>
+      </table>
+    </section>
+
+    <section id="real-output">
+      <h2>Real output</h2>
+      <p>The first command proves the CLI is installed and shows the available subcommands:</p>
+      <pre><code>$ command -v lisa && lisa --help | sed -n '1,140p' && printf '\n---\n' && lisa --version 2>&1 || true
+/home/tester/.local/bin/lisa
+Lisa - DAG-driven concurrent task scheduling
+
+Usage: lisa &lt;COMMAND&gt;
+
+Commands:
+  init         Initialize a project for lisa-loop completion
+  validate     Validate ticket DAG and project setup
+  status       Show DAG status: tickets, dependencies, execution waves, scheduling readiness
+  setup-guide  Output LLM-friendly setup instructions for this project
+  hooks-guide  Output the hooks setup guide for agents configuring Claude Code hooks
+  doctor       Check that all runtime dependencies are installed
+  version      Print version information
+  loop         Launch zellij with the Lisa plugin for DAG-driven task scheduling
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+---
+lisa 0.3.0</code></pre>
+
+      <div class="note bad">
+        Rough edge: on a restricted runner, the first attempt to invoke the CLI failed with a
+        <code>bwrap</code> namespace error before Lisa itself could start. In a normal desktop or CI
+        environment with the right permissions, that wrapper problem should not be the main story.
+      </div>
+    </section>
+
+    <section>
+      <h2>Dependency check</h2>
+      <p><code>doctor</code> is useful before you try the full workflow. This run passed, but it also showed one mild quirk:</p>
+      <pre><code>$ lisa doctor
+Checking dependencies...
+
+  zellij       zellij 0.44.3  OK
+  claude       2.1.211 (Claude Code) OK
+  wasm target  skipped (rustup not found)
+
+All dependencies satisfied.
+
+Checking Zellij plugin cache...
+
+  No stale cache entries found.</code></pre>
+      <div class="note">
+        The <code>wasm target</code> check was skipped because <code>rustup</code> was not installed.
+        Lisa still considered the setup healthy.
+      </div>
+    </section>
+
+    <section>
+      <h2>Initialize a project</h2>
+      <p>The first scratch run used <code>/tmp/lisa-tour</code>, then the real Lisa-managed project was created at <code>/home/tester/lisa-tour-project</code>.</p>
+      <pre><code>$ lisa init --path /tmp/lisa-tour
+Detected project: lisa-tour (unknown)
+
+Planned actions:
+  create  /tmp/lisa-tour/docs/active/tickets/
+  create  /tmp/lisa-tour/docs/active/stories/
+  create  /tmp/lisa-tour/docs/active/work/
+  create  /tmp/lisa-tour/docs/archive/tickets/
+  create  /tmp/lisa-tour/docs/archive/stories/
+  create  /tmp/lisa-tour/docs/archive/work/
+  create  /tmp/lisa-tour/CLAUDE.md
+  create  /tmp/lisa-tour/docs/knowledge/rdspi-workflow.md
+  create  /tmp/lisa-tour/.lisa.toml
+  create  /tmp/lisa-tour/.lisa/hooks/
+  create  /tmp/lisa-tour/.lisa/signals/
+  create  /tmp/lisa-tour/.lisa/hooks/on-idle.sh
+  create  /tmp/lisa-tour/.lisa/hooks/on-stop.sh
+  create  /tmp/lisa-tour/.lisa/hooks/on-clear.sh
+  create  /tmp/lisa-tour/.lisa/hooks/on-heartbeat.sh
+  create  /tmp/lisa-tour/.lisa/hooks/on-notify.sample
+  create  /tmp/lisa-tour/.lisa/.gitignore
+  create  /tmp/lisa-tour/.claude/settings.local.json
+
+Initialization complete.
+
+Next steps:
+  1. Create tickets in docs/active/tickets/
+  2. Run `lisa validate` to check readiness
+  3. Run `lisa loop` to start scheduling</code></pre>
+
+      <div class="two-col">
+        <div>
+          <p>The generated files include the key scaffold:</p>
+          <pre><code>/tmp/lisa-tour/.claude/settings.local.json
+/tmp/lisa-tour/.lisa.toml
+/tmp/lisa-tour/.lisa/.gitignore
+/tmp/lisa-tour/.lisa/hooks/on-clear.sh
+/tmp/lisa-tour/.lisa/hooks/on-heartbeat.sh
+/tmp/lisa-tour/.lisa/hooks/on-idle.sh
+/tmp/lisa-tour/.lisa/hooks/on-notify.sample
+/tmp/lisa-tour/.lisa/hooks/on-stop.sh
+/tmp/lisa-tour/CLAUDE.md
+/tmp/lisa-tour/docs/knowledge/rdspi-workflow.md</code></pre>
+        </div>
+        <div>
+          <p>The generated <code>CLAUDE.md</code> and <code>.lisa.toml</code> were minimal and explicit:</p>
+          <pre><code># CLAUDE.md
+
+## Project
+
+lisa-tour (unknown type) — TODO: add a one-line project description here.
+
+[scheduling]
+max_threads = 2</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Validate too early, and Lisa complains</h2>
+      <p>On an empty scaffold, validation is strict. That is a feature, not a bug.</p>
+      <pre><code>$ lisa validate --path /tmp/lisa-tour
+CLAUDE.md: structure: not found. Run `lisa init` to create it.
+docs/knowledge/rdspi-workflow.md: structure: not found. Run `lisa init` to create it.
+.claude/settings.local.json: structure: not found. Run `lisa init` to create hooks.
+.lisa/hooks/on-idle.sh: structure: not found. Run `lisa init` to create hooks.
+.lisa/hooks/on-stop.sh: structure: not found. Run `lisa init` to create hooks.
+.lisa/hooks/on-clear.sh: structure: not found. Run `lisa init` to create hooks.
+.lisa/hooks/on-heartbeat.sh: structure: not found. Run `lisa init` to create hooks.
+.lisa/hooks/on-notify.sample: structure: not found. Run `lisa init` to create hooks.
+docs/active/tickets: structure: directory not found. Run `lisa init` to create it.
+docs/active/stories: structure (warning): directory not found. Run `lisa init` to create it.
+docs/active/work: structure (warning): directory not found. Run `lisa init` to create it.
+
+9 error(s) found. Fix and re-run `lisa validate`.
+Error: 9 error(s) found. Fix and re-run `lisa validate`.</code></pre>
+      <div class="note bad">
+        This is the biggest newcomer surprise: if the scaffold is missing, <code>validate</code> does not
+        try to be forgiving. It tells you exactly which expected structure is absent.
+      </div>
+    </section>
+
+    <section id="ticket-chain">
+      <h2>The ticket chain</h2>
+      <p>The actual Lisa project uses three tickets. The last one is the synthesis pass that reads the work docs and explains the whole setup back to a newcomer.</p>
+      <pre><code>---
+id: S-001
+title: lisa-landing-page
+tickets: [T-001-01, T-001-02, T-001-03]
+---
+
+T-001-01  capture-lisa-basics     ready
+T-001-02  build-lisa-landing-page  depends on T-001-01
+T-001-03  synthesize-work-docs     depends on T-001-01, T-001-02</code></pre>
+      <p>The last ticket is not just a sign-off. It exists to read the work docs, pull the evidence together, and explain what Lisa did and why the tool exists.</p>
+    </section>
+
+    <section>
+      <h2>Status and success</h2>
+      <pre><code>$ lisa status --path /home/tester/lisa-tour-project
+DAG: 3 tickets, 3 edges, no cycles
+Critical path: 3 tickets
+Status: 0 done, 0 in progress, 1 ready, 2 blocked
+Config: max_threads=2, session_timeout=3600s
+
+Wave 0 (no dependencies):
+  T-001-01      ready  open  capture-lisa-basics  blocks: T-001-02, T-001-03
+
+Wave 1 (depends on wave 0):
+  T-001-02      ready  open  build-lisa-landing-page  deps: T-001-01  blocks: T-001-03
+
+Wave 2 (depends on wave 1):
+  T-001-03      ready  open  synthesize-work-docs  deps: T-001-01, T-001-02
+
+Ready to schedule: T-001-01</code></pre>
+
+      <pre><code>$ lisa validate --path /home/tester/lisa-tour-project
+All checks passed. 3 tickets, 1 ready, DAG valid. Run `lisa loop` to start.
+Config: max_threads=2, session_timeout=3600s</code></pre>
+
+      <div class="note good">
+        Once the scaffold and ticket chain are in place, Lisa becomes straightforward: validate,
+        inspect the DAG, then launch the loop.
+      </div>
+    </section>
+
+    <section>
+      <h2>The final ticket</h2>
+      <p>The synthesis step reads every work doc in the project. Those notes are what the page turns into plain English.</p>
+      <pre><code>/home/tester/lisa-tour-project/docs/active/work/T-001-01/cli-notes.md
+/home/tester/lisa-tour-project/docs/active/work/T-001-02/page-notes.md
+/home/tester/lisa-tour-project/docs/active/work/T-001-03/synthesis-notes.md</code></pre>
+      <div class="note">
+        The end result is not just a landing page. It is a small, documented workflow that explains
+        what Lisa did, what it is for, and how its DAG model keeps the work organized.
+      </div>
+    </section>
+
+    <section>
+      <h2>What to remember</h2>
+      <ul>
+        <li>Run <code>lisa init</code> first; the scaffold matters.</li>
+        <li>Use <code>lisa doctor</code> before a session if you want dependency checks up front.</li>
+        <li>Keep ticket frontmatter accurate: Lisa schedules from the DAG, not from prose.</li>
+        <li><code>lisa status</code> is the quickest way to see what can run now.</li>
+        <li><code>lisa loop</code> is interactive and launches <code>zellij</code>, so it is the least transcript-friendly command.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
