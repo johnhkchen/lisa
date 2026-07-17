@@ -587,7 +587,11 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     let project_report = check_project_version(root);
     let has_project = !matches!(project_report.result, CheckResult::Skipped { .. });
 
-    let mut output = format_report(&reports);
+    let mut output = format!(
+        "{}\n\n{}",
+        resolved_config.client_announcement(),
+        format_report(&reports)
+    );
 
     if has_project {
         output.push_str("\n\nChecking project...\n\n");

@@ -72,6 +72,8 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         return run_dry(root, config);
     }
 
+    println!("{}", config.client_announcement());
+
     // Resolve configured guard intent against the environment exactly once.
     // The immutable result is retained through dependency checks and layout
     // generation; the plugin receives only the pinned tier and never probes.
