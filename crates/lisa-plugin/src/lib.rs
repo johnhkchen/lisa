@@ -1612,14 +1612,22 @@ impl State {
             .lines()
             .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
         {
-            if let ProvenanceLedgerRecord::TriageTransition(record) = record {
-                latest.insert(
-                    (
-                        record.ticket_id.clone(),
-                        record.source_attempt_lease.attempt_id,
-                    ),
-                    record,
-                );
+            match record {
+                ProvenanceLedgerRecord::TriageTransition(record) => {
+                    latest.insert(
+                        (
+                            record.ticket_id.clone(),
+                            record.source_attempt_lease.attempt_id,
+                        ),
+                        record,
+                    );
+                }
+                ProvenanceLedgerRecord::ProposalAction(record)
+                    if record.action == ProposalAction::Failed =>
+                {
+                    latest.remove(&(record.ticket_id, record.source_attempt_lease.attempt_id));
+                }
+                _ => {}
             }
         }
         latest
@@ -9645,6 +9653,78 @@ mod tests {
                 .source_attempt_lease
                 .attempt_id,
             2
+        );
+    }
+
+    #[test]
+    fn failed_apply_resets_same_park_triage_guard_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = operator_triage_state(dir.path(), true);
+        let lease = AttemptLease {
+            ticket_id: "T-046-06-03".to_string(),
+            attempt_id: 1,
+        };
+        let prior_flight = TriageInFlight {
+            source_attempt_lease: lease.clone(),
+            route: Route::from_client(AgentClient::Codex),
+            client: AgentClient::Codex,
+            started_at: std::time::SystemTime::now(),
+            timeout_secs: 1,
+        };
+        assert!(state.append_triage_transition(
+            "T-046-06-03",
+            &prior_flight,
+            TriageState::Proposed,
+            None,
+        ));
+        let proposal = TriageProposal {
+            summary: "The current criterion conflicts with the evidence.".to_string(),
+            recommendation: "Apply the prepared amendment.".to_string(),
+            prepared_steps: vec![lisa_core::triage::PreparedStep::Command {
+                description: "Apply the amendment.".to_string(),
+                command: "false".to_string(),
+            }],
+        };
+        write_stored_proposal(
+            &state
+                .config
+                .work_dir
+                .join("T-046-06-03/triage-proposal.json"),
+            &StoredTriageProposal {
+                ticket_id: "T-046-06-03".to_string(),
+                source_attempt_lease: lease.clone(),
+                state: ProposalState::Failed,
+                proposal,
+            },
+        )
+        .unwrap();
+        provenance::append_proposal_action_record(
+            &state.ledger_path,
+            &ProposalActionRecord {
+                schema_version: provenance::SCHEMA_VERSION,
+                seal: CompletionSeal::Commit,
+                record_type: ProposalRecordType::ProposalAction,
+                ticket_id: "T-046-06-03".to_string(),
+                source_attempt_lease: lease,
+                action: ProposalAction::Failed,
+                actor: "operator".to_string(),
+                proposal: None,
+                step_count: None,
+                applied_steps: Vec::new(),
+                failed_step: Some("Apply the amendment.".to_string()),
+                failure_reason: Some("Prepared command failed".to_string()),
+                occurred_at: 20,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.request_operator_triage(), 1);
+        assert_eq!(state.request_operator_triage(), 0);
+        assert_eq!(
+            state.triage_in_flight["T-046-06-03"]
+                .source_attempt_lease
+                .attempt_id,
+            1
         );
     }
 
