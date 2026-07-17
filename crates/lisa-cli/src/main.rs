@@ -2,6 +2,7 @@ mod agent_exec;
 mod capture_usage;
 mod claim;
 mod codex_launcher;
+mod completion_seal;
 mod config;
 mod detect;
 mod doctor;

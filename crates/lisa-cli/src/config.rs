@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use lisa_core::client::AgentClient;
+use lisa_core::completion::CompletionSealMode;
 use lisa_core::types::PluginConfig;
 
 use crate::runtime::ZellijRuntimeRequest;
@@ -19,6 +20,17 @@ pub struct LisaConfig {
     pub agent: AgentConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub guards: GuardsConfig,
+}
+
+/// Completion guard selection (`[guards]`).
+///
+/// Kept raw so invalid values surface through the same actionable semantic
+/// validation path as `[agent].client`.
+#[derive(Debug, Default, Deserialize)]
+pub struct GuardsConfig {
+    pub completion: Option<String>,
 }
 
 /// Zellij runtime selection (`[runtime]`).
@@ -81,6 +93,9 @@ pub struct ResolvedConfig {
     pub phase_timeouts: std::collections::HashMap<String, u64>,
     pub client: AgentClient,
     pub zellij_runtime: ZellijRuntimeRequest,
+    /// Configured completion intent. A real loop pins this against its startup
+    /// environment exactly once before any scheduler side effects.
+    pub completion_mode: CompletionSealMode,
     /// Resolved per-provider concurrency sub-caps, keyed by raw client name.
     /// Empty when none configured (T-026-02).
     pub provider_caps: std::collections::HashMap<String, usize>,
@@ -102,6 +117,7 @@ impl Default for ResolvedConfig {
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
             zellij_runtime: crate::runtime::default_runtime_request(),
+            completion_mode: CompletionSealMode::Auto,
             provider_caps: std::collections::HashMap::new(),
         }
     }
@@ -162,6 +178,12 @@ pub fn resolve_config(
             Some("system") => ZellijRuntimeRequest::System,
             Some(path) => ZellijRuntimeRequest::Pinned(path.into()),
         },
+        completion_mode: config
+            .guards
+            .completion
+            .as_deref()
+            .and_then(|value| CompletionSealMode::parse(value).ok())
+            .unwrap_or(defaults.completion_mode),
         ticket_dir: config.dirs.tickets.clone().unwrap_or(defaults.ticket_dir),
         story_dir: config.dirs.stories.clone().unwrap_or(defaults.story_dir),
         work_dir: config.dirs.work.clone().unwrap_or(defaults.work_dir),
@@ -205,10 +227,18 @@ pub struct ConfigValidation {
 /// Returns the parsed config plus any warnings about unknown keys.
 /// Returns `Err` for parse failures or invalid values (e.g. max_threads = 0).
 pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
-    let known_top = &["version", "dirs", "scheduling", "agent", "runtime"];
+    let known_top = &[
+        "version",
+        "dirs",
+        "scheduling",
+        "agent",
+        "runtime",
+        "guards",
+    ];
     let known_dirs = &["tickets", "stories", "work"];
     let known_agent = &["client"];
     let known_runtime = &["zellij"];
+    let known_guards = &["completion"];
     let known_scheduling = &[
         "max_threads",
         "auto_advance",
@@ -254,6 +284,14 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
             for key in runtime.keys() {
                 if !known_runtime.contains(&key.as_str()) {
                     warnings.push(format!("Unknown key in [runtime]: {}", key));
+                }
+            }
+        }
+
+        if let Some(toml::Value::Table(guards)) = table.get("guards") {
+            for key in guards.keys() {
+                if !known_guards.contains(&key.as_str()) {
+                    warnings.push(format!("Unknown key in [guards]: {}", key));
                 }
             }
         }
@@ -319,6 +357,9 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
                 "[runtime].zellij must be `managed`, `system`, or an absolute path (got {zellij:?})"
             ));
         }
+    }
+    if let Some(completion) = config.guards.completion.as_deref() {
+        CompletionSealMode::parse(completion)?;
     }
     // A per-provider cap of 0 would starve that provider forever; reject it with
     // the same "at least 1" contract as max_threads (T-026-02).
@@ -426,6 +467,10 @@ work = "docs/active/work"
 # Which agent client the loop drives (default: claude). Set to "codex" to run
 # the Codex client; `lisa doctor` then checks the codex binary + directory trust.
 # client = "claude"
+
+[guards]
+# Completion guard: "auto" (strongest available), "commit", or "journal".
+# completion = "auto"
 
 [scheduling]
 max_threads = 2
@@ -601,6 +646,51 @@ max_threads = 6
         assert_eq!(
             resolve_config(&pinned, None, None).zellij_runtime,
             ZellijRuntimeRequest::Pinned("/opt/lisa/zellij".into())
+        );
+    }
+
+    #[test]
+    fn test_completion_guard_defaults_to_auto_and_resolves_all_valid_values() {
+        assert_eq!(
+            resolve_config(&LisaConfig::default(), None, None).completion_mode,
+            CompletionSealMode::Auto
+        );
+
+        for (raw, expected) in [
+            ("auto", CompletionSealMode::Auto),
+            ("commit", CompletionSealMode::Commit),
+            ("journal", CompletionSealMode::Journal),
+        ] {
+            let validation = validate_config(&format!("[guards]\ncompletion = {raw:?}\n")).unwrap();
+            assert!(validation.warnings.is_empty());
+            assert_eq!(
+                resolve_config(&validation.config, None, None).completion_mode,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_completion_guard_unknown_value_is_actionable_validation_error() {
+        let error = validate_config("[guards]\ncompletion = \"best-effort\"\n").unwrap_err();
+        assert!(error.contains("[guards].completion"));
+        assert!(error.contains("best-effort"));
+        assert!(error.contains("auto, commit, journal"));
+    }
+
+    #[test]
+    fn test_completion_guard_unknown_key_warns_and_default_template_is_inert() {
+        let validation = validate_config("[guards]\nseal = \"commit\"\n").unwrap();
+        assert_eq!(validation.warnings.len(), 1);
+        assert!(validation.warnings[0].contains("[guards]"));
+        assert!(validation.warnings[0].contains("seal"));
+
+        let generated = default_config_toml();
+        let config: LisaConfig = toml::from_str(&generated).unwrap();
+        assert_eq!(config.guards.completion, None);
+        assert_eq!(
+            resolve_config(&config, None, None).completion_mode,
+            CompletionSealMode::Auto
         );
     }
 
