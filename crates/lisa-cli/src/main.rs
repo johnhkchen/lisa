@@ -562,7 +562,6 @@ fn main() {
             ledger,
         } => {
             let path = resolve_path(&path);
-            require_lisa_project(&path);
             let result = if let Some(ticket_id) = ticket {
                 let ledger_path = match ledger {
                     Some(ledger) if ledger.is_absolute() => ledger,
@@ -571,6 +570,7 @@ fn main() {
                 };
                 preownership_status::run_preownership_status(&ledger_path, &ticket_id)
             } else {
+                require_lisa_project(&path);
                 status::run_status(&path)
             };
             if let Err(e) = result {
