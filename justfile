@@ -140,6 +140,7 @@ emulate-debian LEG="":
 # Re-run the acceptance grade inside an existing leg container with the
 # repo's current grader (preserves the leg; only the grading logic updates).
 cbt-regrade CONTAINER:
+    docker start {{CONTAINER}} > /dev/null
     docker cp docker/chromebook-test/bin/grade {{CONTAINER}}:/cbt/grade
     docker exec -it {{CONTAINER}} /cbt/grade
 
