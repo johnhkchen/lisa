@@ -185,14 +185,23 @@ max_threads = 2
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `dirs.tickets` | `docs/active/tickets` | Where Lisa reads ticket files |
-| `dirs.stories` | `docs/active/stories` | Where Lisa reads story files |
-| `dirs.work` | `docs/active/work` | Where phase artifacts are written |
-| `scheduling.max_threads` | `2` | Maximum concurrent agent sessions |
-| `agent.client` | `claude` | Which agent client the loop drives (`claude` or `codex`) |
-| `guards.completion` | `auto` | How finished work is sealed: `auto` picks the strongest seal the project supports, `commit` requires history and fails hard without it, `journal` records hash-stamped journal entries only |
-| `triage.enabled` | `true` | When a ticket parks needing a decision, let an agent read the blocker first and attach a plain suggestion with prepared steps |
-| `triage.timeout_secs` | `120` | How long that triage pass may run before Lisa gives up on it (the park itself is never delayed) |
+| `version` | `0.4.4-rc.1` | Tracks the Lisa version used to set up this project. |
+| `dirs.tickets` | `docs/active/tickets` | Chooses where Lisa reads ticket files. |
+| `dirs.stories` | `docs/active/stories` | Chooses where Lisa reads story files. |
+| `dirs.work` | `docs/active/work` | Chooses where Lisa keeps work records. |
+| `runtime.zellij` | `managed` | Chooses how Lisa starts Zellij. |
+| `agent.client` | `claude` | Chooses which coding agent Lisa drives. Omit it to detect agents on PATH; claude is the default when both are installed. |
+| `guards.completion` | `auto` | Controls how finished work is sealed. auto picks the strongest your project supports. |
+| `triage.enabled` | `true` | Lets Lisa inspect work that needs you before asking for help. |
+| `triage.timeout_secs` | `120` | Limits how long Lisa can inspect work that needs you. |
+| `scheduling.max_threads` | `2` | Limits how many coding agents can work at once. |
+| `scheduling.auto_advance` | `false` | Lets Lisa move reviewed work forward without waiting for approval. |
+| `scheduling.review_timeout_secs` | `600` | Limits how long Lisa waits for review to finish. |
+| `scheduling.session_timeout_secs` | `3600` | Limits how long one coding-agent session can run. |
+| `scheduling.wind_down_secs` | `300` | Sets aside time for an agent to wrap up before its session ends. |
+| `scheduling.assignment_ack_timeout_secs` | `30` | Limits how long Lisa waits for an agent to accept assigned work. |
+| `scheduling.phase_timeouts` | `{}` | Limits how long each kind of work can run. |
+| `scheduling.provider_caps` | `{}` | Limits how many agents of each kind can work at once. |
 
 ## Codex client (experimental)
 

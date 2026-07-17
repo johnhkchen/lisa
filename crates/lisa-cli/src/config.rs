@@ -748,7 +748,9 @@ max_threads = {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const README: &str = include_str!("../../../README.md");
 
     const COMPLETE_CONFIG_FIXTURE: &str = r#"version = "0.4.4"
 
@@ -780,6 +782,119 @@ assignment_ack_timeout_secs = 2
 phase_timeouts = {}
 provider_caps = {}
 "#;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReadmeConfigRow {
+        default: String,
+        description: String,
+    }
+
+    fn strip_code_ticks(cell: &str) -> &str {
+        cell.strip_prefix('`')
+            .and_then(|cell| cell.strip_suffix('`'))
+            .unwrap_or(cell)
+    }
+
+    fn parse_readme_config_table(
+        readme: &str,
+    ) -> Result<BTreeMap<String, ReadmeConfigRow>, String> {
+        const HEADER: &str = "| Key | Default | Description |";
+        const SEPARATOR: &str = "|-----|---------|-------------|";
+
+        let lines: Vec<&str> = readme.lines().collect();
+        let header_index = lines
+            .iter()
+            .position(|line| *line == HEADER)
+            .ok_or_else(|| "README configuration table header is missing".to_string())?;
+
+        if lines.get(header_index + 1) != Some(&SEPARATOR) {
+            return Err("README configuration table separator is missing".to_string());
+        }
+
+        let mut rows = BTreeMap::new();
+        for line in lines
+            .iter()
+            .skip(header_index + 2)
+            .take_while(|line| line.starts_with('|'))
+        {
+            let body = line
+                .strip_prefix('|')
+                .and_then(|line| line.strip_suffix('|'))
+                .ok_or_else(|| format!("malformed README configuration row: {line}"))?;
+            let cells: Vec<&str> = body.split('|').map(str::trim).collect();
+            if cells.len() != 3 {
+                return Err(format!("malformed README configuration row: {line}"));
+            }
+
+            let path = strip_code_ticks(cells[0]);
+            if path.is_empty() {
+                return Err("README configuration table contains an empty key".to_string());
+            }
+
+            let row = ReadmeConfigRow {
+                default: strip_code_ticks(cells[1]).to_string(),
+                description: cells[2].to_string(),
+            };
+            if rows.insert(path.to_string(), row).is_some() {
+                return Err(format!(
+                    "README configuration table contains duplicate key `{path}`"
+                ));
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn readme_default(default: &str) -> &str {
+        default
+            .strip_prefix('"')
+            .and_then(|default| default.strip_suffix('"'))
+            .unwrap_or(default)
+    }
+
+    fn verify_readme_config_table(catalog: &[ConfigKey], readme: &str) -> Result<(), String> {
+        let rows = parse_readme_config_table(readme)?;
+
+        for entry in catalog {
+            let row = rows.get(entry.path).ok_or_else(|| {
+                format!(
+                    "README configuration table is missing description for `{}`",
+                    entry.path
+                )
+            })?;
+            if row.description.is_empty() {
+                return Err(format!(
+                    "README configuration table is missing description for `{}`",
+                    entry.path
+                ));
+            }
+
+            let expected_default = readme_default(entry.default);
+            if row.default != expected_default {
+                return Err(format!(
+                    "README configuration default for `{}` is {:?}; expected {:?}",
+                    entry.path, row.default, expected_default
+                ));
+            }
+            if row.description != entry.description {
+                return Err(format!(
+                    "README configuration description for `{}` is {:?}; expected {:?}",
+                    entry.path, row.description, entry.description
+                ));
+            }
+        }
+
+        if let Some(extra) = rows
+            .keys()
+            .find(|path| !catalog.iter().any(|entry| entry.path == path.as_str()))
+        {
+            return Err(format!(
+                "README configuration table documents unknown key `{extra}`"
+            ));
+        }
+
+        Ok(())
+    }
 
     fn parsed_fixed_paths(content: &str) -> BTreeSet<String> {
         let value: toml::Value = content.parse().unwrap();
@@ -923,6 +1038,27 @@ provider_caps = {}
                 entry.path
             );
         }
+    }
+
+    #[test]
+    fn readme_config_table_matches_catalog() {
+        verify_readme_config_table(CONFIG_KEYS, README).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn readme_config_table_names_missing_fake_description() {
+        let mut catalog = CONFIG_KEYS.to_vec();
+        catalog.push(ConfigKey {
+            path: "fake.missing_description",
+            section: "fake",
+            key: "missing_description",
+            default: "false",
+            description: "Controls a fake setting.",
+        });
+
+        let error = verify_readme_config_table(&catalog, README).unwrap_err();
+        assert!(error.contains("missing description"), "{error}");
+        assert!(error.contains("fake.missing_description"), "{error}");
     }
 
     #[test]
