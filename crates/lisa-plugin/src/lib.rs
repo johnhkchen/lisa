@@ -2985,12 +2985,33 @@ impl State {
     }
 
     fn complete_pending_journal_seal(&mut self, ticket_id: &str) -> bool {
+        // Every arm of this function must leave a durable trace. The
+        // 2026-07-18 rc.3 field stall was a silent early return here: the
+        // completion sat CommandInFlight for 60 quiet seconds until the
+        // reconciliation deadline parked it with a hex reason.
         let Some(pending) = self.pending_completions.get(ticket_id).cloned() else {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "{ticket_id}: journal seal requested with no pending completion; \
+                     reconciliation will re-derive it"
+                ),
+            });
             return false;
         };
         let ticket_file = match self.dag.get_ticket(&ticket_id.to_string()) {
             Some(ticket) if !ticket.file_path.as_os_str().is_empty() => ticket.file_path.clone(),
-            _ => return false,
+            _ => {
+                self.log_completion_rejection(
+                    ticket_id,
+                    &pending.completion_key,
+                    &CompletionRejection::LaunchFailed {
+                        source: LaunchFailure::new(format!(
+                            "Lisa could not find the ticket file for {ticket_id} to journal-seal it"
+                        )),
+                    },
+                );
+                return false;
+            }
         };
         let work_dir = self.config.work_dir.join(ticket_id);
         match completion_journal::complete_with_journal_seal(

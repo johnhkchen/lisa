@@ -141,13 +141,28 @@ pub fn write_stored_proposal(path: &Path, stored: &StoredTriageProposal) -> Resu
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     let body = serde_json::to_vec_pretty(stored)
         .map_err(|error| format!("could not serialize proposal: {error}"))?;
-    let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let temporary = path.with_extension(format!("json.tmp.{}", write_nonce()));
     fs::write(&temporary, body)
         .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
     fs::rename(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         format!("could not publish {}: {error}", path.display())
     })
+}
+
+/// Unique-enough suffix for the atomic-write temp file. Deliberately NOT
+/// `std::process::id()`: this crate compiles into the wasm32-wasip1 plugin,
+/// where WASI has no PIDs and that call panics ("no pids on this platform" —
+/// the 2026-07-18 rc.3 field plugin crash). Time plus an in-process counter
+/// distinguishes concurrent writers well enough for a rename-published file.
+fn write_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()))
+        .unwrap_or(0);
+    (nanos << 16) | (COUNTER.fetch_add(1, Ordering::Relaxed) & 0xffff)
 }
 
 fn visible(field: &str, value: &str) -> Result<(), String> {

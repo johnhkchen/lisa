@@ -476,18 +476,37 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
 }
 
 fn completion_content_path(project_root: &Path, path: &Path) -> Result<String, String> {
-    let relative = path.strip_prefix(project_root).map_err(|_| {
-        format!(
-            "completion content path {} is outside project root {}",
-            path.display(),
-            project_root.display()
-        )
-    })?;
+    // In the WASM sandbox, ticket and work paths are already project-relative
+    // (the plugin's cwd is the /host project mount) while `project_root` is
+    // the absolute HOST path kept for host-side run_command — stripping one
+    // against the other can never succeed there. A relative input is accepted
+    // as already project-relative; the traversal guard below still applies.
+    // (2026-07-18 rc.3 field stall: every journal seal failed this strip.)
+    let relative = match path.strip_prefix(project_root) {
+        Ok(relative) => relative,
+        Err(_) if path.is_relative() => path,
+        Err(_) => {
+            return Err(format!(
+                "completion content path {} is outside project root {}",
+                path.display(),
+                project_root.display()
+            ));
+        }
+    };
     if relative.as_os_str().is_empty() {
         return Err(format!(
             "completion content path {} must name a file below project root {}",
             path.display(),
             project_root.display()
+        ));
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "completion content path {} escapes the project root",
+            path.display()
         ));
     }
     Ok(relative.display().to_string())
@@ -1031,6 +1050,28 @@ fn matching_aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_path_accepts_project_relative_inputs_from_the_sandbox() {
+        // Field shape (2026-07-18 rc.3 stall): the plugin's cwd is the /host
+        // project mount, so seal inputs are project-relative while
+        // project_root is the absolute HOST path — the strip can never match.
+        let root = Path::new("/home/tester/demo");
+        assert_eq!(
+            completion_content_path(root, Path::new("docs/active/tickets/T-001.md")).unwrap(),
+            "docs/active/tickets/T-001.md"
+        );
+        assert_eq!(
+            completion_content_path(root, Path::new("/home/tester/demo/review.md")).unwrap(),
+            "review.md"
+        );
+        assert!(completion_content_path(root, Path::new("../escape.md"))
+            .unwrap_err()
+            .contains("escapes the project root"));
+        assert!(completion_content_path(root, Path::new("/etc/passwd"))
+            .unwrap_err()
+            .contains("outside project root"));
+    }
 
     fn key(ticket: &str, attempt: &str, generation: u64) -> CompletionGenerationId {
         CompletionGenerationId::new(
