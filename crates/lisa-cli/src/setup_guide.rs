@@ -223,11 +223,30 @@ fn section_validate() -> GuideSection {
         - Ticket frontmatter parses correctly\n\
         - DAG has no cycles or missing dependencies\n\
         - At least one ticket is in `phase: ready`\n\n\
-        Fix any errors, then launch with `lisa loop`."
+        Fix any errors until validate passes cleanly."
         .to_string();
 
     GuideSection {
-        title: "Validate and launch".to_string(),
+        title: "Validate the board".to_string(),
+        body,
+    }
+}
+
+fn section_handoff() -> GuideSection {
+    let body = "The board is built — setup is done, and so is the setup agent's job.\n\n\
+        Two things an agent must NOT do from here:\n\n\
+        - **Do not implement the tickets.** Lisa runs each ticket through its phases, \
+        review, and sealed completion record; work done by hand outside the loop gets \
+        none of that.\n\
+        - **Do not run `lisa loop`.** That command belongs to the person you're working \
+        with — they run it themselves in a separate terminal pane, window, or tab, where \
+        they can watch the dashboard and answer anything waiting on them.\n\n\
+        If you are an agent, finish by telling them: the board is ready, and running \
+        `lisa loop` in another terminal starts the work."
+        .to_string();
+
+    GuideSection {
+        title: "Hand off to the person running the loop".to_string(),
         body,
     }
 }
@@ -254,7 +273,12 @@ fn build_guide(root: &Path) -> Result<String, String> {
         "# Lisa Setup Guide for {} ({})\n\n\
          Lisa runs coding agents through your ticket board, so you don't have to approve every step by hand.\n\n\
          Lisa keeps the trail reviewable: an append-only attempt ledger records each run, \
-         the completion journal ties finished tickets to commits, and each ticket keeps its work documents.\n\n\
+         the completion journal seals every finished ticket — to a commit where the project \
+         keeps history, or to tamper-evident content hashes where it doesn't — and each \
+         ticket keeps its work documents.\n\n\
+         This guide is for the agent (or person) setting the project up. Setup means \
+         building the board: the tickets themselves are implemented later by sessions \
+         `lisa loop` starts — not by whoever follows this guide.\n\n\
          Follow these steps to set up this project for lisa-loop. \
          Each step is self-contained — complete them in order.",
         project.name, type_label
@@ -268,6 +292,7 @@ fn build_guide(root: &Path) -> Result<String, String> {
         section_story_format(),
         section_dependencies(),
         section_validate(),
+        section_handoff(),
     ];
 
     Ok(render_guide(&header, sections))
@@ -299,6 +324,11 @@ mod tests {
         assert!(guide.contains("cargo build"));
         assert!(guide.contains("cargo test"));
         assert!(guide.contains("lisa init"));
+        // The guide addresses the setup agent and ends with the operator
+        // handoff — never instructing the agent to run the loop itself.
+        assert!(guide.contains("not by whoever follows this guide"));
+        assert!(guide.contains("Do not run `lisa loop`."));
+        assert!(guide.contains("Hand off to the person running the loop"));
     }
 
     #[test]
@@ -381,7 +411,8 @@ mod tests {
 
         let guide = build_guide(dir.path()).unwrap();
         assert!(guide.contains("append-only attempt ledger"));
-        assert!(guide.contains("completion journal ties finished tickets to commits"));
+        assert!(guide.contains("completion journal seals every finished ticket"));
+        assert!(guide.contains("tamper-evident content hashes where it doesn't"));
         assert!(guide.contains("each ticket keeps its work documents"));
     }
 
@@ -403,14 +434,15 @@ mod tests {
     }
 
     #[test]
-    fn test_guide_ends_with_validate() {
+    fn test_guide_ends_with_operator_handoff() {
         let dir = tempfile::tempdir().unwrap();
 
         let guide = build_guide(dir.path()).unwrap();
         assert!(guide.contains("lisa validate"));
         let last_step = guide.rfind("## Step").unwrap();
         let last_section = &guide[last_step..];
-        assert!(last_section.contains("Validate"));
+        assert!(last_section.contains("Hand off to the person running the loop"));
+        assert!(last_section.contains("Do not run `lisa loop`."));
     }
 
     #[test]

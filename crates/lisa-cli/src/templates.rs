@@ -1,5 +1,5 @@
 use crate::detect::DetectedProject;
-use lisa_core::context::PURPOSE_PARAGRAPH;
+use lisa_core::context::{PURPOSE_PARAGRAPH, ROLE_CONTRACT};
 use std::sync::LazyLock;
 
 /// The RDSPI workflow document, embedded at compile time
@@ -265,8 +265,7 @@ pub const LISA_GITIGNORE: &str =
 pub fn generate_agents_md() -> String {
     format!(
         "# AGENTS.md\n\n{PURPOSE_PARAGRAPH}\n\n\
-Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable \
-record, and wait for Lisa to confirm completion.\n\n\
+{ROLE_CONTRACT}\n\n\
 This project's agent context lives in [CLAUDE.md](CLAUDE.md) — the single source \
 of truth for every agent client (Claude Code reads `CLAUDE.md`; Codex reads this \
 `AGENTS.md`). Read `CLAUDE.md` first.\n\n\
@@ -679,7 +678,7 @@ pub fn generate_claude_md(project: &DetectedProject) -> String {
 
 {purpose}
 
-Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable record, and wait for Lisa to confirm completion.
+{role_contract}
 
 ## Project
 
@@ -701,6 +700,7 @@ The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is inje
 "#,
         name = project.name,
         purpose = PURPOSE_PARAGRAPH,
+        role_contract = ROLE_CONTRACT,
         type_label = type_label,
         build_section = build_section,
         source_layout_section = source_layout_section,
@@ -815,9 +815,16 @@ mod tests {
             lint_command: "cargo clippy".to_string(),
             source_layout: "src:\n  main.rs".to_string(),
         };
-        let contract = "Under Lisa, you take one ticket through every RDSPI phase, leave a reviewable record, and wait for Lisa to confirm completion.";
+        let contract = ROLE_CONTRACT;
         let claude_md = generate_claude_md(&project);
         let agents_md = generate_agents_md();
+
+        // The two-role fork must name both roles and both prohibitions.
+        assert!(contract.contains("Working a ticket for Lisa?"));
+        assert!(contract.contains("Helping set the project up?"));
+        assert!(contract.contains("Do not implement tickets yourself"));
+        assert!(contract.contains("do not run `lisa loop`"));
+        assert!(contract.contains("their own terminal pane or window"));
 
         for (context, heading, later_section) in [
             (claude_md.as_str(), "# CLAUDE.md", "## Project"),
