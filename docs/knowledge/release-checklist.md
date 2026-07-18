@@ -1,9 +1,12 @@
 # Lisa stable release checklist
 
-This is the maintainer runbook for cutting a stable Lisa release.
+This is the maintainer runbook for cutting a stable Lisa release. It is
+version-parameterized: set the block below once and every command derives from
+it. Current cut: **v0.4.4** (prepared 2026-07-17; prior stable v0.4.3).
 
 Only John authorizes publication. Preparing or reviewing this checklist is not
-authorization to tag, dispatch, publish, or update the Homebrew tap.
+authorization to tag, dispatch, publish, or update the Homebrew tap or apt
+repository.
 
 For the automated route, merging the stable version bump to `main` is the
 publication-authorizing action: successful main CI starts Auto Release, which
@@ -13,23 +16,32 @@ Run the automatic and manual release routes one at a time. Never start `just
 release` while an Auto Release or Release run for the same commit is active.
 
 Commands below assume Bash, a checkout of `johnhkchen/lisa`, authenticated `gh`,
-`jq`, and the repository root as the working directory.
+`jq`, Docker (for the apt checks), and the repository root as the working
+directory.
 
 ```bash
 set -euo pipefail
 REPO=johnhkchen/lisa
-TAG=v0.4.0
-E045_GATE=c08e755
-MUSL_GATE=fcdd293
+VERSION=0.4.4
+TAG="v$VERSION"
+PRIOR_STABLE=v0.4.3
+# Ancestry gates: each must be an ancestor of the release commit.
+E045_GATE=c08e755   # completion boundary of the last E-045 ticket
+MUSL_GATE=fcdd293   # static-musl linkage + Bullseye execution checks in release.yml
+SEAL_GATE=6fcb2f2   # completion boundary of S-049-08 (stable-0.4.4 hotfix: E-049 + E-050 line)
 ```
 
-## v0.4.0 channel baseline
+For a future cut: update `VERSION`, `PRIOR_STABLE`, and append the new cut's
+gate commit; do not delete old gates — they are cumulative lineage proof.
 
-Before this stable cut, the expected skew is:
+## Channel baseline
 
-- `releases/latest`: `v0.3.0` (stable, pre-E-045);
-- newest prerelease: `v0.4.0-rc.8`;
-- Homebrew tap: `0.4.0-rc.8` because `publish-prereleases = true`.
+Expected skew before this stable cut:
+
+- `releases/latest`: `$PRIOR_STABLE` (stable);
+- newest prerelease: `v0.4.4-rc.1`;
+- Homebrew tap: `0.4.4-rc.1` (deliberate: `publish-prereleases = true`);
+- apt repository: `$PRIOR_STABLE` versions only (apt publishing skips prereleases).
 
 Capture the live values instead of assuming that baseline is still current:
 
@@ -42,9 +54,12 @@ gh api "repos/$REPO/releases?per_page=1" \
 
 gh api repos/johnhkchen/homebrew-lisa/contents/Formula/lisa.rb \
   --jq .content | tr -d '\n' | base64 --decode | sed -n '1,45p'
+
+curl -fsSL https://johnhkchen.github.io/lisa/dists/stable/main/binary-amd64/Packages \
+  | awk '/^Package: lisa$/{p=1} p&&/^Version:/{print; exit}'
 ```
 
-Stop if a stable v0.4.0 already exists. Switch to the post-cut audit rather than
+Stop if a stable `$TAG` already exists. Switch to the post-cut audit rather than
 creating or moving the tag.
 
 ## 1. Choose and record the release commit
@@ -63,17 +78,18 @@ printf 'release_base=%s\n' "$RELEASE_BASE"
 The status output must be empty for the human cut. Lisa's concurrent ticket
 worktrees are not a suitable place to perform the version bump.
 
-Prove that the chosen line contains both the completed E-045 claim path and the
-static-musl release gate:
+Prove the chosen line contains every gate:
 
 ```bash
-git merge-base --is-ancestor "$E045_GATE" "$RELEASE_BASE"
-git merge-base --is-ancestor "$MUSL_GATE" "$RELEASE_BASE"
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE"; do
+  git merge-base --is-ancestor "$gate" "$RELEASE_BASE"
+done
 ```
 
-Both commands must exit zero. `c08e755` is the completion boundary for the last
-E-045 ticket; `fcdd293` added packaged-musl static linkage, embedded-asset, and
-Bullseye execution checks to the release workflow.
+Every iteration must exit zero. `$SEAL_GATE` is the completion boundary of
+S-049-08 (remedies-that-work); its ancestry proves the release line carries the
+full seal ladder, park-and-ask machinery, andon surfaces, common-sense
+defaults, and the three stable-gating hotfixes.
 
 Confirm that the stable identity is still unused:
 
@@ -85,31 +101,26 @@ Confirm that the stable identity is still unused:
 ## 2. Prepare the stable version change
 
 Change `[workspace.package].version` in `Cargo.toml` from the current release
-candidate to `0.4.0`. Do not edit package records in `Cargo.lock` by hand.
+candidate to `$VERSION`. Also confirm `crates/lisa-cli/Cargo.toml`'s internal
+`lisa-core` requirement tracks the workspace version. Do not edit package
+records in `Cargo.lock` by hand.
 
 Refresh the lockfile through Cargo, then check all Lisa package versions:
 
 ```bash
 cargo check --workspace
-cargo metadata --no-deps --format-version 1 | jq -e '
+cargo metadata --no-deps --format-version 1 | jq -e --arg v "$VERSION" '
   [.packages[] | select(.name | startswith("lisa-")) | .version]
-  | length == 3 and all(. == "0.4.0")
+  | length == 3 and all(. == $v)
 '
-
-awk '
-  /^name = "lisa-(cli|core|plugin)"$/ { package=$0; getline; print package " " $0 }
-' Cargo.lock
 ```
-
-The lockfile output must show `version = "0.4.0"` for `lisa-cli`, `lisa-core`,
-and `lisa-plugin`.
 
 Review and commit only the intended stable-version preparation:
 
 ```bash
 git diff --check
-git diff -- Cargo.toml Cargo.lock
-git commit -am 'chore: release 0.4.0'
+git diff -- Cargo.toml Cargo.lock crates/lisa-cli/Cargo.toml
+git commit -am "chore: release $VERSION"
 RELEASE_COMMIT=$(git rev-parse HEAD)
 printf 'release_commit=%s\n' "$RELEASE_COMMIT"
 ```
@@ -145,7 +156,7 @@ export PATH="$DIST_HOME/cargo/bin:$PATH"
 
 dist --version
 test "$(dist --version)" = 'cargo-dist 0.30.4'
-dist plan --output-format=json > /tmp/lisa-v0.4.0-dist-plan.json
+dist plan --output-format=json > "/tmp/lisa-$TAG-dist-plan.json"
 ```
 
 Assert the four platform archives and their adjacent checksums:
@@ -165,13 +176,17 @@ for artifact in \
 do
   jq -e --arg artifact "$artifact" \
     'any(.releases[].artifacts[]; . == $artifact)' \
-    /tmp/lisa-v0.4.0-dist-plan.json >/dev/null
+    "/tmp/lisa-$TAG-dist-plan.json" >/dev/null
 done
 
 ! jq -e '
   any(.releases[].artifacts[]; test("^lisa-cli-.*unknown-linux-gnu"))
-' /tmp/lisa-v0.4.0-dist-plan.json >/dev/null
+' "/tmp/lisa-$TAG-dist-plan.json" >/dev/null
 ```
+
+The four `.deb` packages are cargo-dist extra artifacts built by
+`scripts/package-debs.sh`; they do not appear in `dist plan` and are asserted on
+the published release in section 6 instead.
 
 Assert both musl matrix jobs and their native linker package:
 
@@ -181,14 +196,14 @@ jq -e '
    | select(.targets | any(. == "aarch64-unknown-linux-musl"))]
   | length == 1 and .[0].runner == "ubuntu-22.04-arm"
     and (.[0].packages_install | contains("musl-tools"))
-' /tmp/lisa-v0.4.0-dist-plan.json >/dev/null
+' "/tmp/lisa-$TAG-dist-plan.json" >/dev/null
 
 jq -e '
   [.ci.github.artifacts_matrix.include[]
    | select(.targets | any(. == "x86_64-unknown-linux-musl"))]
   | length == 1 and .[0].runner == "ubuntu-22.04"
     and (.[0].packages_install | contains("musl-tools"))
-' /tmp/lisa-v0.4.0-dist-plan.json >/dev/null
+' "/tmp/lisa-$TAG-dist-plan.json" >/dev/null
 ```
 
 Finally, parse both workflow files and inspect the release-specific gates:
@@ -197,13 +212,15 @@ Finally, parse both workflow files and inspect the release-specific gates:
 ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/auto-release.yml")'
 ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/release.yml")'
 
-rg -n 'github.event.inputs.tag|Build WASM plugin|Verify static musl artifact|publish-homebrew-formula' \
+rg -n 'github.event.inputs.tag|Build WASM plugin|Verify static musl artifact|publish-homebrew-formula|publish-apt-repository' \
   .github/workflows/release.yml
 ```
 
 The tagged checkout expression must prefer `github.event.inputs.tag`; the WASM
 build must precede cargo-dist; the musl verifier must run after `dist build` and
-before artifact upload; Homebrew must depend on a successful host job.
+before artifact upload; Homebrew must depend on a successful host job; and
+`publish-apt-repository` must be present, gated to stable (non-prerelease) tags,
+and required by `announce`.
 
 ## 4. Publication authorization and cut
 
@@ -216,14 +233,14 @@ John reviews the release commit and explicitly authorizes exactly one route.
 Push the reviewed version bump through the normal main integration path. After
 successful main CI:
 
-1. Auto Release reads version `0.4.0` from that exact CI SHA.
-2. It creates annotated tag `v0.4.0` if absent.
+1. Auto Release reads version `$VERSION` from that exact CI SHA.
+2. It creates annotated tag `$TAG` if absent.
 3. A tag created with `GITHUB_TOKEN` does not trigger a push workflow, so Auto
-   Release explicitly dispatches `release.yml` with `tag=v0.4.0`.
+   Release explicitly dispatches `release.yml` with `tag=$TAG`.
 4. If John already pushed the tag and its Release run is active, Auto Release
    detects the same commit and does not dispatch a duplicate.
 5. `release.yml` checks out the immutable tag, builds, verifies, hosts, and
-   publishes the Homebrew formula.
+   publishes the Homebrew formula and the apt repository.
 
 ### Alternate route: explicit human tag push
 
@@ -262,7 +279,7 @@ gh run view "$RELEASE_RUN_ID" --repo "$REPO" --json jobs \
   --jq '.jobs[] | {name,conclusion,url,steps:[.steps[]|{name,conclusion}]}'
 ```
 
-Required successful jobs are:
+Required successful jobs for a stable cut are:
 
 - `plan`;
 - `build-local-artifacts (aarch64-apple-darwin)`;
@@ -272,6 +289,7 @@ Required successful jobs are:
 - `build-global-artifacts`;
 - `host`;
 - `publish-homebrew-formula`;
+- `publish-apt-repository` (stable tags only — skipped is a FAILED stable cut);
 - `announce`.
 
 Both musl jobs must show `Verify static musl artifact on Debian bullseye` as
@@ -300,7 +318,8 @@ jq -e --arg tag "$TAG" '
 ' "$EVIDENCE/latest-release.json" >/dev/null
 ```
 
-Require the complete asset surface:
+Require the complete asset surface — archives, installer, formula, checksums,
+and all four Debian packages:
 
 ```bash
 jq -e '
@@ -317,6 +336,10 @@ jq -e '
       "lisa-cli-x86_64-unknown-linux-musl.tar.gz.sha256",
       "lisa-cli-installer.sh",
       "lisa.rb",
+      "lisa-amd64.deb",
+      "lisa-arm64.deb",
+      "lisa-runtime-zellij-amd64.deb",
+      "lisa-runtime-zellij-arm64.deb",
       "sha256.sum",
       "source.tar.gz",
       "source.tar.gz.sha256"
@@ -333,21 +356,22 @@ No released Lisa Linux archive may contain `unknown-linux-gnu`:
 ! grep -E '^lisa-cli-.*unknown-linux-gnu' "$EVIDENCE/assets.txt"
 ```
 
-## 7. Prove the public tag contains E-045
+## 7. Prove the public tag's ancestry
 
-Fetch and peel the public stable tag, then repeat the ancestry gate:
+Fetch and peel the public stable tag, then repeat the ancestry gates:
 
 ```bash
 git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
 PUBLIC_TAG_COMMIT=$(git rev-parse "$TAG^{commit}")
-git merge-base --is-ancestor "$E045_GATE" "$PUBLIC_TAG_COMMIT"
-git merge-base --is-ancestor "$MUSL_GATE" "$PUBLIC_TAG_COMMIT"
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE"; do
+  git merge-base --is-ancestor "$gate" "$PUBLIC_TAG_COMMIT"
+done
 printf 'public_tag_commit=%s\n' "$PUBLIC_TAG_COMMIT" \
   | tee "$EVIDENCE/tag-ancestry.txt"
 ```
 
-This is the source-level proof that `releases/latest` resolves to the fixed
-Codex claim-path line rather than the old v0.3.0 configuration.
+This is the source-level proof that `releases/latest` resolves to the line
+carrying every gated fix, not an older configuration.
 
 ## 8. Run the exact README installer in isolation
 
@@ -364,19 +388,15 @@ HOME="$EVIDENCE/home" \
   2>&1 | tee "$EVIDENCE/installer-output.txt"
 ```
 
-Verify the Rust-free destination, stable version, and packaged claim command:
+Verify the Rust-free destination and stable version:
 
 ```bash
 LISA_UNDER_TEST="$EVIDENCE/home/.local/bin/lisa"
 test -x "$LISA_UNDER_TEST"
 test ! -e "$EVIDENCE/home/.cargo"
-test "$("$LISA_UNDER_TEST" --version)" = 'lisa 0.4.0'
-"$LISA_UNDER_TEST" claim --help > "$EVIDENCE/claim-help.txt"
+test "$("$LISA_UNDER_TEST" --version)" = "lisa $VERSION"
 "$LISA_UNDER_TEST" --version | tee "$EVIDENCE/installed-version.txt"
 ```
-
-This records both the exact one-liner redirect's installer and the installed
-binary without replacing the operator's normal Lisa or editing shell profiles.
 
 ## 9. Verify Homebrew convergence
 
@@ -387,10 +407,63 @@ gh api repos/johnhkchen/homebrew-lisa/contents/Formula/lisa.rb \
   --jq .content | tr -d '\n' | base64 --decode \
   > "$EVIDENCE/lisa.rb"
 
-grep -F 'version "0.4.0"' "$EVIDENCE/lisa.rb"
+grep -F "version \"$VERSION\"" "$EVIDENCE/lisa.rb"
 grep -F 'lisa-cli-aarch64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa.rb"
 grep -F 'lisa-cli-x86_64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa.rb"
 ```
+
+## 10. Verify apt convergence — fresh install and upgrade
+
+Both checks run in disposable Debian containers against the live Pages
+repository, after `publish-apt-repository` succeeds. The first proves the
+README's Debian path installs the new stable; the second proves ordinary
+`apt-get upgrade` moves an existing $PRIOR_STABLE machine forward (the audit
+item deferred from the $PRIOR_STABLE cut).
+
+Fresh install:
+
+```bash
+docker run --rm debian:bookworm bash -ec '
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl gnupg >/dev/null
+  curl --proto "=https" --tlsv1.2 -fsSL \
+    https://johnhkchen.github.io/lisa/lisa-archive-keyring.asc \
+    | gpg --batch --dearmor -o /usr/share/keyrings/lisa-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lisa-archive-keyring.gpg] https://johnhkchen.github.io/lisa stable main" \
+    > /etc/apt/sources.list.d/lisa.list
+  apt-get update -qq
+  apt-get install -y -qq lisa lisa-runtime-zellij >/dev/null
+  lisa --version
+  test -x /usr/libexec/lisa/zellij
+' | tee "$EVIDENCE/apt-fresh-install.txt"
+grep -F "lisa $VERSION" "$EVIDENCE/apt-fresh-install.txt"
+```
+
+Upgrade from the prior stable:
+
+```bash
+docker run --rm debian:bookworm bash -ec '
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl gnupg >/dev/null
+  curl --proto "=https" --tlsv1.2 -fsSL \
+    https://johnhkchen.github.io/lisa/lisa-archive-keyring.asc \
+    | gpg --batch --dearmor -o /usr/share/keyrings/lisa-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lisa-archive-keyring.gpg] https://johnhkchen.github.io/lisa stable main" \
+    > /etc/apt/sources.list.d/lisa.list
+  apt-get update -qq
+  apt-get install -y -qq lisa='"${PRIOR_STABLE#v}"'* lisa-runtime-zellij >/dev/null || \
+    apt-get install -y -qq lisa lisa-runtime-zellij >/dev/null
+  before=$(lisa --version)
+  apt-get update -qq && apt-get upgrade -y -qq >/dev/null
+  after=$(lisa --version)
+  echo "before=$before after=$after"
+' | tee "$EVIDENCE/apt-upgrade.txt"
+grep -F "after=lisa $VERSION" "$EVIDENCE/apt-upgrade.txt"
+```
+
+If the repository no longer serves the prior stable version (single-version
+repo), the fallback install makes the upgrade leg equal the fresh leg — record
+that explicitly in the cut record rather than skipping the check.
 
 Compare all stable-facing versions in one record:
 
@@ -402,48 +475,41 @@ Compare all stable-facing versions in one record:
   "$LISA_UNDER_TEST" --version
   printf 'brew_version='
   sed -n 's/^  version "\([^"]*\)"/\1/p' "$EVIDENCE/lisa.rb"
+  printf 'apt_version='
+  sed -n 's/^lisa \(.*\)/\1/p' "$EVIDENCE/apt-fresh-install.txt" | head -1
 } | tee "$EVIDENCE/channel-versions.txt"
 ```
 
-For v0.4.0, all three values must agree. The intended disposition is
+All four values must agree on `$VERSION`. The intended disposition is
 `eliminated`; a mismatch is not a passing release.
 
-An optional macOS smoke check after the formula audit is:
-
-```bash
-brew update
-brew upgrade johnhkchen/lisa/lisa || brew install johnhkchen/lisa/lisa
-brew list --versions lisa
-lisa --version
-```
-
-## 10. Record the v0.4.0 cut
+## 11. Record the cut
 
 Copy this block into the release ticket's Review or a dated field report and
 replace every `PENDING` value from the evidence files:
 
 ```text
-release: v0.4.0
+release: $TAG
 cut_at: PENDING
 operator: PENDING
 release_commit: PENDING
 release_run_url: PENDING
 latest_api_tag: PENDING
 latest_prerelease: PENDING
-e045_gate_ancestor: PENDING
-musl_gate_ancestor: PENDING
-asset_audit: PENDING
+ancestry_gates: PENDING            # e045 / musl / seal, each "ancestor"
+asset_audit: PENDING               # includes all four .deb packages
 aarch64_musl_bullseye_step: PENDING
 x86_64_musl_bullseye_step: PENDING
 readme_installer_path: PENDING
 installed_version: PENDING
-claim_help: PENDING
 homebrew_version: PENDING
+apt_fresh_version: PENDING
+apt_upgrade_from_prior: PENDING    # before/after line, or "equal-to-fresh (single-version repo)"
 channel_skew: pending
 ```
 
-Set `channel_skew: eliminated` only when latest, the isolated shell install, and
-the tap all report v0.4.0.
+Set `channel_skew: eliminated` only when latest, the isolated shell install,
+the tap, and the apt repository all report `$VERSION`.
 
 If skew is intentionally retained, use `channel_skew: deliberate` and also
 record the exact versions, reason, owner, and resolution date. Unexplained skew
@@ -453,7 +519,7 @@ is a failed post-cut audit.
 
 Keep release tags immutable.
 
-If `v0.4.0` exists, no public release exists, and no Release run for its commit
+If `$TAG` exists, no public release exists, and no Release run for its commit
 is active, dispatch the existing tag:
 
 ```bash
@@ -468,8 +534,9 @@ gh run view "$RELEASE_RUN_ID" --repo "$REPO" --log-failed
 gh run rerun "$RELEASE_RUN_ID" --repo "$REPO" --failed
 ```
 
-If the GitHub release exists but Homebrew publication failed, repair or rerun
-the tap job before signing off. Record the temporary skew until convergence.
+If the GitHub release exists but Homebrew or apt publication failed, repair or
+rerun the failed publish job before signing off. Record the temporary skew until
+convergence.
 
 Never delete and recreate a public stable tag to hide a bad artifact. A product
 defect discovered after publication is fixed in a new patch release.

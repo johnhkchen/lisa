@@ -42,7 +42,7 @@ Execute the plan. Track progress in `progress.md`. Commit meaningful units throu
 
 Follow the plan step by step. Update `progress.md` with what has been completed, what remains, and any deviations from the plan. If the plan needs adjustment, document the deviation and rationale before proceeding.
 
-For each meaningful implementation unit, run `lisa commit-ticket --ticket-id <ticket-id> --message <message> --include <exact-repository-relative-path>...`. Pass only paths owned by this ticket. Never use the ordinary index for ticket work: do not run ordinary `git add`, broad `git add -A`, or ordinary `git commit`, and do not leave staged changes for another command or process to consume. Before finishing Review, ensure every ticket-owned source change is committed through `lisa commit-ticket` and no ticket-owned source file remains staged, modified, or untracked.
+For each meaningful implementation unit, run `lisa commit-ticket --ticket-id <ticket-id> --message <message> --include <exact-repository-relative-path>...`. Pass only paths owned by this ticket. Never use the ordinary index for ticket work: do not run ordinary `git add`, broad `git add -A`, or ordinary `git commit`, and do not leave staged changes for another command or process to consume. Before finishing Review, ensure every ticket-owned source change is committed through `lisa commit-ticket` and no ticket-owned source file remains staged, modified, or untracked. In a journal-sealed project (no repository — `lisa status` reports the journal-only seal), skip every commit command: leave finished files saved in the working tree, and Lisa's completion records the ticket and its work artifacts with content hashes instead.
 
 Artifact: `docs/active/work/{ticket-id}/progress.md`
 
@@ -87,7 +87,7 @@ Artifacts:
 
 5. **Artifacts are insurance.** If a session crashes or hits limits, the latest artifact plus the ticket is enough to seed a new session at the correct phase.
 
-6. **Completion is commit-gated.** The agent makes ticket-owned source changes durable through `lisa commit-ticket`, but Lisa alone writes Done and publishes completion. A failed completion commit leaves the ticket, seat, and dependents in place for a safe retry.
+6. **Completion is seal-gated.** In commit-sealed projects the agent makes ticket-owned source changes durable through `lisa commit-ticket`, and completion lands as an atomic commit; in journal-sealed projects completion is gated on the review disposition plus content hashes of the ticket and its work artifacts. Either way, Lisa alone writes Done and publishes completion, and a failed completion leaves the ticket, seat, and dependents in place for a safe, bounded retry.
 
 ---
 
@@ -131,6 +131,6 @@ Fields:
 
 ## Concurrency
 
-Lisa computes the DAG from ticket dependencies and spawns threads for all tickets whose dependencies are satisfied. Multiple threads work on the same branch. `lisa commit-ticket` and Lisa's final completion command serialize commits while using an isolated Git index, so unrelated entries already staged in the ordinary index remain untouched and uncommitted.
+Lisa computes the DAG from ticket dependencies and spawns threads for all tickets whose dependencies are satisfied. Multiple threads work on the same branch. `lisa commit-ticket` and Lisa's final completion command serialize commits while using an isolated Git index, so unrelated entries already staged in the ordinary index remain untouched and uncommitted. In journal-sealed projects there are no commits to serialize; completions are journaled one at a time under the same scheduler discipline.
 
 If two tickets modify the same files, that is a missing dependency edge in the DAG. The isolated transaction is a safety boundary, not a substitute for correct dependency modeling or exact `--include` ownership.
