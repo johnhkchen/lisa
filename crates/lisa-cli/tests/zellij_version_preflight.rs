@@ -22,6 +22,15 @@ fn run_with_zellij_version_and_path(
     version_output: &str,
     include_host_path: bool,
 ) -> Output {
+    run_with_zellij_version_and_path_and_home(command, version_output, include_host_path, true)
+}
+
+fn run_with_zellij_version_and_path_and_home(
+    command: &str,
+    version_output: &str,
+    include_host_path: bool,
+    seed_claude_acceptance: bool,
+) -> Output {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     let bin = temp.path().join("bin");
@@ -29,6 +38,16 @@ fn run_with_zellij_version_and_path(
     fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&home).unwrap();
+    // These fixtures test Zellij/seal preflights, so by default the Claude
+    // one-time confirmation is declared already accepted; the refusal path
+    // has its own dedicated test.
+    if seed_claude_acceptance {
+        fs::write(
+            home.join(".claude.json"),
+            "{\"bypassPermissionsModeAccepted\": true}\n",
+        )
+        .unwrap();
+    }
 
     fs::write(root.join("CLAUDE.md"), "# Stubbed Zellij preflight\n").unwrap();
     fs::write(
@@ -136,6 +155,26 @@ fn doctor_explicit_commit_without_git_fails_with_apt_remedy() {
     );
     assert!(stdout.contains("git"));
     assert!(stdout.contains("sudo apt install git"));
+}
+
+#[test]
+fn loop_refuses_claude_without_first_run_confirmation() {
+    // Field stall, 2026-07-18: a fresh machine's loop spawned two Claude panes
+    // that froze at the bypass-permissions dialog. The loop must refuse with
+    // the one-command remedy instead — and Lisa never accepts it for you.
+    let output = run_with_zellij_version_and_path_and_home(
+        "loop",
+        "zellij 0.44.3",
+        false,
+        false, // do NOT seed the acceptance
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "loop must refuse: {stderr}");
+    assert!(stderr.contains("one-time confirmation"));
+    assert!(stderr.contains("claude --dangerously-skip-permissions"));
+    assert!(stderr.contains("Lisa never accepts it for you"));
+    assert!(stderr.contains("Then run `lisa loop` again."));
 }
 
 #[test]

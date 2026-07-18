@@ -40,6 +40,12 @@ the tested agent cannot stumble onto the grading rubric; never mention them to
 the agent under test. The prose sections below remain the authoritative
 protocol; the scripts implement it.
 
+Auth note for Claude legs that will run a real `lisa loop`: after `claude`
+login, the operator also runs `claude --dangerously-skip-permissions` once and
+accepts Claude's one-time confirmation (then exits). Lisa deliberately never
+accepts it on anyone's behalf — an unaccepted machine makes `lisa loop` refuse
+with that exact instruction instead of freezing panes (2026-07-18 field stall).
+
 Inside a leg container (after fresh auth):
 
 ```

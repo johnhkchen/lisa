@@ -103,6 +103,19 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
             .map_err(|failures| format_dependency_preflight_error(*client, &failures))?;
     }
 
+    // Claude's bypass-permissions mode needs a one-time human confirmation
+    // that Lisa deliberately never grants (field stall, 2026-07-18: two panes
+    // frozen at a dialog no one could see). Refuse to launch into that wall
+    // and hand the operator the one command instead.
+    if clients.contains(&AgentClient::Claude) && !crate::doctor::claude_bypass_accepted() {
+        return Err(format!(
+            "Lisa can't run Claude unattended on this machine yet — Claude asks for a \
+             one-time confirmation first, and that choice is yours to make, not Lisa's.\n\n\
+             {}\n\nThen run `lisa loop` again.",
+            crate::doctor::CLAUDE_FIRST_RUN_REMEDY
+        ));
+    }
+
     // The native Codex TUI can stop at its directory-trust prompt before Lisa's
     // injected ticket is handled, so pre-seed trust for every loop that may route
     // to Codex. Best-effort — the launch command independently bypasses approval,

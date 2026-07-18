@@ -245,6 +245,50 @@ fn build_required_deps_checks(client: AgentClient, require_git: bool) -> Vec<Dep
     checks
 }
 
+/// The one-command remedy for Claude's one-time bypass confirmation. Lisa
+/// never accepts this on the operator's behalf — Claude's own dialog calls
+/// bypass mode highly unadvised, so the choice stays a conscious human one.
+/// Lisa's job is only to say it plainly before a pane can freeze on it.
+pub(crate) const CLAUDE_FIRST_RUN_REMEDY: &str =
+    "Run `claude --dangerously-skip-permissions` once in your own terminal, \
+read Claude's confirmation, and accept it if you're comfortable — then exit. \
+Claude remembers that choice, and Lisa's sessions won't stop at a prompt no \
+one can see. Lisa never accepts it for you.";
+
+/// Whether this machine has completed Claude's one-time bypass-permissions
+/// confirmation (`bypassPermissionsModeAccepted` in `$HOME/.claude.json`).
+/// Missing file, missing key, or unreadable JSON all read as not-yet —
+/// conservative, and never an error.
+pub(crate) fn claude_bypass_accepted() -> bool {
+    std::env::var_os("HOME")
+        .map(|home| claude_bypass_accepted_in(Path::new(&home)))
+        .unwrap_or(false)
+}
+
+pub(crate) fn claude_bypass_accepted_in(home: &Path) -> bool {
+    std::fs::read_to_string(home.join(".claude.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_str::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("bypassPermissionsModeAccepted")
+                .and_then(|flag| flag.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+fn check_claude_first_run() -> CheckResult {
+    if claude_bypass_accepted() {
+        CheckResult::Found {
+            version: "one-time confirmation accepted".to_string(),
+        }
+    } else {
+        CheckResult::Skipped {
+            reason: format!("pending — {CLAUDE_FIRST_RUN_REMEDY}"),
+        }
+    }
+}
+
 fn check_git_journal_optional() -> CheckResult {
     match get_command_version("git", &["--version"]) {
         Some(version) => CheckResult::Found { version },
@@ -269,6 +313,16 @@ fn build_checks(client: AgentClient, require_git: bool) -> Vec<DependencyCheck> 
             name: "git",
             required: false,
             check: Box::new(check_git_journal_optional),
+        });
+    }
+    // Friendly reminder, never a failure: unattended Claude sessions need the
+    // operator's one-time bypass confirmation. `lisa loop` enforces it with
+    // the same remedy; doctor just gives the heads-up early.
+    if client == AgentClient::Claude {
+        checks.push(DependencyCheck {
+            name: "claude unattended",
+            required: false,
+            check: Box::new(check_claude_first_run),
         });
     }
     checks.extend([
@@ -1304,6 +1358,47 @@ mod tests {
         let git: Vec<_> = checks.iter().filter(|c| c.name == "git").collect();
         assert_eq!(git.len(), 1, "journal tier still shows one git line");
         assert!(!git[0].required, "journal tier never requires git");
+    }
+
+    #[test]
+    fn test_claude_first_run_reminder_is_informational_and_claude_only() {
+        let claude = build_checks(AgentClient::Claude, true);
+        let reminder: Vec<_> = claude
+            .iter()
+            .filter(|c| c.name == "claude unattended")
+            .collect();
+        assert_eq!(reminder.len(), 1);
+        assert!(
+            !reminder[0].required,
+            "the first-run reminder must never fail doctor"
+        );
+        assert!(build_checks(AgentClient::Codex, true)
+            .iter()
+            .all(|c| c.name != "claude unattended"));
+    }
+
+    #[test]
+    fn test_claude_bypass_acceptance_reads_conservatively() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file → not accepted.
+        assert!(!claude_bypass_accepted_in(dir.path()));
+        // Malformed JSON → not accepted, never an error.
+        std::fs::write(dir.path().join(".claude.json"), "{not json").unwrap();
+        assert!(!claude_bypass_accepted_in(dir.path()));
+        // Key false → not accepted.
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            "{\"bypassPermissionsModeAccepted\": false}",
+        )
+        .unwrap();
+        assert!(!claude_bypass_accepted_in(dir.path()));
+        // Accepted.
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            "{\"bypassPermissionsModeAccepted\": true}",
+        )
+        .unwrap();
+        assert!(claude_bypass_accepted_in(dir.path()));
     }
 
     #[test]
