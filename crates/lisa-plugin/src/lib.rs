@@ -9997,7 +9997,7 @@ mod tests {
             .collect::<Vec<_>>();
         let aggregate_before = restarted.completion_aggregates["T-NOTE"].clone();
 
-        lisa_core::notes::acknowledge_note(&journal, &ledger, "T-NOTE").unwrap();
+        lisa_core::notes::acknowledge_note(&journal, &ledger, "T-NOTE", None).unwrap();
 
         assert!(restarted.to_ui_state().note_items.is_empty());
         assert_eq!(restarted.dag.get_ready_tickets(), ready_before);
