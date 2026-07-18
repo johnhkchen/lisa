@@ -74,6 +74,12 @@ contract, agents never start the loop. Refresh the captured board deliberately
 (copy a better field board over `docker/chromebook-test/board/` and note it
 here), never ad hoc.
 
+For loop-focused testing where the install claim is already proven, `just
+loop-rc [OS] [AGENT]` pre-installs the candidate, stages the standing board,
+and runs init — inside the container only auth, the one-time Claude
+acceptance, and the operator's own `lisa loop` remain. Loop legs are not
+install evidence; graded install claims always come from `test-rc` legs.
+
 The one-command host route for a candidate leg is `just test-rc [OS] [AGENT]
 [prepare-flags…]` — it derives the tag from the workspace version, builds the
 fixture on the named apt-flavored base (default `debian:bookworm`; the
