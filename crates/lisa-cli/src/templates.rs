@@ -60,6 +60,14 @@ if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
 fi
 
+# An operator's own session has no Lisa pane: nothing to attribute, so stay
+# silent. Inside a Lisa-managed pane, capture errors remain loud on purpose
+# (silent no-writes were the 2026-07-09 attribution incident).
+if [ -z "${LISA_PANE_ID:-}" ]; then
+    cat >/dev/null
+    exit 0
+fi
+
 # Forward the Stop payload (stdin: includes transcript_path) to the usage
 # capturer. No-capture markers and capture errors remain visible to operators.
 in=$(cat)
@@ -68,6 +76,23 @@ printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage
 
 /// Exact prior Stop-hook generations eligible for safe `lisa init` upgrades.
 pub(crate) const LEGACY_ON_STOP_HOOKS: &[&str] = &[
+    r#"#!/bin/sh
+# Lisa stop signal hook — called when the native agent finishes responding.
+# Writes a signal file so the plugin knows the pane is ready for input, and
+# captures session token usage for the provenance ledger (T-027-02).
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
+fi
+
+# Forward the Stop payload (stdin: includes transcript_path) to the usage
+# capturer. No-capture markers and capture errors remain visible to operators.
+in=$(cat)
+printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage
+"#,
     r#"#!/bin/sh
 # Lisa stop signal hook — called when the native agent finishes responding.
 # Writes a signal file so the plugin knows the pane is ready for input, and
@@ -1451,6 +1476,14 @@ mod tests {
         // forwards its stdin payload to `lisa capture-usage`.
         assert!(ON_STOP_HOOK.contains("pane-$LISA_PANE_ID.stopped"));
         assert!(ON_STOP_HOOK.contains("capture-usage"));
+        // Outside a Lisa-managed pane the hook exits silently before the
+        // capturer runs — the operator's own sessions must never see an error.
+        assert!(ON_STOP_HOOK.contains(r#"if [ -z "${LISA_PANE_ID:-}" ]; then"#));
+        assert!(
+            ON_STOP_HOOK.find(r#"[ -z "${LISA_PANE_ID:-}" ]"#).unwrap()
+                < ON_STOP_HOOK.find("capture-usage").unwrap(),
+            "the no-pane guard must precede the capture-usage forward"
+        );
         assert!(ON_STOP_HOOK.contains("${LISA_BIN:-lisa}"));
         // Reads stdin once (the Stop payload carries transcript_path).
         assert!(ON_STOP_HOOK.contains("in=$(cat)"));
