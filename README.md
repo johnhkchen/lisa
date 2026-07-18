@@ -185,7 +185,7 @@ max_threads = 2
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `version` | `0.4.4-rc.1` | Tracks the Lisa version used to set up this project. |
+| `version` | the installed Lisa version | Tracks the Lisa version used to set up this project. |
 | `dirs.tickets` | `docs/active/tickets` | Chooses where Lisa reads ticket files. |
 | `dirs.stories` | `docs/active/stories` | Chooses where Lisa reads story files. |
 | `dirs.work` | `docs/active/work` | Chooses where Lisa keeps work records. |

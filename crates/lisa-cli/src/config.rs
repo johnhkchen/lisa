@@ -869,7 +869,15 @@ provider_caps = {}
                 ));
             }
 
-            let expected_default = readme_default(entry.default);
+            // The version key's catalog default is the literal crate version;
+            // rendering that literal into the README would force a README edit
+            // on every release bump (first tripped by the 0.4.4-rc.2 cut).
+            // The README describes it symbolically instead.
+            let expected_default = if entry.path == "version" {
+                "the installed Lisa version"
+            } else {
+                readme_default(entry.default)
+            };
             if row.default != expected_default {
                 return Err(format!(
                     "README configuration default for `{}` is {:?}; expected {:?}",
