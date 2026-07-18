@@ -5,6 +5,7 @@
 set -eu
 
 PIN=""
+RELEASE_TAG=""
 SEED_OLD_ZELLIJ=0
 XDG_SEED=0
 NO_GIT=0
@@ -12,14 +13,17 @@ INSTR=A
 while [ $# -gt 0 ]; do
     case "$1" in
         --pin) PIN=$2; shift 2 ;;
+        --release) RELEASE_TAG=$2; shift 2 ;;
         --seed-old-zellij) SEED_OLD_ZELLIJ=1; shift ;;
         --xdg-cache) XDG_SEED=1; shift ;;
         --no-git) NO_GIT=1; shift ;;
         --discovery) INSTR=B; shift ;;
         *)
-            echo "usage: /cbt/prepare [--pin SHA] [--seed-old-zellij] [--xdg-cache] [--no-git] [--discovery]"
+            echo "usage: /cbt/prepare [--pin SHA] [--release TAG] [--seed-old-zellij] [--xdg-cache] [--no-git] [--discovery]"
             echo "  no flags      closing-run leg: live README, instruction A"
             echo "  --pin SHA     baseline-style leg against a pinned README"
+            echo "  --release TAG install the named (pre)release, e.g. v0.4.4-rc.1 —"
+            echo "                the leg tests to-be-released artifacts, never stable claims"
             echo "  --seed-old-zellij   place Zellij 0.40.1 in ~/.local/bin first"
             echo "  --xdg-cache   set XDG_CACHE_HOME for the agent session"
             echo "  --no-git      finish T-NOGIT-001 in a bare folder with journal sealing"
@@ -27,6 +31,11 @@ while [ $# -gt 0 ]; do
             exit 2 ;;
     esac
 done
+
+if [ -n "$RELEASE_TAG" ] && [ "$INSTR" = B ]; then
+    echo "FAIL: --release needs the README handed over; it cannot combine with --discovery" >&2
+    exit 1
+fi
 
 REF=${PIN:-main}
 curl -fsSL "https://raw.githubusercontent.com/johnhkchen/lisa/$REF/README.md" \
@@ -37,6 +46,23 @@ awk '/^## Install( Lisa)?$/{f=1} f&&/^## /&&!/^## Install( Lisa)?$/{exit} f{prin
     echo "FAIL: extracted install section is empty — README heading changed?" >&2
     exit 1
 }
+
+if [ -n "$RELEASE_TAG" ]; then
+    # Point the one-command installer at the named (pre)release, and drop the
+    # apt subsection: the apt channel is structurally stable-only, so leaving
+    # it in would let the agent install the wrong version by following honest
+    # instructions.
+    grep -q 'releases/latest/download/lisa-cli-installer.sh' /tmp/install-section.md || {
+        echo "FAIL: README installer URL not found — install section changed?" >&2
+        exit 1
+    }
+    sed -i "s|releases/latest/download/lisa-cli-installer.sh|releases/download/$RELEASE_TAG/lisa-cli-installer.sh|" \
+        /tmp/install-section.md
+    awk '/^### Debian and Ubuntu$/{skip=1; next} skip && /^### /{skip=0} skip && /^## /{skip=0} !skip{print}' \
+        /tmp/install-section.md > /tmp/install-section.release &&
+        mv /tmp/install-section.release /tmp/install-section.md
+    echo "release leg: installer pinned to $RELEASE_TAG; apt subsection omitted (stable-only channel)"
+fi
 
 if [ "$NO_GIT" = 1 ]; then
     if command -v git >/dev/null 2>&1; then
@@ -114,6 +140,7 @@ df -B1 --output=used / | tail -1 > /tmp/disk.before
 {
     echo "prepared_utc: $(date -u +%FT%TZ)"
     echo "readme_ref: $REF"
+    echo "release_tag: ${RELEASE_TAG:-none}"
     echo "instruction: $INSTR"
     echo "seed_old_zellij: $SEED_OLD_ZELLIJ"
     echo "xdg_cache_seed: $XDG_SEED"

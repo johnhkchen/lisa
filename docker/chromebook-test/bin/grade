@@ -21,6 +21,8 @@ disk=$((after_d - before_d))
 disk_mib=$((disk / 1048576))
 no_git=0
 grep -q '^no_git: 1$' /tmp/leg-meta 2>/dev/null && no_git=1
+release_tag=$(sed -n 's/^release_tag: //p' /tmp/leg-meta 2>/dev/null || true)
+[ "$release_tag" = none ] && release_tag=""
 project_root="$HOME/demo"
 wall_limit=600
 if [ "$no_git" = 1 ]; then
@@ -34,6 +36,16 @@ journal_rc=0
 say "== positives"
 lisa_path=$(bash -lc 'command -v lisa' 2>/dev/null || true)
 if [ -n "$lisa_path" ]; then note "PATH: $lisa_path"; else failhard "lisa not on login PATH"; fi
+
+lisa_version=$(bash -lc 'lisa --version' 2>/dev/null || echo unknown)
+if [ -n "$release_tag" ]; then
+    expected_version="lisa ${release_tag#v}"
+    if [ "$lisa_version" = "$expected_version" ]; then
+        note "version: $lisa_version (pinned release leg)"
+    else
+        failhard "version '$lisa_version' is not the pinned release '$expected_version' — agent likely installed from a stable channel"
+    fi
+fi
 
 if [ "$no_git" = 1 ]; then
     doctor_out=$(cd "$project_root" 2>/dev/null && bash -lc 'lisa doctor' 2>&1); doctor_rc=$?
@@ -229,7 +241,10 @@ fi
     echo "- journal verification: $journal_verify"
     echo "- apt actions:"
     printf '%s\n' "${apt_hist:-  (none)}" | sed 's/^/    /'
-    echo "- lisa version: $(bash -lc 'lisa --version' 2>/dev/null || echo unknown)"
+    echo "- lisa version: ${lisa_version:-$(bash -lc 'lisa --version' 2>/dev/null || echo unknown)}"
+    if [ -n "$release_tag" ]; then
+        echo "- channel: prerelease $release_tag — evidence for the to-be-released version only, never for stable claims"
+    fi
 } > /tmp/run-record.md
 
 say ""

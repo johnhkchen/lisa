@@ -45,6 +45,7 @@ Inside a leg container (after fresh auth):
 ```
 /cbt/prepare                      # closing leg: live README, instruction A
 /cbt/prepare --pin <SHA>          # baseline-style leg against a pinned README
+/cbt/prepare --release <TAG>      # to-be-released leg: installer pinned to a (pre)release
 /cbt/prepare --seed-old-zellij    # variant: Zellij 0.40.1 in ~/.local/bin
 /cbt/prepare --xdg-cache          # variant: XDG_CACHE_HOME set for the agent
 /cbt/prepare --no-git             # full loop: bare folder finishes journal-sealed
@@ -52,6 +53,15 @@ Inside a leg container (after fresh auth):
 /cbt/grade                        # all acceptance checks, writes /tmp/run-record.md
 /cbt/tour claude|codex [model]    # landing-probe rematch (FRESH session only)
 ```
+
+A `--release` leg (e.g. `--release v0.4.4-rc.1`) tests the **to-be-released**
+version before the stable cut: prepare rewrites the handed install one-liner to
+the tag's versioned installer and omits the apt subsection (that channel is
+structurally stable-only, so following it honestly would install the wrong
+version), and grade hard-fails unless `lisa --version` matches the pinned tag.
+Its run record is labeled `channel: prerelease` — such a leg is evidence for
+the release candidate only and never satisfies a stable install claim. Flags
+compose: `--release <TAG> --no-git` runs the journal-seal loop on the candidate.
 
 On the host, `just cbt-collect <container-name>` copies the run record, leg
 metadata, instruction, tour page, and a docker-diff summary into
