@@ -121,7 +121,7 @@ Example: lisa status --path ./my-project
 Usage: lisa notes [OPTIONS] [COMMAND]
 
 Commands:
-  ack   Mark one ticket's current note as read
+  ack   Mark a ticket's oldest or selected note as read
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -131,6 +131,7 @@ Options:
 Examples:
   lisa notes --path ./my-project
   lisa notes ack T-001 --path ./my-project
+  lisa notes ack T-001 --generation 2 --path ./my-project
 "#,
     },
     OperatorHelpSnapshot {
