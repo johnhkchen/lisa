@@ -146,6 +146,46 @@ emulate-debian LEG="":
 # Inside the container: authenticate the agent CLI, then run /tmp/go —
 # it chains prepare --release <tag>, run, and grade. Afterwards on the
 # host: just cbt-collect <container-name>.
+# Straight to the loop: the install path is proven (graded by test-rc), so
+# this recipe pre-installs the current candidate, stages the standing board,
+# and runs lisa init — the only steps left inside are the human-only ones.
+#   just loop-rc                     # bookworm + claude
+#   just loop-rc ubuntu:24.04 codex  # other OS flavor / agent
+# Inside: 1) auth the agent CLI  2) claude legs: run
+# `claude --dangerously-skip-permissions` once and accept (your choice —
+# Lisa never accepts it for you)  3) cd ~/demo && lisa loop
+loop-rc OS="debian:bookworm" AGENT="claude":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="v$(cargo metadata --no-deps --format-version 1 |
+        jq -r '.packages[] | select(.name == "lisa-cli") | .version')"
+    echo ">>> candidate: $tag on {{OS}} driving {{AGENT}} (loop leg, preinstalled)"
+    if ! curl -sfLI -o /dev/null \
+        "https://github.com/johnhkchen/lisa/releases/download/$tag/lisa-cli-installer.sh"; then
+        echo "FAIL: no published release for $tag — cut it first, or bump/check the workspace version" >&2
+        exit 1
+    fi
+    slug=$(printf '%s' "{{OS}}" | tr ':/.' '---')
+    image="lisa-chromebook-test:$slug"
+    docker build --build-arg "BASE_IMAGE={{OS}}" -t "$image" docker/chromebook-test/
+    name="cbt-$(date +%m%d-%H%M%S)-loop-$slug"
+    docker run -d --memory=4g --cpus=2 --name "$name" "$image" sleep infinity > /dev/null
+    echo ">>> installing lisa $tag inside the leg"
+    docker exec "$name" bash -c \
+        "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/download/$tag/lisa-cli-installer.sh | sh" \
+        > /dev/null
+    docker exec "$name" /cbt/prepare --release "$tag"
+    docker exec "$name" bash -lc \
+        'lisa --version && lisa init --no-history --path "$HOME/demo" > /dev/null && cd "$HOME/demo" && lisa validate | tail -1'
+    echo ""
+    echo ">>> leg container: $name   (kept after exit — record this name)"
+    echo ">>> inside: 1) authenticate: claude auth login  |  codex login --device-auth"
+    if [ "{{AGENT}}" = claude ]; then
+        echo ">>>         2) run: claude --dangerously-skip-permissions  — accept once, exit"
+    fi
+    echo ">>>         3) cd ~/demo && lisa loop     (you run the loop; agents never do)"
+    exec docker exec -it "$name" bash
+
 test-rc OS="debian:bookworm" AGENT="claude" *FLAGS="":
     #!/usr/bin/env bash
     set -euo pipefail
