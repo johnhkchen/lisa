@@ -482,7 +482,17 @@ fn completion_content_path(project_root: &Path, path: &Path) -> Result<String, S
     // against the other can never succeed there. A relative input is accepted
     // as already project-relative; the traversal guard below still applies.
     // (2026-07-18 rc.3 field stall: every journal seal failed this strip.)
-    let relative = match path.strip_prefix(project_root) {
+    // Zellij mounts the host project at /host inside the plugin sandbox, and
+    // filesystem events hand the plugin /host-prefixed absolute paths while
+    // `project_root` stays the host-absolute path kept for run_command.
+    // (Field, 2026-07-18 rc.6: T-001's seal failed labeling
+    // "/host/docs/…" against "/home/tester/demo" — named by the bounded
+    // failure routing within seconds of the attempt.)
+    const SANDBOX_MOUNT: &str = "/host";
+    let relative = match path
+        .strip_prefix(project_root)
+        .or_else(|_| path.strip_prefix(SANDBOX_MOUNT))
+    {
         Ok(relative) => relative,
         Err(_) if path.is_relative() => path,
         Err(_) => {
@@ -1065,9 +1075,19 @@ mod tests {
             completion_content_path(root, Path::new("/home/tester/demo/review.md")).unwrap(),
             "review.md"
         );
+        // Zellij filesystem events deliver /host-prefixed absolute paths —
+        // the actual field shape from the 2026-07-18 rc.6 leg.
+        assert_eq!(
+            completion_content_path(root, Path::new("/host/docs/active/tickets/T-001.md")).unwrap(),
+            "docs/active/tickets/T-001.md"
+        );
         assert!(completion_content_path(root, Path::new("../escape.md"))
             .unwrap_err()
             .contains("escapes the project root"));
+        assert!(
+            completion_content_path(root, Path::new("/host/../etc/passwd")).is_err(),
+            "traversal under the sandbox mount must still be rejected"
+        );
         assert!(completion_content_path(root, Path::new("/etc/passwd"))
             .unwrap_err()
             .contains("outside project root"));
