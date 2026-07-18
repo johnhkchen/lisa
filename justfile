@@ -137,6 +137,59 @@ emulate-debian LEG="":
     echo ">>> auth inside:  claude auth login   |   codex login --device-auth"
     exec docker run -it --memory=4g --cpus=2 --name "$name" lisa-chromebook-test bash
 
+# Test the current release candidate inside an emulated OS. The tag derives
+# from the workspace version, so this always targets "the rc we just made".
+# Defaults: debian:bookworm, claude. Extra flags go to /cbt/prepare.
+#   just test-rc                                  # bookworm + claude, install leg
+#   just test-rc ubuntu:24.04 codex               # other OS flavor / agent
+#   just test-rc debian:bookworm claude --no-git  # journal-seal loop on the rc
+# Inside the container: authenticate the agent CLI, then run /tmp/go —
+# it chains prepare --release <tag>, run, and grade. Afterwards on the
+# host: just cbt-collect <container-name>.
+test-rc OS="debian:bookworm" AGENT="claude" *FLAGS="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="v$(cargo metadata --no-deps --format-version 1 |
+        jq -r '.packages[] | select(.name == "lisa-cli") | .version')"
+    echo ">>> candidate: $tag on {{OS}} driving {{AGENT}}"
+    if ! curl -sfLI -o /dev/null \
+        "https://github.com/johnhkchen/lisa/releases/download/$tag/lisa-cli-installer.sh"; then
+        echo "FAIL: no published release for $tag — cut it first, or bump/check the workspace version" >&2
+        exit 1
+    fi
+    slug=$(printf '%s' "{{OS}}" | tr ':/.' '---')
+    image="lisa-chromebook-test:$slug"
+    docker build --build-arg "BASE_IMAGE={{OS}}" -t "$image" docker/chromebook-test/
+    echo ">>> preflight: fixture invariants (disposable container, no tokens spent)"
+    docker run --rm --memory=4g --cpus=2 "$image" bash -c '
+        set -eu
+        test "$(id -un)" = tester
+        sudo -n true
+        command -v claude >/dev/null
+        command -v codex >/dev/null
+        for b in git rustc cargo rustup xz gcc cc g++ make; do
+            if command -v "$b" >/dev/null 2>&1; then
+                echo "fixture invariant failed: $b present" >&2
+                exit 1
+            fi
+        done
+        test ! -e "$HOME/.claude"
+        test ! -e "$HOME/.codex"
+        echo "preflight OK: node=$(node --version) claude=$(claude --version) codex=$(codex --version)"
+    '
+    name="cbt-$(date +%m%d-%H%M%S)-rc-$slug"
+    docker run -d --memory=4g --cpus=2 --name "$name" "$image" sleep infinity > /dev/null
+    docker exec "$name" sh -c "printf '%s\n' '#!/bin/sh' 'set -eu' \
+        '/cbt/prepare --release $tag {{FLAGS}}' \
+        '/cbt/run {{AGENT}}' \
+        '/cbt/grade' > /tmp/go && chmod +x /tmp/go"
+    echo ""
+    echo ">>> leg container: $name   (kept after exit — record this name)"
+    echo ">>> inside: 1) authenticate: claude auth login  |  codex login --device-auth"
+    echo ">>>         2) /tmp/go   (= prepare --release $tag {{FLAGS}} + run + grade)"
+    echo ">>> afterwards on the host: just cbt-collect $name"
+    exec docker exec -it "$name" bash
+
 # Re-run the acceptance grade inside an existing leg container with the
 # repo's current grader (preserves the leg; only the grading logic updates).
 cbt-regrade CONTAINER:

@@ -1,4 +1,8 @@
-FROM debian:bookworm
+# Base is parameterized so legs can run on any apt-flavored OS a target
+# user might have (debian:bookworm, debian:bullseye, ubuntu:24.04, ...).
+# Default stays the Crostini stand-in.
+ARG BASE_IMAGE=debian:bookworm
+FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 

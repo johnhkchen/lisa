@@ -54,6 +54,13 @@ Inside a leg container (after fresh auth):
 /cbt/tour claude|codex [model]    # landing-probe rematch (FRESH session only)
 ```
 
+The one-command host route for a candidate leg is `just test-rc [OS] [AGENT]
+[prepare-flags…]` — it derives the tag from the workspace version, builds the
+fixture on the named apt-flavored base (default `debian:bookworm`; the
+Dockerfile's `BASE_IMAGE` arg accepts e.g. `ubuntu:24.04`), preflights the
+invariants, and drops the operator into a leg container where the remaining
+ritual after agent auth is one command, `/tmp/go` (prepare + run + grade).
+
 A `--release` leg (e.g. `--release v0.4.4-rc.1`) tests the **to-be-released**
 version before the stable cut: prepare rewrites the handed install one-liner to
 the tag's versioned installer and omits the apt subsection (that channel is
