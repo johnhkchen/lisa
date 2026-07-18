@@ -1966,8 +1966,20 @@ impl State {
         match parse_review_disposition(disposition_path) {
             ReviewDisposition::Pass => Ok(None),
             ReviewDisposition::Note(note) => Ok(Some(note)),
-            ReviewDisposition::Block { reason, .. } => {
-                Err(CompletionRejection::DispositionBlocked { reason })
+            ReviewDisposition::Block { reason, ask, .. } => {
+                // Lead with the block's own ask — it is the plain sentence
+                // written for the operator (a reviewer's request, or Lisa's
+                // own completion-failure park). The technical reason follows
+                // so nothing is hidden. Field fix, 2026-07-18: a deadline
+                // park's modal blamed "the reviewer" for a block no reviewer
+                // wrote.
+                Err(CompletionRejection::DispositionBlocked {
+                    reason: if ask.trim().is_empty() || ask == reason {
+                        reason
+                    } else {
+                        format!("{ask} [{reason}]")
+                    },
+                })
             }
             ReviewDisposition::Invalid { reason } => Err(CompletionRejection::DispositionBlocked {
                 reason: format!("invalid review disposition: {reason}"),
@@ -3001,14 +3013,17 @@ impl State {
         let ticket_file = match self.dag.get_ticket(&ticket_id.to_string()) {
             Some(ticket) if !ticket.file_path.as_os_str().is_empty() => ticket.file_path.clone(),
             _ => {
-                self.log_completion_rejection(
+                // Route through the same bounded failure machinery as a failed
+                // completion command: classified, journaled, parked — never a
+                // silent wait for the reconciliation deadline.
+                self.handle_completion_result(
                     ticket_id,
-                    &pending.completion_key,
-                    &CompletionRejection::LaunchFailed {
-                        source: LaunchFailure::new(format!(
-                            "Lisa could not find the ticket file for {ticket_id} to journal-seal it"
-                        )),
-                    },
+                    Some(1),
+                    Vec::new(),
+                    format!(
+                        "journal seal failed: ticket file for {ticket_id} not found on the board"
+                    )
+                    .into_bytes(),
                 );
                 return false;
             }
@@ -3021,15 +3036,16 @@ impl State {
         ) {
             Ok(receipt) => self.finish_successful_completion(ticket_id, pending, receipt),
             Err(error) => {
-                self.rebuild_dag();
-                self.log_completion_rejection(
+                // Same routing as above: a seal failure is a completion
+                // failure, with the bounded budget, the durable FailureObserved
+                // rows carrying the real reason, and the fast park-with-ask —
+                // not sixty silent seconds and a deadline park (field stall,
+                // 2026-07-18).
+                self.handle_completion_result(
                     ticket_id,
-                    &pending.completion_key,
-                    &CompletionRejection::LaunchFailed {
-                        source: LaunchFailure::new(format!(
-                            "Lisa could not create the journal seal for {ticket_id}. [{error}]"
-                        )),
-                    },
+                    Some(1),
+                    Vec::new(),
+                    format!("journal seal failed: {error}").into_bytes(),
                 );
                 false
             }

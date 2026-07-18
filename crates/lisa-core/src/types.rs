@@ -947,7 +947,7 @@ impl CompletionRejectionKind {
                 "An older session tried to finish this ticket; the current run is in charge. Try again."
             }
             Self::DispositionBlocked => {
-                "The reviewer asked for a decision instead of a pass. Settle the reviewer's note, then finish this ticket."
+                "This ticket is parked with a note that needs you. Read the note below, settle it, then finish the ticket."
             }
             Self::DependencyBlocked => "This ticket is waiting for earlier tickets to finish first.",
             Self::LaunchFailed => {
