@@ -25,18 +25,20 @@ hammered by all 16.
 
 ## Slot provider-affinity
 
-Both native clients stay live so same-provider reuse is cheap: Lisa sends
-`/clear`, waits for the clear hook, and injects the next ticket prompt. Each slot
-records `last_client`; a fresh pane or matching resident client is always the
-first choice.
+Every ticket gets a fresh session (since 0.4.4-rc.8): both native clients end
+their TUI after each ticket, so each launch re-exports fresh per-ticket identity
+(`LISA_TICKET_ID`, `LISA_ATTEMPT_ID`) into the pane. A finished session is
+exited with `/exit`, Lisa waits a bounded grace period for the shell to return,
+then launches the next ticket's full CLI command. A `WaitingForExit` transition
+reserves the pane between those two steps so another ticket cannot claim it.
+Each slot records `last_client`; a fresh pane or matching resident client is
+always the first choice.
 
-Affinity is no longer permanent. If no compatible pane exists, Lisa may recycle
-a released pane belonging to the other provider. The pane must be idle, out of
-cooldown, signal-quiet for `wind_down_secs`, and not awaiting a human; an actively
-assigned pane is never recycled. Lisa sends `/exit` to the resident TUI, waits a
-grace period for the shell to return, then launches the incoming provider's full
-CLI command. A `WaitingForExit` transition reserves the pane between those two
-steps so another ticket cannot claim it.
+Affinity is not permanent. If no compatible pane exists, Lisa may recycle a
+released pane belonging to the other provider through the same exit-then-fresh
+boundary. In every case the pane must be idle, out of cooldown, signal-quiet for
+`wind_down_secs`, and not awaiting a human; an actively assigned pane is never
+recycled.
 
 ## What breaks at high N — the realistic ceiling
 

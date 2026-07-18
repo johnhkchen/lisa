@@ -325,9 +325,11 @@ struct AgentSlot {
     /// stopped and then keep working for another minute or two.
     last_activity_at: Option<std::time::SystemTime>,
     /// Which agent client owns (or is being launched into) this pane, or `None`
-    /// for a clean shell. Compatible tickets reuse the resident TUI via `/clear`;
-    /// an incoming ticket for the other provider first recycles it via `/exit`.
-    /// This prevents a fresh CLI command from being typed into the wrong TUI.
+    /// for a clean shell. A resident session is exited (`/exit`, bounded grace)
+    /// before the next ticket launches fresh; `last_client` records who holds
+    /// the pane so provider affinity and the graceful-exit spelling resolve
+    /// correctly, and prevents a fresh CLI command from being typed into the
+    /// wrong TUI.
     last_client: Option<AgentClient>,
 }
 
@@ -374,9 +376,11 @@ impl OperatorModalOutcome {
     }
 }
 
-/// Per-slot state machine for session transitions. Same-provider reset is gated
-/// by hook-generated `.stopped`/`.cleared` signals; cross-provider recycling
-/// uses a bounded `/exit` grace period before launching at the shell.
+/// Per-slot state machine for session transitions. Both native adapters end a
+/// session per ticket: `/exit`, a bounded grace period, then a fresh launch at
+/// the shell. The `.stopped`/`.cleared`-gated in-place reset states remain for
+/// the documented `ClearHandshake` seam; no shipped adapter reaches them
+/// (removal tracked by T-051-02-01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TransitionState {
     /// No transition pending — slot is idle or running normally.
@@ -4781,8 +4785,9 @@ impl State {
     }
 
     /// Mark a slot as idle when its ticket completes. Keeps `has_session = true`
-    /// so the same provider can reuse the TUI via `/clear`, while the other
-    /// provider can explicitly recycle it via `/exit` after cooldown.
+    /// so the scheduler knows a resident TUI still occupies the pane; the next
+    /// assignment exits it (`/exit`, bounded grace) and launches fresh after
+    /// cooldown.
     fn release_slot_for_ticket(&mut self, ticket_id: &TicketId) {
         // Release is the shared rescheduling boundary. No caller may expose a
         // ticket to the DAG while its prior attempt remains authoritative.
@@ -4845,36 +4850,38 @@ impl State {
         }
     }
 
-    /// Release a durably completed ticket and gracefully retire a resident
-    /// Codex TUI before this physical pane can accept another assignment.
+    /// Release a durably completed ticket and gracefully retire the resident
+    /// agent TUI before this physical pane can accept another assignment.
     ///
     /// Generic release remains provider-neutral and is also used by failure
     /// paths. Successful completion alone owns this clean process boundary:
     /// revoke the predecessor authority first, then exit its TUI, and leave the
     /// unassigned pane unavailable until the existing exit grace proves a
-    /// clean shell.
+    /// clean shell. Applies to any resident whose adapter ends sessions per
+    /// ticket (both native clients): the finished session — and its
+    /// per-ticket environment — must not outlive its ticket.
     fn release_completed_slot_for_ticket(&mut self, ticket_id: &TicketId) {
         let clean_exit = self
             .agent_slots
             .iter()
             .find(|slot| slot.ticket_id.as_ref() == Some(ticket_id))
             .filter(|slot| {
-                slot.transition_state != TransitionState::Fenced
-                    && slot.has_session
-                    && slot.last_client == Some(AgentClient::Codex)
+                slot.transition_state != TransitionState::Fenced && slot.has_session
             })
-            .map(|slot| {
+            .and_then(|slot| {
+                let resident = slot.last_client?;
                 let (adapter, _) = resolve_adapter_or_native(
                     None,
-                    AgentClient::Codex,
+                    resident,
                     self.config.lisa_bin.as_deref(),
                 );
-                (slot.pane_id, adapter.exit_command())
+                (adapter.reset_strategy() == ResetStrategy::ExitThenFresh)
+                    .then(|| (slot.pane_id, adapter.exit_command(), resident))
             });
 
         self.release_slot_for_ticket(ticket_id);
 
-        let Some((pane_id, exit_command)) = clean_exit else {
+        let Some((pane_id, exit_command, resident)) = clean_exit else {
             return;
         };
 
@@ -4897,8 +4904,8 @@ impl State {
             });
         self.log_activity(ActivityEvent::Info {
             message: format!(
-                "Completion boundary revoked {} and requested clean Codex exit on pane {}",
-                ticket_id, pane_id
+                "Completion boundary revoked {} and requested clean {} exit on pane {}",
+                ticket_id, resident, pane_id
             ),
         });
     }
@@ -5134,7 +5141,7 @@ impl State {
 
             let launch_cmd;
             if recycle {
-                // Cross-provider reuse must return to the pane's shell first.
+                // A recycle must return to the pane's shell first.
                 // Resolve the resident adapter (not the incoming one) so future
                 // clients can own their graceful-exit spelling independently.
                 let resident_client = self.agent_slots[slot_idx]
@@ -5176,19 +5183,27 @@ impl State {
                 self.notified_attention.remove(&pane_id);
                 self.awaiting_human.remove(&pane_id);
                 self.log_activity(ActivityEvent::Info {
-                    message: format!(
-                        "Recycling pane {} from {} to {} via {}",
-                        pane_id, resident_client, route.agent, exit_command
-                    ),
+                    message: if resident_client == route.agent {
+                        format!(
+                            "Pane {}: fresh {} session for the next ticket (via {})",
+                            pane_id, route.agent, exit_command
+                        )
+                    } else {
+                        format!(
+                            "Recycling pane {} from {} to {} via {}",
+                            pane_id, resident_client, route.agent, exit_command
+                        )
+                    },
                 });
             } else if self.agent_slots[slot_idx].has_session {
-                // Session reuse. For the ClearHandshake adapter (native Claude):
-                // the slot is idle (ticket_id was None), so Claude Code is already
-                // at its prompt. Send /clear directly and wait for the .cleared
-                // signal before sending the prompt. (The old WaitingForStop
-                // approach deadlocked because the previous session's .stopped
-                // signal was already consumed by check_transition_signals()
-                // earlier in the same poll_tick.)
+                // Session reuse. For a ClearHandshake adapter (the documented
+                // seam — no shipped adapter uses it; removal tracked by
+                // T-051-02-01): the slot is idle (ticket_id was None), so the
+                // TUI is already at its prompt. Send /clear directly and wait
+                // for the .cleared signal before sending the prompt. (The old
+                // WaitingForStop approach deadlocked because the previous
+                // session's .stopped signal was already consumed by
+                // check_transition_signals() earlier in the same poll_tick.)
                 match adapter.reset_strategy() {
                     ResetStrategy::ClearHandshake => {
                         let reuse_prompt = adapter.reuse_prompt(&ctx);
@@ -6870,7 +6885,8 @@ impl State {
                 return;
             }
             let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-            // Adapter owns the reuse prompt (native Claude → ticket_prompt).
+            // Adapter owns the reuse prompt (ClearHandshake seam; no shipped
+            // adapter reaches this — removal tracked by T-051-02-01).
             // Reuse path only needs the adapter; the route is surfaced at spawn.
             let (adapter, _route) = resolve_adapter_or_native(
                 self.dag.get_ticket(&ticket_id),
@@ -7099,12 +7115,14 @@ impl State {
                         relaunches: 0,
                     },
                 );
-                // Same launch-dispatch readiness read as the primary path, so a
-                // recovery-relaunched Starting seat is also classified
-                // (T-037-01-01).
-                self.seat_readiness
-                    .insert(pane_id, adapter.readiness_mode());
             }
+            // The launch above used the adapter re-resolved at fire time, which
+            // can differ from the one recorded at schedule dispatch (a ticket
+            // frontmatter edit or mid-rebuild DAG miss during the exit grace).
+            // Re-record readiness for the provider actually launched so the
+            // Starting seat gates on the right startup contract (T-037-01-01).
+            self.seat_readiness
+                .insert(pane_id, adapter.readiness_mode());
             self.start_assignment_ack_wait(pane_id, now);
             if recovering {
                 self.log_activity(ActivityEvent::SessionLaunch {
@@ -7144,7 +7162,8 @@ impl State {
             });
             if let Some(tid) = &ticket_id {
                 let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-                // Adapter owns the reuse prompt (native Claude → ticket_prompt).
+                // Adapter owns the reuse prompt (ClearHandshake seam; no shipped
+                // adapter reaches this — removal tracked by T-051-02-01).
                 let (adapter, _route) = resolve_adapter_or_native(
                     self.dag.get_ticket(tid),
                     self.config.client,
@@ -16879,16 +16898,22 @@ mod tests {
         .unwrap();
         assert_eq!(
             marker, first,
-            "the predecessor marker remains while the resident session clears"
+            "the predecessor marker remains while the resident session exits"
         );
-        state.handle_cleared_signal(10);
+        // Elapse the bounded exit grace: the successor's fresh launch is
+        // dispatched and its marker published at that delivery boundary.
+        state.agent_slots[0].transition_started_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+        );
+        state.check_transition_timeouts();
         let marker: AttemptLease = serde_json::from_str(
             &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
         )
         .unwrap();
         assert_eq!(
             marker, second,
-            "the successor marker is published at prompt delivery"
+            "the successor marker is published at fresh-launch delivery"
         );
     }
 
@@ -18270,7 +18295,7 @@ owned\n\
     }
 
     #[test]
-    fn test_reused_claude_assignment_remains_owned() {
+    fn test_reused_claude_seat_exits_then_starts_fresh() {
         let (mut state, _dir) =
             pane_name_schedule_state("claude", AgentClient::Codex, Some(AgentClient::Claude));
 
@@ -18278,15 +18303,61 @@ owned\n\
 
         assert_eq!(
             state.agent_slots[0].transition_state,
-            TransitionState::WaitingForClear,
-            "Claude keeps its existing clear handshake"
+            TransitionState::WaitingForExit,
+            "a reused Claude TUI is exited so the next ticket gets a fresh \
+             process with fresh per-ticket environment"
         );
-        assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
-        assert!(state.seat_is_owned(10));
+        let lease = state.current_leases["T-NAME"].clone();
+        assert!(
+            matches!(
+                state.seat_assignment(10),
+                Some(SeatAssignmentState::Starting {
+                    generation,
+                    start_deadline: None,
+                    ..
+                }) if generation == lease.attempt_id
+            ),
+            "the reused seat awaits its fresh process; in-place reuse no longer \
+             inherits ownership"
+        );
+        assert!(!state.seat_is_owned(10));
     }
 
     #[test]
-    fn test_consecutive_reused_panes_resolve_codex_ack_or_fallback_and_preserve_claude() {
+    fn completed_claude_ticket_gets_completion_time_clean_exit() {
+        // The completion boundary ends the finished session for any resident
+        // whose adapter ends sessions per ticket — not just Codex. A finished
+        // Claude TUI must not stay resident carrying its per-ticket
+        // environment until the next assignment happens to recycle it.
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        state.schedule_ready_tickets();
+        assert!(state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Claude));
+
+        state.release_completed_slot_for_ticket(&"T-NAME".to_string());
+
+        assert_eq!(
+            state.attempt_lifecycle.last(),
+            Some(&AttemptLifecycleEvent::CleanExitRequested {
+                ticket_id: "T-NAME".to_string(),
+                pane_id: 10,
+            })
+        );
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert!(!state.agent_slots[0].has_session);
+        assert!(state.agent_slots[0].ticket_id.is_none());
+        assert!(state.activity_log.iter().any(|event| matches!(
+            event,
+            ActivityEvent::Info { message }
+                if message.contains("requested clean claude exit on pane 10")
+        )));
+    }
+
+    #[test]
+    fn test_consecutive_reused_panes_resolve_codex_ack_or_fallback_and_claude_fresh_start() {
         let (mut codex, _codex_dir) =
             consecutive_reuse_state(AgentClient::Codex, "T-CODEX", &[10, 11]);
         let mut codex_tickets = std::collections::HashSet::new();
@@ -18411,17 +18482,32 @@ owned\n\
                         .iter()
                         .find(|slot| slot.pane_id == *pane_id)
                         .map(|slot| slot.transition_state),
-                    Some(TransitionState::WaitingForClear),
-                    "Claude must retain its clear handshake"
+                    Some(TransitionState::WaitingForExit),
+                    "native Claude exits the resident TUI before fresh delivery"
                 );
-                assert_eq!(
+                let lease = claude.current_leases[ticket_id].clone();
+                assert!(matches!(
                     claude.seat_assignment(*pane_id),
-                    Some(SeatAssignmentState::Owned)
-                );
-                assert!(claude.seat_is_owned(*pane_id));
-                assert_eq!(claude.active_assignment_generation(*pane_id), None);
+                    Some(SeatAssignmentState::Starting {
+                        generation,
+                        start_deadline: None,
+                        ..
+                    }) if generation == lease.attempt_id
+                ));
+                assert!(!claude.seat_is_owned(*pane_id));
 
-                claude.handle_cleared_signal(*pane_id);
+                // Elapse the bounded exit grace: the fresh launch is dispatched
+                // and the SessionStart acceptance clock armed.
+                claude
+                    .agent_slots
+                    .iter_mut()
+                    .find(|slot| slot.pane_id == *pane_id)
+                    .unwrap()
+                    .transition_started_at = Some(
+                    std::time::SystemTime::now()
+                        - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+                );
+                claude.check_transition_timeouts();
                 assert_eq!(
                     claude
                         .agent_slots
@@ -18430,6 +18516,35 @@ owned\n\
                         .map(|slot| slot.transition_state),
                     Some(TransitionState::Idle)
                 );
+                assert!(matches!(
+                    claude.seat_assignment(*pane_id),
+                    Some(SeatAssignmentState::Starting {
+                        generation,
+                        start_deadline: Some(_),
+                        ..
+                    }) if generation == lease.attempt_id
+                ));
+                assert!(
+                    !claude.seat_is_owned(*pane_id),
+                    "a fresh process must prove itself; the exited session's \
+                     ownership does not carry over"
+                );
+
+                // The fresh process proves itself: exact process-start signal,
+                // then assignment delivery, then the exact chat acknowledgment.
+                assert!(claude.acknowledge_process_start(*pane_id, &lease));
+                claude.deliver_ready_assignments();
+                assert!(matches!(
+                    claude.seat_assignment(*pane_id),
+                    Some(SeatAssignmentState::Delivering { generation, .. })
+                        if generation == lease.attempt_id
+                ));
+                assert!(acknowledge_assignment(
+                    &mut claude,
+                    *pane_id,
+                    ticket_id,
+                    lease.attempt_id,
+                ));
                 assert_eq!(
                     claude.seat_assignment(*pane_id),
                     Some(SeatAssignmentState::Owned)
@@ -18438,7 +18553,8 @@ owned\n\
                 assert!(claude_tickets.insert(ticket_id.clone()));
                 claude_panes.insert(*pane_id);
                 println!(
-                    "T0330302|assignment|provider=claude|sequence={sequence:02}|ticket={ticket_id}|pane={pane_id}|generation=none|outcome=clear-then-owned-unchanged|fallback_launches=0|final=owned|silent_stall=false"
+                    "T0330302|assignment|provider=claude|sequence={sequence:02}|ticket={ticket_id}|pane={pane_id}|generation={generation}|outcome=exit-fresh-start-then-owned|fallback_launches=0|final=owned|silent_stall=false",
+                    generation = lease.attempt_id
                 );
             }
 

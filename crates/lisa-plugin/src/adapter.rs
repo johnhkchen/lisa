@@ -29,10 +29,11 @@
 //! The trait is shaped so the two other planned integration methods drop in
 //! without changing this interface (epic E-001, Decision 4; design thesis §5):
 //!
-//! - **Native Codex**: launches the official interactive TUI bare, reuses it
-//!   through the same `/clear` handshake as Claude, and types
-//!   follow-ups into the live composer. Codex lifecycle hooks emit the normalized
-//!   `.heartbeat`/`.stopped`/`.cleared` files the scheduler already consumes.
+//! - **Native Codex**: launches the official interactive TUI bare, ends the
+//!   session after each ticket (the same per-ticket process boundary Claude
+//!   uses), and types follow-ups into the live composer. Codex lifecycle hooks
+//!   emit the normalized `.heartbeat`/`.stopped`/`.cleared` files the scheduler
+//!   already consumes.
 //! - **ACP** (Agent Client Protocol, future): a host-side bridge process writes
 //!   the same normalized signal files, so only `launch_command` (launch the
 //!   bridge) and `signals` differ; the rest of the shape is unchanged.
@@ -77,13 +78,19 @@ pub(crate) struct FollowUpContext<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResetStrategy {
     /// Send `/clear` into the live TUI and wait for the `.cleared` signal before
-    /// sending the next prompt (native Claude Code). This is the behaviour the
-    /// scheduler's `TransitionState` handshake implements.
+    /// sending the next prompt. This is the behaviour the scheduler's
+    /// `TransitionState` handshake implements. No current adapter uses it —
+    /// retained for future in-place-reset integrations — because an in-place
+    /// reset keeps the launch line's `LISA_TICKET_ID`/`LISA_ATTEMPT_ID`
+    /// environment alive across tickets, leaving every ticket after the first
+    /// under a stale identity.
     ClearHandshake,
     /// Gracefully exit the resident interactive client, allow the bounded exit
-    /// grace, then launch a fresh process for the next ticket. Codex
-    /// uses this because its interactive `/clear` hook is not a reliable
-    /// unattended delivery boundary.
+    /// grace, then launch a fresh process for the next ticket. Both native
+    /// clients use this: it is the only boundary that re-exports fresh
+    /// per-ticket identity into the environment, and for Codex the interactive
+    /// `/clear` hook is additionally not a reliable unattended delivery
+    /// boundary.
     ExitThenFresh,
     /// Reuse is a fresh launch; there is no in-place reset handshake, so the
     /// `TransitionState` machine does not apply (headless/ACP bridges).
@@ -181,9 +188,11 @@ pub(crate) trait AgentAdapter {
         "/exit"
     }
 
-    /// How a slot that already has a session is reset before new work. Native
-    /// interactive clients share the clear handshake; integrations with a
-    /// different transport override this default.
+    /// How a slot that already has a session is reset before new work. Both
+    /// native interactive clients override this to [`ResetStrategy::ExitThenFresh`]
+    /// so each ticket gets a fresh process with fresh per-ticket environment;
+    /// the default documents the in-place handshake seam for future
+    /// integrations whose identity does not live in process environment.
     fn reset_strategy(&self) -> ResetStrategy {
         ResetStrategy::ClearHandshake
     }
@@ -264,6 +273,16 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
         self.assignment_text(ctx)
+    }
+
+    fn reset_strategy(&self) -> ResetStrategy {
+        // A reused Claude TUI keeps its launch line's LISA_TICKET_ID /
+        // LISA_ATTEMPT_ID environment for the life of the process, so every
+        // ticket after the first runs under a stale identity: agents read the
+        // wrong ticket id from their environment and lifecycle hooks
+        // mis-attribute usage. Ending the session per ticket (the Codex
+        // boundary) re-exports fresh identity on every launch.
+        ResetStrategy::ExitThenFresh
     }
 
     fn signals(&self) -> SignalCapabilities {
@@ -552,10 +571,14 @@ mod tests {
     }
 
     #[test]
-    fn native_reset_is_clear_handshake() {
+    fn native_reset_exits_then_fresh() {
+        // A fresh process per ticket is the only boundary that re-exports
+        // fresh LISA_TICKET_ID/LISA_ATTEMPT_ID identity into the pane
+        // environment; in-place /clear reuse left every subsequent ticket
+        // running under the first ticket's identity.
         assert_eq!(
             ClaudeCodeAdapter::default().reset_strategy(),
-            ResetStrategy::ClearHandshake
+            ResetStrategy::ExitThenFresh
         );
     }
 
@@ -581,7 +604,8 @@ mod tests {
     fn resolver_returns_claude_default_for_unrouted_ticket() {
         let ticket = Ticket::new("T-001", "example");
         let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, None);
-        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
+        assert_eq!(adapter.readiness_mode(), ReadinessMode::SessionStart);
         assert_eq!(route.agent, AgentClient::Claude);
         assert!(!route.substituted);
     }
@@ -589,7 +613,8 @@ mod tests {
     #[test]
     fn resolver_or_native_handles_missing_ticket() {
         let (adapter, route) = resolve_adapter_or_native(None, AgentClient::Claude, None);
-        assert_eq!(adapter.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
+        assert_eq!(adapter.readiness_mode(), ReadinessMode::SessionStart);
         assert_eq!(route.agent, AgentClient::Claude);
         assert!(!route.substituted);
     }
@@ -656,8 +681,12 @@ mod tests {
         let (adapter_a, route_a) = resolve_adapter(&a, AgentClient::Claude, Some("/abs/lisa"));
         let (adapter_b, route_b) = resolve_adapter(&b, AgentClient::Claude, Some("/abs/lisa"));
 
+        // Both native clients share the per-ticket process boundary; the
+        // heterogeneity shows in readiness mode and the launched command.
         assert_eq!(adapter_a.reset_strategy(), ResetStrategy::ExitThenFresh);
-        assert_eq!(adapter_b.reset_strategy(), ResetStrategy::ClearHandshake);
+        assert_eq!(adapter_b.reset_strategy(), ResetStrategy::ExitThenFresh);
+        assert_eq!(adapter_a.readiness_mode(), ReadinessMode::Grace);
+        assert_eq!(adapter_b.readiness_mode(), ReadinessMode::SessionStart);
         assert_eq!(route_a.agent, AgentClient::Codex);
         assert_eq!(route_a.model.as_deref(), Some("gpt-5"));
         assert_eq!(route_b.agent, AgentClient::Claude);

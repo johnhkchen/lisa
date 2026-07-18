@@ -255,14 +255,15 @@ verify the binary, version, and trust seeding.
 A Codex ticket launches the official interactive Codex TUI with its initial RDSPI
 prompt, just as the Claude path launches Claude Code. Lisa-generated hooks in
 `.codex/hooks.json` translate `Stop`, `SessionStart[clear]`, and `PostToolUse`
-into the same `.lisa/signals/` files the scheduler consumes. A reused pane stays
-inside Codex: Lisa sends `/clear`, waits for the clear hook, then types the next
-ticket prompt. Review follow-ups are typed into the live composer too.
+into the same `.lisa/signals/` files the scheduler consumes. Every ticket gets a
+fresh session: when a ticket finishes, Lisa exits the TUI, waits a short grace
+period for the shell to return, and launches the next ticket's CLI fresh — so
+each session carries exactly one ticket's identity from start to end. Review
+follow-ups are typed into the live composer of the ticket's own session.
 
 In mixed-provider loops, Lisa prefers a pane already running the requested
-client. If all released panes belong to the other provider, it safely recycles
-one: `/exit` returns the pane to its shell, then Lisa launches the correct fresh
-CLI after a short grace period. Running or human-blocked panes are never evicted.
+client, and the same exit-then-fresh boundary safely hands a pane from one
+provider to the other. Running or human-blocked panes are never evicted.
 
 Codex reads `AGENTS.md` for project context (Claude reads `CLAUDE.md`). `lisa
 init` scaffolds both files plus both clients' hook configuration; `AGENTS.md`

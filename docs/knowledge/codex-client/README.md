@@ -22,6 +22,16 @@ per-pane provider/model routing** in `lisa loop`.
 > TUI and keeps `agent-exec` as a headless fallback. See
 > [09 · Native-TUI parity decision](./09-native-tui-parity.md).
 
+> **Implementation update (2026-07-18, 0.4.4-rc.8):** the `/clear` session-reuse
+> handshake these docs describe as Lisa's current Claude coupling (01 §7–§8, 05,
+> and the reuse mentions in 09) is no longer how either provider hands a pane
+> between tickets. Both native clients now end their session after each ticket —
+> `/exit`, a bounded grace, then a fresh launch — because in-place reuse kept the
+> launch line's `LISA_TICKET_ID`/`LISA_ATTEMPT_ID` environment alive across
+> tickets, leaving every ticket after the first under a stale identity. The
+> `/clear` handshake text below stands as the historical record of the surface
+> that research mapped.
+
 Compiled 2026-07-01 from a multi-agent sweep: 5 readers over the lisa repo, 5 web
 researchers over official Codex docs + `openai/codex` issues, 6 adversarial
 verifiers on the highest-risk correspondences, and a synthesis pass. Codex facts
