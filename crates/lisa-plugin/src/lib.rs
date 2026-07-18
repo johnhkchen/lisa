@@ -4865,16 +4865,11 @@ impl State {
             .agent_slots
             .iter()
             .find(|slot| slot.ticket_id.as_ref() == Some(ticket_id))
-            .filter(|slot| {
-                slot.transition_state != TransitionState::Fenced && slot.has_session
-            })
+            .filter(|slot| slot.transition_state != TransitionState::Fenced && slot.has_session)
             .and_then(|slot| {
                 let resident = slot.last_client?;
-                let (adapter, _) = resolve_adapter_or_native(
-                    None,
-                    resident,
-                    self.config.lisa_bin.as_deref(),
-                );
+                let (adapter, _) =
+                    resolve_adapter_or_native(None, resident, self.config.lisa_bin.as_deref());
                 (adapter.reset_strategy() == ResetStrategy::ExitThenFresh)
                     .then(|| (slot.pane_id, adapter.exit_command(), resident))
             });
