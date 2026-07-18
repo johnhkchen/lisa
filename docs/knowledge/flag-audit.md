@@ -42,6 +42,7 @@ rows with the live command tree and config catalog.
 | `flag:lisa/status:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/status:--ticket` | Show one ticket's retained failures | working default | Without the flag, Lisa shows the whole board status. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/notes:--path` | Choose the project folder for notes | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/notes/ack:--generation` | Choose an exact listed note generation | working default | Without the flag, Lisa marks the oldest active note read so repeated acknowledgments drain the queue. | `two_active_notes_are_labeled_and_bare_ack_drains_oldest_first` | — |
 | `flag:lisa/notes/ack:--path` | Choose the project folder while acknowledging a note | working default | The inherited default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
 | `flag:lisa/unblock:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/proposal/apply:--path` | Choose the project folder for applying advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
