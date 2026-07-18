@@ -245,11 +245,32 @@ fn build_required_deps_checks(client: AgentClient, require_git: bool) -> Vec<Dep
     checks
 }
 
-fn build_checks(client: AgentClient) -> Vec<DependencyCheck> {
+fn check_git_journal_optional() -> CheckResult {
+    match get_command_version("git", &["--version"]) {
+        Some(version) => CheckResult::Found { version },
+        None => CheckResult::Skipped {
+            reason: "not present — fine here: finished work is recorded in Lisa's journal. \
+                     Install git if you want undoable history."
+                .to_string(),
+        },
+    }
+}
+
+fn build_checks(client: AgentClient, require_git: bool) -> Vec<DependencyCheck> {
     // Doctor also diagnoses packaging and optional developer-tool state. Loop
     // retains its adjacent empty-WASM guard so that failure has loop-specific
     // shell-installer guidance at the point before the bytes are consumed.
-    let mut checks = build_required_deps_checks(client, true);
+    // Git is a required dependency only when the resolved completion seal is
+    // commit; on the journal tier it is informational — a machine without git
+    // is a supported environment, never a doctor failure.
+    let mut checks = build_required_deps_checks(client, require_git);
+    if !require_git {
+        checks.push(DependencyCheck {
+            name: "git",
+            required: false,
+            check: Box::new(check_git_journal_optional),
+        });
+    }
     checks.extend([
         DependencyCheck {
             name: "embedded WASM",
@@ -575,7 +596,13 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     let client = resolved_config.client;
     let completion = crate::completion_seal::resolve_for_run(root, resolved_config.completion_mode);
 
-    let checks = build_checks(client);
+    // Journal tier: git is informational, not required. An unresolvable
+    // explicit-commit stance keeps git required — the operator chose it.
+    let require_git = match &completion {
+        Ok(resolved) => resolved.seal() == lisa_core::completion::CompletionSeal::Commit,
+        Err(_) => true,
+    };
+    let checks = build_checks(client, require_git);
     let mut reports = vec![CheckReport {
         name: "zellij",
         required: true,
@@ -1247,7 +1274,7 @@ mod tests {
 
     #[test]
     fn test_build_checks_claude_selects_claude() {
-        let names: Vec<&str> = build_checks(AgentClient::Claude)
+        let names: Vec<&str> = build_checks(AgentClient::Claude, true)
             .iter()
             .map(|c| c.name)
             .collect();
@@ -1260,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_build_checks_codex_selects_codex() {
-        let names: Vec<&str> = build_checks(AgentClient::Codex)
+        let names: Vec<&str> = build_checks(AgentClient::Codex, true)
             .iter()
             .map(|c| c.name)
             .collect();
@@ -1269,6 +1296,14 @@ mod tests {
         assert!(names.contains(&"embedded WASM"));
         assert!(!names.contains(&"claude"));
         assert!(!names.contains(&"zellij"));
+    }
+
+    #[test]
+    fn test_build_checks_journal_tier_keeps_git_informational_only() {
+        let checks = build_checks(AgentClient::Claude, false);
+        let git: Vec<_> = checks.iter().filter(|c| c.name == "git").collect();
+        assert_eq!(git.len(), 1, "journal tier still shows one git line");
+        assert!(!git[0].required, "journal tier never requires git");
     }
 
     #[test]

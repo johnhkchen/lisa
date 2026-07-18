@@ -76,13 +76,65 @@ fn run_with_zellij_version_and_path(
 }
 
 #[test]
-fn doctor_names_missing_git_and_apt_remedy() {
+fn doctor_auto_without_git_passes_journal_sealed() {
+    // 2026-07-17 rc.1 field regression: auto seal + no usable git resolves
+    // journal, and doctor must pass instead of demanding a git install.
     let output = run_with_zellij_version_and_path("doctor", "zellij 0.44.3", false);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(!output.status.success());
+    assert!(
+        output.status.success(),
+        "auto doctor failed without git:\n{stdout}"
+    );
+    assert!(stdout
+        .contains("completion seal: journal-only — finished work is recorded but not undoable"));
+    assert!(!stdout.contains("sudo apt install git"));
+}
+
+#[test]
+fn doctor_explicit_commit_without_git_fails_with_apt_remedy() {
+    // The operator chose commit sealing; a machine without git is then a
+    // hard, named failure — git stays a required dependency with its remedy.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(root.join("CLAUDE.md"), "# Stubbed Zellij preflight\n").unwrap();
+    fs::write(
+        root.join(".lisa.toml"),
+        format!(
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n\n[guards]\ncompletion = \"commit\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("zellij"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; fi\nexit 0\n",
+    );
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lisa"));
+    command
+        .env("PATH", &bin)
+        .env("HOME", &home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["doctor", "--path"])
+        .arg(&root);
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "explicit commit must fail without git:\n{stdout}"
+    );
     assert!(stdout.contains("git"));
-    assert!(stdout.contains("not found"));
     assert!(stdout.contains("sudo apt install git"));
 }
 

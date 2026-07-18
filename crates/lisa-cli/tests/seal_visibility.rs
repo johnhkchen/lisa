@@ -293,6 +293,60 @@ fn doctor_auto_without_repository_defers_to_journal_seal_line() {
 }
 
 #[test]
+fn doctor_without_git_binary_passes_journal_sealed_with_plain_note() {
+    // Field regression, 2026-07-17 rc.1 sim leg: a machine with no git at all
+    // installed Lisa cleanly, then failed `lisa doctor` on a hardcoded git
+    // requirement the journal tier does not have. Git-absent is a supported
+    // environment: doctor exits 0, resolves journal, and says so plainly.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(root.join("CLAUDE.md"), "# Seal visibility fixture\n").unwrap();
+    fs::write(
+        root.join("docs/active/tickets/T-FIXTURE.md"),
+        "---\nid: T-FIXTURE\ntitle: seal fixture\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nFixture\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".lisa.toml"),
+        format!(
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n\n[guards]\ncompletion = \"auto\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("zellij"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; fi\nexit 0\n",
+    );
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
+    );
+    // Shadow git with a stub that always fails: to every probe and check,
+    // this machine has no usable git — exactly like the fixture container.
+    write_executable(&bin.join("git"), "#!/bin/sh\nexit 127\n");
+
+    let output = lisa_command(&root, &home, &bin, "doctor").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        output.status.success(),
+        "doctor must pass without git on the journal tier:\n{stdout}"
+    );
+    assert!(stdout
+        .contains("completion seal: journal-only — finished work is recorded but not undoable"));
+    assert!(
+        stdout.contains("not present — fine here: finished work is recorded in Lisa's journal."),
+        "missing the plain optional-git note:\n{stdout}"
+    );
+}
+
+#[test]
 fn doctor_explicit_commit_uses_contextual_missing_identity_hard_failure() {
     let output = run_fixture("doctor", "commit", RepositoryFixture::BornMissingIdentity);
     let stdout = String::from_utf8(output.stdout).unwrap();
