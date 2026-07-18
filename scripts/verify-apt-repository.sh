@@ -151,6 +151,9 @@ docker exec -e DEBIAN_FRONTEND=noninteractive "$client_container" sh -eu -c '
     printf "%s\n" "#!/bin/sh" "echo claude 1.0.0" > /usr/local/bin/claude
     chmod 0755 /usr/local/bin/claude
     mkdir -p /tmp/lisa-doctor-project
+    # Since 0.4.4, doctor in an uninitialized folder exits nonzero with the
+    # "Run: lisa init" guidance — the fixture must be a real project.
+    /usr/bin/lisa init --no-history --path /tmp/lisa-doctor-project
 '
 
 networks=$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}' \
