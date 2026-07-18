@@ -266,14 +266,23 @@ pub(crate) fn claude_bypass_accepted() -> bool {
 }
 
 pub(crate) fn claude_bypass_accepted_in(home: &Path) -> bool {
-    std::fs::read_to_string(home.join(".claude.json"))
+    // Claude Code has recorded this acceptance in two places across versions:
+    // older builds set `bypassPermissionsModeAccepted` in `~/.claude.json`;
+    // current builds set `skipDangerousModePermissionPrompt` in
+    // `~/.claude/settings.json` (field observation, 2026-07-18: a real
+    // operator acceptance wrote only the latter). Either signal counts.
+    json_bool_flag(&home.join(".claude.json"), "bypassPermissionsModeAccepted")
+        || json_bool_flag(
+            &home.join(".claude/settings.json"),
+            "skipDangerousModePermissionPrompt",
+        )
+}
+
+fn json_bool_flag(path: &Path, key: &str) -> bool {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|bytes| serde_json::from_str::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .get("bypassPermissionsModeAccepted")
-                .and_then(|flag| flag.as_bool())
-        })
+        .and_then(|value| value.get(key).and_then(|flag| flag.as_bool()))
         .unwrap_or(false)
 }
 
@@ -1392,13 +1401,35 @@ mod tests {
         )
         .unwrap();
         assert!(!claude_bypass_accepted_in(dir.path()));
-        // Accepted.
+        // Accepted, legacy location.
         std::fs::write(
             dir.path().join(".claude.json"),
             "{\"bypassPermissionsModeAccepted\": true}",
         )
         .unwrap();
         assert!(claude_bypass_accepted_in(dir.path()));
+    }
+
+    #[test]
+    fn test_claude_bypass_acceptance_reads_current_settings_location() {
+        // Field shape, 2026-07-18: Claude Code 2.1.211 records the acceptance
+        // as skipDangerousModePermissionPrompt in ~/.claude/settings.json and
+        // writes nothing to ~/.claude.json.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/settings.json"),
+            "{\"model\": \"sonnet\", \"skipDangerousModePermissionPrompt\": true}",
+        )
+        .unwrap();
+        assert!(claude_bypass_accepted_in(dir.path()));
+
+        std::fs::write(
+            dir.path().join(".claude/settings.json"),
+            "{\"skipDangerousModePermissionPrompt\": false}",
+        )
+        .unwrap();
+        assert!(!claude_bypass_accepted_in(dir.path()));
     }
 
     #[test]
