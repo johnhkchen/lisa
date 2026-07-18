@@ -9,6 +9,7 @@ RELEASE_TAG=""
 SEED_OLD_ZELLIJ=0
 XDG_SEED=0
 NO_GIT=0
+SEEDED_BOARD=0
 INSTR=A
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -17,9 +18,10 @@ while [ $# -gt 0 ]; do
         --seed-old-zellij) SEED_OLD_ZELLIJ=1; shift ;;
         --xdg-cache) XDG_SEED=1; shift ;;
         --no-git) NO_GIT=1; shift ;;
+        --seeded-board) SEEDED_BOARD=1; shift ;;
         --discovery) INSTR=B; shift ;;
         *)
-            echo "usage: /cbt/prepare [--pin SHA] [--release TAG] [--seed-old-zellij] [--xdg-cache] [--no-git] [--discovery]"
+            echo "usage: /cbt/prepare [--pin SHA] [--release TAG] [--seed-old-zellij] [--xdg-cache] [--no-git] [--seeded-board] [--discovery]"
             echo "  no flags      closing-run leg: live README, instruction A"
             echo "  --pin SHA     baseline-style leg against a pinned README"
             echo "  --release TAG install the named (pre)release, e.g. v0.4.4-rc.1 —"
@@ -27,10 +29,18 @@ while [ $# -gt 0 ]; do
             echo "  --seed-old-zellij   place Zellij 0.40.1 in ~/.local/bin first"
             echo "  --xdg-cache   set XDG_CACHE_HOME for the agent session"
             echo "  --no-git      finish T-NOGIT-001 in a bare folder with journal sealing"
+            echo "  --seeded-board      stage the standing demo board in ~/demo — loop-test"
+            echo "                legs re-run Lisa on the same captured tickets instead of"
+            echo "                prompting a model to author a fresh board"
             echo "  --discovery   instruction B (no README handed over)"
             exit 2 ;;
     esac
 done
+
+if [ "$SEEDED_BOARD" = 1 ] && [ "$NO_GIT" = 1 ]; then
+    echo "FAIL: --seeded-board and --no-git each stage their own project; pick one" >&2
+    exit 1
+fi
 
 if [ -n "$RELEASE_TAG" ] && [ "$INSTR" = B ]; then
     echo "FAIL: --release needs the README handed over; it cannot combine with --discovery" >&2
@@ -118,6 +128,21 @@ else
         > /tmp/instruction.txt
 fi
 
+if [ "$SEEDED_BOARD" = 1 ]; then
+    project="$HOME/demo"
+    if [ -e "$project/docs/active/tickets" ] && [ -n "$(ls -A "$project/docs/active/tickets" 2>/dev/null)" ]; then
+        echo "FAIL: refusing to overwrite an existing board in $project" >&2
+        exit 1
+    fi
+    mkdir -p "$project/docs/active/tickets" "$project/docs/active/stories"
+    cp /cbt/board/tickets/*.md "$project/docs/active/tickets/"
+    cp /cbt/board/stories/*.md "$project/docs/active/stories/"
+    count=$(ls "$project/docs/active/tickets" | wc -l)
+    echo "seeded: standing demo board in ~/demo ($count tickets incl. T-001 smoke canary)"
+    echo "        after install: cd ~/demo && lisa init (choose history), then the"
+    echo "        OPERATOR runs lisa loop — per the role contract, agents never do."
+fi
+
 rm -f /tmp/leg-env
 if [ $SEED_OLD_ZELLIJ = 1 ]; then
     case "$(uname -m)" in
@@ -145,6 +170,7 @@ df -B1 --output=used / | tail -1 > /tmp/disk.before
     echo "seed_old_zellij: $SEED_OLD_ZELLIJ"
     echo "xdg_cache_seed: $XDG_SEED"
     echo "no_git: $NO_GIT"
+    echo "seeded_board: $SEEDED_BOARD"
 } > /tmp/leg-meta
 
 echo "READY. Next: /cbt/run claude|codex [model] — then hands off until it exits."

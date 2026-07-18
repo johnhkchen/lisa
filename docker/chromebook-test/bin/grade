@@ -69,9 +69,10 @@ else
     git init -q . 2>/dev/null || note "FINDING: git absent or init failed"
     bash -lc 'cd "$HOME/demo" && lisa init --no-history' >/dev/null 2>&1 && init_rc=0
     # validate requires a schedulable board — an empty scaffold correctly errors
-    # with "no tickets found", so give it one smoke ticket first.
+    # with "no tickets found", so give it one smoke ticket first. A leg
+    # prepared with --seeded-board already carries T-001; never overwrite it.
     mkdir -p docs/active/tickets
-    cat > docs/active/tickets/T-001.md <<'EOF'
+    [ -f docs/active/tickets/T-001.md ] || cat > docs/active/tickets/T-001.md <<'EOF'
 ---
 id: T-001
 title: smoke-ticket

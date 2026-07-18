@@ -55,10 +55,21 @@ Inside a leg container (after fresh auth):
 /cbt/prepare --seed-old-zellij    # variant: Zellij 0.40.1 in ~/.local/bin
 /cbt/prepare --xdg-cache          # variant: XDG_CACHE_HOME set for the agent
 /cbt/prepare --no-git             # full loop: bare folder finishes journal-sealed
+/cbt/prepare --seeded-board       # stage the standing demo board in ~/demo
 /cbt/run claude|codex [model]     # stamps clock + identity, launches — then hands off
 /cbt/grade                        # all acceptance checks, writes /tmp/run-record.md
 /cbt/tour claude|codex [model]    # landing-probe rematch (FRESH session only)
 ```
+
+The **standing demo board** (`--seeded-board`, baked into the image from
+`docker/chromebook-test/board/`) is a nine-ticket landing-page story authored
+by claude-haiku in the 2026-07-18 rc.4 leg, kept verbatim so loop-test legs
+re-run Lisa against the *same* tickets instead of spending tokens prompting a
+model to author a fresh board every time. T-001 is the smoke ticket, retained
+as the stuck-at-review canary. After install, the operator runs `lisa init`
+and `lisa loop` themselves in ~/demo — per the role contract, agents never
+start the loop. Refresh the captured board deliberately (copy a better field
+board over `docker/chromebook-test/board/` and note it here), never ad hoc.
 
 The one-command host route for a candidate leg is `just test-rc [OS] [AGENT]
 [prepare-flags…]` — it derives the tag from the workspace version, builds the

@@ -53,6 +53,11 @@ RUN useradd --create-home --shell /bin/bash tester \
 # These are for the human running the protocol — never mention them to the
 # agent under test.
 COPY bin/ /cbt/
+# Standing demo board for loop-test legs: a model-authored landing-page
+# story (captured from the 2026-07-18 rc.4 leg, claude-haiku) plus the
+# T-001 smoke ticket as the stuck-at-review canary. Legs re-run Lisa on
+# this same board instead of prompting a model to author a fresh one.
+COPY board/ /cbt/board/
 RUN chmod 0755 /cbt/*
 
 USER tester
