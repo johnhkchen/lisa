@@ -131,8 +131,8 @@ pub(crate) enum FollowUp {
 /// `.heartbeat`/`.stopped`(/`.error`) core that every adapter must produce.
 ///
 /// A `false` field tells the scheduler it must not wait on or expect that
-/// signal from this adapter. Codex emits `.cleared` but has no equivalent of
-/// Claude's `.idle`/`.awaiting` signals.
+/// signal from this adapter. Codex emits none of the optional set — no
+/// `.cleared` and no equivalent of Claude's `.idle`/`.awaiting` signals.
 // Declared here (with the native adapter reporting its set) as the
 // "expected-signal-set" seam; the behavioural consumer is the `.error` work in
 // T-022-02 and the Codex adapter in T-023-02, which read it to treat the absence

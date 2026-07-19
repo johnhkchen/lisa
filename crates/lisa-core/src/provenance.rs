@@ -314,7 +314,10 @@ pub struct UsageCorrectionRecord {
     /// Provider client name (`"claude"` | `"codex"`) — disambiguates
     /// [`Self::source_line`], which is per-client-file.
     pub method: String,
-    /// Opaque provider session the capture observed (audit/trace only).
+    /// Provider session the capture observed. Load-bearing for the corrected
+    /// view: captures are cumulative per-session snapshots, so
+    /// [`correct_usage`] keeps only the latest snapshot per
+    /// `(method, session_id)` and sums across distinct sessions.
     pub session_id: String,
     pub pane_id: u32,
     /// One-based physical line in the provider's `captures.jsonl`. With
@@ -369,18 +372,30 @@ pub struct TicketUsage {
 /// Fold a mixed ledger into per-ticket token totals from the **corrected view**.
 ///
 /// Each ticket is seeded from its authoritative `Done` execution row (raw tokens,
-/// possibly `None`). Corrections are then layered by `ticket_id`: when a ticket
-/// has any correction, its tokens are the sum of those corrections (the late-
-/// joined truth, overriding the raw null row); otherwise the raw row tokens stand
-/// as a legacy fallback. A completed ticket with neither stays `None`.
+/// possibly `None`). Corrections are then layered by `ticket_id` — but a capture
+/// row is a *cumulative snapshot*, not a delta: the Stop hook re-observes the
+/// session's whole transcript every time it fires, so a multi-turn session
+/// appends monotonically growing rows for the same session. Summing snapshots
+/// double-counts (the first 0.4.4 field ledgers reported ~2× true usage). Per
+/// `(method, session_id)` only the latest snapshot — ordered by
+/// `(captured_at, source_line)` — is that session's truth; tokens sum across
+/// *distinct* sessions only. `correction_count` still counts every correction
+/// record (the append-only audit trail), not just surviving snapshots. When a
+/// ticket has any correction its tokens override the raw null row; otherwise the
+/// raw row tokens stand as a legacy fallback. A completed ticket with neither
+/// stays `None`.
 pub fn correct_usage<'a>(
     records: impl IntoIterator<Item = &'a ProvenanceLedgerRecord>,
 ) -> std::collections::BTreeMap<String, TicketUsage> {
     use std::collections::BTreeMap;
 
-    // Raw seed from authoritative Done rows, and accumulated corrections.
+    // Raw seed from authoritative Done rows; latest snapshot per session; and
+    // the audit count of every correction record seen.
     let mut raw: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
-    let mut corrections: BTreeMap<String, (u64, u64, usize)> = BTreeMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut latest: BTreeMap<String, BTreeMap<(String, String), (u64, u64, u64, u64)>> =
+        BTreeMap::new();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for record in records {
         match record {
@@ -390,12 +405,23 @@ pub fn correct_usage<'a>(
                 raw.insert(exec.ticket_id.clone(), (exec.tokens_in, exec.tokens_out));
             }
             ProvenanceLedgerRecord::UsageCorrection(correction) => {
-                let entry = corrections
-                    .entry(correction.ticket_id.clone())
-                    .or_insert((0, 0, 0));
-                entry.0 = entry.0.saturating_add(correction.tokens_in);
-                entry.1 = entry.1.saturating_add(correction.tokens_out);
-                entry.2 += 1;
+                *counts.entry(correction.ticket_id.clone()).or_insert(0) += 1;
+                let sessions = latest.entry(correction.ticket_id.clone()).or_default();
+                let key = (correction.method.clone(), correction.session_id.clone());
+                let is_newer = sessions.get(&key).is_none_or(|&(at, line, _, _)| {
+                    (correction.captured_at, correction.source_line) >= (at, line)
+                });
+                if is_newer {
+                    sessions.insert(
+                        key,
+                        (
+                            correction.captured_at,
+                            correction.source_line,
+                            correction.tokens_in,
+                            correction.tokens_out,
+                        ),
+                    );
+                }
             }
             _ => {}
         }
@@ -412,7 +438,17 @@ pub fn correct_usage<'a>(
             },
         );
     }
-    for (ticket_id, (tokens_in, tokens_out, count)) in corrections {
+    for (ticket_id, sessions) in latest {
+        let (tokens_in, tokens_out) = sessions.values().fold(
+            (0u64, 0u64),
+            |(acc_in, acc_out), &(_, _, session_in, session_out)| {
+                (
+                    acc_in.saturating_add(session_in),
+                    acc_out.saturating_add(session_out),
+                )
+            },
+        );
+        let correction_count = counts.get(&ticket_id).copied().unwrap_or(0);
         // Corrections override the raw seed even for a ticket with no Done row on
         // this ledger slice.
         view.insert(
@@ -420,7 +456,7 @@ pub fn correct_usage<'a>(
             TicketUsage {
                 tokens_in: Some(tokens_in),
                 tokens_out: Some(tokens_out),
-                correction_count: count,
+                correction_count,
             },
         );
     }
@@ -1125,18 +1161,118 @@ mod tests {
         );
     }
 
+    fn session_correction(
+        ticket_id: &str,
+        method: &str,
+        session_id: &str,
+        captured_at: u64,
+        source_line: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> UsageCorrectionRecord {
+        let mut record = sample_correction(ticket_id, tokens_in, tokens_out);
+        record.method = method.to_string();
+        record.session_id = session_id.to_string();
+        record.captured_at = captured_at;
+        record.source_line = source_line;
+        record
+    }
+
     #[test]
-    fn correct_usage_overrides_null_row_with_summed_corrections() {
+    fn correct_usage_sums_across_distinct_sessions() {
+        // Two different provider sessions worked this ticket (e.g. a park and
+        // a fresh attempt): their latest snapshots sum.
         let rows = vec![
             ProvenanceLedgerRecord::Execution(done_row("T-A", None, None)),
-            ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-A", 100, 10)),
-            ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-A", 250, 20)),
+            ProvenanceLedgerRecord::UsageCorrection(session_correction(
+                "T-A",
+                "claude",
+                "session-1",
+                100,
+                1,
+                100,
+                10,
+            )),
+            ProvenanceLedgerRecord::UsageCorrection(session_correction(
+                "T-A",
+                "claude",
+                "session-2",
+                200,
+                2,
+                250,
+                20,
+            )),
         ];
         let view = correct_usage(&rows);
         let usage = view.get("T-A").unwrap();
         assert_eq!(usage.tokens_in, Some(350));
         assert_eq!(usage.tokens_out, Some(30));
         assert_eq!(usage.correction_count, 2);
+    }
+
+    #[test]
+    fn correct_usage_takes_latest_snapshot_within_a_session() {
+        // A capture row is a cumulative snapshot of the whole session
+        // transcript — Stop fires per turn, so one session appends
+        // monotonically growing rows. The field shape that caught this:
+        // 6,761,596 then 7,809,647 input on one session; summing reported
+        // 14,571,243 (~2x truth). The view must report the later snapshot.
+        for reversed in [false, true] {
+            let mut corrections = vec![
+                session_correction("T-B", "claude", "session-7baf", 100, 1, 6_761_596, 33_049),
+                session_correction("T-B", "claude", "session-7baf", 714, 2, 7_809_647, 40_000),
+            ];
+            if reversed {
+                corrections.reverse();
+            }
+            let mut rows = vec![ProvenanceLedgerRecord::Execution(done_row(
+                "T-B", None, None,
+            ))];
+            rows.extend(
+                corrections
+                    .into_iter()
+                    .map(ProvenanceLedgerRecord::UsageCorrection),
+            );
+            let view = correct_usage(&rows);
+            let usage = view.get("T-B").unwrap();
+            assert_eq!(usage.tokens_in, Some(7_809_647), "reversed={reversed}");
+            assert_eq!(usage.tokens_out, Some(40_000), "reversed={reversed}");
+            assert_eq!(
+                usage.correction_count, 2,
+                "the audit count still sees every correction record"
+            );
+        }
+    }
+
+    #[test]
+    fn correct_usage_treats_same_session_id_across_methods_as_distinct() {
+        // The session id is provider-scoped; the same string under different
+        // methods is two sessions, never one.
+        let rows = vec![
+            ProvenanceLedgerRecord::Execution(done_row("T-C", None, None)),
+            ProvenanceLedgerRecord::UsageCorrection(session_correction(
+                "T-C",
+                "claude",
+                "shared-id",
+                100,
+                1,
+                1_000,
+                100,
+            )),
+            ProvenanceLedgerRecord::UsageCorrection(session_correction(
+                "T-C",
+                "codex",
+                "shared-id",
+                200,
+                1,
+                2_000,
+                200,
+            )),
+        ];
+        let view = correct_usage(&rows);
+        let usage = view.get("T-C").unwrap();
+        assert_eq!(usage.tokens_in, Some(3_000));
+        assert_eq!(usage.tokens_out, Some(300));
     }
 
     #[test]

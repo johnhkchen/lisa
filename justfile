@@ -45,8 +45,10 @@ test-one NAME:
 # The local gate — the same fmt + clippy + test gates CI enforces
 # (.github/workflows/ci.yml job `check`, lines 35/38/41/44). The gates live in
 # the `fmt-check` and `lint` recipes so there is one place to track CI drift.
+# CI additionally builds the WASM release target; `check-wasm` is the fast
+# local proxy that catches wasm-target breakage the native gates miss.
 # Green `just check` == green CI.
-check: fmt-check lint
+check: check-wasm fmt-check lint
     cargo test --workspace
 
 # Type check only (no tests)

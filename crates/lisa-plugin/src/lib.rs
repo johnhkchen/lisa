@@ -581,7 +581,7 @@ enum AttemptLifecycleEvent {
 /// Scheduler-owned truth for the ticket assigned to a physical seat.
 ///
 /// This is deliberately independent of [`TransitionState`]: a pane can be
-/// waiting for `/clear` or `/exit` while its ticket assignment is still waiting
+/// waiting for `/exit` while its ticket assignment is still waiting
 /// for positive provider acknowledgment. Absence from `State::seat_assignments`
 /// means the seat is unassigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1336,7 +1336,7 @@ impl State {
     }
 
     /// Publish the marker immediately before delivering this attempt's prompt
-    /// or launch. Deferring until after `/clear` or `/exit` prevents the
+    /// or launch. Deferring until after `/exit` prevents the
     /// predecessor process from copying a successor identity during handoff.
     fn publish_prompt_lease_marker(&self, ticket_id: &str, pane_id: u32) -> Result<(), String> {
         match self.pane_attempt_lease(pane_id) {
@@ -3637,8 +3637,8 @@ impl State {
     }
 
     /// Start the finite provider-acceptance clock after an actual fresh launch
-    /// or tagged prompt delivery. Transport-only `/clear` and `/exit` steps
-    /// deliberately leave it unarmed so a reservation cannot expire before the
+    /// or tagged prompt delivery. The transport-only `/exit` step
+    /// deliberately leaves it unarmed so a reservation cannot expire before the
     /// provider receives its input.
     fn start_assignment_ack_wait(&mut self, pane_id: u32, now: std::time::SystemTime) -> bool {
         // `send_line_to_pane` has typed the prompt, but its Enter is deliberately
@@ -5010,7 +5010,7 @@ impl State {
 
             // Defensive: an idle slot rarely hosts an agent blocked on a question,
             // but if it does, leave the slot unassigned and retry next poll rather
-            // than /clear-ing or launching over the question UI.
+            // than exiting or launching over the question UI.
             if self.is_pane_awaiting(pane_id) {
                 unscheduled += 1;
                 continue;
@@ -5108,7 +5108,7 @@ impl State {
             let assignment_path = strip_host_prefix(&assignment_ref.path);
 
             // Replace any previous ticket/idle title before the first lifecycle
-            // input for this assignment (/exit, /clear, or a fresh launch).
+            // input for this assignment (/exit or a fresh launch).
             let ticket_title = self
                 .dag
                 .get_ticket(&ticket_id)
@@ -19363,10 +19363,10 @@ owned\n\
     // =========================================================================
     // Review auto-complete tests (T-010-03)
     //
-    // Note: We test auto_complete_review() directly instead of
-    // handle_stopped_signal() because the latter calls self.send_line_to_pane()
-    // (a zellij host function) in the WaitingForStop branch, which
-    // can't link on native test targets.
+    // Note: We test auto_complete_review() directly to pin the completion
+    // decision at its own boundary, independent of handle_stopped_signal()'s
+    // signal bookkeeping. (The original reason — a send_line_to_pane call in
+    // the removed WaitingForStop branch — is gone with T-051-02-01.)
     // =========================================================================
 
     #[test]
@@ -21761,7 +21761,8 @@ owned\n\
             attempt_lease: None,
             has_session: true,
             // A running/ready native TUI sits Idle. When the slot is reassigned,
-            // scheduling moves it through WaitingForClear before the next prompt.
+            // scheduling exits it and relaunches fresh (WaitingForExit) before
+            // the next assignment.
             transition_state: TransitionState::Idle,
             transition_started_at: None,
             cooldown_until: None,
@@ -22650,14 +22651,16 @@ owned\n\
             "every capture has a pane-reign owner; none quarantines"
         );
 
-        // Per-ticket totals come from the corrected view, summed across
-        // corrections.
+        // Per-ticket totals come from the corrected view. Capture rows are
+        // cumulative snapshots of their session, so within one session only
+        // the latest snapshot counts — never the sum (summing snapshots was
+        // the ~2x over-count the first 0.4.4 field ledgers reported).
         let view = provenance::correct_usage(&read_mixed_ledger(&ledger));
-        assert_eq!(view[TICKET_A].tokens_in, Some(30));
-        assert_eq!(view[TICKET_A].tokens_out, Some(10));
+        assert_eq!(view[TICKET_A].tokens_in, Some(20));
+        assert_eq!(view[TICKET_A].tokens_out, Some(7));
         assert_eq!(view[TICKET_A].correction_count, 2);
-        assert_eq!(view[TICKET_B].tokens_in, Some(300));
-        assert_eq!(view[TICKET_B].tokens_out, Some(100));
+        assert_eq!(view[TICKET_B].tokens_in, Some(200));
+        assert_eq!(view[TICKET_B].tokens_out, Some(60));
         assert_eq!(view[TICKET_B].correction_count, 2);
 
         // A rescan is idempotent: no duplicate corrections.
