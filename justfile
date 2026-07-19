@@ -42,9 +42,11 @@ test:
 test-one NAME:
     cargo test --workspace {{NAME}}
 
-# Type check without building (fast feedback)
-check:
-    cargo check -p lisa-plugin --target wasm32-wasip1
+# The local gate — the same fmt + clippy + test gates CI enforces
+# (.github/workflows/ci.yml job `check`, lines 35/38/41/44). The gates live in
+# the `fmt-check` and `lint` recipes so there is one place to track CI drift.
+# Green `just check` == green CI.
+check: fmt-check lint
     cargo test --workspace
 
 # Type check only (no tests)

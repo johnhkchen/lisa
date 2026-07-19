@@ -26,7 +26,7 @@ cargo build -p lisa-cli --release
 # Run tests (native target, not wasm)
 cargo test --workspace
 
-# Quick check (WASM check + tests)
+# Quick check (fmt + clippy + tests — the gates CI enforces)
 just check
 ```
 
