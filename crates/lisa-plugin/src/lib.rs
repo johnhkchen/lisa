@@ -6779,13 +6779,14 @@ impl State {
                 started_at: record.started_at,
                 source: ownership::ReignSource::Completed(record),
             })
-            .chain(live.iter().map(|(pane_id, started_at, ticket_id)| {
-                ownership::Reign {
-                    pane_id: *pane_id,
-                    started_at: *started_at,
-                    source: ownership::ReignSource::Live { ticket_id },
-                }
-            }))
+            .chain(
+                live.iter()
+                    .map(|(pane_id, started_at, ticket_id)| ownership::Reign {
+                        pane_id: *pane_id,
+                        started_at: *started_at,
+                        source: ownership::ReignSource::Live { ticket_id },
+                    }),
+            )
             .collect();
 
         let ledger_path = self.ledger_path.clone();
@@ -22835,7 +22836,14 @@ owned\n\
             let ended_at = started_at + 49;
             provenance::append_record(
                 &ledger,
-                &null_done_row(ticket_id, 1, PANE_ID, AgentClient::Claude, started_at, ended_at),
+                &null_done_row(
+                    ticket_id,
+                    1,
+                    PANE_ID,
+                    AgentClient::Claude,
+                    started_at,
+                    ended_at,
+                ),
             )
             .unwrap();
         }

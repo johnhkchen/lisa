@@ -14,7 +14,7 @@ fn group_thousands(value: u64) -> String {
     let bytes = digits.as_bytes();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, byte) in bytes.iter().enumerate() {
-        if index > 0 && (bytes.len() - index) % 3 == 0 {
+        if index > 0 && (bytes.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(char::from(*byte));
@@ -568,7 +568,11 @@ mod tests {
 
     #[test]
     fn token_usage_reads_the_corrected_view_not_the_raw_row() {
-        let ledger = format!("{}\n{}\n", null_done("T-A"), correction("T-A", 1_234_567, 8_900));
+        let ledger = format!(
+            "{}\n{}\n",
+            null_done("T-A"),
+            correction("T-A", 1_234_567, 8_900)
+        );
         let lines = token_usage_lines(&parse_ledger(&ledger));
         assert_eq!(lines[0], "Token usage");
         // The raw row is null; the corrected total comes from the correction,
@@ -595,12 +599,20 @@ mod tests {
             .iter()
             .any(|line| line.contains("Not yet joined: 1 completed ticket")));
         // The gap ticket is never printed with a fabricated zero.
-        assert!(!lines.iter().any(|line| line.contains("T-B") && line.contains("0 in")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("T-B") && line.contains("0 in")));
     }
 
     #[test]
     fn token_usage_empty_ledger_says_nothing_yet() {
         let lines = token_usage_lines(&[]);
-        assert_eq!(lines, vec!["Token usage".to_string(), "  Nothing measured yet.".to_string()]);
+        assert_eq!(
+            lines,
+            vec![
+                "Token usage".to_string(),
+                "  Nothing measured yet.".to_string()
+            ]
+        );
     }
 }

@@ -173,7 +173,9 @@ pub(crate) fn drain(
 /// Count every quarantined row across all session files under `quarantine/`.
 ///
 /// This is the terminal, countable signal for captures that never gained
-/// attribution. A missing directory counts as zero.
+/// attribution. A missing directory counts as zero. Currently exercised by the
+/// sweep's regression fixtures; the on-disk rows are the durable count.
+#[cfg(test)]
 pub(crate) fn count_quarantined(provider_dir: &Path) -> usize {
     let dir = provider_dir.join("quarantine");
     let entries = match fs::read_dir(&dir) {
@@ -189,9 +191,7 @@ pub(crate) fn count_quarantined(provider_dir: &Path) -> usize {
         if let Ok(raw) = fs::read_to_string(&path) {
             total += raw
                 .lines()
-                .filter(|line| {
-                    serde_json::from_str::<QuarantinedCaptureRecord>(line).is_ok()
-                })
+                .filter(|line| serde_json::from_str::<QuarantinedCaptureRecord>(line).is_ok())
                 .count();
         }
     }

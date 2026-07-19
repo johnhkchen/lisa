@@ -1031,7 +1031,11 @@ mod tests {
         assert_eq!(extract_usage(&u), (None, None, None));
     }
 
-    fn sample_correction(ticket_id: &str, tokens_in: u64, tokens_out: u64) -> UsageCorrectionRecord {
+    fn sample_correction(
+        ticket_id: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> UsageCorrectionRecord {
         UsageCorrectionRecord {
             schema_version: SCHEMA_VERSION,
             seal: CompletionSeal::Journal,
@@ -1052,7 +1056,11 @@ mod tests {
         }
     }
 
-    fn done_row(ticket_id: &str, tokens_in: Option<u64>, tokens_out: Option<u64>) -> ProvenanceRecord {
+    fn done_row(
+        ticket_id: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+    ) -> ProvenanceRecord {
         let route = Route::from_client(AgentClient::Claude);
         ProvenanceRecord {
             schema_version: SCHEMA_VERSION,
