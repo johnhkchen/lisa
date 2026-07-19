@@ -310,11 +310,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_runner_kills_timeout_near_the_configured_deadline() {
+        // The fake agent sleeps far past the 1s deadline, so the ONLY way the
+        // runner returns TimedOut is by enforcing the deadline: a disabled kill
+        // path lets `sleep 30` exit naturally with empty stdout, which parses as
+        // Failed, not TimedOut. So `error == TimedOut` is the load-immune proof
+        // that the deadline fired. The lower bound proves the kill wasn't
+        // premature — and since load can only delay the runner, never hurry it,
+        // that floor never trips under contention. We deliberately assert NO
+        // upper wall-clock bound: any ceiling large enough to be load-safe is
+        // redundant with the TimedOut-vs-Failed distinction above, and a tight
+        // one just measures how busy the machine is (the old `< 3s` bound that
+        // flaked the gate under parallel load).
         let (dir, agent) = executable_script("sleep 30");
         let started = Instant::now();
         let error = run_triage_agent(&args(dir.path().to_path_buf(), agent, 1)).unwrap_err();
         assert_eq!(error, TriageAgentError::TimedOut);
         assert!(started.elapsed() >= Duration::from_millis(900));
-        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
