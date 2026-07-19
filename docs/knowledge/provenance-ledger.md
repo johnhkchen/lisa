@@ -8,7 +8,7 @@ never race agent-owned ticket fields. `.lisa/` gitignores only `signals/`, so
 the ledger is **committable learning data** that can be queried across runs.
 
 Schema owner: `crates/lisa-core/src/provenance.rs`. Current
-`schema_version`: **6**.
+`schema_version`: **9**.
 
 ## Execution record shape
 
@@ -152,12 +152,75 @@ Example:
 The interval fields let an unpark row carry stranded time directly. Producers
 own the precise mapping from scheduler observations to those timestamps.
 
+## Usage-correction record shape
+
+Schema 9 adds the **late token-usage join** (T-051-03-01). A completed ticket's
+terminal execution row is written with null tokens *by construction*:
+rest-before-retire lands the session's Stop-hook capture *after* the row. The
+scheduler's capture sweep reconciles `.lisa/<client>/captures.jsonl` against the
+durable ledger and, when a capture is owned by a completed ticket, appends one
+usage-correction row carrying the joined tokens. The original row's bytes are
+never mutated.
+
+Example:
+
+```json
+{"schema_version":9,"seal":"commit","record_type":"usage-correction","ticket_id":"T-051-03-01","attempt_lease":{"ticket_id":"T-051-03-01","attempt_id":1},"method":"codex","session_id":"019f7121-bd8b-7163-853e-c18f9f7ba3d9","pane_id":2,"source_line":42,"captured_at":1784311961,"tokens_in":15305521,"tokens_out":55850,"occurred_at":1784312000}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema_version` | int | `9` for the generation that introduced this shape. |
+| `seal` | enum | Completion tier of the corrected attempt; missing means `commit`. |
+| `record_type` | enum | Always `usage-correction`. |
+| `ticket_id` | string | The completed ticket these tokens belong to. |
+| `attempt_lease` | object | The exact owning attempt (its pane-reign owned the capture). |
+| `method` | string | Provider client (`claude`/`codex`); disambiguates `source_line`. |
+| `session_id` | string | Provider session the capture observed (audit/trace only). |
+| `pane_id` | int | Zellij pane the capture occurred on. |
+| `source_line` | int | One-based line in that client's `captures.jsonl`. With `method` this makes the join idempotent across rescans. |
+| `captured_at` | int | Capture time, UTC epoch seconds. |
+| `tokens_in` | int | Joined input tokens — non-null; a correction exists only for a real capture. |
+| `tokens_out` | int | Joined output tokens. |
+| `occurred_at` | int | When the correction was written, UTC epoch seconds. |
+
+**Attribution is by pane reign, not a closed window.** Because the winning
+capture lands after the ticket's `ended_at`, ownership extends from an occupant's
+`started_at` until the pane's next occupant starts. A capture owned by a still-live
+thread is left for a later sweep; a capture with no owning reign quarantines by
+session id under `.lisa/<client>/quarantine/`. A quarantined capture drains to a
+correction if a covering row later appears, and otherwise stays quarantined and
+countable — never fabricated as usage.
+
+### Corrected view
+
+Per-ticket token totals must be read from the **corrected view**, not the raw
+first-write row. `correct_usage` folds the mixed ledger: a ticket with any
+corrections takes the sum of them (the late-joined truth); a ticket with none
+falls back to its raw authoritative `Done` row (legacy ledgers). A completed
+ticket with neither stays `null` — the honest, countable capture gap that
+`usage_gap` enumerates and `lisa status` surfaces. Zero is never a substitute for
+unknown.
+
+**jq** — corrected input tokens per ticket (corrections override the raw row):
+
+```sh
+jq -s '
+  (map(select(.record_type=="usage-correction"))
+   | group_by(.ticket_id)
+   | map({key: .[0].ticket_id, value: (map(.tokens_in) | add)})
+   | from_entries) as $corrected
+  | map(select(.outcome=="done" and .authoritative==true))
+  | map({ticket_id, tokens_in: ($corrected[.ticket_id] // .tokens_in)})
+' .lisa/provenance.jsonl
+```
+
 ## Mixed-ledger reading
 
-Historical execution rows have no `record_type`. Assignment and parking rows
-have distinct required discriminators and fields. Core exposes the untagged
-`ProvenanceLedgerRecord` enum to replay all three shapes without rewriting old
-lines.
+Historical execution rows have no `record_type`. Assignment, parking, triage,
+proposal, and usage-correction rows have distinct required discriminators and
+fields. Core exposes the untagged `ProvenanceLedgerRecord` enum to replay every
+shape without rewriting old lines.
 
 All three row shapes deserialize an absent `seal` as `commit`. Such rows are
 pre-ladder history produced when commit sealing was the only completion path.
@@ -216,7 +279,8 @@ required execution `attempt_lease`, `authoritative`, and `fenced` fields.
 Version 3 added assignment-transition rows. Version 4 added park/unpark rows
 and the shared remedy-owner classification. Version 5 added bounded blocked
 retry fields. Version 6 added the completion `seal`; its default keeps rows
-from versions 1–5 classified as commit-sealed pre-ladder history. Version-1 rows remain valid
+from versions 1–5 classified as commit-sealed pre-ladder history. Version 9 added
+the usage-correction row (the late token-usage join). Version-1 rows remain valid
 append-only history but predate attempt attribution; readers of a mixed ledger
 must branch on version and shape rather than inventing leases.
 
