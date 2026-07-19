@@ -77,20 +77,19 @@ pub(crate) struct FollowUpContext<'a> {
 /// How a slot that already has a live session is reset before new work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResetStrategy {
-    /// Send `/clear` into the live TUI and wait for the `.cleared` signal before
-    /// sending the next prompt. This is the behaviour the scheduler's
-    /// `TransitionState` handshake implements. No current adapter uses it —
-    /// retained for future in-place-reset integrations — because an in-place
-    /// reset keeps the launch line's `LISA_TICKET_ID`/`LISA_ATTEMPT_ID`
-    /// environment alive across tickets, leaving every ticket after the first
-    /// under a stale identity.
-    ClearHandshake,
     /// Gracefully exit the resident interactive client, allow the bounded exit
     /// grace, then launch a fresh process for the next ticket. Both native
     /// clients use this: it is the only boundary that re-exports fresh
     /// per-ticket identity into the environment, and for Codex the interactive
     /// `/clear` hook is additionally not a reliable unattended delivery
     /// boundary.
+    ///
+    /// An integration whose identity does *not* ride the launch line's process
+    /// environment could in principle reset in place instead. Lisa carried that
+    /// path — a `/clear` handshake gated on the `.cleared` signal — until
+    /// T-051-02-01 removed it: no shipped adapter could reach it, so it read as
+    /// live while never running. Building it back is a deliberate change that
+    /// adds the strategy and its scheduler machinery together.
     ExitThenFresh,
     /// Reuse is a fresh launch; there is no in-place reset handshake, so the
     /// `TransitionState` machine does not apply (headless/ACP bridges).
@@ -208,13 +207,13 @@ pub(crate) trait AgentAdapter {
         "/exit"
     }
 
-    /// How a slot that already has a session is reset before new work. Both
-    /// native interactive clients override this to [`ResetStrategy::ExitThenFresh`]
-    /// so each ticket gets a fresh process with fresh per-ticket environment;
-    /// the default documents the in-place handshake seam for future
-    /// integrations whose identity does not live in process environment.
+    /// How a slot that already has a session is reset before new work. The
+    /// default is the boundary both native interactive clients use: each ticket
+    /// gets a fresh process with fresh per-ticket environment. An adapter that
+    /// reuses the pane's shell rather than a resident TUI overrides this to
+    /// [`ResetStrategy::FreshExec`].
     fn reset_strategy(&self) -> ResetStrategy {
-        ResetStrategy::ClearHandshake
+        ResetStrategy::ExitThenFresh
     }
 
     /// When the scheduler may gracefully end this provider's resident session
@@ -223,9 +222,17 @@ pub(crate) trait AgentAdapter {
         CompletionExit::Immediate
     }
 
-    /// The bare next-prompt to inject into a *reused* session once it is ready
-    /// (post-`.cleared` for Claude). Separate from [`Self::launch_command`]
-    /// because reuse sends the prompt alone, not the wrapped launch invocation.
+    /// The bare next-prompt to inject into a *reused* session that is already at
+    /// its prompt. Separate from [`Self::launch_command`] because reuse sends
+    /// the prompt alone, not the wrapped launch invocation.
+    ///
+    /// No caller remains: the in-place `/clear` handshake that used it was
+    /// removed in T-051-02-01, and `FreshExec` reuse re-execs via
+    /// [`Self::launch_command`] instead. Both adapters still implement it and
+    /// tests still pin the exact delivery text, so it is kept as a declared seam
+    /// rather than deleted inside a scheduler-machinery ticket — removing it
+    /// touches the Codex delivery surface, which N4 keeps out of this change.
+    #[allow(dead_code)]
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String;
 
     /// The follow-up nudge for a parked Review session. Native interactive

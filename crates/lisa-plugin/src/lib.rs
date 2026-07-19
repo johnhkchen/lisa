@@ -85,17 +85,6 @@ const COMPLETION_RECONCILIATION_TIMEOUT_SECS: u64 = 60;
 /// Maximum failed host-command observations for one completion generation.
 const MAX_COMPLETION_FAILURES: u8 = 2;
 
-/// Timeout (seconds) for waiting for a `.stopped` signal after phase completion.
-/// If no signal arrives AND the pane has been signal-silent for the wind-down
-/// period, fall back to sending `/clear` anyway.
-const STOP_SIGNAL_TIMEOUT_SECS: u64 = 60;
-
-/// Timeout (seconds) for waiting for a `.cleared` signal after sending `/clear`.
-/// If no signal arrives AND the pane has been signal-silent for the wind-down
-/// period, fall back to sending the prompt anyway. The quiet requirement means
-/// the prompt is never injected into a session that is still working.
-const CLEAR_SIGNAL_TIMEOUT_SECS: u64 = 90;
-
 /// Grace period after submitting `/exit` before typing a fresh provider launch
 /// command into the returned shell. Enter itself is deferred by
 /// `ENTER_DELAY_SECS`; using a longer grace ensures the old TUI has fully torn
@@ -376,20 +365,14 @@ impl OperatorModalOutcome {
     }
 }
 
-/// Per-slot state machine for session transitions. Both native adapters end a
-/// session per ticket: `/exit`, a bounded grace period, then a fresh launch at
-/// the shell. The `.stopped`/`.cleared`-gated in-place reset states remain for
-/// the documented `ClearHandshake` seam; no shipped adapter reaches them
-/// (removal tracked by T-051-02-01).
+/// Per-slot state machine for session transitions. Every adapter ends a session
+/// per ticket: `/exit`, a bounded grace period, then a fresh launch at the
+/// shell. Every variant here is a state a live pane occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TransitionState {
     /// No transition pending — slot is idle or running normally.
     #[default]
     Idle,
-    /// Phase complete, waiting for `.stopped` signal before sending `/clear`.
-    WaitingForStop,
-    /// `/clear` sent, waiting for `.cleared` signal before sending the prompt.
-    WaitingForClear,
     /// `/exit` sent to a released session whose provider does not match the next
     /// ticket. Once the grace period expires, launch the new provider at shell.
     WaitingForExit,
@@ -5194,33 +5177,15 @@ impl State {
                     },
                 });
             } else if self.agent_slots[slot_idx].has_session {
-                // Session reuse. For a ClearHandshake adapter (the documented
-                // seam — no shipped adapter uses it; removal tracked by
-                // T-051-02-01): the slot is idle (ticket_id was None), so the
-                // TUI is already at its prompt. Send /clear directly and wait
-                // for the .cleared signal before sending the prompt. (The old
-                // WaitingForStop approach deadlocked because the previous
-                // session's .stopped signal was already consumed by
-                // check_transition_signals() earlier in the same poll_tick.)
+                // Session reuse.
                 match adapter.reset_strategy() {
-                    ResetStrategy::ClearHandshake => {
-                        let reuse_prompt = adapter.reuse_prompt(&ctx);
-                        self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
-                        self.agent_slots[slot_idx].transition_state =
-                            TransitionState::WaitingForClear;
-                        self.agent_slots[slot_idx].transition_started_at =
-                            Some(std::time::SystemTime::now());
-                        launch_cmd = reuse_prompt;
-                    }
                     ResetStrategy::ExitThenFresh => {
                         unreachable!("exit-then-fresh sessions enter the recycle branch")
                     }
                     // Reuse-as-fresh-exec (headless/bridge adapters). The prior
-                    // process left the pane's shell at its prompt, so there is no
-                    // /clear handshake: type a fresh command for the new ticket.
-                    // WaitingForClear must not engage — leaving
-                    // transition_state untouched (Idle) keeps the .cleared/
-                    // clear-timeout machinery inert for this pane.
+                    // process left the pane's shell at its prompt: type a fresh
+                    // command for the new ticket. transition_state stays Idle —
+                    // there is no in-place reset handshake to wait on.
                     ResetStrategy::FreshExec => {
                         let payload = adapter.launch_command(&ctx, &assignment_path);
                         launch_cmd = match Self::prepare_fresh_launch(
@@ -6276,11 +6241,14 @@ impl State {
         }
     }
 
-    /// Scan for `.stopped` and `.cleared` signal files and advance the
-    /// per-slot transition state machine accordingly.
+    /// Scan for `.stopped` and `.cleared` signal files and act on them.
     ///
-    /// - `.stopped` → if slot is `WaitingForStop`, send `/clear` and move to `WaitingForClear`
-    /// - `.cleared` → if slot is `WaitingForClear`, send the prompt and move to `Idle`
+    /// - `.stopped` → pane liveness, plus Review auto-completion for an idle
+    ///   slot whose ticket is in Review.
+    /// - `.cleared` → pane liveness only. Claude's `on-clear.sh` hook fires on
+    ///   any `/clear`, including one a human types; Lisa never sends `/clear`
+    ///   as a scheduling transport, so this drives no transition. Consuming the
+    ///   file still matters: unread signal files would accumulate forever.
     ///
     /// Signal files are deleted immediately after reading (same as `.idle` signals).
     fn check_transition_signals(&mut self) {
@@ -6294,7 +6262,6 @@ impl State {
                 }
                 SignalRecord::Cleared { pane_id } => {
                     self.bump_pane_activity(pane_id);
-                    self.handle_cleared_signal(pane_id);
                 }
                 _ => {}
             }
@@ -6379,9 +6346,9 @@ impl State {
 
     /// Handle a `.stopped` signal for the given pane.
     ///
-    /// Two cases:
-    /// 1. Slot is `WaitingForStop` (mid-transition): send `/clear` and advance to `WaitingForClear`.
-    /// 2. Slot is `Idle` and ticket is in Review phase: auto-complete the ticket as Done.
+    /// One case: the slot is `Idle` and its ticket is in Review phase, so the
+    /// ticket auto-completes as Done. A slot mid-transition (`WaitingForExit`)
+    /// or fenced has nothing to auto-complete.
     fn handle_stopped_signal(&mut self, pane_id: u32) {
         let slot_info = self
             .agent_slots
@@ -6394,25 +6361,6 @@ impl State {
             None => return,
         };
 
-        // Case 1: Mid-transition — send /clear
-        if transition_state == TransitionState::WaitingForStop {
-            // Never /clear a pane blocked on a question — would discard the agent's
-            // session mid-question. Stay in WaitingForStop; retry once unblocked.
-            if self.is_pane_awaiting(pane_id) {
-                return;
-            }
-            self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
-            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
-                slot.transition_state = TransitionState::WaitingForClear;
-                slot.transition_started_at = Some(std::time::SystemTime::now());
-            }
-            self.log_activity(ActivityEvent::Info {
-                message: format!("Pane {} stopped, sent /clear", pane_id),
-            });
-            return;
-        }
-
-        // Case 2: Idle slot with Review-phase ticket — auto-complete
         if transition_state == TransitionState::Idle {
             if let Some(ref tid) = ticket_id {
                 let is_review = self
@@ -6911,83 +6859,12 @@ impl State {
         }
     }
 
-    /// Handle a `.cleared` signal for the given pane.
-    /// If the slot is waiting for clear, send the new ticket prompt and return to `Idle`.
-    fn handle_cleared_signal(&mut self, pane_id: u32) {
-        // Check state and collect data before mutating, to avoid borrow conflicts.
-        let action = self
-            .agent_slots
-            .iter()
-            .find(|s| s.pane_id == pane_id)
-            .and_then(|slot| {
-                if slot.transition_state == TransitionState::WaitingForClear {
-                    slot.ticket_id.clone()
-                } else {
-                    None
-                }
-            });
-
-        if let Some(ticket_id) = action {
-            // Don't type the next-ticket prompt over a question. Leave the slot in
-            // WaitingForClear; the prompt goes out on a later tick once unblocked.
-            if self.is_pane_awaiting(pane_id) {
-                return;
-            }
-            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-            // Adapter owns the reuse prompt (ClearHandshake seam; no shipped
-            // adapter reaches this — removal tracked by T-051-02-01).
-            // Reuse path only needs the adapter; the route is surfaced at spawn.
-            let (adapter, _route) = resolve_adapter_or_native(
-                self.dag.get_ticket(&ticket_id),
-                self.config.client,
-                self.config.lisa_bin.as_deref(),
-            );
-            let Some(artifact_dir) = self.prompt_artifact_dir(&ticket_id, pane_id) else {
-                return;
-            };
-            if let Err(error) = self.publish_prompt_lease_marker(&ticket_id, pane_id) {
-                self.log_activity(ActivityEvent::Error {
-                    message: format!(
-                        "Cannot deliver prompt for {} on pane {}: {}",
-                        ticket_id, pane_id, error
-                    ),
-                });
-                return;
-            }
-            let artifact_dir = strip_host_prefix(&artifact_dir);
-            let ctx = SpawnContext {
-                ticket_dir: &host_ticket_dir,
-                ticket_id: &ticket_id,
-                pane_id,
-                attempt_id: self
-                    .pane_attempt_lease(pane_id)
-                    .map_or(0, |lease| lease.attempt_id),
-                artifact_dir: &artifact_dir,
-                assignment_generation: self.active_assignment_generation(pane_id),
-            };
-            let prompt = adapter.reuse_prompt(&ctx);
-            self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
-            self.start_assignment_ack_wait(pane_id, std::time::SystemTime::now());
-
-            self.log_activity(ActivityEvent::Info {
-                message: format!("Pane {} cleared, sent prompt for {}", pane_id, ticket_id),
-            });
-
-            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
-                slot.transition_state = TransitionState::Idle;
-                slot.transition_started_at = None;
-            }
-        }
-    }
-
     /// Check for transition deadlines and advance stalled transitions.
     ///
-    /// Prevents indefinite stalls if hooks fail to produce signal files.
-    ///
-    /// Busy-pane guard: a fallback only fires once the pane has also been
-    /// signal-silent for the wind-down period. If the expected signal never
-    /// arrives because the session is still working (heartbeats flowing), the
-    /// transition waits rather than injecting input into a busy session.
+    /// One transition can stall: a session told to `/exit` that has not yet
+    /// returned its pane to a shell. Once the bounded exit grace expires the
+    /// pane is launched fresh regardless — the old client is leaving either
+    /// way, so no activity or pending-question exemption applies.
     fn check_transition_timeouts(&mut self) {
         let evaluator = DeadlineEvaluator::new(SystemClock);
         let now = evaluator.now();
@@ -6997,28 +6874,17 @@ impl State {
                 ticket_id: slot.ticket_id.clone(),
                 state: slot.transition_state,
                 started: slot.transition_started_at,
-                last_activity: slot.last_activity_at,
-                awaiting_human: self.awaiting_human.contains(&slot.pane_id),
             }),
             TransitionPolicy {
-                wind_down: std::time::Duration::from_secs(self.config.wind_down_secs),
                 exit_grace_secs: AGENT_EXIT_GRACE_SECS,
-                stop_timeout_secs: STOP_SIGNAL_TIMEOUT_SECS,
-                clear_timeout_secs: CLEAR_SIGNAL_TIMEOUT_SECS,
             },
         );
 
         let mut exit_ready: Vec<(u32, Option<TicketId>)> = Vec::new();
-        let mut stop_timeouts: Vec<u32> = Vec::new();
-        let mut clear_timeouts: Vec<(u32, Option<TicketId>)> = Vec::new();
         for action in actions {
             match action {
                 TransitionAction::ExitReady { pane_id, ticket_id } => {
                     exit_ready.push((pane_id, ticket_id));
-                }
-                TransitionAction::StopTimedOut { pane_id } => stop_timeouts.push(pane_id),
-                TransitionAction::ClearTimedOut { pane_id, ticket_id } => {
-                    clear_timeouts.push((pane_id, ticket_id));
                 }
             }
         }
@@ -7186,69 +7052,6 @@ impl State {
                     pane_id, route.agent, ticket_id
                 ),
             });
-        }
-
-        for pane_id in stop_timeouts {
-            self.log_activity(ActivityEvent::Warning {
-                message: format!(
-                    "Stop signal timeout for pane {}, sending /clear anyway",
-                    pane_id
-                ),
-            });
-            self.send_line_to_pane("/clear", PaneId::Terminal(pane_id));
-            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
-                slot.transition_state = TransitionState::WaitingForClear;
-                slot.transition_started_at = Some(now);
-            }
-        }
-
-        for (pane_id, ticket_id) in clear_timeouts {
-            self.log_activity(ActivityEvent::Warning {
-                message: format!(
-                    "Clear signal timeout for pane {}, sending prompt anyway",
-                    pane_id
-                ),
-            });
-            if let Some(tid) = &ticket_id {
-                let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-                // Adapter owns the reuse prompt (ClearHandshake seam; no shipped
-                // adapter reaches this — removal tracked by T-051-02-01).
-                let (adapter, _route) = resolve_adapter_or_native(
-                    self.dag.get_ticket(tid),
-                    self.config.client,
-                    self.config.lisa_bin.as_deref(),
-                );
-                let Some(artifact_dir) = self.prompt_artifact_dir(tid, pane_id) else {
-                    continue;
-                };
-                if let Err(error) = self.publish_prompt_lease_marker(tid, pane_id) {
-                    self.log_activity(ActivityEvent::Error {
-                        message: format!(
-                            "Cannot deliver timeout prompt for {} on pane {}: {}",
-                            tid, pane_id, error
-                        ),
-                    });
-                    continue;
-                }
-                let artifact_dir = strip_host_prefix(&artifact_dir);
-                let ctx = SpawnContext {
-                    ticket_dir: &host_ticket_dir,
-                    ticket_id: tid,
-                    pane_id,
-                    attempt_id: self
-                        .pane_attempt_lease(pane_id)
-                        .map_or(0, |lease| lease.attempt_id),
-                    artifact_dir: &artifact_dir,
-                    assignment_generation: self.active_assignment_generation(pane_id),
-                };
-                let prompt = adapter.reuse_prompt(&ctx);
-                self.send_line_to_pane(&prompt, PaneId::Terminal(pane_id));
-                self.start_assignment_ack_wait(pane_id, now);
-            }
-            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
-                slot.transition_state = TransitionState::Idle;
-                slot.transition_started_at = None;
-            }
         }
     }
 
@@ -15144,89 +14947,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stopped_signal_skips_when_awaiting() {
-        // A WaitingForStop pane blocked on a question must not be /clear-ed.
-        let mut state = State::default();
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForStop,
-            transition_started_at: Some(std::time::SystemTime::now()),
-            cooldown_until: None,
-            last_activity_at: None,
-            last_client: None,
-        });
-        state.awaiting_human.insert(1);
-
-        // Would call send_line_to_pane("/clear", ..) (a zellij host call that
-        // panics natively) if the guard were missing — so reaching the assert
-        // proves the guard short-circuited.
-        state.handle_stopped_signal(1);
-
-        // No state-machine advance: still WaitingForStop, not WaitingForClear.
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForStop
-        );
-    }
-
-    #[test]
-    fn test_cleared_signal_skips_when_awaiting() {
-        // A WaitingForClear pane blocked on a question must not receive the prompt.
-        let mut state = State::default();
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForClear,
-            transition_started_at: Some(std::time::SystemTime::now()),
-            cooldown_until: None,
-            last_activity_at: None,
-            last_client: None,
-        });
-        state.awaiting_human.insert(1);
-
-        state.handle_cleared_signal(1);
-
-        // Still WaitingForClear — the prompt was not sent, slot did not flip to Idle.
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForClear
-        );
-    }
-
-    #[test]
-    fn test_transition_timeouts_skip_when_awaiting() {
-        // A timed-out WaitingForStop pane that is quiet would normally be force
-        // /clear-ed; while awaiting it must be skipped, leaving state unchanged.
-        let mut state = State::default();
-        let long_ago = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(state.config.wind_down_secs + 100_000);
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForStop,
-            transition_started_at: Some(long_ago),
-            cooldown_until: None,
-            last_activity_at: Some(long_ago),
-            last_client: None,
-        });
-        state.awaiting_human.insert(1);
-
-        state.check_transition_timeouts();
-
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForStop
-        );
-    }
-
-    #[test]
     fn test_review_timeout_skips_when_awaiting() {
         use lisa_core::types::Thread;
 
@@ -19218,50 +18938,6 @@ owned\n\
     }
 
     #[test]
-    fn test_check_transition_signals_stopped_advances_state() {
-        use std::fs;
-
-        let dir = tempfile::tempdir().unwrap();
-        let signal_dir = dir.path().join("signals");
-        fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("pane-1.stopped"), "2025-01-01T00:00:00Z").unwrap();
-
-        let mut state = State {
-            signal_dir: signal_dir.clone(),
-            ..State::default()
-        };
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForStop,
-            transition_started_at: Some(std::time::SystemTime::now()),
-            cooldown_until: None,
-            last_activity_at: None,
-            last_client: None,
-        });
-
-        state.check_transition_signals();
-
-        // Signal file should be deleted
-        assert!(!signal_dir.join("pane-1.stopped").exists());
-
-        // State should advance to WaitingForClear
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForClear
-        );
-        assert!(state.agent_slots[0].transition_started_at.is_some());
-
-        // Should have logged an info event
-        assert!(state.activity_log.iter().any(|e| matches!(
-            e,
-            ActivityEvent::Info { message } if message.contains("stopped") && message.contains("/clear")
-        )));
-    }
-
-    #[test]
     fn test_check_transition_signals_stopped_ignored_when_idle() {
         use std::fs;
 
@@ -19296,54 +18972,13 @@ owned\n\
     }
 
     #[test]
-    fn test_check_transition_signals_cleared_advances_state() {
+    fn test_cleared_signal_is_liveness_only() {
         use std::fs;
 
-        let dir = tempfile::tempdir().unwrap();
-        let signal_dir = dir.path().join("signals");
-        fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("pane-1.cleared"), "2025-01-01T00:00:00Z").unwrap();
-
-        let mut state = State {
-            config: PluginConfig {
-                ticket_dir: dir.path().join("tickets"),
-                ..PluginConfig::new()
-            },
-            signal_dir: signal_dir.clone(),
-            ..State::default()
-        };
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForClear,
-            transition_started_at: Some(std::time::SystemTime::now()),
-            cooldown_until: None,
-            last_activity_at: None,
-            last_client: None,
-        });
-
-        state.check_transition_signals();
-
-        // Signal file should be deleted
-        assert!(!signal_dir.join("pane-1.cleared").exists());
-
-        // State should return to Idle
-        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
-        assert!(state.agent_slots[0].transition_started_at.is_none());
-
-        // Should have logged an info event about sending prompt
-        assert!(state.activity_log.iter().any(|e| matches!(
-            e,
-            ActivityEvent::Info { message } if message.contains("cleared") && message.contains("T-001")
-        )));
-    }
-
-    #[test]
-    fn test_check_transition_signals_cleared_ignored_when_idle() {
-        use std::fs;
-
+        // Lisa never sends `/clear` as a scheduling transport, but Claude's
+        // on-clear hook still fires when a human types it. The signal counts as
+        // pane activity, is consumed so it cannot accumulate, and drives no
+        // transition and no prompt.
         let dir = tempfile::tempdir().unwrap();
         let signal_dir = dir.path().join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
@@ -19367,9 +19002,12 @@ owned\n\
 
         state.check_transition_signals();
 
-        // Signal cleaned up but state unchanged
         assert!(!signal_dir.join("pane-1.cleared").exists());
         assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        // Liveness recorded — the wind-down clock restarted.
+        assert!(state.agent_slots[0].last_activity_at.is_some());
+        // No prompt was typed into the pane: every send queues a deferred Enter.
+        assert!(state.pending_enters.is_empty());
     }
 
     #[test]
@@ -19393,92 +19031,6 @@ owned\n\
     }
 
     #[test]
-    fn test_check_transition_timeouts_stop_timeout() {
-        let mut state = State::default();
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForStop,
-            // Set to 61 seconds ago
-            transition_started_at: Some(
-                std::time::SystemTime::now() - std::time::Duration::from_secs(61),
-            ),
-            cooldown_until: None,
-            last_activity_at: None,
-            last_client: None,
-        });
-
-        state.check_transition_timeouts();
-
-        // Should have forced to WaitingForClear
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForClear
-        );
-        assert!(state.agent_slots[0].transition_started_at.is_some());
-
-        // Should have logged a warning
-        assert!(state.activity_log.iter().any(|e| matches!(
-            e,
-            ActivityEvent::Warning { message } if message.contains("Stop signal timeout")
-        )));
-    }
-
-    #[test]
-    fn test_check_transition_timeouts_clear_timeout() {
-        let mut state = State {
-            config: PluginConfig {
-                ticket_dir: std::path::PathBuf::from("/tmp/tickets"),
-                ..PluginConfig::new()
-            },
-            ..State::default()
-        };
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForClear,
-            // Past the 90s clear-signal timeout
-            transition_started_at: Some(
-                std::time::SystemTime::now() - std::time::Duration::from_secs(91),
-            ),
-            cooldown_until: None,
-            last_activity_at: None,
-            last_client: None,
-        });
-        state.seat_assignments.insert(
-            1,
-            SeatAssignmentState::AssignedPendingAck {
-                generation: 1,
-                ack_deadline: None,
-            },
-        );
-
-        state.check_transition_timeouts();
-
-        // Should have forced to Idle
-        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
-        assert!(state.agent_slots[0].transition_started_at.is_none());
-        assert!(matches!(
-            state.seat_assignment(1),
-            Some(SeatAssignmentState::AssignedPendingAck {
-                generation: 1,
-                ack_deadline: Some(_),
-            })
-        ));
-        assert!(!state.seat_is_owned(1));
-
-        // Should have logged a warning
-        assert!(state.activity_log.iter().any(|e| matches!(
-            e,
-            ActivityEvent::Warning { message } if message.contains("Clear signal timeout")
-        )));
-    }
-
-    #[test]
     fn test_check_transition_timeouts_within_threshold_no_change() {
         let mut state = State::default();
         state.agent_slots.push(AgentSlot {
@@ -19486,10 +19038,10 @@ owned\n\
             ticket_id: Some("T-001".to_string()),
             attempt_lease: None,
             has_session: true,
-            transition_state: TransitionState::WaitingForStop,
-            // Set to 5 seconds ago — well within the 60s threshold
+            transition_state: TransitionState::WaitingForExit,
+            // Well inside the exit grace — the fresh launch must not fire yet.
             transition_started_at: Some(
-                std::time::SystemTime::now() - std::time::Duration::from_secs(5),
+                std::time::SystemTime::now() - std::time::Duration::from_secs(1),
             ),
             cooldown_until: None,
             last_activity_at: None,
@@ -19498,10 +19050,10 @@ owned\n\
 
         state.check_transition_timeouts();
 
-        // No change — still WaitingForStop
+        // No change — still waiting for the old client to exit.
         assert_eq!(
             state.agent_slots[0].transition_state,
-            TransitionState::WaitingForStop
+            TransitionState::WaitingForExit
         );
         assert!(state.activity_log.is_empty());
     }
@@ -21299,34 +20851,6 @@ owned\n\
         assert_eq!(state.find_idle_slot(AgentClient::Claude), Some(0));
     }
 
-    #[test]
-    fn test_check_transition_timeouts_deferred_while_pane_active() {
-        let mut state = State::default();
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::WaitingForClear,
-            // Far past the 90s clear-signal timeout...
-            transition_started_at: Some(
-                std::time::SystemTime::now() - std::time::Duration::from_secs(600),
-            ),
-            cooldown_until: None,
-            // ...but the pane is still active, so the fallback must wait
-            last_activity_at: Some(std::time::SystemTime::now()),
-            last_client: None,
-        });
-
-        state.check_transition_timeouts();
-
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForClear
-        );
-        assert!(state.activity_log.is_empty());
-    }
-
     // =========================================================================
     // Deadline policy characterization (T-039-04-01)
     //
@@ -21428,36 +20952,7 @@ owned\n\
                 last_activity_at: None,
                 last_client: Some(AgentClient::Codex),
             },
-            AgentSlot {
-                pane_id: 3,
-                ticket_id: Some("T-ACTIVE".to_string()),
-                attempt_lease: None,
-                has_session: true,
-                transition_state: TransitionState::WaitingForClear,
-                transition_started_at: Some(
-                    now - std::time::Duration::from_secs(CLEAR_SIGNAL_TIMEOUT_SECS + 10),
-                ),
-                cooldown_until: None,
-                last_activity_at: Some(now),
-                last_client: Some(AgentClient::Codex),
-            },
-            AgentSlot {
-                pane_id: 4,
-                ticket_id: Some("T-HUMAN".to_string()),
-                attempt_lease: None,
-                has_session: true,
-                transition_state: TransitionState::WaitingForClear,
-                transition_started_at: Some(
-                    now - std::time::Duration::from_secs(CLEAR_SIGNAL_TIMEOUT_SECS + 10),
-                ),
-                cooldown_until: None,
-                last_activity_at: Some(
-                    now - std::time::Duration::from_secs(state.config.wind_down_secs + 10),
-                ),
-                last_client: Some(AgentClient::Codex),
-            },
         ]);
-        state.awaiting_human.insert(4);
 
         state.check_transition_timeouts();
 
@@ -21466,22 +20961,11 @@ owned\n\
         assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(!state.agent_slots[0].has_session);
         assert_eq!(state.agent_slots[0].last_client, None);
+        // Inside the grace, the pane keeps waiting.
         assert_eq!(
             state.agent_slots[1].transition_state,
             TransitionState::WaitingForExit
         );
-        // Stop/clear use last_activity_at as an independent busy-pane guard.
-        assert_eq!(
-            state.agent_slots[2].transition_state,
-            TransitionState::WaitingForClear
-        );
-        // A quiet pane is independently exempt while its question is awaiting
-        // a human answer.
-        assert_eq!(
-            state.agent_slots[3].transition_state,
-            TransitionState::WaitingForClear
-        );
-        assert!(state.awaiting_human.contains(&4));
     }
 
     #[test]

@@ -62,31 +62,9 @@ impl DeadlineEvaluator {
             .filter_map(|candidate| {
                 let started = candidate.started?;
                 let elapsed_secs = elapsed(now, started).as_secs();
-                let quiet = candidate
-                    .last_activity
-                    .is_none_or(|at| elapsed(now, at) >= policy.wind_down);
                 match candidate.state {
                     TransitionState::WaitingForExit if elapsed_secs > policy.exit_grace_secs => {
                         Some(TransitionAction::ExitReady {
-                            pane_id: candidate.pane_id,
-                            ticket_id: candidate.ticket_id,
-                        })
-                    }
-                    TransitionState::WaitingForStop
-                        if elapsed_secs > policy.stop_timeout_secs
-                            && quiet
-                            && !candidate.awaiting_human =>
-                    {
-                        Some(TransitionAction::StopTimedOut {
-                            pane_id: candidate.pane_id,
-                        })
-                    }
-                    TransitionState::WaitingForClear
-                        if elapsed_secs > policy.clear_timeout_secs
-                            && quiet
-                            && !candidate.awaiting_human =>
-                    {
-                        Some(TransitionAction::ClearTimedOut {
                             pane_id: candidate.pane_id,
                             ticket_id: candidate.ticket_id,
                         })
@@ -234,27 +212,18 @@ pub(crate) struct TransitionInput {
     pub(crate) ticket_id: Option<TicketId>,
     pub(crate) state: TransitionState,
     pub(crate) started: Option<SystemTime>,
-    pub(crate) last_activity: Option<SystemTime>,
-    pub(crate) awaiting_human: bool,
 }
 
+/// The exit grace is the whole transition policy: a session that has been told
+/// to `/exit` is given a bounded window to tear down, and nothing exempts it —
+/// not pane activity, not a pending question. The pane is already leaving.
 pub(crate) struct TransitionPolicy {
-    pub(crate) wind_down: Duration,
     pub(crate) exit_grace_secs: u64,
-    pub(crate) stop_timeout_secs: u64,
-    pub(crate) clear_timeout_secs: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TransitionAction {
     ExitReady {
-        pane_id: u32,
-        ticket_id: Option<TicketId>,
-    },
-    StopTimedOut {
-        pane_id: u32,
-    },
-    ClearTimedOut {
         pane_id: u32,
         ticket_id: Option<TicketId>,
     },
@@ -375,15 +344,8 @@ mod tests {
                 ticket_id: None,
                 state: TransitionState::WaitingForExit,
                 started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(91)),
-                last_activity: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
-                awaiting_human: true,
             }],
-            TransitionPolicy {
-                wind_down: Duration::from_secs(20),
-                exit_grace_secs: 8,
-                stop_timeout_secs: 60,
-                clear_timeout_secs: 90,
-            },
+            TransitionPolicy { exit_grace_secs: 8 },
         );
         assert_eq!(
             transitions,
@@ -455,26 +417,10 @@ mod tests {
     #[test]
     fn policy_specific_exemptions_are_preserved() {
         let evaluator = evaluator(100);
-        let policy = TransitionPolicy {
-            wind_down: Duration::from_secs(10),
-            exit_grace_secs: 8,
-            stop_timeout_secs: 60,
-            clear_timeout_secs: 90,
-        };
-        assert!(evaluator
-            .transitions(
-                [TransitionInput {
-                    pane_id: 1,
-                    ticket_id: None,
-                    state: TransitionState::WaitingForStop,
-                    started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(SystemTime::UNIX_EPOCH),
-                    awaiting_human: true,
-                }],
-                policy,
-            )
-            .is_empty());
-
+        // The transition policy is deliberately absent here: it has no
+        // exemptions to preserve. A pane told to `/exit` leaves on the grace
+        // clock alone — pending questions and pane activity do not hold it
+        // back, unlike the review/session/stale policies below.
         let review = ReviewInput {
             ticket_id: "T-R".into(),
             pane_id: 2,
@@ -539,6 +485,9 @@ mod tests {
             }]
         ));
 
+        // The transition policy emits exactly one action, and only for the one
+        // state that can stall. Idle and Fenced panes are past their deadline by
+        // the same clock and still yield nothing.
         let transitions = evaluator.transitions(
             [
                 TransitionInput {
@@ -546,46 +495,28 @@ mod tests {
                     ticket_id: Some("T-EXIT".into()),
                     state: TransitionState::WaitingForExit,
                     started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(SystemTime::UNIX_EPOCH),
-                    awaiting_human: false,
                 },
                 TransitionInput {
                     pane_id: 22,
-                    ticket_id: Some("T-STOP".into()),
-                    state: TransitionState::WaitingForStop,
+                    ticket_id: Some("T-IDLE".into()),
+                    state: TransitionState::Idle,
                     started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(SystemTime::UNIX_EPOCH),
-                    awaiting_human: false,
                 },
                 TransitionInput {
                     pane_id: 23,
-                    ticket_id: Some("T-CLEAR".into()),
-                    state: TransitionState::WaitingForClear,
+                    ticket_id: Some("T-FENCED".into()),
+                    state: TransitionState::Fenced,
                     started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(SystemTime::UNIX_EPOCH),
-                    awaiting_human: false,
                 },
             ],
-            TransitionPolicy {
-                wind_down: Duration::from_secs(10),
-                exit_grace_secs: 8,
-                stop_timeout_secs: 60,
-                clear_timeout_secs: 90,
-            },
+            TransitionPolicy { exit_grace_secs: 8 },
         );
         assert_eq!(
             transitions,
-            vec![
-                TransitionAction::ExitReady {
-                    pane_id: 21,
-                    ticket_id: Some("T-EXIT".into()),
-                },
-                TransitionAction::StopTimedOut { pane_id: 22 },
-                TransitionAction::ClearTimedOut {
-                    pane_id: 23,
-                    ticket_id: Some("T-CLEAR".into()),
-                },
-            ]
+            vec![TransitionAction::ExitReady {
+                pane_id: 21,
+                ticket_id: Some("T-EXIT".into()),
+            }]
         );
 
         let reviews = evaluator.reviews(
@@ -694,77 +625,10 @@ mod tests {
             }]
         ));
 
-        let transitions = evaluator.transitions(
-            [
-                TransitionInput {
-                    pane_id: 21,
-                    ticket_id: Some("T-EXIT-ACTIVE".into()),
-                    state: TransitionState::WaitingForExit,
-                    started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(recent),
-                    awaiting_human: false,
-                },
-                TransitionInput {
-                    pane_id: 22,
-                    ticket_id: Some("T-EXIT-HUMAN".into()),
-                    state: TransitionState::WaitingForExit,
-                    started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(SystemTime::UNIX_EPOCH),
-                    awaiting_human: true,
-                },
-                TransitionInput {
-                    pane_id: 23,
-                    ticket_id: Some("T-STOP-ACTIVE".into()),
-                    state: TransitionState::WaitingForStop,
-                    started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(recent),
-                    awaiting_human: false,
-                },
-                TransitionInput {
-                    pane_id: 24,
-                    ticket_id: Some("T-STOP-HUMAN".into()),
-                    state: TransitionState::WaitingForStop,
-                    started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(SystemTime::UNIX_EPOCH),
-                    awaiting_human: true,
-                },
-                TransitionInput {
-                    pane_id: 25,
-                    ticket_id: Some("T-CLEAR-ACTIVE".into()),
-                    state: TransitionState::WaitingForClear,
-                    started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(recent),
-                    awaiting_human: false,
-                },
-                TransitionInput {
-                    pane_id: 26,
-                    ticket_id: Some("T-CLEAR-HUMAN".into()),
-                    state: TransitionState::WaitingForClear,
-                    started: Some(SystemTime::UNIX_EPOCH),
-                    last_activity: Some(SystemTime::UNIX_EPOCH),
-                    awaiting_human: true,
-                },
-            ],
-            TransitionPolicy {
-                wind_down: Duration::from_secs(10),
-                exit_grace_secs: 8,
-                stop_timeout_secs: 60,
-                clear_timeout_secs: 90,
-            },
-        );
-        assert_eq!(
-            transitions,
-            vec![
-                TransitionAction::ExitReady {
-                    pane_id: 21,
-                    ticket_id: Some("T-EXIT-ACTIVE".into()),
-                },
-                TransitionAction::ExitReady {
-                    pane_id: 22,
-                    ticket_id: Some("T-EXIT-HUMAN".into()),
-                },
-            ]
-        );
+        // Transition evaluation, like acknowledgement above, now carries no
+        // activity or awaiting-human exemption input at all: a pane told to
+        // `/exit` leaves on the grace clock. The exemptions below belong to the
+        // review, session, and stale policies and must stay distinct from it.
 
         let reviews = evaluator.reviews(
             [

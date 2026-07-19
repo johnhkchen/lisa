@@ -145,7 +145,7 @@ impl Scenario {
 
         let mut primary_slot = fresh_slot(PRIMARY_PANE, Some(AgentClient::Codex));
         primary_slot.ticket_id = Some(PRIMARY.to_string());
-        primary_slot.transition_state = TransitionState::WaitingForStop;
+        primary_slot.transition_state = TransitionState::Idle;
         primary_slot.transition_started_at = Some(std::time::SystemTime::now());
         state.agent_slots.push(primary_slot);
         state
@@ -563,10 +563,12 @@ fn passing_review_hostile_order_converges_once_and_schedules_dependent() {
         2
     );
 
+    // A second `.stopped` while the completion is already in flight must not
+    // launch another one, and drives no transition of its own.
     scenario.state.handle_stopped_signal(PRIMARY_PANE);
     assert_eq!(
         scenario.state.agent_slots[0].transition_state,
-        TransitionState::WaitingForClear
+        TransitionState::Idle
     );
     assert_eq!(scenario.state.launched_completion_effects.len(), 1);
 
