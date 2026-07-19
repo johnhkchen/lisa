@@ -55,7 +55,8 @@ use lisa_core::provenance::{
     self, AssignmentState, AssignmentTransitionRecord, ParkingTransitionRecord,
     ParkingTransitionType, ProposalAction, ProposalActionRecord, ProposalRecordType,
     ProvenanceLedgerRecord, ProvenanceRecord, ProvenanceRecordType, Route, RunOutcome,
-    TriageRecordType, TriageState, TriageTransitionRecord,
+    TriageRecordType, TriageState, TriageTransitionRecord, UsageCorrectionRecord,
+    UsageCorrectionType,
 };
 use lisa_core::ticket;
 use lisa_core::triage::{
@@ -6708,13 +6709,9 @@ impl State {
             concurrency_at_spawn: thread.concurrency_at_spawn,
             pane_id: thread.pane_id,
         };
-        let (tokens_in, tokens_out, cost_usd) = self.read_usage(client, &record);
-        let record = ProvenanceRecord {
-            tokens_in,
-            tokens_out,
-            cost_usd,
-            ..record
-        };
+        // Tokens are null by construction: rest-before-retire lands this
+        // session's capture *after* this row. `sweep_usage_captures` performs the
+        // late join as an append-only correction (T-051-03-01).
         if let Err(e) = provenance::append_record(&self.ledger_path, &record) {
             self.log_activity(ActivityEvent::Error {
                 message: format!("provenance write failed for {}: {}", ticket_id, e),
@@ -6724,93 +6721,218 @@ impl State {
         true
     }
 
-    /// Sum capture rows uniquely owned by the current ticket's pane-time window.
+    /// Late-join capture rows onto their owning tickets as append-only
+    /// corrections (T-051-03-01).
     ///
-    /// Prior execution records provide durable ownership for recycled panes;
-    /// `current` closes the still-in-memory interval that has not been appended
-    /// yet. Assignment-transition rows never establish provider ownership. A
-    /// missing ledger, malformed row, or capture without a unique owner cannot
-    /// fabricate usage. Capture rows contain no dollar-cost observation, so
-    /// `cost_usd` remains `None`.
-    fn read_usage(
-        &mut self,
-        client: AgentClient,
-        current: &ProvenanceRecord,
-    ) -> (Option<u64>, Option<u64>, Option<f64>) {
-        let dir = match client {
-            AgentClient::Codex => &self.codex_dir,
-            AgentClient::Claude => &self.claude_dir,
-        };
-        let raw = match std::fs::read_to_string(dir.join("captures.jsonl")) {
-            Ok(s) => s,
-            Err(_) => return (None, None, None),
-        };
-
-        let prior_records: Vec<ProvenanceRecord> = std::fs::read_to_string(&self.ledger_path)
-            .ok()
-            .map(|ledger| {
-                ledger
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
-                    .filter_map(|record| match record {
-                        ProvenanceLedgerRecord::Execution(record) => Some(record),
-                        ProvenanceLedgerRecord::AssignmentTransition(_)
-                        | ProvenanceLedgerRecord::ParkingTransition(_)
-                        | ProvenanceLedgerRecord::TriageTransition(_)
-                        | ProvenanceLedgerRecord::ProposalAction(_)
-                        | ProvenanceLedgerRecord::NoteAcknowledgment(_) => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut totals = None;
-        for (source_index, line) in raw.lines().enumerate() {
-            let Ok(capture) = serde_json::from_str::<CaptureRecord>(line) else {
-                continue;
-            };
-            if capture.pane_id != current.pane_id || capture.captured_at > current.ended_at {
-                continue;
-            }
-
-            match ownership::owner_at(
-                prior_records.iter().chain(std::iter::once(current)),
-                capture.pane_id,
-                capture.captured_at,
-            ) {
-                Some(owner) if owner == current.ticket_id.as_str() => {}
-                Some(_) => continue,
-                None => {
-                    let Some(source_line) = u64::try_from(source_index)
-                        .ok()
-                        .and_then(|index| index.checked_add(1))
-                    else {
-                        self.log_activity(ActivityEvent::Error {
-                            message: format!(
-                                "usage capture quarantine failed: {} capture ledger line is not representable as u64",
-                                client
-                            ),
-                        });
-                        break;
-                    };
-                    self.quarantine_capture(client, source_line, &capture);
-                    continue;
-                }
-            }
-
-            let (input_tokens, output_tokens) = totals.unwrap_or((0_u64, 0_u64));
-            let Some(input_tokens) = input_tokens.checked_add(capture.input_tokens) else {
-                return (None, None, None);
-            };
-            let Some(output_tokens) = output_tokens.checked_add(capture.output_tokens) else {
-                return (None, None, None);
-            };
-            totals = Some((input_tokens, output_tokens));
+    /// Run each poll after `retire_resting_sessions`. Because rest-before-retire
+    /// lands a session's capture *after* its terminal row, attribution cannot
+    /// happen at completion; this pass reconciles `.lisa/<client>/captures.jsonl`
+    /// against the durable ledger and current live occupancy:
+    ///
+    /// - a capture owned by a completed ticket that has not been joined yet gets
+    ///   one `UsageCorrectionRecord` (idempotent by `(method, source_line)`), and
+    ///   drains out of quarantine if it was held there;
+    /// - a capture owned by a still-live thread is left for a later poll;
+    /// - a capture with no owning reign quarantines by session id.
+    ///
+    /// Best-effort and non-fatal: every write logs and is swallowed, exactly like
+    /// the other ledger writes in the poll loop. It never fabricates usage — a
+    /// capture that never gains an owner stays quarantined and countable.
+    fn sweep_usage_captures(&mut self) {
+        if self.ledger_path.as_os_str().is_empty() {
+            return;
         }
 
-        match totals {
-            Some((input_tokens, output_tokens)) => (Some(input_tokens), Some(output_tokens), None),
-            None => (None, None, None),
+        // Load the ledger once: durable execution rows establish pane reigns, and
+        // existing corrections tell us which captures are already joined.
+        let ledger_raw = std::fs::read_to_string(&self.ledger_path).unwrap_or_default();
+        let mut prior_records: Vec<ProvenanceRecord> = Vec::new();
+        let mut already_corrected: HashSet<(String, u64)> = HashSet::new();
+        for line in ledger_raw.lines() {
+            match serde_json::from_str::<ProvenanceLedgerRecord>(line) {
+                Ok(ProvenanceLedgerRecord::Execution(record)) => prior_records.push(record),
+                Ok(ProvenanceLedgerRecord::UsageCorrection(correction)) => {
+                    already_corrected.insert((correction.method, correction.source_line));
+                }
+                _ => {}
+            }
+        }
+
+        // Live occupancy bounds an open reign so a not-yet-recorded successor's
+        // capture is never misattributed to a prior completed ticket.
+        let live: Vec<(u32, u64, String)> = self
+            .threads
+            .iter()
+            .map(|(ticket_id, thread)| {
+                (
+                    thread.pane_id,
+                    provenance::system_time_to_epoch(thread.started_at),
+                    ticket_id.clone(),
+                )
+            })
+            .collect();
+
+        let reigns: Vec<ownership::Reign> = prior_records
+            .iter()
+            .map(|record| ownership::Reign {
+                pane_id: record.pane_id,
+                started_at: record.started_at,
+                source: ownership::ReignSource::Completed(record),
+            })
+            .chain(live.iter().map(|(pane_id, started_at, ticket_id)| {
+                ownership::Reign {
+                    pane_id: *pane_id,
+                    started_at: *started_at,
+                    source: ownership::ReignSource::Live { ticket_id },
+                }
+            }))
+            .collect();
+
+        let ledger_path = self.ledger_path.clone();
+        let seal = self.config.completion_seal;
+        let now = provenance::system_time_to_epoch(std::time::SystemTime::now());
+
+        // Actions are collected first so the `reigns` borrow (which borrows the
+        // local `prior_records`/`live`, not `self`) never overlaps the `&mut self`
+        // logging/quarantine calls that execute them.
+        enum Action {
+            Correction(UsageCorrectionRecord),
+            Drain {
+                client: AgentClient,
+                session_id: String,
+                source_line: u64,
+            },
+            Quarantine {
+                client: AgentClient,
+                source_line: u64,
+                capture: CaptureRecord,
+            },
+            LineOverflow(AgentClient),
+        }
+        let mut actions: Vec<Action> = Vec::new();
+
+        for client in [AgentClient::Claude, AgentClient::Codex] {
+            let dir = match client {
+                AgentClient::Codex => self.codex_dir.clone(),
+                AgentClient::Claude => self.claude_dir.clone(),
+            };
+            let raw = match std::fs::read_to_string(dir.join("captures.jsonl")) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let method = client.as_str().to_string();
+
+            for (source_index, line) in raw.lines().enumerate() {
+                let Ok(capture) = serde_json::from_str::<CaptureRecord>(line) else {
+                    continue;
+                };
+                let Some(source_line) = u64::try_from(source_index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1))
+                else {
+                    actions.push(Action::LineOverflow(client));
+                    break;
+                };
+
+                match ownership::reign_owner_at(&reigns, capture.pane_id, capture.captured_at) {
+                    ownership::ReignOutcome::Attributed(owner) => {
+                        let key = (method.clone(), source_line);
+                        if !already_corrected.contains(&key) {
+                            already_corrected.insert(key);
+                            actions.push(Action::Correction(UsageCorrectionRecord {
+                                schema_version: provenance::SCHEMA_VERSION,
+                                seal,
+                                record_type: UsageCorrectionType::UsageCorrection,
+                                ticket_id: owner.ticket_id.clone(),
+                                attempt_lease: owner.attempt_lease.clone(),
+                                method: method.clone(),
+                                session_id: capture.session_id.clone(),
+                                pane_id: capture.pane_id,
+                                source_line,
+                                captured_at: capture.captured_at,
+                                tokens_in: capture.input_tokens,
+                                tokens_out: capture.output_tokens,
+                                occurred_at: now,
+                            }));
+                        }
+                        // Drain the quarantine straggler whether we just joined it
+                        // or an earlier poll did — idempotent cleanup.
+                        actions.push(Action::Drain {
+                            client,
+                            session_id: capture.session_id.clone(),
+                            source_line,
+                        });
+                    }
+                    ownership::ReignOutcome::Pending => {}
+                    ownership::ReignOutcome::Unowned => {
+                        actions.push(Action::Quarantine {
+                            client,
+                            source_line,
+                            capture,
+                        });
+                    }
+                }
+            }
+        }
+
+        drop(reigns);
+
+        for action in actions {
+            match action {
+                Action::Correction(correction) => {
+                    let summary = format!(
+                        "usage joined: ticket={} pane=#{} +{} in / +{} out via correction",
+                        correction.ticket_id,
+                        correction.pane_id,
+                        correction.tokens_in,
+                        correction.tokens_out,
+                    );
+                    match provenance::append_usage_correction_record(&ledger_path, &correction) {
+                        Ok(()) => self.log_activity(ActivityEvent::Info { message: summary }),
+                        Err(error) => self.log_activity(ActivityEvent::Error {
+                            message: format!(
+                                "usage correction write failed for {}: {}",
+                                correction.ticket_id, error
+                            ),
+                        }),
+                    }
+                }
+                Action::Drain {
+                    client,
+                    session_id,
+                    source_line,
+                } => {
+                    let provider_dir = match client {
+                        AgentClient::Codex => self.codex_dir.clone(),
+                        AgentClient::Claude => self.claude_dir.clone(),
+                    };
+                    if let Ok(quarantine::DrainOutcome::Drained) =
+                        quarantine::drain(&provider_dir, &session_id, source_line)
+                    {
+                        self.log_activity(ActivityEvent::Info {
+                            message: format!(
+                                "usage capture drained from quarantine: client={} session={:?} source_line={}",
+                                client, session_id, source_line
+                            ),
+                        });
+                    }
+                }
+                Action::Quarantine {
+                    client,
+                    source_line,
+                    capture,
+                } => {
+                    self.quarantine_capture(client, source_line, &capture);
+                }
+                Action::LineOverflow(client) => {
+                    self.log_activity(ActivityEvent::Error {
+                        message: format!(
+                            "usage capture quarantine failed: {} capture ledger line is not representable as u64",
+                            client
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -7575,6 +7697,10 @@ impl State {
         // End finished AfterRest sessions once they have been quiet long
         // enough for their Stop-hook usage capture to be durable.
         self.retire_resting_sessions();
+
+        // Late-join any captures that have since landed onto their owning
+        // tickets as append-only corrections, and drain quarantine stragglers.
+        self.sweep_usage_captures();
 
         // Audit threads: remove any orphaned entries for done/missing tickets
         self.audit_threads();
@@ -22005,6 +22131,64 @@ owned\n\
             .collect()
     }
 
+    /// Execution rows only, from a ledger that may also carry corrections.
+    fn read_executions(path: &std::path::Path) -> Vec<ProvenanceRecord> {
+        read_mixed_ledger(path)
+            .into_iter()
+            .filter_map(|record| match record {
+                ProvenanceLedgerRecord::Execution(record) => Some(record),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Late-join correction rows from a mixed ledger.
+    fn read_corrections(path: &std::path::Path) -> Vec<UsageCorrectionRecord> {
+        read_mixed_ledger(path)
+            .into_iter()
+            .filter_map(|record| match record {
+                ProvenanceLedgerRecord::UsageCorrection(correction) => Some(correction),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One authoritative, null-token `Done` execution row on a pane over a fixed
+    /// window — the shape `emit_provenance` writes before the late join.
+    fn null_done_row(
+        ticket_id: &str,
+        attempt_id: u64,
+        pane_id: u32,
+        client: AgentClient,
+        started_at: u64,
+        ended_at: u64,
+    ) -> ProvenanceRecord {
+        let route = Route::from_client(client);
+        ProvenanceRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            completion_note: None,
+            ticket_id: ticket_id.to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: ticket_id.to_string(),
+                attempt_id,
+            },
+            outcome: RunOutcome::Done,
+            authoritative: true,
+            fenced: false,
+            requested: route.clone(),
+            actual: route,
+            started_at,
+            ended_at,
+            wall_clock_secs: ended_at.saturating_sub(started_at),
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            concurrency_at_spawn: 0,
+            pane_id,
+        }
+    }
+
     fn preownership_failure_state(
         seat: SeatAssignmentState,
         client: AgentClient,
@@ -22362,44 +22546,50 @@ owned\n\
     #[test]
     fn provenance_codex_usage_flows_into_record() {
         use lisa_core::capture::{append_capture_record, CaptureRecord};
-        use lisa_core::types::Thread;
 
         let (mut state, dir) = codex_state_with_dag();
         let ledger = with_ledger(&mut state, &dir);
 
-        let mut thread = Thread::new("T-CDX-01", 1);
-        thread.client = AgentClient::Codex;
+        // The completed ticket's null-token row is already on the ledger; its
+        // capture lands afterward (rest-before-retire), inside the pane reign.
+        let row = null_done_row("T-CDX-01", 1, 1, AgentClient::Codex, 1_000, 1_100);
+        provenance::append_record(&ledger, &row).unwrap();
         append_capture_record(
             &state.codex_dir.join("captures.jsonl"),
             &CaptureRecord {
-                pane_id: thread.pane_id,
+                pane_id: 1,
                 session_id: "codex-session".to_string(),
-                captured_at: provenance::system_time_to_epoch(std::time::SystemTime::now()),
+                captured_at: 1_150,
                 input_tokens: 120,
                 output_tokens: 34,
             },
         )
         .unwrap();
-        state.threads.insert("T-CDX-01".to_string(), thread);
-        install_current_attempt(&mut state, "T-CDX-01");
-        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
 
-        let records = read_ledger(&ledger);
-        assert_eq!(records[0].tokens_in, Some(120));
-        assert_eq!(records[0].tokens_out, Some(34));
-        assert_eq!(
-            records[0].cost_usd, None,
-            "no cost field → null, never fabricated"
-        );
+        state.sweep_usage_captures();
+
+        // The original row is untouched; tokens arrive via one correction.
+        let executions = read_executions(&ledger);
+        assert_eq!(executions, vec![row]);
+        let corrections = read_corrections(&ledger);
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].ticket_id, "T-CDX-01");
+        assert_eq!(corrections[0].tokens_in, 120);
+        assert_eq!(corrections[0].tokens_out, 34);
+        assert_eq!(corrections[0].method, "codex");
+
+        let view = provenance::correct_usage(&read_mixed_ledger(&ledger));
+        assert_eq!(view["T-CDX-01"].tokens_in, Some(120));
+        assert_eq!(view["T-CDX-01"].tokens_out, Some(34));
     }
 
-    /// T-043-03-01 AC: a physical pane recycled from A to B attributes each
-    /// capture to its pane-time owner, sums per ticket, and appends B without
-    /// rewriting A's terminal provenance row.
+    /// A physical pane recycled from A to B late-joins each capture to its
+    /// pane-reign owner and sums per ticket, appending corrections without
+    /// rewriting either terminal row. A's rest capture lands after A's `ended_at`
+    /// but before B starts, so the reign still attributes it to A.
     #[test]
     fn provenance_recycled_pane_attributes_capture_sums_to_each_ticket() {
         use lisa_core::capture::{append_capture_record, CaptureRecord};
-        use lisa_core::types::Thread;
 
         const PANE_ID: u32 = 7;
         const TICKET_A: &str = "T-CDX-01";
@@ -22408,37 +22598,41 @@ owned\n\
         let (mut state, dir) = codex_state_with_dag();
         let ledger = with_ledger(&mut state, &dir);
         let captures = state.codex_dir.join("captures.jsonl");
-        let now = provenance::system_time_to_epoch(std::time::SystemTime::now());
-        let a_started = now.saturating_sub(1_000);
-        let a_ended = now.saturating_sub(800);
-        let b_started = now.saturating_sub(600);
+
+        // A reigned [1000, 1100]; B [2000, 2100]. Both rows already terminal.
+        let a_row = null_done_row(TICKET_A, 1, PANE_ID, AgentClient::Codex, 1_000, 1_100);
+        let b_row = null_done_row(TICKET_B, 1, PANE_ID, AgentClient::Codex, 2_000, 2_100);
+        provenance::append_record(&ledger, &a_row).unwrap();
+        provenance::append_record(&ledger, &b_row).unwrap();
 
         for capture in [
+            // Within A's window.
             CaptureRecord {
                 pane_id: PANE_ID,
                 session_id: "session-a".to_string(),
-                captured_at: a_started + 50,
+                captured_at: 1_050,
                 input_tokens: 10,
                 output_tokens: 3,
             },
+            // After A's ended_at but before B starts — A's rest capture.
             CaptureRecord {
                 pane_id: PANE_ID,
                 session_id: "session-a".to_string(),
-                captured_at: a_started + 100,
+                captured_at: 1_500,
                 input_tokens: 20,
                 output_tokens: 7,
             },
             CaptureRecord {
                 pane_id: PANE_ID,
                 session_id: "session-b".to_string(),
-                captured_at: b_started + 50,
+                captured_at: 2_050,
                 input_tokens: 100,
                 output_tokens: 40,
             },
             CaptureRecord {
                 pane_id: PANE_ID,
                 session_id: "session-b".to_string(),
-                captured_at: b_started + 100,
+                captured_at: 2_100,
                 input_tokens: 200,
                 output_tokens: 60,
             },
@@ -22446,67 +22640,28 @@ owned\n\
             append_capture_record(&captures, &capture).unwrap();
         }
 
-        let route = Route::from_client(AgentClient::Codex);
-        let a_without_usage = ProvenanceRecord {
-            schema_version: provenance::SCHEMA_VERSION,
-            seal: CompletionSeal::Commit,
-            completion_note: None,
-            ticket_id: TICKET_A.to_string(),
-            attempt_lease: AttemptLease {
-                ticket_id: TICKET_A.to_string(),
-                attempt_id: 1,
-            },
-            outcome: RunOutcome::Done,
-            authoritative: true,
-            fenced: false,
-            requested: route.clone(),
-            actual: route,
-            started_at: a_started,
-            ended_at: a_ended,
-            wall_clock_secs: a_ended.saturating_sub(a_started),
-            tokens_in: None,
-            tokens_out: None,
-            cost_usd: None,
-            concurrency_at_spawn: 0,
-            pane_id: PANE_ID,
-        };
-        let (tokens_in, tokens_out, cost_usd) =
-            state.read_usage(AgentClient::Codex, &a_without_usage);
+        state.sweep_usage_captures();
+
+        // Both terminal rows are byte-for-byte intact.
+        assert_eq!(read_executions(&ledger), vec![a_row, b_row]);
         assert!(
             !state.codex_dir.join("quarantine").exists(),
-            "captures after A's closed interval must remain pending for B"
+            "every capture has a pane-reign owner; none quarantines"
         );
-        let a_record = ProvenanceRecord {
-            tokens_in,
-            tokens_out,
-            cost_usd,
-            ..a_without_usage
-        };
-        provenance::append_record(&ledger, &a_record).unwrap();
 
-        let after_a = read_ledger(&ledger);
-        assert_eq!(after_a.len(), 1);
-        assert_eq!(after_a[0].ticket_id, TICKET_A);
-        assert_eq!(after_a[0].tokens_in, Some(30));
-        assert_eq!(after_a[0].tokens_out, Some(10));
+        // Per-ticket totals come from the corrected view, summed across
+        // corrections.
+        let view = provenance::correct_usage(&read_mixed_ledger(&ledger));
+        assert_eq!(view[TICKET_A].tokens_in, Some(30));
+        assert_eq!(view[TICKET_A].tokens_out, Some(10));
+        assert_eq!(view[TICKET_A].correction_count, 2);
+        assert_eq!(view[TICKET_B].tokens_in, Some(300));
+        assert_eq!(view[TICKET_B].tokens_out, Some(100));
+        assert_eq!(view[TICKET_B].correction_count, 2);
 
-        let mut b_thread = Thread::new(TICKET_B, PANE_ID);
-        b_thread.client = AgentClient::Codex;
-        b_thread.started_at = std::time::UNIX_EPOCH
-            .checked_add(std::time::Duration::from_secs(b_started))
-            .unwrap();
-        state.threads.insert(TICKET_B.to_string(), b_thread);
-        install_current_attempt(&mut state, TICKET_B);
-        assert!(state.emit_provenance(TICKET_B, RunOutcome::Done, false));
-
-        let records = read_ledger(&ledger);
-        assert_eq!(records.len(), 2, "B must append rather than overwrite A");
-        assert_eq!(records[0].ticket_id, TICKET_A);
-        assert_eq!(records[0].tokens_in, Some(30));
-        assert_eq!(records[0].tokens_out, Some(10));
-        assert_eq!(records[1].ticket_id, TICKET_B);
-        assert_eq!(records[1].tokens_in, Some(300));
-        assert_eq!(records[1].tokens_out, Some(100));
+        // A rescan is idempotent: no duplicate corrections.
+        state.sweep_usage_captures();
+        assert_eq!(read_corrections(&ledger).len(), 4);
     }
 
     /// T-043-03-03 AC: replay the field incident as one deterministic chain.
@@ -22673,72 +22828,53 @@ owned\n\
         assert!(no_capture_diagnostics.contains(NO_CAPTURE_SESSION));
         assert!(no_capture_diagnostics.contains("empty-transcript"));
 
-        let route = Route::from_client(AgentClient::Claude);
-        for (index, (ticket_id, input_tokens, output_tokens)) in expected_usage.iter().enumerate() {
+        // Every ticket's terminal row is already on the ledger with null tokens;
+        // each reigns over a disjoint window on the recycled pane.
+        for (index, (ticket_id, _, _)) in expected_usage.iter().enumerate() {
             let started_at = 100 + u64::try_from(index).unwrap() * 100;
             let ended_at = started_at + 49;
-            let current = ProvenanceRecord {
-                schema_version: provenance::SCHEMA_VERSION,
-                seal: CompletionSeal::Commit,
-                completion_note: None,
-                ticket_id: ticket_id.clone(),
-                attempt_lease: AttemptLease {
-                    ticket_id: ticket_id.clone(),
-                    attempt_id: 1,
-                },
-                outcome: RunOutcome::Done,
-                authoritative: true,
-                fenced: false,
-                requested: route.clone(),
-                actual: route.clone(),
-                started_at,
-                ended_at,
-                wall_clock_secs: ended_at - started_at,
-                tokens_in: None,
-                tokens_out: None,
-                cost_usd: None,
-                concurrency_at_spawn: 0,
-                pane_id: PANE_ID,
-            };
-            let usage = state.read_usage(AgentClient::Claude, &current);
-            assert_eq!(
-                usage,
-                (Some(*input_tokens), Some(*output_tokens), None),
-                "{ticket_id} must receive only its pane-time capture"
-            );
             provenance::append_record(
                 &ledger,
-                &ProvenanceRecord {
-                    tokens_in: usage.0,
-                    tokens_out: usage.1,
-                    cost_usd: usage.2,
-                    ..current
-                },
+                &null_done_row(ticket_id, 1, PANE_ID, AgentClient::Claude, started_at, ended_at),
             )
             .unwrap();
         }
 
-        let records = read_ledger(&ledger);
-        assert_eq!(records.len(), TICKETS.len());
-        let actual_usage: Vec<_> = records
+        // One sweep late-joins all seven captures and quarantines the unowned one.
+        state.sweep_usage_captures();
+
+        // No terminal row was rewritten: they all stay null.
+        let executions = read_executions(&ledger);
+        assert_eq!(executions.len(), TICKETS.len());
+        assert!(executions.iter().all(|record| record.tokens_in.is_none()));
+
+        // The corrected view carries each ticket's own pane-reign capture.
+        let view = provenance::correct_usage(&read_mixed_ledger(&ledger));
+        let actual_usage: Vec<_> = expected_usage
             .iter()
-            .map(|record| {
+            .map(|(ticket_id, _, _)| {
+                let usage = view.get(ticket_id).unwrap();
                 (
-                    record.ticket_id.clone(),
-                    record.tokens_in.unwrap(),
-                    record.tokens_out.unwrap(),
+                    ticket_id.clone(),
+                    usage.tokens_in.unwrap(),
+                    usage.tokens_out.unwrap(),
                 )
             })
             .collect();
         assert_eq!(
             actual_usage, expected_usage,
-            "all six later pane recycles must append without rewriting ticket 1"
+            "all six later pane recycles must correct without rewriting ticket 1"
         );
-        assert!(records.iter().all(|record| record.cost_usd.is_none()));
-        assert!(records.iter().all(|record| {
-            record.tokens_in != Some(unowned_capture.input_tokens)
-                && record.tokens_out != Some(unowned_capture.output_tokens)
+        let corrections = read_corrections(&ledger);
+        assert_eq!(corrections.len(), TICKETS.len());
+        assert!(corrections.iter().all(|correction| {
+            correction.tokens_in != unowned_capture.input_tokens
+                && correction.tokens_out != unowned_capture.output_tokens
         }));
+
+        // A rescan must neither duplicate corrections nor re-warn on quarantine.
+        state.sweep_usage_captures();
+        assert_eq!(read_corrections(&ledger).len(), TICKETS.len());
 
         let quarantine_path = quarantine::session_path(&state.claude_dir, UNOWNED_SESSION);
         let quarantined: Vec<quarantine::QuarantinedCaptureRecord> =
@@ -22834,10 +22970,13 @@ owned\n\
             pane_id: PANE_ID,
         };
 
-        assert_eq!(
-            state.read_usage(AgentClient::Codex, &current),
-            (None, None, None),
-            "unowned tokens must not blend into the current ticket"
+        // The ticket ran [200, 300]; the capture at 150 predates its reign, so it
+        // has no owner and must quarantine rather than blend into any ticket.
+        provenance::append_record(&state.ledger_path, &current).unwrap();
+        state.sweep_usage_captures();
+        assert!(
+            read_corrections(&state.ledger_path).is_empty(),
+            "an unowned capture produces no correction"
         );
 
         let quarantine_path = quarantine::session_path(&state.codex_dir, SESSION_ID);
@@ -22882,10 +23021,9 @@ owned\n\
                     && message.contains(SESSION_ID)
         ));
 
-        assert_eq!(
-            state.read_usage(AgentClient::Codex, &current),
-            (None, None, None)
-        );
+        // A rescan is idempotent: still no correction, still one quarantine row.
+        state.sweep_usage_captures();
+        assert!(read_corrections(&state.ledger_path).is_empty());
         assert_eq!(
             std::fs::read_to_string(&quarantine_path)
                 .unwrap()
@@ -22942,33 +23080,173 @@ owned\n\
     #[test]
     fn provenance_claude_usage_flows_into_record() {
         use lisa_core::capture::{append_capture_record, CaptureRecord};
-        use lisa_core::types::Thread;
 
         let (mut state, dir) = codex_state_with_dag();
         let ledger = with_ledger(&mut state, &dir);
 
-        let mut thread = Thread::new("T-CDX-01", 1);
-        thread.client = AgentClient::Claude;
+        let row = null_done_row("T-CDX-01", 1, 1, AgentClient::Claude, 1_000, 1_100);
+        provenance::append_record(&ledger, &row).unwrap();
         append_capture_record(
             &state.claude_dir.join("captures.jsonl"),
             &CaptureRecord {
-                pane_id: thread.pane_id,
+                pane_id: 1,
                 session_id: "claude-session".to_string(),
-                captured_at: provenance::system_time_to_epoch(std::time::SystemTime::now()),
+                captured_at: 1_150,
                 input_tokens: 167,
                 output_tokens: 37,
             },
         )
         .unwrap();
-        state.threads.insert("T-CDX-01".to_string(), thread);
-        install_current_attempt(&mut state, "T-CDX-01");
-        state.emit_provenance("T-CDX-01", RunOutcome::Done, false);
 
-        let records = read_ledger(&ledger);
-        assert_eq!(records[0].tokens_in, Some(167));
-        assert_eq!(records[0].tokens_out, Some(37));
-        assert_eq!(records[0].cost_usd, None, "Claude records no dollar cost");
-        assert_eq!(records[0].actual.method, "claude");
+        state.sweep_usage_captures();
+
+        // The row stays null; the correction carries tokens, no dollar cost.
+        assert_eq!(read_executions(&ledger), vec![row]);
+        let corrections = read_corrections(&ledger);
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].tokens_in, 167);
+        assert_eq!(corrections[0].tokens_out, 37);
+        assert_eq!(corrections[0].method, "claude");
+        let view = provenance::correct_usage(&read_mixed_ledger(&ledger));
+        assert_eq!(view["T-CDX-01"].tokens_in, Some(167));
+        assert_eq!(view["T-CDX-01"].tokens_out, Some(37));
+    }
+
+    /// AC #1: a capture landing after completion joins via a correction, and the
+    /// original terminal row's bytes are untouched (append-only, never mutated).
+    #[test]
+    fn sweep_correction_leaves_original_row_bytes_untouched() {
+        use lisa_core::capture::{append_capture_record, CaptureRecord};
+
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        let row = null_done_row("T-BYTES", 1, 2, AgentClient::Codex, 1_000, 1_100);
+        provenance::append_record(&ledger, &row).unwrap();
+        let bytes_before = std::fs::read(&ledger).unwrap();
+
+        append_capture_record(
+            &state.codex_dir.join("captures.jsonl"),
+            &CaptureRecord {
+                pane_id: 2,
+                session_id: "s".to_string(),
+                captured_at: 1_150,
+                input_tokens: 42,
+                output_tokens: 7,
+            },
+        )
+        .unwrap();
+
+        state.sweep_usage_captures();
+
+        let bytes_after = std::fs::read(&ledger).unwrap();
+        assert!(
+            bytes_after.starts_with(&bytes_before),
+            "the original row line must be byte-for-byte intact"
+        );
+        assert!(
+            bytes_after.len() > bytes_before.len(),
+            "the correction is appended after the original row"
+        );
+        assert_eq!(read_corrections(&ledger).len(), 1);
+    }
+
+    /// AC #2: an unowned capture quarantines by session id; when a covering row
+    /// later appears it drains to a correction, while a capture that never gains
+    /// an owner stays quarantined and countable.
+    #[test]
+    fn sweep_drains_quarantine_when_attribution_arrives_and_keeps_terminal() {
+        use lisa_core::capture::{append_capture_record, CaptureRecord};
+
+        const PANE_ID: u32 = 5;
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        let captures = state.codex_dir.join("captures.jsonl");
+
+        // One capture will gain an owner later; one never will.
+        append_capture_record(
+            &captures,
+            &CaptureRecord {
+                pane_id: PANE_ID,
+                session_id: "owned".to_string(),
+                captured_at: 1_500,
+                input_tokens: 80,
+                output_tokens: 8,
+            },
+        )
+        .unwrap();
+        append_capture_record(
+            &captures,
+            &CaptureRecord {
+                pane_id: PANE_ID,
+                session_id: "orphan".to_string(),
+                captured_at: 50,
+                input_tokens: 5,
+                output_tokens: 1,
+            },
+        )
+        .unwrap();
+
+        // No owning row yet: both captures quarantine by session id.
+        state.sweep_usage_captures();
+        assert!(read_corrections(&ledger).is_empty());
+        assert_eq!(quarantine::count_quarantined(&state.codex_dir), 2);
+        assert!(quarantine::session_path(&state.codex_dir, "owned").exists());
+        assert!(quarantine::session_path(&state.codex_dir, "orphan").exists());
+
+        // The owning ticket completes; its reign [1000, 1600] covers the owned
+        // capture but not the orphan at 50.
+        provenance::append_record(
+            &ledger,
+            &null_done_row("T-OWN", 1, PANE_ID, AgentClient::Codex, 1_000, 1_600),
+        )
+        .unwrap();
+        state.sweep_usage_captures();
+
+        // The owned capture drained into one correction; the orphan is terminal
+        // and still counted.
+        let corrections = read_corrections(&ledger);
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].ticket_id, "T-OWN");
+        assert_eq!(corrections[0].tokens_in, 80);
+        assert_eq!(corrections[0].session_id, "owned");
+        assert!(
+            !quarantine::session_path(&state.codex_dir, "owned").exists(),
+            "a drained session bucket is removed"
+        );
+        assert_eq!(
+            quarantine::count_quarantined(&state.codex_dir),
+            1,
+            "the never-attributable capture stays quarantined and countable"
+        );
+        assert!(quarantine::session_path(&state.codex_dir, "orphan").exists());
+
+        let view = provenance::correct_usage(&read_mixed_ledger(&ledger));
+        assert_eq!(view["T-OWN"].tokens_in, Some(80));
+    }
+
+    /// AC #3: a completed ticket whose capture never arrives keeps null columns —
+    /// no fabricated zero — and the gap is countable.
+    #[test]
+    fn sweep_leaves_capture_never_null_and_gap_counts_it() {
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+        provenance::append_record(
+            &ledger,
+            &null_done_row("T-NOCAP", 1, 3, AgentClient::Codex, 1_000, 1_100),
+        )
+        .unwrap();
+
+        state.sweep_usage_captures();
+
+        assert!(read_corrections(&ledger).is_empty());
+        let mixed = read_mixed_ledger(&ledger);
+        let view = provenance::correct_usage(&mixed);
+        assert_eq!(
+            view["T-NOCAP"].tokens_in, None,
+            "unknown usage stays null, never a fabricated zero"
+        );
+        assert_eq!(view["T-NOCAP"].tokens_out, None);
+        assert_eq!(provenance::usage_gap(&mixed), vec!["T-NOCAP".to_string()]);
     }
 
     /// AC: the emission never touches agent-owned ticket frontmatter.
