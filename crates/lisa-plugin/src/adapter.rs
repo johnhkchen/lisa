@@ -102,15 +102,19 @@ pub(crate) enum ResetStrategy {
 /// completed durably.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompletionExit {
-    /// Exit at the completion boundary itself. Codex uses this: its lifecycle
-    /// hooks leave no in-flight work an immediate exit could destroy, and the
-    /// contract is field-proven.
+    /// Exit at the completion boundary itself. No shipped adapter uses this:
+    /// both native clients run `lisa capture-usage` from their Stop hooks, and
+    /// completion is artifact-driven — it can fire before or during the final
+    /// Stop, so an immediate exit destroys the capture in flight. Retained for
+    /// future integrations whose usage accounting does not ride the session's
+    /// own lifecycle hooks (e.g. a headless bridge reading an event stream).
     Immediate,
     /// Leave the finished session resident and end it only once the pane has
-    /// been signal-quiet for the wind-down period. Claude runs
-    /// `lisa capture-usage` inside its Stop hook; an exit landing seconds
-    /// after completion races that capture — the 0.4.4-rc.8 field leg lost
-    /// 8 of 9 usage records to exactly this.
+    /// been signal-quiet for the wind-down period. Both native clients need
+    /// this: the 0.4.4-rc.8 Claude leg lost 8 of 9 usage records to the
+    /// completion-exit race, and the 0.4.4-rc.9 Codex leg lost 9 of 9 — a
+    /// Codex ticket is one turn with a single Stop at the very end, so the
+    /// race has no lucky survivors.
     AfterRest,
 }
 
@@ -437,6 +441,16 @@ impl AgentAdapter for CodexAdapter {
         ResetStrategy::ExitThenFresh
     }
 
+    fn completion_exit(&self) -> CompletionExit {
+        // A Codex ticket is one turn with a single Stop at the very end, and
+        // that Stop hook runs `lisa capture-usage`. Completion is
+        // artifact-driven and can fire before or during that Stop, so an
+        // immediate boundary exit destroys the only capture the session will
+        // ever produce — the 0.4.4-rc.9 field leg lost 9 of 9 usage records.
+        // The finished session rests; the retirement sweep ends it.
+        CompletionExit::AfterRest
+    }
+
     fn signals(&self) -> SignalCapabilities {
         SignalCapabilities {
             idle: false,
@@ -620,12 +634,14 @@ mod tests {
     }
 
     #[test]
-    fn completion_exit_immediate_for_codex_after_rest_for_claude() {
-        // Codex's completion-boundary exit is field-proven; Claude's Stop hook
-        // runs the usage capture, so its finished session rests first.
+    fn completion_exit_is_after_rest_for_both_native_clients() {
+        // Both native Stop hooks run the usage capture, and artifact-driven
+        // completion can fire before or during the final Stop — an immediate
+        // boundary exit destroys the capture (rc.8 Claude leg: 1/9 survived;
+        // rc.9 Codex leg: 0/9). Finished sessions rest, then retire.
         assert_eq!(
             CodexAdapter::new(None, None).completion_exit(),
-            CompletionExit::Immediate
+            CompletionExit::AfterRest
         );
         assert_eq!(
             ClaudeCodeAdapter::default().completion_exit(),

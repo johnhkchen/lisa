@@ -16116,7 +16116,10 @@ mod tests {
                 client: AgentClient::Codex,
                 lisa_bin: Some("/fixture/lisa".to_string()),
                 max_threads: 1,
-                wind_down_secs: 0,
+                // Nonzero so the post-completion rest is observable: with a
+                // zero wind-down the successor recycles the pane in the same
+                // tick as the completion itself.
+                wind_down_secs: 300,
                 assignment_ack_timeout_secs: 1,
                 ..PluginConfig::new()
             },
@@ -16289,10 +16292,6 @@ mod tests {
                 AttemptLifecycleEvent::SlotReleased {
                     ticket_id: PREDECESSOR.to_string(),
                 },
-                AttemptLifecycleEvent::CleanExitRequested {
-                    ticket_id: PREDECESSOR.to_string(),
-                    pane_id: PANE_ID,
-                },
             ]
         );
         assert!(!state.current_leases.contains_key(PREDECESSOR));
@@ -16302,20 +16301,21 @@ mod tests {
         );
         assert!(state.agent_slots[0].ticket_id.is_none());
         assert!(state.agent_slots[0].attempt_lease.is_none());
-        assert_eq!(
-            state.agent_slots[0].transition_state,
-            TransitionState::WaitingForExit
-        );
-        assert!(!state.agent_slots[0].has_session);
+        // AfterRest: no completion-boundary exit — the finished TUI rests,
+        // because its single final Stop may still be running the usage capture
+        // (the rc.9 field leg lost 9 of 9 captures to that race).
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(state.agent_slots[0].has_session);
         assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
         assert_eq!(state.seat_assignment(PANE_ID), None);
-        assert!(state.activity_log.iter().any(|event| matches!(
-            event,
-            ActivityEvent::Info { message }
-                if message.contains("Completion boundary revoked")
-                    && message.contains(PREDECESSOR)
-                    && message.contains(&PANE_ID.to_string())
-        )));
+        assert!(
+            !state.activity_log.iter().any(|event| matches!(
+                event,
+                ActivityEvent::Info { message }
+                    if message.contains("Completion boundary revoked")
+            )),
+            "no immediate-exit boundary log for an AfterRest resident"
+        );
 
         assert!(
             !state.admit_assignment_claim(PANE_ID, &predecessor_claim),
@@ -16323,34 +16323,38 @@ mod tests {
         );
         assert_eq!(state.seat_assignment(PANE_ID), None);
         println!(
-            "T0450401|boundary|step=exit-requested|ticket={PREDECESSOR}|pane={PANE_ID}|lease=revoked|late_claim=rejected"
+            "T0450401|boundary|step=resting|ticket={PREDECESSOR}|pane={PANE_ID}|lease=revoked|late_claim=rejected"
         );
 
-        let launches_before_exit = state
-            .activity_log
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == SUCCESSOR
-                )
-            })
-            .count();
+        // The successor claims the resting pane through the recycle boundary:
+        // /exit is typed, the pane is reserved, and the actual launch waits
+        // for the exit grace to prove a clean shell. Elapse the rest first —
+        // the recycle honors the same quiet standard the retirement sweep uses.
+        state.agent_slots[0].cooldown_until =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        state.agent_slots[0].last_activity_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(state.config.wind_down_secs + 1),
+        );
         state.schedule_ready_tickets();
-        assert!(!state.current_leases.contains_key(SUCCESSOR));
-        assert!(!state.assignment_refs.contains_key(SUCCESSOR));
-        assert!(!state.threads.contains_key(SUCCESSOR));
+        let successor_lease = state.current_leases[SUCCESSOR].clone();
+        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some(SUCCESSOR));
         assert_eq!(
-            state
-                .activity_log
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == SUCCESSOR
-                ))
-                .count(),
-            launches_before_exit,
-            "the successor cannot launch while the predecessor TUI exits"
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+        assert!(!state.agent_slots[0].has_session);
+        assert!(matches!(
+            state.seat_assignment(PANE_ID),
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: None,
+                ..
+            }) if generation == successor_lease.attempt_id
+        ));
+        println!(
+            "T0450401|boundary|step=recycle-reserved|ticket={SUCCESSOR}|pane={PANE_ID}|attempt={}",
+            successor_lease.attempt_id
         );
 
         state.agent_slots[0].transition_started_at = Some(
@@ -16359,32 +16363,20 @@ mod tests {
         );
         state.check_transition_timeouts();
         assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
-        assert!(!state.agent_slots[0].has_session);
-        assert_eq!(state.agent_slots[0].last_client, None);
-        assert_eq!(
-            state.last_pane_names.get(&PANE_ID).map(String::as_str),
-            Some("lisa · idle")
-        );
-        println!(
-            "T0450401|boundary|step=shell-ready|pane={PANE_ID}|resident=none|next_reserved=false"
-        );
-
-        state.schedule_ready_tickets();
-        let successor_lease = state.current_leases[SUCCESSOR].clone();
-        let successor_assignment = state.assignment_refs[SUCCESSOR].clone();
-        assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some(SUCCESSOR));
+        assert!(state.agent_slots[0].has_session);
+        assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
         assert_eq!(
             state.agent_slots[0].attempt_lease.as_ref(),
             Some(&successor_lease)
         );
-        assert!(state.agent_slots[0].has_session);
-        assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
-        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(matches!(
             state.seat_assignment(PANE_ID),
             Some(SeatAssignmentState::Starting { generation, .. })
                 if generation == successor_lease.attempt_id
         ));
+        // The ExitReady handler prepares the assignment the fresh launch
+        // actually references; read it after the grace elapse.
+        let successor_assignment = state.assignment_refs[SUCCESSOR].clone();
         assert_ne!(successor_assignment.path, predecessor_assignment.path);
         assert_ne!(successor_assignment.nonce, predecessor_assignment.nonce);
         let launch_path = state
@@ -24119,12 +24111,15 @@ owned\n\
         assert!(!state.pending_completions.contains_key("T-CDX-01"));
         assert!(!state.threads.contains_key("T-CDX-01"));
         assert!(state.agent_slots[0].ticket_id.is_none());
+        // AfterRest: the finished Codex TUI is NOT exited at the completion
+        // boundary — its single final Stop may still be running the usage
+        // capture (the rc.9 field leg lost 9 of 9 captures to that race).
         assert_eq!(
             state.agent_slots[0].transition_state,
-            TransitionState::WaitingForExit,
-            "verified completion must retire the resident Codex TUI"
+            TransitionState::Idle,
+            "verified completion leaves the finished Codex TUI resting"
         );
-        assert!(!state.agent_slots[0].has_session);
+        assert!(state.agent_slots[0].has_session);
         assert_eq!(
             state.last_pane_names.get(&1).map(String::as_str),
             Some("codex · idle")
@@ -24132,6 +24127,22 @@ owned\n\
         let ticket = state.dag.get_ticket(&"T-CDX-01".to_string()).unwrap();
         assert_eq!(ticket.phase, Phase::Done);
         assert_eq!(ticket.status, TicketStatus::Done);
+
+        // Once the pane has rested through the wind-down, the retirement
+        // sweep ends the session.
+        state.agent_slots[0].cooldown_until =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        state.agent_slots[0].last_activity_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(state.config.wind_down_secs + 1),
+        );
+        state.retire_resting_sessions();
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit,
+            "the rested Codex session is retired by the sweep"
+        );
+        assert!(!state.agent_slots[0].has_session);
     }
 
     #[test]
