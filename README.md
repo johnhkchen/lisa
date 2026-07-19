@@ -78,8 +78,11 @@ Each ticket goes through six phases: Research, Design, Structure, Plan, Implemen
 Lisa keeps the trail reviewable: an append-only attempt ledger records each run,
 the completion journal seals every finished ticket — to a commit where the
 project keeps history, or to tamper-evident content hashes where it doesn't —
-and each ticket keeps its work documents. `lisa doctor` and `lisa status` name
-which seal is in effect in plain words.
+and each ticket keeps its work documents. Every ticket runs in its own agent
+session, and what each one cost is recorded too: token usage joins the ledger
+after the session ends, and `lisa status` shows it per ticket — with an honest
+"not yet joined" line instead of a made-up number when a capture hasn't landed.
+`lisa doctor` and `lisa status` name which seal is in effect in plain words.
 
 ## Prerequisites
 
@@ -90,7 +93,7 @@ which seal is in effect in plain words.
 
 Claude Code is the default and only required agent client. Lisa can alternatively
 drive [Codex](https://developers.openai.com/codex) — see
-[Codex client](#codex-client-experimental) below.
+[Codex client](#codex-client) below.
 
 After installing Lisa, run `lisa doctor` to verify everything is in place. `lisa
 doctor` checks the dependencies for your *selected* client (Claude by default).
@@ -203,12 +206,13 @@ max_threads = 2
 | `scheduling.phase_timeouts` | `{}` | Limits how long each kind of work can run. |
 | `scheduling.provider_caps` | `{}` | Limits how many agents of each kind can work at once. |
 
-## Codex client (experimental)
+## Codex client
 
 By default Lisa drives Claude Code. It can alternatively drive
-[Codex](https://developers.openai.com/codex), OpenAI's native agent CLI. Claude
-and Codex are the only supported clients today; broader protocol support (ACP) is
-future work, not available yet.
+[Codex](https://developers.openai.com/codex), OpenAI's native agent CLI —
+full boards run end-to-end on either client, through the same scheduling,
+sealing, and usage accounting. Claude and Codex are the only supported clients
+today; broader protocol support (ACP) is future work, not available yet.
 
 **A project that never opts in behaves exactly as before** — the default is
 `claude`, and Claude Code's launch, prompt, and `lisa doctor` output are
@@ -410,7 +414,9 @@ Inspect the DAG offline: tickets, dependencies, execution waves, and scheduling
 readiness. Anything that needs your decision appears first under **Waiting on
 you**, each with one plain sentence you can act on (or paste to your coding
 agent). Reviewer observations that didn't stop the work appear under **Notes
-for you**. The completion-seal line says how finished work is being recorded.
+for you**. **Token usage** lists what each completed ticket cost once its
+session's capture joins the ledger — never a fabricated zero for a missing
+capture. The completion-seal line says how finished work is being recorded.
 
 ```bash
 lisa status
