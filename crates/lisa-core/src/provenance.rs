@@ -38,8 +38,9 @@ use crate::types::AttemptLease;
 
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
-/// `requested` from `actual`).
-pub const SCHEMA_VERSION: u32 = 8;
+/// `requested` from `actual`). Version 9 adds the usage-correction row that late-
+/// joins a capture onto an already-completed ticket (T-051-03-01).
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -130,6 +131,13 @@ pub enum ProposalAction {
     Applied,
     Failed,
     Dismissed,
+}
+
+/// Explicit JSON-level kind for a late token-usage join (T-051-03-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageCorrectionType {
+    UsageCorrection,
 }
 
 /// Stable, operator-visible assignment state retained in provenance.
@@ -285,6 +293,45 @@ pub struct ProposalActionRecord {
     pub occurred_at: u64,
 }
 
+/// One late token-usage join for an already-terminal ticket-run.
+///
+/// The terminal [`ProvenanceRecord`] is written at completion with null tokens by
+/// construction: rest-before-retire lands the session's capture *after* the row.
+/// This append-only correction carries the joined tokens without ever mutating
+/// the original row's bytes. It is attributed to the exact owning attempt and
+/// keyed to its source capture line so a rescan never writes it twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCorrectionRecord {
+    pub schema_version: u32,
+    /// Completion durability tier in effect for the corrected attempt.
+    #[serde(default)]
+    pub seal: CompletionSeal,
+    pub record_type: UsageCorrectionType,
+    /// The completed ticket these tokens belong to.
+    pub ticket_id: String,
+    /// The exact attempt whose pane-time reign owned the capture.
+    pub attempt_lease: AttemptLease,
+    /// Provider client name (`"claude"` | `"codex"`) — disambiguates
+    /// [`Self::source_line`], which is per-client-file.
+    pub method: String,
+    /// Opaque provider session the capture observed (audit/trace only).
+    pub session_id: String,
+    pub pane_id: u32,
+    /// One-based physical line in the provider's `captures.jsonl`. With
+    /// [`Self::method`] this uniquely identifies the source capture, so the join
+    /// is idempotent across rescans.
+    pub source_line: u64,
+    /// Capture time as UTC epoch seconds.
+    pub captured_at: u64,
+    /// Joined input tokens. Never fabricated: a correction exists only when a
+    /// real capture was observed.
+    pub tokens_in: u64,
+    /// Joined output tokens.
+    pub tokens_out: u64,
+    /// When this correction was written, UTC epoch seconds.
+    pub occurred_at: u64,
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -304,7 +351,104 @@ pub enum ProvenanceLedgerRecord {
     ParkingTransition(ParkingTransitionRecord),
     TriageTransition(TriageTransitionRecord),
     ProposalAction(ProposalActionRecord),
+    UsageCorrection(UsageCorrectionRecord),
     Execution(ProvenanceRecord),
+}
+
+/// Per-ticket token totals after layering usage corrections over the raw row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TicketUsage {
+    /// Corrected input tokens, or `None` when neither a correction nor a legacy
+    /// non-null row supplies them — never a fabricated zero.
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+    /// How many corrections joined onto this ticket.
+    pub correction_count: usize,
+}
+
+/// Fold a mixed ledger into per-ticket token totals from the **corrected view**.
+///
+/// Each ticket is seeded from its authoritative `Done` execution row (raw tokens,
+/// possibly `None`). Corrections are then layered by `ticket_id`: when a ticket
+/// has any correction, its tokens are the sum of those corrections (the late-
+/// joined truth, overriding the raw null row); otherwise the raw row tokens stand
+/// as a legacy fallback. A completed ticket with neither stays `None`.
+pub fn correct_usage<'a>(
+    records: impl IntoIterator<Item = &'a ProvenanceLedgerRecord>,
+) -> std::collections::BTreeMap<String, TicketUsage> {
+    use std::collections::BTreeMap;
+
+    // Raw seed from authoritative Done rows, and accumulated corrections.
+    let mut raw: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    let mut corrections: BTreeMap<String, (u64, u64, usize)> = BTreeMap::new();
+
+    for record in records {
+        match record {
+            ProvenanceLedgerRecord::Execution(exec)
+                if exec.authoritative && exec.outcome == RunOutcome::Done =>
+            {
+                raw.insert(exec.ticket_id.clone(), (exec.tokens_in, exec.tokens_out));
+            }
+            ProvenanceLedgerRecord::UsageCorrection(correction) => {
+                let entry = corrections
+                    .entry(correction.ticket_id.clone())
+                    .or_insert((0, 0, 0));
+                entry.0 = entry.0.saturating_add(correction.tokens_in);
+                entry.1 = entry.1.saturating_add(correction.tokens_out);
+                entry.2 += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut view: BTreeMap<String, TicketUsage> = BTreeMap::new();
+    for (ticket_id, (tokens_in, tokens_out)) in raw {
+        view.insert(
+            ticket_id,
+            TicketUsage {
+                tokens_in,
+                tokens_out,
+                correction_count: 0,
+            },
+        );
+    }
+    for (ticket_id, (tokens_in, tokens_out, count)) in corrections {
+        // Corrections override the raw seed even for a ticket with no Done row on
+        // this ledger slice.
+        view.insert(
+            ticket_id,
+            TicketUsage {
+                tokens_in: Some(tokens_in),
+                tokens_out: Some(tokens_out),
+                correction_count: count,
+            },
+        );
+    }
+    view
+}
+
+/// Ticket ids that completed (authoritative `Done`) but still have no joined
+/// input tokens in the corrected view — the countable capture gap. Sorted.
+/// A `null` here is honestly unknown usage, never a fabricated zero.
+pub fn usage_gap<'a>(
+    records: impl IntoIterator<Item = &'a ProvenanceLedgerRecord> + Clone,
+) -> Vec<String> {
+    let mut done: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for record in records.clone() {
+        if let ProvenanceLedgerRecord::Execution(exec) = record {
+            if exec.authoritative && exec.outcome == RunOutcome::Done {
+                done.insert(exec.ticket_id.clone());
+            }
+        }
+    }
+    let view = correct_usage(records);
+    done.into_iter()
+        .filter(|ticket_id| {
+            view.get(ticket_id)
+                .map(|usage| usage.tokens_in.is_none())
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 /// Convert a `SystemTime` to UTC epoch seconds, saturating pre-epoch times to 0.
@@ -370,6 +514,14 @@ pub fn append_triage_transition_record(
 pub fn append_proposal_action_record(
     path: &Path,
     record: &ProposalActionRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+/// Append one late token-usage join as a single JSONL row.
+pub fn append_usage_correction_record(
+    path: &Path,
+    record: &UsageCorrectionRecord,
 ) -> std::io::Result<()> {
     append_serialized(path, record)
 }
@@ -498,7 +650,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":8"));
+        assert!(json.contains("\"schema_version\":9"));
         assert!(json.contains("\"seal\":\"commit\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
@@ -539,7 +691,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":8"));
+        assert!(json.contains("\"schema_version\":9"));
         assert!(json.contains("\"seal\":\"journal\""));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
@@ -579,7 +731,7 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
-            assert!(json.contains("\"schema_version\":8"));
+            assert!(json.contains("\"schema_version\":9"));
             assert!(json.contains("\"seal\":\"journal\""));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",
@@ -877,6 +1029,133 @@ mod tests {
     fn extract_usage_absent_is_none() {
         let u = serde_json::json!({"unrelated": true});
         assert_eq!(extract_usage(&u), (None, None, None));
+    }
+
+    fn sample_correction(ticket_id: &str, tokens_in: u64, tokens_out: u64) -> UsageCorrectionRecord {
+        UsageCorrectionRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Journal,
+            record_type: UsageCorrectionType::UsageCorrection,
+            ticket_id: ticket_id.to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: ticket_id.to_string(),
+                attempt_id: 3,
+            },
+            method: "claude".to_string(),
+            session_id: "session-late".to_string(),
+            pane_id: 4,
+            source_line: 7,
+            captured_at: 1_752_345_600,
+            tokens_in,
+            tokens_out,
+            occurred_at: 1_752_345_900,
+        }
+    }
+
+    fn done_row(ticket_id: &str, tokens_in: Option<u64>, tokens_out: Option<u64>) -> ProvenanceRecord {
+        let route = Route::from_client(AgentClient::Claude);
+        ProvenanceRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            completion_note: None,
+            ticket_id: ticket_id.to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: ticket_id.to_string(),
+                attempt_id: 1,
+            },
+            outcome: RunOutcome::Done,
+            authoritative: true,
+            fenced: false,
+            requested: route.clone(),
+            actual: route,
+            started_at: 1_752_345_000,
+            ended_at: 1_752_345_500,
+            wall_clock_secs: 500,
+            tokens_in,
+            tokens_out,
+            cost_usd: None,
+            concurrency_at_spawn: 0,
+            pane_id: 4,
+        }
+    }
+
+    #[test]
+    fn usage_correction_serializes_to_one_compact_line_and_round_trips() {
+        let record = sample_correction("T-051-03-01", 1200, 340);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains('\n'), "record must be single-line: {json}");
+        assert!(json.contains("\"schema_version\":9"));
+        assert!(json.contains("\"record_type\":\"usage-correction\""));
+        assert!(json.contains("\"method\":\"claude\""));
+        assert!(json.contains("\"source_line\":7"));
+        assert!(json.contains("\"tokens_in\":1200"));
+        let back: UsageCorrectionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn usage_correction_appends_and_replays_distinct_from_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.jsonl");
+        let exec = done_row("T-051-03-01", None, None);
+        let correction = sample_correction("T-051-03-01", 1200, 340);
+
+        append_record(&path, &exec).unwrap();
+        append_usage_correction_record(&path, &correction).unwrap();
+
+        let rows: Vec<ProvenanceLedgerRecord> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ProvenanceLedgerRecord::Execution(exec),
+                ProvenanceLedgerRecord::UsageCorrection(correction),
+            ]
+        );
+    }
+
+    #[test]
+    fn correct_usage_overrides_null_row_with_summed_corrections() {
+        let rows = vec![
+            ProvenanceLedgerRecord::Execution(done_row("T-A", None, None)),
+            ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-A", 100, 10)),
+            ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-A", 250, 20)),
+        ];
+        let view = correct_usage(&rows);
+        let usage = view.get("T-A").unwrap();
+        assert_eq!(usage.tokens_in, Some(350));
+        assert_eq!(usage.tokens_out, Some(30));
+        assert_eq!(usage.correction_count, 2);
+    }
+
+    #[test]
+    fn correct_usage_falls_back_to_legacy_non_null_row() {
+        let rows = vec![ProvenanceLedgerRecord::Execution(done_row(
+            "T-LEGACY",
+            Some(12_000),
+            Some(3_400),
+        ))];
+        let view = correct_usage(&rows);
+        let usage = view.get("T-LEGACY").unwrap();
+        assert_eq!(usage.tokens_in, Some(12_000));
+        assert_eq!(usage.tokens_out, Some(3_400));
+        assert_eq!(usage.correction_count, 0);
+    }
+
+    #[test]
+    fn correct_usage_leaves_capture_never_ticket_null_and_gap_counts_it() {
+        let rows = vec![
+            ProvenanceLedgerRecord::Execution(done_row("T-NULL", None, None)),
+            ProvenanceLedgerRecord::Execution(done_row("T-JOINED", None, None)),
+            ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-JOINED", 5, 1)),
+        ];
+        let view = correct_usage(&rows);
+        assert_eq!(view.get("T-NULL").unwrap().tokens_in, None);
+        assert_eq!(view.get("T-JOINED").unwrap().tokens_in, Some(5));
+        assert_eq!(usage_gap(&rows), vec!["T-NULL".to_string()]);
     }
 
     #[test]
