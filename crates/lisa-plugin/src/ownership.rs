@@ -1,42 +1,101 @@
-//! Pane-time ownership lookup over durable scheduler provenance.
+//! Pane-time ownership over durable scheduler provenance plus live occupancy.
 //!
-//! Terminal execution records retain the physical pane, ticket, and closed
-//! start/end window after a thread leaves scheduler memory. Capture attribution
-//! can combine persisted records with the current record being completed and
-//! resolve ownership without trusting inherited environment or pane residency.
+//! Terminal execution records retain the physical pane, ticket, attempt, and
+//! start time after a thread leaves scheduler memory. A capture is attributed by
+//! **pane reign**: on a pane, each occupant reigns from its `started_at` until
+//! the next occupant starts, so a capture belongs to the occupant with the
+//! greatest `started_at` at or before the capture time.
+//!
+//! This matters because rest-before-retire lands a session's final capture
+//! *after* its terminal `ended_at`; a closed `[started_at, ended_at]` window
+//! could never cover it, but the reign extends past `ended_at` until the pane's
+//! next occupant. A reign that is still open must not swallow a capture belonging
+//! to a currently live but not-yet-recorded successor, so live threads are folded
+//! in as pending occupants and resolve to [`ReignOutcome::Pending`].
 
 use lisa_core::provenance::ProvenanceRecord;
 
-/// Return the unique ticket that owned `pane_id` at `captured_at`.
+/// What a pane occupant is: a durable, attributable terminal record, or a live
+/// thread that has not yet produced one.
+pub(crate) enum ReignSource<'a> {
+    /// A durable terminal execution record — attributable now.
+    Completed(&'a ProvenanceRecord),
+    /// An in-flight thread occupying the pane — attribution must wait for it to
+    /// complete and land its own record.
+    Live { ticket_id: &'a str },
+}
+
+/// One pane occupant in reign resolution.
+pub(crate) struct Reign<'a> {
+    pub(crate) pane_id: u32,
+    pub(crate) started_at: u64,
+    pub(crate) source: ReignSource<'a>,
+}
+
+/// The result of resolving a capture against a pane's reigns.
+pub(crate) enum ReignOutcome<'a> {
+    /// The capture belongs to this completed record's ticket/attempt.
+    Attributed(&'a ProvenanceRecord),
+    /// The winning reign is a live thread; attribution is not yet possible.
+    Pending,
+    /// No occupant started at or before the capture, or the evidence is
+    /// ambiguous — the capture is unowned and quarantines.
+    Unowned,
+}
+
+/// Resolve which occupant reigned over `pane_id` at `captured_at`.
 ///
-/// Provenance timestamps have epoch-second resolution, so both interval
-/// endpoints are inclusive. Repeated matching records for the same ticket keep
-/// the same answer. If different tickets overlap at the requested pane-time,
-/// the evidence is ambiguous and the lookup fails closed with `None` rather
-/// than depending on record order.
-pub(crate) fn owner_at<'a>(
-    records: impl IntoIterator<Item = &'a ProvenanceRecord>,
+/// The winner is the occupant with the greatest `started_at ≤ captured_at`.
+/// If two *different* tickets tie on that greatest `started_at`, the evidence is
+/// ambiguous and this fails closed to [`ReignOutcome::Unowned`] rather than
+/// depending on record order. A live winner yields [`ReignOutcome::Pending`].
+pub(crate) fn reign_owner_at<'a>(
+    reigns: &'a [Reign<'a>],
     pane_id: u32,
     captured_at: u64,
-) -> Option<&'a str> {
-    let mut owner = None;
+) -> ReignOutcome<'a> {
+    let mut best_started_at: Option<u64> = None;
+    let mut winner: Option<&'a Reign<'a>> = None;
+    let mut ambiguous = false;
 
-    for record in records {
-        if record.pane_id != pane_id
-            || captured_at < record.started_at
-            || captured_at > record.ended_at
-        {
+    for reign in reigns {
+        if reign.pane_id != pane_id || reign.started_at > captured_at {
             continue;
         }
-
-        match owner {
-            None => owner = Some(record.ticket_id.as_str()),
-            Some(ticket_id) if ticket_id == record.ticket_id => {}
-            Some(_) => return None,
+        match best_started_at {
+            Some(best) if reign.started_at < best => {}
+            Some(best) if reign.started_at == best => {
+                // A later occupant with the same start is only ambiguous when it
+                // is a different ticket.
+                if ticket_of(reign) != winner.map(ticket_of).unwrap_or_default() {
+                    ambiguous = true;
+                }
+            }
+            _ => {
+                best_started_at = Some(reign.started_at);
+                winner = Some(reign);
+                ambiguous = false;
+            }
         }
     }
 
-    owner
+    if ambiguous {
+        return ReignOutcome::Unowned;
+    }
+    match winner {
+        None => ReignOutcome::Unowned,
+        Some(reign) => match &reign.source {
+            ReignSource::Completed(record) => ReignOutcome::Attributed(record),
+            ReignSource::Live { .. } => ReignOutcome::Pending,
+        },
+    }
+}
+
+fn ticket_of<'a>(reign: &'a Reign<'a>) -> &'a str {
+    match &reign.source {
+        ReignSource::Completed(record) => record.ticket_id.as_str(),
+        ReignSource::Live { ticket_id } => ticket_id,
+    }
 }
 
 #[cfg(test)]
@@ -45,9 +104,9 @@ mod tests {
     use lisa_core::provenance::{ProvenanceRecord, Route, RunOutcome, SCHEMA_VERSION};
     use lisa_core::types::AttemptLease;
 
-    use super::owner_at;
+    use super::{reign_owner_at, Reign, ReignOutcome, ReignSource};
 
-    fn interval(
+    fn record(
         ticket_id: &str,
         attempt_id: u64,
         pane_id: u32,
@@ -84,40 +143,114 @@ mod tests {
         }
     }
 
-    #[test]
-    fn owner_at_resolves_each_ticket_window_on_a_recycled_pane() {
-        let records = [
-            interval("T-A", 1, 7, 100, 199),
-            interval("T-B", 1, 7, 300, 399),
-        ];
+    fn completed<'a>(record: &'a ProvenanceRecord) -> Reign<'a> {
+        Reign {
+            pane_id: record.pane_id,
+            started_at: record.started_at,
+            source: ReignSource::Completed(record),
+        }
+    }
 
-        assert_eq!(owner_at(&records, 7, 150), Some("T-A"));
-        assert_eq!(owner_at(&records, 7, 350), Some("T-B"));
+    fn live<'a>(pane_id: u32, started_at: u64, ticket_id: &'a str) -> Reign<'a> {
+        Reign {
+            pane_id,
+            started_at,
+            source: ReignSource::Live { ticket_id },
+        }
+    }
 
-        assert_eq!(owner_at(&records, 7, 100), Some("T-A"));
-        assert_eq!(owner_at(&records, 7, 199), Some("T-A"));
-        assert_eq!(owner_at(&records, 7, 300), Some("T-B"));
-        assert_eq!(owner_at(&records, 7, 399), Some("T-B"));
-
-        assert_eq!(owner_at(&records, 7, 50), None);
-        assert_eq!(owner_at(&records, 7, 250), None);
-        assert_eq!(owner_at(&records, 7, 450), None);
-        assert_eq!(owner_at(&records, 8, 150), None);
+    fn owner(outcome: ReignOutcome<'_>) -> Option<&str> {
+        match outcome {
+            ReignOutcome::Attributed(record) => Some(record.ticket_id.as_str()),
+            _ => None,
+        }
     }
 
     #[test]
-    fn owner_at_accepts_duplicate_identity_but_rejects_conflicting_overlap() {
-        let duplicate_owner = [
-            interval("T-A", 1, 7, 100, 200),
-            interval("T-A", 2, 7, 150, 250),
-        ];
-        assert_eq!(owner_at(&duplicate_owner, 7, 175), Some("T-A"));
+    fn reign_attributes_post_ended_at_rest_capture_to_the_owner() {
+        // A ran [100, 199]; its rest capture lands at 250, after ended_at, before
+        // any successor. The reign still belongs to A.
+        let a = record("T-A", 1, 7, 100, 199);
+        let reigns = [completed(&a)];
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 250)), Some("T-A"));
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 150)), Some("T-A"));
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 100)), Some("T-A"));
+    }
 
-        let conflicting_owner = [
-            interval("T-A", 1, 7, 100, 200),
-            interval("T-B", 1, 7, 150, 250),
-        ];
-        assert_eq!(owner_at(&conflicting_owner, 7, 175), None);
-        assert_eq!(owner_at(conflicting_owner.iter().rev(), 7, 175), None);
+    #[test]
+    fn reign_splits_a_recycled_pane_by_successor_start() {
+        let a = record("T-A", 1, 7, 100, 199);
+        let b = record("T-B", 1, 7, 300, 399);
+        let reigns = [completed(&a), completed(&b)];
+        // A's reign runs until B starts, covering the gap after A's ended_at.
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 250)), Some("T-A"));
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 299)), Some("T-A"));
+        // From B's start onward the pane is B's.
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 300)), Some("T-B"));
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 450)), Some("T-B"));
+    }
+
+    #[test]
+    fn reign_defers_to_a_live_successor() {
+        // A completed at 199; B is live from 300 with no record yet. A capture in
+        // B's live reign must be Pending, not misattributed to A.
+        let a = record("T-A", 1, 7, 100, 199);
+        let reigns = [completed(&a), live(7, 300, "T-B")];
+        assert!(matches!(
+            reign_owner_at(&reigns, 7, 350),
+            ReignOutcome::Pending
+        ));
+        // Before B started, the capture is still A's.
+        assert_eq!(owner(reign_owner_at(&reigns, 7, 250)), Some("T-A"));
+    }
+
+    #[test]
+    fn reign_is_unowned_before_any_occupant_and_on_other_panes() {
+        let a = record("T-A", 1, 7, 100, 199);
+        let reigns = [completed(&a)];
+        assert!(matches!(
+            reign_owner_at(&reigns, 7, 50),
+            ReignOutcome::Unowned
+        ));
+        assert!(matches!(
+            reign_owner_at(&reigns, 8, 150),
+            ReignOutcome::Unowned
+        ));
+    }
+
+    #[test]
+    fn reign_accepts_duplicate_identity_retries_but_rejects_conflicting_ties() {
+        // Two attempts of the same ticket sharing the winning start → still owned.
+        let a1 = record("T-A", 1, 7, 200, 300);
+        let a2 = record("T-A", 2, 7, 200, 320);
+        let same = [completed(&a1), completed(&a2)];
+        assert_eq!(owner(reign_owner_at(&same, 7, 250)), Some("T-A"));
+
+        // Two different tickets tie on the winning start → fail closed.
+        let a = record("T-A", 1, 7, 200, 300);
+        let b = record("T-B", 1, 7, 200, 300);
+        let conflict = [completed(&a), completed(&b)];
+        assert!(matches!(
+            reign_owner_at(&conflict, 7, 250),
+            ReignOutcome::Unowned
+        ));
+        let reversed = [completed(&b), completed(&a)];
+        assert!(matches!(
+            reign_owner_at(&reversed, 7, 250),
+            ReignOutcome::Unowned
+        ));
+    }
+
+    #[test]
+    fn reign_attribution_carries_the_owning_attempt() {
+        let a = record("T-A", 5, 7, 100, 199);
+        let reigns = [completed(&a)];
+        match reign_owner_at(&reigns, 7, 150) {
+            ReignOutcome::Attributed(record) => {
+                assert_eq!(record.attempt_lease.attempt_id, 5);
+                assert_eq!(record.ticket_id, "T-A");
+            }
+            _ => panic!("expected attribution"),
+        }
     }
 }
