@@ -22,8 +22,8 @@ use std::path::{Component, Path, PathBuf};
 use zellij_tile::prelude::*;
 
 use adapter::{
-    resolve_adapter_or_native, FollowUp, FollowUpContext, ReadinessMode, ResetStrategy,
-    SpawnContext,
+    resolve_adapter_or_native, CompletionExit, FollowUp, FollowUpContext, ReadinessMode,
+    ResetStrategy, SpawnContext,
 };
 use assignment::{write_assignment, AssignmentRef};
 use completion_journal::{
@@ -4857,9 +4857,11 @@ impl State {
     /// paths. Successful completion alone owns this clean process boundary:
     /// revoke the predecessor authority first, then exit its TUI, and leave the
     /// unassigned pane unavailable until the existing exit grace proves a
-    /// clean shell. Applies to any resident whose adapter ends sessions per
-    /// ticket (both native clients): the finished session — and its
-    /// per-ticket environment — must not outlive its ticket.
+    /// clean shell. Only providers whose adapter allows an immediate
+    /// completion-boundary exit (Codex) take it; an AfterRest resident
+    /// (Claude) keeps its session so the Stop hook's in-flight usage capture
+    /// is never destroyed, and `retire_resting_sessions` ends it once the
+    /// pane has been signal-quiet for the wind-down period.
     fn release_completed_slot_for_ticket(&mut self, ticket_id: &TicketId) {
         let clean_exit = self
             .agent_slots
@@ -4870,7 +4872,8 @@ impl State {
                 let resident = slot.last_client?;
                 let (adapter, _) =
                     resolve_adapter_or_native(None, resident, self.config.lisa_bin.as_deref());
-                (adapter.reset_strategy() == ResetStrategy::ExitThenFresh)
+                (adapter.reset_strategy() == ResetStrategy::ExitThenFresh
+                    && adapter.completion_exit() == CompletionExit::Immediate)
                     .then(|| (slot.pane_id, adapter.exit_command(), resident))
             });
 
@@ -5406,6 +5409,57 @@ impl State {
                 message: format!(
                     "Slot #{} held stale ticket {}, releasing",
                     pane_id, ticket_id
+                ),
+            });
+        }
+    }
+
+    /// Gracefully end finished sessions that have rested (AfterRest providers).
+    ///
+    /// The completion boundary leaves an AfterRest resident (native Claude) in
+    /// place so the Stop hook's in-flight usage capture is never destroyed by
+    /// an exit — the 0.4.4-rc.8 field leg lost 8 of 9 usage records to that
+    /// race. Once the pane has been signal-quiet for the wind-down period the
+    /// finished session is exited, so no TUI outlives its ticket's identity
+    /// indefinitely; the pane then follows the normal exit grace into a clean
+    /// shell. Immediate-exit providers (Codex) never reach this sweep — their
+    /// sessions end at the completion boundary itself.
+    fn retire_resting_sessions(&mut self) {
+        let now = std::time::SystemTime::now();
+        let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
+        let candidates: Vec<(u32, AgentClient)> = self
+            .agent_slots
+            .iter()
+            .filter(|slot| {
+                slot.ticket_id.is_none()
+                    && slot.has_session
+                    && slot.transition_state == TransitionState::Idle
+                    && !self.is_pane_awaiting(slot.pane_id)
+                    && slot.cooldown_until.is_none_or(|until| now >= until)
+                    && slot
+                        .last_activity_at
+                        .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= wind_down)
+            })
+            .filter_map(|slot| slot.last_client.map(|client| (slot.pane_id, client)))
+            .collect();
+        for (pane_id, client) in candidates {
+            let (adapter, _) =
+                resolve_adapter_or_native(None, client, self.config.lisa_bin.as_deref());
+            if adapter.completion_exit() != CompletionExit::AfterRest {
+                continue;
+            }
+            self.send_line_to_pane(adapter.exit_command(), PaneId::Terminal(pane_id));
+            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                slot.transition_state = TransitionState::WaitingForExit;
+                slot.transition_started_at = Some(now);
+                slot.has_session = false;
+            }
+            self.log_activity(ActivityEvent::Info {
+                message: format!(
+                    "Pane {}: finished {} session rested — ending it (via {})",
+                    pane_id,
+                    client,
+                    adapter.exit_command()
                 ),
             });
         }
@@ -7714,6 +7768,10 @@ impl State {
 
         // Safety sweep: release any slots still pointing at done tickets
         self.sweep_stale_slots();
+
+        // End finished AfterRest sessions once they have been quiet long
+        // enough for their Stop-hook usage capture to be durable.
+        self.retire_resting_sessions();
 
         // Audit threads: remove any orphaned entries for done/missing tickets
         self.audit_threads();
@@ -18319,11 +18377,13 @@ owned\n\
     }
 
     #[test]
-    fn completed_claude_ticket_gets_completion_time_clean_exit() {
-        // The completion boundary ends the finished session for any resident
-        // whose adapter ends sessions per ticket — not just Codex. A finished
-        // Claude TUI must not stay resident carrying its per-ticket
-        // environment until the next assignment happens to recycle it.
+    fn completed_claude_ticket_rests_then_retires() {
+        // A finished Claude session is NOT exited at the completion boundary —
+        // its Stop hook may still be writing the usage capture, and the
+        // 0.4.4-rc.8 field leg lost 8 of 9 usage records to exactly that race.
+        // The session rests, and the retirement sweep ends it once the pane
+        // has been signal-quiet for the wind-down period (0 in this fixture),
+        // so no TUI outlives its ticket's identity indefinitely.
         let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
         state.schedule_ready_tickets();
         assert!(state.agent_slots[0].has_session);
@@ -18331,23 +18391,32 @@ owned\n\
 
         state.release_completed_slot_for_ticket(&"T-NAME".to_string());
 
-        assert_eq!(
-            state.attempt_lifecycle.last(),
-            Some(&AttemptLifecycleEvent::CleanExitRequested {
-                ticket_id: "T-NAME".to_string(),
-                pane_id: 10,
-            })
+        assert!(
+            !state
+                .attempt_lifecycle
+                .iter()
+                .any(|event| matches!(event, AttemptLifecycleEvent::CleanExitRequested { .. })),
+            "no completion-boundary exit: the Stop-hook capture may be in flight"
         );
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(
+            state.agent_slots[0].has_session,
+            "the finished session rests instead of being exited immediately"
+        );
+        assert!(state.agent_slots[0].ticket_id.is_none());
+
+        state.retire_resting_sessions();
+
         assert_eq!(
             state.agent_slots[0].transition_state,
             TransitionState::WaitingForExit
         );
         assert!(!state.agent_slots[0].has_session);
-        assert!(state.agent_slots[0].ticket_id.is_none());
         assert!(state.activity_log.iter().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
-                if message.contains("requested clean claude exit on pane 10")
+                if message.contains("finished claude session rested")
+                    && message.contains("Pane 10")
         )));
     }
 

@@ -98,6 +98,22 @@ pub(crate) enum ResetStrategy {
     FreshExec,
 }
 
+/// When the scheduler may gracefully end a resident session whose ticket just
+/// completed durably.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionExit {
+    /// Exit at the completion boundary itself. Codex uses this: its lifecycle
+    /// hooks leave no in-flight work an immediate exit could destroy, and the
+    /// contract is field-proven.
+    Immediate,
+    /// Leave the finished session resident and end it only once the pane has
+    /// been signal-quiet for the wind-down period. Claude runs
+    /// `lisa capture-usage` inside its Stop hook; an exit landing seconds
+    /// after completion races that capture — the 0.4.4-rc.8 field leg lost
+    /// 8 of 9 usage records to exactly this.
+    AfterRest,
+}
+
 /// A follow-up delivery mechanism for a parked Review session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FollowUp {
@@ -197,6 +213,12 @@ pub(crate) trait AgentAdapter {
         ResetStrategy::ClearHandshake
     }
 
+    /// When the scheduler may gracefully end this provider's resident session
+    /// after its ticket completes durably (see [`CompletionExit`]).
+    fn completion_exit(&self) -> CompletionExit {
+        CompletionExit::Immediate
+    }
+
     /// The bare next-prompt to inject into a *reused* session once it is ready
     /// (post-`.cleared` for Claude). Separate from [`Self::launch_command`]
     /// because reuse sends the prompt alone, not the wrapped launch invocation.
@@ -283,6 +305,15 @@ impl AgentAdapter for ClaudeCodeAdapter {
         // mis-attribute usage. Ending the session per ticket (the Codex
         // boundary) re-exports fresh identity on every launch.
         ResetStrategy::ExitThenFresh
+    }
+
+    fn completion_exit(&self) -> CompletionExit {
+        // Claude's Stop hook runs `lisa capture-usage` when the agent finishes
+        // its final message; an exit landing right at the completion boundary
+        // races that capture (the 0.4.4-rc.8 field leg lost 8 of 9 usage
+        // records). The finished session rests and is retired once the pane
+        // has been signal-quiet for the wind-down period.
+        CompletionExit::AfterRest
     }
 
     fn signals(&self) -> SignalCapabilities {
@@ -586,6 +617,20 @@ mod tests {
     fn native_clients_support_common_exit_command() {
         assert_eq!(ClaudeCodeAdapter::default().exit_command(), "/exit");
         assert_eq!(CodexAdapter::new(None, None).exit_command(), "/exit");
+    }
+
+    #[test]
+    fn completion_exit_immediate_for_codex_after_rest_for_claude() {
+        // Codex's completion-boundary exit is field-proven; Claude's Stop hook
+        // runs the usage capture, so its finished session rests first.
+        assert_eq!(
+            CodexAdapter::new(None, None).completion_exit(),
+            CompletionExit::Immediate
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::default().completion_exit(),
+            CompletionExit::AfterRest
+        );
     }
 
     #[test]
