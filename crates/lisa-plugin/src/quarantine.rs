@@ -29,6 +29,15 @@ pub(crate) enum AppendOutcome {
     AlreadyPresent(PathBuf),
 }
 
+/// Result of draining one source line out of its session quarantine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DrainOutcome {
+    /// The row was removed (the file was deleted if it became empty).
+    Drained,
+    /// The row (or its session file) was not present — nothing to remove.
+    Absent,
+}
+
 /// Return a provider-local quarantine path keyed by an opaque session ID.
 ///
 /// Only ASCII alphanumeric bytes, `-`, and `_` survive literally. Encoding all
@@ -112,6 +121,81 @@ pub(crate) fn append(
     file.write_all(line.as_bytes())?;
 
     Ok(AppendOutcome::Appended(path))
+}
+
+/// Remove one source line from its session quarantine once it gains attribution.
+///
+/// The session file is rewritten without that `source_line` (a temp file plus
+/// rename, so a crash never leaves a half-written bucket); an emptied file is
+/// deleted so the terminal quarantine count stays equal to the rows on disk.
+/// Draining a line or file that is not present is a non-mutating [`DrainOutcome::Absent`].
+pub(crate) fn drain(
+    provider_dir: &Path,
+    session_id: &str,
+    source_line: u64,
+) -> io::Result<DrainOutcome> {
+    let path = session_path(provider_dir, session_id);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DrainOutcome::Absent),
+        Err(error) => return Err(error),
+    };
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut removed = false;
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<QuarantinedCaptureRecord>(line) {
+            Ok(record) if record.source_line == source_line => removed = true,
+            _ => kept.push(line.to_string()),
+        }
+    }
+
+    if !removed {
+        return Ok(DrainOutcome::Absent);
+    }
+
+    if kept.is_empty() {
+        fs::remove_file(&path)?;
+        return Ok(DrainOutcome::Drained);
+    }
+
+    let mut body = kept.join("\n");
+    body.push('\n');
+    let tmp = path.with_extension("jsonl.draining");
+    fs::write(&tmp, body.as_bytes())?;
+    fs::rename(&tmp, &path)?;
+    Ok(DrainOutcome::Drained)
+}
+
+/// Count every quarantined row across all session files under `quarantine/`.
+///
+/// This is the terminal, countable signal for captures that never gained
+/// attribution. A missing directory counts as zero.
+pub(crate) fn count_quarantined(provider_dir: &Path) -> usize {
+    let dir = provider_dir.join("quarantine");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Ok(raw) = fs::read_to_string(&path) {
+            total += raw
+                .lines()
+                .filter(|line| {
+                    serde_json::from_str::<QuarantinedCaptureRecord>(line).is_ok()
+                })
+                .count();
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -199,5 +283,89 @@ mod tests {
         assert_eq!(records[0].capture, records[1].capture);
         assert_eq!(records[0].source_line, 1);
         assert_eq!(records[1].source_line, 2);
+    }
+
+    #[test]
+    fn drain_removes_only_the_target_line_and_keeps_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_dir = dir.path().join("codex");
+        let capture = capture("session-multi");
+        let path = session_path(&provider_dir, &capture.session_id);
+
+        append(&provider_dir, 1, &capture).unwrap();
+        append(&provider_dir, 2, &capture).unwrap();
+        append(&provider_dir, 3, &capture).unwrap();
+
+        assert_eq!(
+            drain(&provider_dir, &capture.session_id, 2).unwrap(),
+            DrainOutcome::Drained
+        );
+        let remaining: Vec<u64> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<QuarantinedCaptureRecord>(line)
+                    .unwrap()
+                    .source_line
+            })
+            .collect();
+        assert_eq!(remaining, vec![1, 3]);
+    }
+
+    #[test]
+    fn drain_of_last_row_deletes_the_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_dir = dir.path().join("claude");
+        let capture = capture("session-solo");
+        let path = session_path(&provider_dir, &capture.session_id);
+
+        append(&provider_dir, 1, &capture).unwrap();
+        assert!(path.exists());
+
+        assert_eq!(
+            drain(&provider_dir, &capture.session_id, 1).unwrap(),
+            DrainOutcome::Drained
+        );
+        assert!(!path.exists(), "an emptied quarantine bucket is removed");
+    }
+
+    #[test]
+    fn drain_of_absent_line_or_file_is_non_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_dir = dir.path().join("codex");
+        let capture = capture("session-x");
+
+        // Absent file.
+        assert_eq!(
+            drain(&provider_dir, &capture.session_id, 1).unwrap(),
+            DrainOutcome::Absent
+        );
+
+        // Absent line within an existing file leaves it byte-for-byte intact.
+        append(&provider_dir, 1, &capture).unwrap();
+        let path = session_path(&provider_dir, &capture.session_id);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            drain(&provider_dir, &capture.session_id, 9).unwrap(),
+            DrainOutcome::Absent
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn count_quarantined_sums_rows_across_session_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_dir = dir.path().join("codex");
+        assert_eq!(count_quarantined(&provider_dir), 0);
+
+        let a = capture("session-a");
+        let b = capture("session-b");
+        append(&provider_dir, 1, &a).unwrap();
+        append(&provider_dir, 2, &a).unwrap();
+        append(&provider_dir, 1, &b).unwrap();
+        assert_eq!(count_quarantined(&provider_dir), 3);
+
+        drain(&provider_dir, &a.session_id, 1).unwrap();
+        assert_eq!(count_quarantined(&provider_dir), 2);
     }
 }
