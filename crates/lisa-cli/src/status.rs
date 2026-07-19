@@ -6,6 +6,83 @@ use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
 use lisa_core::disposition::RemedyOwner;
 use lisa_core::notes::{collect_notes, QueuedNote};
 use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
+use lisa_core::provenance::{correct_usage, usage_gap, ProvenanceLedgerRecord};
+
+/// Group a token count with thousands separators so big numbers stay legible.
+fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 && (bytes.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(char::from(*byte));
+    }
+    out
+}
+
+/// Render the "Token usage" block from the **corrected view** — per-ticket totals
+/// layered from append-only usage corrections, never the raw first-write row.
+/// A completed ticket whose capture never joined stays a visible, counted gap
+/// rather than a fabricated zero (T-051-03-01).
+fn token_usage_lines(records: &[ProvenanceLedgerRecord]) -> Vec<String> {
+    let view = correct_usage(records);
+    let gap = usage_gap(records);
+
+    let mut lines = vec!["Token usage".to_string()];
+
+    let mut joined = 0usize;
+    let mut total_in = 0u64;
+    let mut total_out = 0u64;
+    for (ticket_id, usage) in &view {
+        if let (Some(tokens_in), Some(tokens_out)) = (usage.tokens_in, usage.tokens_out) {
+            joined += 1;
+            total_in = total_in.saturating_add(tokens_in);
+            total_out = total_out.saturating_add(tokens_out);
+            lines.push(format!(
+                "  {:<12}  {} in / {} out",
+                ticket_id,
+                group_thousands(tokens_in),
+                group_thousands(tokens_out),
+            ));
+        }
+    }
+
+    if joined == 0 {
+        lines.push("  Nothing measured yet.".to_string());
+    } else {
+        lines.push(format!(
+            "  Joined {} ticket{}: {} in / {} out",
+            joined,
+            if joined == 1 { "" } else { "s" },
+            group_thousands(total_in),
+            group_thousands(total_out),
+        ));
+    }
+
+    if !gap.is_empty() {
+        lines.push(format!(
+            "  Not yet joined: {} completed ticket{} — usage capture pending or never arrived.",
+            gap.len(),
+            if gap.len() == 1 { "" } else { "s" },
+        ));
+    }
+
+    lines
+}
+
+fn print_token_usage(ledger_path: &Path) {
+    let records: Vec<ProvenanceLedgerRecord> = std::fs::read_to_string(ledger_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    for line in token_usage_lines(&records) {
+        println!("{line}");
+    }
+    println!();
+}
 
 fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
     remedies
@@ -167,6 +244,8 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     );
     print!("{}", format_config_summary(&resolved, completion_seal));
     println!();
+
+    print_token_usage(&root.join(".lisa/provenance.jsonl"));
 
     // Print execution waves
     let waves = dag
@@ -463,5 +542,65 @@ mod tests {
         assert!(lines[2].contains("Prepared:"));
         assert!(lines[3].contains("Original ask:"));
         assert!(lines[4].contains("Reviewer's note:"));
+    }
+
+    fn parse_ledger(jsonl: &str) -> Vec<ProvenanceLedgerRecord> {
+        jsonl
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    // A null-token Done row and a matching usage-correction, as written to the
+    // ledger by the plugin.
+    fn null_done(ticket: &str) -> String {
+        format!(
+            r#"{{"schema_version":9,"seal":"commit","ticket_id":"{ticket}","attempt_lease":{{"ticket_id":"{ticket}","attempt_id":1}},"outcome":"done","authoritative":true,"fenced":false,"requested":{{"method":"codex","provider":"openai","model":null}},"actual":{{"method":"codex","provider":"openai","model":null}},"started_at":1000,"ended_at":1100,"wall_clock_secs":100,"tokens_in":null,"tokens_out":null,"cost_usd":null,"concurrency_at_spawn":0,"pane_id":1}}"#
+        )
+    }
+
+    fn correction(ticket: &str, tokens_in: u64, tokens_out: u64) -> String {
+        format!(
+            r#"{{"schema_version":9,"record_type":"usage-correction","ticket_id":"{ticket}","attempt_lease":{{"ticket_id":"{ticket}","attempt_id":1}},"method":"codex","session_id":"s","pane_id":1,"source_line":1,"captured_at":1150,"tokens_in":{tokens_in},"tokens_out":{tokens_out},"occurred_at":1200}}"#
+        )
+    }
+
+    #[test]
+    fn token_usage_reads_the_corrected_view_not_the_raw_row() {
+        let ledger = format!("{}\n{}\n", null_done("T-A"), correction("T-A", 1_234_567, 8_900));
+        let lines = token_usage_lines(&parse_ledger(&ledger));
+        assert_eq!(lines[0], "Token usage");
+        // The raw row is null; the corrected total comes from the correction,
+        // rendered with thousands separators.
+        assert!(lines.iter().any(|line| line.contains("T-A")
+            && line.contains("1,234,567 in")
+            && line.contains("8,900 out")));
+        assert!(lines.iter().any(|line| line.contains("Joined 1 ticket:")));
+        assert!(!lines.iter().any(|line| line.contains("Not yet joined")));
+    }
+
+    #[test]
+    fn token_usage_counts_the_capture_never_gap() {
+        // T-A joined; T-B completed but never joined a capture.
+        let ledger = format!(
+            "{}\n{}\n{}\n",
+            null_done("T-A"),
+            correction("T-A", 100, 10),
+            null_done("T-B"),
+        );
+        let lines = token_usage_lines(&parse_ledger(&ledger));
+        assert!(lines.iter().any(|line| line.contains("Joined 1 ticket:")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Not yet joined: 1 completed ticket")));
+        // The gap ticket is never printed with a fabricated zero.
+        assert!(!lines.iter().any(|line| line.contains("T-B") && line.contains("0 in")));
+    }
+
+    #[test]
+    fn token_usage_empty_ledger_says_nothing_yet() {
+        let lines = token_usage_lines(&[]);
+        assert_eq!(lines, vec!["Token usage".to_string(), "  Nothing measured yet.".to_string()]);
     }
 }
