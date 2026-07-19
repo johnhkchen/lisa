@@ -23257,6 +23257,60 @@ owned\n\
         assert_eq!(provenance::usage_gap(&mixed), vec!["T-NOCAP".to_string()]);
     }
 
+    /// A resting session still occupies `self.threads` when its capture lands, so
+    /// both its Done row and its live thread share a start. The sweep must join
+    /// via the durable record rather than stall the capture as Pending.
+    #[test]
+    fn sweep_joins_capture_while_the_session_still_rests() {
+        use lisa_core::capture::{append_capture_record, CaptureRecord};
+        use lisa_core::types::Thread;
+
+        const PANE_ID: u32 = 6;
+        let (mut state, dir) = codex_state_with_dag();
+        let ledger = with_ledger(&mut state, &dir);
+
+        let started = 1_000;
+        let ended = 1_100;
+        provenance::append_record(
+            &ledger,
+            &null_done_row("T-CDX-01", 1, PANE_ID, AgentClient::Codex, started, ended),
+        )
+        .unwrap();
+
+        // The thread is still present (AfterRest) with the same spawn time as the
+        // terminal row.
+        let mut thread = Thread::new("T-CDX-01", PANE_ID);
+        thread.client = AgentClient::Codex;
+        thread.started_at = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(started))
+            .unwrap();
+        state.threads.insert("T-CDX-01".to_string(), thread);
+
+        // The capture lands during rest, after ended_at.
+        append_capture_record(
+            &state.codex_dir.join("captures.jsonl"),
+            &CaptureRecord {
+                pane_id: PANE_ID,
+                session_id: "resting".to_string(),
+                captured_at: 1_150,
+                input_tokens: 64,
+                output_tokens: 9,
+            },
+        )
+        .unwrap();
+
+        state.sweep_usage_captures();
+
+        let corrections = read_corrections(&ledger);
+        assert_eq!(
+            corrections.len(),
+            1,
+            "the resting thread must not block the join"
+        );
+        assert_eq!(corrections[0].ticket_id, "T-CDX-01");
+        assert_eq!(corrections[0].tokens_in, 64);
+    }
+
     /// AC: the emission never touches agent-owned ticket frontmatter.
     #[test]
     fn provenance_does_not_touch_ticket_frontmatter() {

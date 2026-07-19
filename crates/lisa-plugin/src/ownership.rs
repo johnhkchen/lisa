@@ -65,10 +65,14 @@ pub(crate) fn reign_owner_at<'a>(
         match best_started_at {
             Some(best) if reign.started_at < best => {}
             Some(best) if reign.started_at == best => {
-                // A later occupant with the same start is only ambiguous when it
-                // is a different ticket.
                 if ticket_of(reign) != winner.map(ticket_of).unwrap_or_default() {
+                    // Two different tickets tie on the winning start → ambiguous.
                     ambiguous = true;
+                } else if matches!(reign.source, ReignSource::Completed(_)) {
+                    // Same ticket: a durable record can attribute now, so prefer
+                    // it over a still-live occupant (a resting session shows both
+                    // a completed row and its live thread at the same start).
+                    winner = Some(reign);
                 }
             }
             _ => {
@@ -239,6 +243,18 @@ mod tests {
             reign_owner_at(&reversed, 7, 250),
             ReignOutcome::Unowned
         ));
+    }
+
+    #[test]
+    fn reign_prefers_a_completed_record_over_the_same_tickets_live_thread() {
+        // A resting session: its Done row and its still-live thread share a
+        // start. Attribution must resolve to the durable record regardless of
+        // reign order, not stall at Pending.
+        let a = record("T-A", 1, 7, 100, 199);
+        let completed_first = [completed(&a), live(7, 100, "T-A")];
+        assert_eq!(owner(reign_owner_at(&completed_first, 7, 250)), Some("T-A"));
+        let live_first = [live(7, 100, "T-A"), completed(&a)];
+        assert_eq!(owner(reign_owner_at(&live_first, 7, 250)), Some("T-A"));
     }
 
     #[test]
