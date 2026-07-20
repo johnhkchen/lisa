@@ -447,6 +447,32 @@ fn format_time_since(timestamp: Duration, current_time: Duration) -> String {
     format_duration(elapsed)
 }
 
+/// Rendered age for an entry whose emit instant was never recorded.
+const UNKNOWN_AGE: &str = "—";
+
+/// Format an activity entry's age in coarse human buckets.
+///
+/// The activity feed answers "how long ago" in the words a person uses — "just
+/// now", "5m ago", "3h ago", "2d ago" — rather than the `{h}h {m}m` composite
+/// [`format_time_since`] produces for thread elapsed times.
+///
+/// An epoch-zero timestamp means the emit instant was never recorded. It renders
+/// as a bounded [`UNKNOWN_AGE`] instead of the seconds-since-1970 figure that
+/// once surfaced in the feed as `495696h 11m`.
+pub(crate) fn format_age_bucket(timestamp: Duration, current_time: Duration) -> String {
+    if timestamp.is_zero() {
+        return UNKNOWN_AGE.to_string();
+    }
+
+    let secs = current_time.saturating_sub(timestamp).as_secs();
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
 /// Render a horizontal separator line
 fn render_separator(width: usize) -> String {
     format!("{}{}{}", DIM, "─".repeat(width.min(80)), RESET)
@@ -1006,7 +1032,7 @@ fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec
     let entries: Vec<_> = state.activity_log.iter().rev().take(max_entries).collect();
 
     for entry in entries {
-        let time_ago = format_time_since(entry.timestamp, state.current_time);
+        let time_ago = format_age_bucket(entry.timestamp, state.current_time);
 
         let (icon, color, message) = match &entry.activity {
             ActivityType::PhaseCompleted { ticket_id, phase } => (
@@ -1119,7 +1145,7 @@ fn render_filtered_activity_log(state: &PluginState, max_entries: usize, output:
     }
 
     for entry in entries {
-        let time_ago = format_time_since(entry.timestamp, state.current_time);
+        let time_ago = format_age_bucket(entry.timestamp, state.current_time);
 
         let (icon, color, message) = match &entry.activity {
             ActivityType::PhaseCompleted { ticket_id, phase } => (
@@ -1752,6 +1778,113 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(30)), "30s");
         assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
         assert_eq!(format_duration(Duration::from_secs(3700)), "1h 1m");
+    }
+
+    /// A fixed 2026-era wall clock, so age assertions never depend on the real one.
+    const TEST_NOW_SECS: u64 = 1_800_000_000;
+
+    fn age_at(elapsed_secs: u64) -> String {
+        format_age_bucket(
+            Duration::from_secs(TEST_NOW_SECS - elapsed_secs),
+            Duration::from_secs(TEST_NOW_SECS),
+        )
+    }
+
+    #[test]
+    fn format_age_bucket_covers_the_four_shapes() {
+        assert_eq!(age_at(0), "just now");
+        assert_eq!(age_at(5 * 60), "5m ago");
+        assert_eq!(age_at(3 * 3600), "3h ago");
+        assert_eq!(age_at(2 * 86_400), "2d ago");
+    }
+
+    #[test]
+    fn format_age_bucket_boundaries_are_exact() {
+        assert_eq!(age_at(59), "just now");
+        assert_eq!(age_at(60), "1m ago");
+        assert_eq!(age_at(61), "1m ago");
+        assert_eq!(age_at(3599), "59m ago");
+        assert_eq!(age_at(3600), "1h ago");
+        assert_eq!(age_at(86_399), "23h ago");
+        assert_eq!(age_at(86_400), "1d ago");
+    }
+
+    #[test]
+    fn format_age_bucket_renders_epoch_zero_as_bounded_fallback() {
+        // The exact shape that produced `495696h 11m` in the 2026-07 field bug:
+        // a never-stamped entry measured against a genuine wall clock.
+        let rendered = format_age_bucket(Duration::ZERO, Duration::from_secs(TEST_NOW_SECS));
+
+        assert_eq!(rendered, UNKNOWN_AGE);
+        assert!(
+            !rendered.contains('h'),
+            "epoch-zero entry must never render an hours figure, got {rendered}"
+        );
+        assert!(
+            rendered.chars().count() <= 12,
+            "fallback must stay inside the age column, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_age_bucket_clamps_future_timestamps() {
+        // Backwards clock skew must not surface as a wrong large number.
+        let rendered = format_age_bucket(
+            Duration::from_secs(TEST_NOW_SECS + 600),
+            Duration::from_secs(TEST_NOW_SECS),
+        );
+        assert_eq!(rendered, "just now");
+    }
+
+    #[test]
+    fn activity_feed_renders_only_bucket_shapes() {
+        let cases = [
+            (0_u64, "just now"),
+            (5 * 60, "5m ago"),
+            (3 * 3600, "3h ago"),
+            (2 * 86_400, "2d ago"),
+        ];
+        // PhaseCompleted survives the alerts-only filter, so one fixture drives
+        // both renderers.
+        let activity_log = cases
+            .iter()
+            .map(|(elapsed, _)| ActivityEntry {
+                timestamp: Duration::from_secs(TEST_NOW_SECS - elapsed),
+                activity: ActivityType::PhaseCompleted {
+                    ticket_id: format!("T-AGE-{elapsed}"),
+                    phase: Phase::Implement,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let state = PluginState {
+            activity_log,
+            current_time: Duration::from_secs(TEST_NOW_SECS),
+            ..PluginState::default()
+        };
+
+        let mut full = Vec::new();
+        render_activity_log(&state, cases.len(), &mut full);
+        let full = full.join("\n");
+        let mut alerts = Vec::new();
+        render_filtered_activity_log(&state, cases.len(), &mut alerts);
+        let alerts = alerts.join("\n");
+
+        for (view_name, view) in [("full Activity", &full), ("alerts-only", &alerts)] {
+            for (_, expected) in cases {
+                // The renderers lay the age out as `{:<12}`; matching the padded
+                // column pins the age position, not an incidental substring.
+                let column = format!("{:<12}", expected);
+                assert!(
+                    view.contains(&column),
+                    "{view_name} view lost the {expected:?} bucket: {view}"
+                );
+            }
+            assert!(
+                !view.contains("495696h"),
+                "{view_name} view regressed to the epoch composite: {view}"
+            );
+        }
     }
 
     #[test]
