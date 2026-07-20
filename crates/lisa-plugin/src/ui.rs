@@ -1164,6 +1164,14 @@ fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
         output.push(colored_line);
     }
 
+    // Guarded by the same predicate that drove condensing, so there is no
+    // third outcome: either the board fits, or it has already been condensed
+    // and says what is still off the edge. Clipping quietly is not reachable.
+    let widest = widest_visible_line(&rendered);
+    if pane_cols > 0 && widest > pane_cols {
+        output.push(dag_overflow_line(widest, pane_cols));
+    }
+
     // Summary + legend
     if done_count > 0 {
         output.push(String::new());
@@ -1195,6 +1203,24 @@ fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
         ),
         LabelStyle::Condensed => dag_status_legend(),
     });
+}
+
+/// What the pane is cutting off, said plainly.
+///
+/// Reached only when a condensed board still runs past the pane, which is the
+/// one case where the map cannot be made to fit. Silence there would be the map
+/// lying about its own edge, so it says how much is missing and how wide a pane
+/// would have to be. S-054-02 will add the keys for panning to this sentence.
+fn dag_overflow_line(widest: usize, pane_cols: usize) -> String {
+    format!(
+        "{}({} column{} off-screen — the map needs {}, the pane has {}){}",
+        DIM,
+        widest - pane_cols,
+        if widest - pane_cols == 1 { "" } else { "s" },
+        widest,
+        pane_cols,
+        RESET
+    )
 }
 
 /// The color code condensed mode reads by: each status word in its own color.
@@ -3611,6 +3637,81 @@ mod tests {
             .join("\n")
             .contains("T-054-01-02 RDY"));
         assert!(!output.join("\n").contains("off-screen"));
+    }
+
+    /// AC4 as a property: no render may leave columns off-pane without saying
+    /// so. Measures every body line and requires the indicator whenever one
+    /// exceeds the pane — the negative fixture, since a silently clipped board
+    /// fails here rather than passing unnoticed.
+    fn assert_no_silent_clip(output: &[String], pane_cols: usize) {
+        let body = dag_body_lines(output);
+        let widest = widest_visible_line(&body.join("\n"));
+        let said_so = output.iter().any(|line| line.contains("off-screen"));
+
+        if widest > pane_cols {
+            assert!(
+                said_so,
+                "{widest} columns on a {pane_cols}-column pane, clipped in \
+                 silence:\n{body:#?}"
+            );
+        } else {
+            assert!(
+                !said_so,
+                "{widest} columns fit a {pane_cols}-column pane, yet the board \
+                 claimed an overflow:\n{output:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_beyond_condensed_carries_the_indicator() {
+        // AC4. The 7-node board is 83 columns even condensed; on a 60-column
+        // pane there is nothing left to shed, so it must say what is missing.
+        let state = fan_board(7);
+        let mut output = Vec::new();
+        render_dag(&state, 60, &mut output);
+
+        let indicator = output
+            .iter()
+            .find(|line| line.contains("off-screen"))
+            .map(|line| strip_ansi(line))
+            .expect("an overflowing board must carry the indicator");
+
+        assert_eq!(
+            indicator,
+            "(23 columns off-screen — the map needs 83, the pane has 60)"
+        );
+        assert_no_silent_clip(&output, 60);
+    }
+
+    #[test]
+    fn a_board_that_fits_says_nothing() {
+        // Guards against an indicator that is simply always on, which would
+        // pass the overflow tests by brute force.
+        let state = fan_board(7);
+
+        for pane in [200, 100] {
+            let mut output = Vec::new();
+            render_dag(&state, pane, &mut output);
+            assert!(
+                !output.iter().any(|line| line.contains("off-screen")),
+                "a board that fits a {pane}-column pane must say nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn no_body_line_exceeds_the_pane_without_the_indicator() {
+        // AC4 across the matrix: four board sizes against four panes, from one
+        // that cannot hold a single node to one nothing overflows.
+        for nodes in [3, 6, 7, 9] {
+            let state = fan_board(nodes);
+            for pane in [20, 60, 100, 200] {
+                let mut output = Vec::new();
+                render_dag(&state, pane, &mut output);
+                assert_no_silent_clip(&output, pane);
+            }
+        }
     }
 
     #[test]
