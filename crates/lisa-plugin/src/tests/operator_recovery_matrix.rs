@@ -111,7 +111,13 @@ fn assert_operator_pending(state: &State) -> String {
     correlation_id
 }
 
-fn assert_named_rejection(
+/// The dispatcher half: a refusal is logged under its own name, correlated to
+/// the operator's request, carrying a detail a person can act on.
+///
+/// Split from [`assert_named_rejection`] because one rejection kind no longer
+/// reaches the modal at all: `[d]` routes a blocked disposition to the reason
+/// step instead (T-053-01-02), so the guard's naming outlives its display.
+fn assert_named_rejection_event(
     state: &State,
     expected_kind: CompletionRejectionKind,
     detail_fragment: &str,
@@ -149,6 +155,17 @@ fn assert_named_rejection(
         detail.contains(detail_fragment),
         "expected {detail:?} to contain {detail_fragment:?}"
     );
+    correlation_id.clone()
+}
+
+/// The dispatcher half plus its display: the refusal is also the thing the
+/// operator is looking at.
+fn assert_named_rejection(
+    state: &State,
+    expected_kind: CompletionRejectionKind,
+    detail_fragment: &str,
+) -> String {
+    let correlation_id = assert_named_rejection_event(state, expected_kind, detail_fragment);
     assert!(state.modal.open, "Rejection must remain visible");
     assert!(matches!(
         state.modal.operator_outcome.as_ref(),
@@ -159,10 +176,11 @@ fn assert_named_rejection(
             detail: modal_detail,
         }) if ticket_id == TICKET_ID
             && *kind == expected_kind
-            && modal_correlation == correlation_id
-            && modal_detail == detail
+            && modal_correlation == &correlation_id
+            && detail_fragment.is_empty() == modal_detail.is_empty()
+            && modal_detail.contains(detail_fragment)
     ));
-    correlation_id.clone()
+    correlation_id
 }
 
 #[test]
@@ -203,6 +221,12 @@ fn orphaned_review_accepts_operator_recovery_without_attempt_authority() {
     assert!(!state.current_leases.contains_key(TICKET_ID));
 }
 
+/// The guard itself is unchanged: a completion carrying no operator-chosen
+/// reason still refuses a blocked disposition, and says so by name.
+///
+/// This used to be driven through `[d]`. It is not any more — see
+/// [`blocked_disposition_no_longer_dead_ends_on_the_done_key`] — so it exercises
+/// the dispatcher directly, which is the surface the claim is actually about.
 #[test]
 fn blocked_disposition_rejects_operator_recovery_with_name_and_correlation() {
     let (mut state, _dir) = review_state();
@@ -212,14 +236,48 @@ fn blocked_disposition_rejects_operator_recovery_with_name_and_correlation() {
         r#"{"disposition":"block","reason":"resolve the blocked review"}"#,
     );
 
-    submit_from_done_key(&mut state);
+    state.mark_ticket_done(TICKET_ID);
 
     assert!(state.pending_completions.is_empty());
     assert!(state.launched_completion_effects.is_empty());
-    assert_named_rejection(
+    assert_named_rejection_event(
         &state,
         CompletionRejectionKind::DispositionBlocked,
         "resolve the blocked review",
+    );
+}
+
+/// The retirement of the dead end, pinned where the old expectation lived
+/// (T-053-01-02). `[d]` on a parked ticket now leads to the reason step; it no
+/// longer produces a rejection the operator can do nothing with.
+#[test]
+fn blocked_disposition_no_longer_dead_ends_on_the_done_key() {
+    let (mut state, _dir) = review_state();
+    write_canonical_review_disposition(
+        &state,
+        TICKET_ID,
+        r#"{"disposition":"block","reason":"resolve the blocked review"}"#,
+    );
+
+    submit_from_done_key(&mut state);
+
+    assert!(
+        state.modal.reason_step.is_some(),
+        "[d] must offer a signature rather than a rejection"
+    );
+    assert!(state.pending_completions.is_empty());
+    assert!(state.launched_completion_effects.is_empty());
+    assert!(
+        !state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::CompletionRejected {
+                ticket_id,
+                kind: CompletionRejectionKind::DispositionBlocked,
+                ..
+            } if ticket_id == TICKET_ID
+        )),
+        "the [d] path must not reject a ticket it can offer a signature for: {:?}",
+        state.activity_log
     );
 }
 

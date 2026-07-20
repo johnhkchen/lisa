@@ -857,6 +857,25 @@ struct SchedulingPass {
     declined: Vec<(TicketId, DeclineReason)>,
 }
 
+/// The MarkDone modal's second step: which canned reason signs this ticket.
+///
+/// `cursor` here indexes `choices` and nothing else. It is a separate field
+/// from [`MarkDoneModal::cursor`] on purpose: that one keeps pointing at the
+/// ticket list underneath, and [`State::operator_modal_targets`] resolves the
+/// acting ticket through it. Sharing one cursor would silently retarget
+/// completion feedback at whatever ticket sat at the chosen reason's index.
+struct ReasonStep {
+    /// The ticket being signed.
+    ticket_id: TicketId,
+    /// The state this signature answers, as observed at the moment [d] chose
+    /// the ticket.
+    ask: OverriddenAsk,
+    /// The reasons that honestly fit `ask`, in catalog order.
+    choices: Vec<OverrideReason>,
+    /// Index into `choices`.
+    cursor: usize,
+}
+
 /// State for the modal overlay (mark-done, reset-ticket, or quit-confirm).
 #[derive(Default)]
 struct MarkDoneModal {
@@ -872,6 +891,9 @@ struct MarkDoneModal {
     new_ticket_ids: Vec<TicketId>,
     /// (MarkDone only) Visible feedback for the submitted completion request.
     operator_outcome: Option<OperatorModalOutcome>,
+    /// (MarkDone only) The reason step, when the chosen ticket needs a
+    /// signature. `None` means the ticket list is showing.
+    reason_step: Option<ReasonStep>,
 }
 
 /// Main plugin state
@@ -8578,6 +8600,31 @@ impl State {
                         _ => false,
                     };
                 }
+
+                // The reason step, when one is open. Ordered after the
+                // submitted-request layer above so a pending request still
+                // swallows keys, and before the ticket list below so Esc means
+                // "back" here and j/k do not move the ticket cursor underneath.
+                if let Some(step) = self.modal.reason_step.as_mut() {
+                    match key.bare_key {
+                        BareKey::Esc | BareKey::Char('q') => {
+                            // Back to the ticket list; `modal.cursor` is a
+                            // separate field, so the ticket stays highlighted.
+                            self.modal.reason_step = None;
+                        }
+                        BareKey::Up | BareKey::Char('k') => {
+                            step.cursor = step.cursor.saturating_sub(1);
+                        }
+                        BareKey::Down | BareKey::Char('j') => {
+                            if step.cursor + 1 < step.choices.len() {
+                                step.cursor += 1;
+                            }
+                        }
+                        BareKey::Enter => self.confirm_reason_step(),
+                        _ => return false,
+                    }
+                    return true;
+                }
             }
 
             match key.bare_key {
@@ -8599,7 +8646,15 @@ impl State {
                     match self.modal.mode {
                         ModalMode::MarkDone => {
                             if let Some(ticket_id) = ticket_id {
-                                self.mark_ticket_done(&ticket_id);
+                                // Every listed ticket leads somewhere: a ticket
+                                // whose own verdict authorizes completion seals
+                                // on this keypress exactly as it always has,
+                                // and one that needs a signature opens the
+                                // reason step instead of dying in a rejection.
+                                match self.override_choices_for(&ticket_id) {
+                                    Some(ask) => self.open_reason_step(ticket_id, ask),
+                                    None => self.mark_ticket_done(&ticket_id),
+                                }
                             }
                         }
                         ModalMode::ResetTicket => {
@@ -8734,6 +8789,7 @@ impl State {
             mode: ModalMode::MarkDone,
             new_ticket_ids: Vec::new(),
             operator_outcome: None,
+            reason_step: None,
         };
     }
 
@@ -8748,9 +8804,8 @@ impl State {
     /// Sign a parked ticket's completion with a catalog reason.
     ///
     /// The recorded authority branch: the chosen reason becomes the completion's
-    /// note and rides the ordinary sealing path. Called by the reason step the
-    /// MarkDone modal gains in T-053-01-02.
-    #[allow(dead_code)]
+    /// note and rides the ordinary sealing path. Called by the modal's reason
+    /// step through [`Self::confirm_reason_step`].
     fn mark_ticket_done_with_override(&mut self, ticket_id: &str, reason: OverrideReason) {
         self.request_operator_completion(ticket_id, Some(reason));
     }
@@ -8758,13 +8813,55 @@ impl State {
     /// What an override on this ticket would answer, or `None` when its verdict
     /// already authorizes completion.
     ///
-    /// The seam T-053-01-02's reason step consumes: it asks the state what to
+    /// The seam the modal's reason step consumes: it asks the state what to
     /// list ([`OverriddenAsk::applicable_reasons`]) and what to preselect
     /// ([`OverriddenAsk::recommended_reason`]) without reaching into completion
     /// internals.
-    #[allow(dead_code)]
     fn override_choices_for(&self, ticket_id: &str) -> Option<OverriddenAsk> {
         self.observed_override_state(ticket_id)
+    }
+
+    /// Open the reason step for a ticket that needs a signature.
+    ///
+    /// The recommendation is preselected, which is what keeps the happy path
+    /// inside its keypress budget: the operator confirms rather than navigates.
+    fn open_reason_step(&mut self, ticket_id: TicketId, ask: OverriddenAsk) {
+        let choices = ask.applicable_reasons().to_vec();
+        if choices.is_empty() {
+            // Unreachable through the catalog — every state names at least one
+            // fitting reason — but a step with nothing to sign would be the
+            // dead end this ticket exists to remove.
+            self.log_activity(ActivityEvent::Warning {
+                message: format!("{ticket_id}: no reason in the catalog fits this ticket's state"),
+            });
+            return;
+        }
+        let recommended = ask.recommended_reason();
+        let cursor = choices
+            .iter()
+            .position(|reason| *reason == recommended)
+            .unwrap_or(0);
+        self.modal.reason_step = Some(ReasonStep {
+            ticket_id,
+            ask,
+            choices,
+            cursor,
+        });
+    }
+
+    /// Sign the completion with the reason under the step's cursor.
+    fn confirm_reason_step(&mut self) {
+        let Some(step) = self.modal.reason_step.take() else {
+            return;
+        };
+        let Some(reason) = step.choices.get(step.cursor).copied() else {
+            return;
+        };
+        // The step is cleared before dispatch so the submitted-request feedback
+        // paints over the ticket list, exactly as an ordinary [d] does — and so
+        // `operator_modal_targets` resolves through `modal.cursor`, which is
+        // still the ticket the operator chose.
+        self.mark_ticket_done_with_override(&step.ticket_id, reason);
     }
 
     fn request_operator_completion(
@@ -8817,6 +8914,7 @@ impl State {
             mode: ModalMode::ResetTicket,
             new_ticket_ids: Vec::new(),
             operator_outcome: None,
+            reason_step: None,
         };
     }
 
@@ -8930,6 +9028,7 @@ impl State {
             mode: ModalMode::QuitConfirm,
             new_ticket_ids: new_tickets,
             operator_outcome: None,
+            reason_step: None,
         };
     }
 
@@ -9492,7 +9591,16 @@ impl State {
                         },
                     },
                 ),
-                reason_step: None,
+                reason_step: self
+                    .modal
+                    .reason_step
+                    .as_ref()
+                    .map(|step| ui::ReasonStepState {
+                        ticket_id: step.ticket_id.clone(),
+                        ask: step.ask.clone(),
+                        choices: step.choices.clone(),
+                        cursor: step.cursor,
+                    }),
             },
             paused: self.paused,
             active_view: self.view_preset,
@@ -15705,6 +15813,236 @@ mod tests {
             Phase::Done
         );
         assert!(state.pending_completions.is_empty());
+    }
+
+    // ==================================================================
+    // The reason step — choices, not essays (T-053-01-02)
+    // ==================================================================
+
+    fn press(state: &mut State, bare_key: BareKey) -> bool {
+        state.handle_key(KeyWithModifier {
+            bare_key,
+            key_modifiers: Default::default(),
+        })
+    }
+
+    /// Open the mark-done modal with the cursor on `ticket_id` and press Enter.
+    fn choose_ticket(state: &mut State, ticket_id: &str) {
+        state.open_mark_done_modal();
+        state.modal.cursor = state
+            .modal
+            .ticket_ids
+            .iter()
+            .position(|listed| listed == ticket_id)
+            .unwrap_or_else(|| panic!("{ticket_id} must be listed by the modal"));
+        assert!(press(state, BareKey::Enter));
+    }
+
+    fn open_step(state: &State) -> &ReasonStep {
+        state
+            .modal
+            .reason_step
+            .as_ref()
+            .expect("the reason step must be open")
+    }
+
+    /// Arm 1: a ticket parked on a Block opens the reason step instead of
+    /// dispatching into the rejection that used to dead-end here.
+    #[test]
+    fn enter_on_a_blocked_ticket_opens_the_reason_step() {
+        let (_dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+
+        choose_ticket(&mut state, "T-PARKED");
+
+        let step = open_step(&state);
+        assert_eq!(step.ticket_id, "T-PARKED");
+        assert!(matches!(step.ask, OverriddenAsk::Block { .. }));
+        assert!(
+            state.pending_completions.is_empty(),
+            "choosing a ticket must not dispatch a completion on its own"
+        );
+        assert!(
+            state.modal.operator_outcome.is_none(),
+            "the rejection modal must not appear on the [d] path"
+        );
+        assert!(state.modal.open);
+    }
+
+    /// Arm 2: no review file at all.
+    #[test]
+    fn enter_on_a_ticket_with_no_review_opens_the_reason_step() {
+        let (_dir, mut state) = sealing_fixture(None);
+
+        choose_ticket(&mut state, "T-PARKED");
+
+        assert_eq!(open_step(&state).ask, OverriddenAsk::NoReviewOnFile);
+        assert!(state.pending_completions.is_empty());
+        assert!(state.modal.operator_outcome.is_none());
+    }
+
+    /// Arm 3: a review file that exists but cannot be read.
+    #[test]
+    fn enter_on_an_unreadable_review_opens_the_reason_step() {
+        let (_dir, mut state) = sealing_fixture(Some("{this is not JSON"));
+
+        choose_ticket(&mut state, "T-PARKED");
+
+        assert!(matches!(
+            open_step(&state).ask,
+            OverriddenAsk::UnreadableReview { .. }
+        ));
+        assert!(state.pending_completions.is_empty());
+    }
+
+    /// Arm 4: a verdict that already authorizes completion still seals on the
+    /// first Enter — the reason step never interposes itself where the agent
+    /// already signed.
+    #[test]
+    fn enter_on_a_passing_ticket_still_dispatches_without_a_reason_step() {
+        let (dir, mut state) = sealing_fixture(Some(r#"{"disposition":"pass","reason":null}"#));
+
+        choose_ticket(&mut state, "T-PARKED");
+
+        assert!(
+            state.modal.reason_step.is_none(),
+            "a passing ticket needs no signature"
+        );
+        assert_eq!(
+            state.dag.get_ticket(&"T-PARKED".to_string()).unwrap().phase,
+            Phase::Done,
+            "the agent's own verdict still seals on the first Enter"
+        );
+        assert!(
+            read_mixed_ledger(&dir.path().join("provenance.jsonl"))
+                .iter()
+                .all(|record| !matches!(record, ProvenanceLedgerRecord::OperatorOverride(_))),
+            "an unsigned completion writes no operator receipt"
+        );
+    }
+
+    /// Criterion 1's keypress budget rests on this: the operator confirms
+    /// rather than navigates.
+    #[test]
+    fn the_reason_step_preselects_the_recommendation() {
+        let cases = [
+            (Some(XCODE_BLOCK), OverrideReason::EvidenceSatisfies),
+            (None, OverrideReason::NoReviewOnFile),
+            (Some("{this is not JSON"), OverrideReason::NoReviewOnFile),
+        ];
+        for (disposition, expected) in cases {
+            let (_dir, mut state) = sealing_fixture(disposition);
+            choose_ticket(&mut state, "T-PARKED");
+
+            let step = open_step(&state);
+            assert_eq!(
+                step.choices[step.cursor], expected,
+                "wrong recommendation for {disposition:?}"
+            );
+            assert_eq!(
+                step.choices,
+                step.ask.applicable_reasons().to_vec(),
+                "the step lists exactly the reasons that fit the state"
+            );
+        }
+    }
+
+    /// The two cursors stay separate. Sharing one would retarget
+    /// `operator_modal_targets` at whichever ticket sat at the reason's index.
+    #[test]
+    fn reason_step_navigation_moves_only_its_own_cursor() {
+        let (_dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+        choose_ticket(&mut state, "T-PARKED");
+        let ticket_cursor = state.modal.cursor;
+        assert_eq!(open_step(&state).cursor, 0);
+
+        assert!(press(&mut state, BareKey::Down));
+        assert_eq!(open_step(&state).cursor, 1);
+        assert!(press(&mut state, BareKey::Char('j')));
+        assert_eq!(open_step(&state).cursor, 2);
+        // The list has three entries; the cursor clamps rather than wrapping.
+        assert!(press(&mut state, BareKey::Char('j')));
+        assert_eq!(open_step(&state).cursor, 2);
+
+        assert!(press(&mut state, BareKey::Up));
+        assert_eq!(open_step(&state).cursor, 1);
+        assert!(press(&mut state, BareKey::Char('k')));
+        assert_eq!(open_step(&state).cursor, 0);
+        assert!(press(&mut state, BareKey::Char('k')));
+        assert_eq!(open_step(&state).cursor, 0);
+
+        assert_eq!(
+            state.modal.cursor, ticket_cursor,
+            "the ticket cursor must not move while the reason step is open"
+        );
+        assert!(
+            state.operator_modal_targets("T-PARKED"),
+            "completion feedback must still resolve to the chosen ticket"
+        );
+    }
+
+    /// Criterion 1: each step is Esc-reversible.
+    #[test]
+    fn esc_on_the_reason_step_returns_to_the_ticket_list() {
+        for back_key in [BareKey::Esc, BareKey::Char('q')] {
+            let (_dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+            choose_ticket(&mut state, "T-PARKED");
+            let ticket_cursor = state.modal.cursor;
+
+            assert!(press(&mut state, back_key));
+
+            assert!(state.modal.reason_step.is_none(), "the step backs out");
+            assert!(state.modal.open, "backing out is not closing");
+            assert_eq!(state.modal.cursor, ticket_cursor);
+            assert!(
+                state.pending_completions.is_empty(),
+                "backing out must not sign anything"
+            );
+        }
+    }
+
+    #[test]
+    fn esc_on_the_ticket_list_still_closes_the_modal() {
+        let (_dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+        state.open_mark_done_modal();
+
+        assert!(press(&mut state, BareKey::Esc));
+
+        assert!(!state.modal.open);
+        assert!(state.modal.reason_step.is_none());
+    }
+
+    /// Enter on the step signs with the reason under its own cursor, not the
+    /// recommendation and not the ticket cursor's index.
+    #[test]
+    fn enter_on_the_reason_step_signs_the_chosen_reason() {
+        let (dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+        choose_ticket(&mut state, "T-PARKED");
+        // One row down from the recommendation, so the receipt can only carry
+        // the reason under the step's own cursor.
+        assert!(press(&mut state, BareKey::Down));
+
+        assert!(press(&mut state, BareKey::Enter));
+
+        assert!(
+            state.modal.reason_step.is_none(),
+            "signing closes the step so the submitted-request feedback shows"
+        );
+        assert_eq!(
+            state.dag.get_ticket(&"T-PARKED".to_string()).unwrap().phase,
+            Phase::Done
+        );
+        assert!(
+            read_mixed_ledger(&dir.path().join("provenance.jsonl"))
+                .iter()
+                .any(|record| matches!(
+                    record,
+                    ProvenanceLedgerRecord::OperatorOverride(receipt)
+                        if receipt.reason_id == "cannot-verify-here"
+                            && receipt.overridden_ask == XCODE_ASK
+                            && receipt.actor == "operator"
+                )),
+            "the ledger records who signed, which reason, and the ask it overrode"
+        );
     }
 
     #[test]
