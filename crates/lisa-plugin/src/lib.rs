@@ -9492,6 +9492,7 @@ impl State {
                         },
                     },
                 ),
+                reason_step: None,
             },
             paused: self.paused,
             active_view: self.view_preset,

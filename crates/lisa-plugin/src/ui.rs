@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use lisa_core::operator_override::{OverriddenAsk, OverrideReason};
 use lisa_core::triage::TriageProposal;
 use lisa_core::types::CompletionRejectionKind;
 
@@ -334,6 +335,23 @@ pub enum OperatorModalOutcome {
     },
 }
 
+/// (MarkDone only) The modal's second step: which canned reason signs this
+/// ticket, and what that signature answers.
+///
+/// `cursor` indexes `choices` and nothing else. The ticket being signed is
+/// carried here by name rather than read back out of [`ModalState::cursor`],
+/// which keeps pointing at the ticket list underneath.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasonStepState {
+    pub ticket_id: String,
+    /// The state the signature answers, from the override catalog.
+    pub ask: OverriddenAsk,
+    /// The reasons that honestly fit `ask`, in catalog order.
+    pub choices: Vec<OverrideReason>,
+    /// Index into `choices`.
+    pub cursor: usize,
+}
+
 /// State for the modal overlay (UI representation).
 #[derive(Debug, Clone, Default)]
 pub struct ModalState {
@@ -349,6 +367,9 @@ pub struct ModalState {
     pub new_ticket_ids: Vec<String>,
     /// (MarkDone only) Durable visible feedback for a submitted request.
     pub operator_outcome: Option<OperatorModalOutcome>,
+    /// (MarkDone only) The reason step, when the chosen ticket needs a
+    /// signature. `None` means the ticket list is showing.
+    pub reason_step: Option<ReasonStepState>,
 }
 
 /// Which preset view is active on the dashboard.
@@ -1387,6 +1408,110 @@ fn wrap_modal_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// What the operator reads above the choices: the ask this signature answers.
+///
+/// The one place the reason step's copy rule lives. A block's `ask` is shown
+/// verbatim — the disposition schema already requires it to be one sentence
+/// addressed to a person who didn't do the work, with the jargon kept in its
+/// `reason` companion. The two fail-closed shapes destructure with `{ .. }` on
+/// purpose: the parse failure and the block's technical reason are not merely
+/// unused here, they are unreachable, so "never a raw parse error on screen" is
+/// checkable by reading this function.
+fn ask_header_lines(ask: &OverriddenAsk, width: usize) -> Vec<String> {
+    match ask {
+        OverriddenAsk::Block { ask, .. } => wrap_modal_text(ask, width),
+        OverriddenAsk::NoReviewOnFile => {
+            wrap_modal_text("No review was left for this ticket.", width)
+        }
+        OverriddenAsk::UnreadableReview { .. } => {
+            wrap_modal_text("No review Lisa can read was left for this ticket.", width)
+        }
+    }
+}
+
+/// Fit one line to `width` display columns, marking any cut with an ellipsis.
+///
+/// Measured in characters, not bytes: every catalog summary carries an em dash,
+/// and byte length would over-pad the box.
+fn fit_modal_line(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut fitted: String = text.chars().take(width.saturating_sub(1)).collect();
+    fitted.push('…');
+    fitted
+}
+
+/// Render the reason step: the ask above, the canned choices below.
+///
+/// One choice per row, truncated rather than wrapped — a three-item list read at
+/// a glance is the point, and no sentence is lost: the chosen reason's full text
+/// is what the receipt records.
+fn render_reason_step_modal(step: &ReasonStepState, width: usize, height: usize) -> Vec<String> {
+    let box_w = width.min(50);
+    let inner_w = box_w.saturating_sub(4);
+
+    let header = ask_header_lines(&step.ask, inner_w);
+    let choices: Vec<String> = step
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(index, reason)| {
+            let prefix = if index == step.cursor { "▸ " } else { "  " };
+            fit_modal_line(&format!("{prefix}{}", reason.summary()), inner_w)
+        })
+        .collect();
+
+    let border_h = "─".repeat(box_w.saturating_sub(2));
+    let box_h = header.len() + choices.len() + 6;
+    let pad_top = height.saturating_sub(box_h) / 2;
+    let mut output = vec![String::new(); pad_top];
+
+    let centered = |text: &str, decoration: &str| {
+        let pad = box_w.saturating_sub(2).saturating_sub(text.chars().count());
+        let left = pad / 2;
+        format!(
+            "│{}{}{}{}{}│",
+            " ".repeat(left),
+            decoration,
+            text,
+            RESET,
+            " ".repeat(pad - left),
+        )
+    };
+
+    output.push(format!("┌{}┐", border_h));
+    output.push(centered(&format!(" Sign {} ", step.ticket_id), BOLD));
+    output.push(format!("├{}┤", border_h));
+
+    for line in &header {
+        output.push(format!(
+            "│ {}{} │",
+            line,
+            " ".repeat(inner_w.saturating_sub(line.chars().count()))
+        ));
+    }
+
+    output.push(format!("├{}┤", border_h));
+
+    for (index, line) in choices.iter().enumerate() {
+        let pad = " ".repeat(inner_w.saturating_sub(line.chars().count()));
+        if index == step.cursor {
+            output.push(format!("│ {BOLD}{CYAN}{line}{RESET}{pad} │"));
+        } else {
+            output.push(format!("│ {line}{pad} │"));
+        }
+    }
+
+    output.push(format!("├{}┤", border_h));
+    output.push(centered(" Enter=sign  Esc=back ", DIM));
+    output.push(format!("└{}┘", border_h));
+    output
+}
+
 fn render_operator_outcome_modal(
     outcome: &OperatorModalOutcome,
     width: usize,
@@ -1513,8 +1638,14 @@ fn render_modal(modal: &ModalState, width: usize, height: usize) -> Vec<String> 
         return render_quit_confirm_modal(modal, width, height);
     }
     if modal.kind == ModalKind::MarkDone {
+        // Outcome first: a submitted request has already cleared the step, so
+        // the two are never both set — the ordering states the precedence
+        // rather than relying on that.
         if let Some(outcome) = modal.operator_outcome.as_ref() {
             return render_operator_outcome_modal(outcome, width, height);
+        }
+        if let Some(step) = modal.reason_step.as_ref() {
+            return render_reason_step_modal(step, width, height);
         }
     }
 
@@ -3413,6 +3544,7 @@ mod tests {
             kind: ModalKind::ResetTicket,
             new_ticket_ids: Vec::new(),
             operator_outcome: None,
+            reason_step: None,
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");
@@ -3431,6 +3563,7 @@ mod tests {
             kind: ModalKind::MarkDone,
             new_ticket_ids: Vec::new(),
             operator_outcome: None,
+            reason_step: None,
         };
         let lines = render_modal(&modal, 50, 20);
         let full = lines.join("\n");
@@ -3468,6 +3601,7 @@ mod tests {
                 kind: ModalKind::MarkDone,
                 new_ticket_ids: Vec::new(),
                 operator_outcome: Some(outcome.clone()),
+                reason_step: None,
             };
             let rendered = render_modal(&modal, 50, 24).join("\n");
 
@@ -3522,6 +3656,208 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ==================================================================
+    // The reason step — choices, not essays (T-053-01-02)
+    // ==================================================================
+
+    /// The field block from E-053's "Done looks like".
+    const XCODE_ASK: &str = "Sign into Xcode with an Apple ID, then re-run the signed build.";
+    const XCODE_REASON: &str = "codesign refused: no signing identity found";
+    const PARSE_FAILURE: &str =
+        "review disposition is malformed JSON: expected value at line 1 column 1";
+
+    /// Drop SGR escapes so a rendered row can be measured as the terminal
+    /// displays it.
+    fn strip_ansi(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(character) = chars.next() {
+            if character == '\u{1b}' {
+                for escaped in chars.by_ref() {
+                    if escaped == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(character);
+        }
+        out
+    }
+
+    fn reason_step_modal(ask: OverriddenAsk, cursor: usize) -> ModalState {
+        ModalState {
+            open: true,
+            ticket_ids: vec!["T-015-02-02".to_string()],
+            cursor: 0,
+            kind: ModalKind::MarkDone,
+            new_ticket_ids: Vec::new(),
+            operator_outcome: None,
+            reason_step: Some(ReasonStepState {
+                ticket_id: "T-015-02-02".to_string(),
+                choices: ask.applicable_reasons().to_vec(),
+                cursor,
+                ask,
+            }),
+        }
+    }
+
+    fn blocked_ask() -> OverriddenAsk {
+        OverriddenAsk::Block {
+            ask: XCODE_ASK.to_string(),
+            reason: XCODE_REASON.to_string(),
+        }
+    }
+
+    /// Criterion 2, first half: the block's ask, above the choices, verbatim.
+    #[test]
+    fn reason_step_shows_the_blocks_ask_verbatim() {
+        let rendered = render_modal(&reason_step_modal(blocked_ask(), 0), 50, 24).join("\n");
+
+        assert!(rendered.contains("Sign T-015-02-02"), "{rendered}");
+        // The ask wraps across rows, so it is checked word-for-word in order
+        // rather than as one substring.
+        let mut haystack = rendered.as_str();
+        for word in XCODE_ASK.split_whitespace() {
+            let found = haystack
+                .find(word)
+                .unwrap_or_else(|| panic!("the ask lost {word:?} on screen: {rendered}"));
+            haystack = &haystack[found + word.len()..];
+        }
+    }
+
+    /// Criterion 2, second half: a fail-closed ticket says so plainly — never a
+    /// raw parse error.
+    #[test]
+    fn reason_step_never_prints_the_parse_error() {
+        let ask = OverriddenAsk::UnreadableReview {
+            detail: PARSE_FAILURE.to_string(),
+        };
+        let rendered = render_modal(&reason_step_modal(ask, 0), 50, 24).join("\n");
+
+        for machine_word in ["malformed", "JSON", "column", "expected value"] {
+            assert!(
+                !rendered.contains(machine_word),
+                "the parse error leaked {machine_word:?} onto the screen: {rendered}"
+            );
+        }
+        for plain_word in ["No", "review", "Lisa", "can", "read"] {
+            assert!(rendered.contains(plain_word), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn reason_step_says_plainly_when_no_review_is_on_file() {
+        let rendered =
+            render_modal(&reason_step_modal(OverriddenAsk::NoReviewOnFile, 0), 50, 24).join("\n");
+
+        for plain_word in ["No", "review", "was", "left", "ticket"] {
+            assert!(rendered.contains(plain_word), "{rendered}");
+        }
+    }
+
+    /// The old rejection modal's dump does not come back one line lower.
+    #[test]
+    fn reason_step_never_prints_the_blocks_technical_reason() {
+        let rendered = render_modal(&reason_step_modal(blocked_ask(), 0), 50, 24).join("\n");
+
+        for machine_word in ["codesign", "signing identity"] {
+            assert!(
+                !rendered.contains(machine_word),
+                "the technical reason leaked {machine_word:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn reason_step_lists_every_applicable_choice_and_marks_the_cursor() {
+        let ask = blocked_ask();
+        let expected = ask.applicable_reasons().len();
+        assert_eq!(expected, 3);
+
+        for cursor in 0..expected {
+            let lines = render_modal(&reason_step_modal(blocked_ask(), cursor), 50, 24);
+            let marked: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains('▸'))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(marked.len(), 1, "exactly one choice is selected: {lines:?}");
+
+            // Every choice's opening words are on screen, whether selected or not.
+            let rendered = lines.join("\n");
+            for reason in ask.applicable_reasons() {
+                let opening: String = reason
+                    .summary()
+                    .split_whitespace()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    rendered.contains(&opening),
+                    "choice {} missing at cursor {cursor}: {rendered}",
+                    reason.id()
+                );
+            }
+        }
+    }
+
+    /// The box stays square on copy that carries em dashes — a byte-length
+    /// measurement would over-pad every choice row.
+    #[test]
+    fn reason_step_rows_fit_the_box() {
+        for ask in [
+            blocked_ask(),
+            OverriddenAsk::NoReviewOnFile,
+            OverriddenAsk::UnreadableReview {
+                detail: PARSE_FAILURE.to_string(),
+            },
+        ] {
+            let lines = render_modal(&reason_step_modal(ask.clone(), 0), 50, 24);
+            let widths: Vec<usize> = lines
+                .iter()
+                .filter(|line| !line.is_empty())
+                .map(|line| strip_ansi(line).chars().count())
+                .collect();
+            assert!(
+                widths.windows(2).all(|pair| pair[0] == pair[1]),
+                "ragged box for {ask:?}: {widths:?}"
+            );
+        }
+    }
+
+    /// Criterion 4 where it renders: the only keys the step advertises are the
+    /// two that move it. No text field, no "type a reason".
+    #[test]
+    fn reason_step_footer_offers_only_sign_and_back() {
+        let rendered = render_modal(&reason_step_modal(blocked_ask(), 0), 50, 24).join("\n");
+
+        assert!(rendered.contains("Enter=sign"), "{rendered}");
+        assert!(rendered.contains("Esc=back"), "{rendered}");
+        for absent in ["type", "Type", "input", "edit", "Tab"] {
+            assert!(
+                !rendered.contains(absent),
+                "the step advertises {absent:?}: {rendered}"
+            );
+        }
+    }
+
+    /// A long ask and a narrow box must not spill outside the border.
+    #[test]
+    fn reason_step_survives_a_narrow_box() {
+        let lines = render_modal(&reason_step_modal(blocked_ask(), 2), 24, 24);
+        let widths: Vec<usize> = lines
+            .iter()
+            .filter(|line| !line.is_empty())
+            .map(|line| strip_ansi(line).chars().count())
+            .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "ragged narrow box: {widths:?}"
+        );
     }
 
     #[test]
