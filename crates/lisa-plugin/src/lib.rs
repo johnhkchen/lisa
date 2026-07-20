@@ -16045,6 +16045,193 @@ mod tests {
         );
     }
 
+    /// Criterion 1, end to end: four keypresses from the board to a sealed
+    /// ticket, driven only through `handle_key`.
+    ///
+    /// The fixture lists `T-AFTER` then `T-PARKED`, so the parked ticket is one
+    /// row down — the worst case the criterion budgets for.
+    #[test]
+    fn four_keypresses_seal_a_parked_ticket() {
+        let (dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+
+        // [d] — the board offers the tickets it can finish.
+        assert!(press(&mut state, BareKey::Char('d')));
+        assert!(state.modal.open);
+        assert_eq!(state.modal.ticket_ids, vec!["T-AFTER", "T-PARKED"]);
+
+        // [j] — down to the parked one.
+        assert!(press(&mut state, BareKey::Char('j')));
+        assert_eq!(
+            state.modal.ticket_ids[state.modal.cursor].as_str(),
+            "T-PARKED"
+        );
+
+        // [Enter] — the reason step, with the recommendation preselected.
+        assert!(press(&mut state, BareKey::Enter));
+        let step = open_step(&state);
+        assert_eq!(step.choices[step.cursor], OverrideReason::EvidenceSatisfies);
+
+        // [Enter] — signed.
+        assert!(press(&mut state, BareKey::Enter));
+
+        let parked = state.dag.get_ticket(&"T-PARKED".to_string()).unwrap();
+        assert_eq!(parked.phase, Phase::Done);
+        assert_eq!(parked.status, lisa_core::types::TicketStatus::Done);
+        assert!(
+            state.dag.all_dependencies_done(&"T-AFTER".to_string()),
+            "the dependent goes ready on the next scheduling pass"
+        );
+
+        let ledger = read_mixed_ledger(&dir.path().join("provenance.jsonl"));
+        let receipt = ledger
+            .iter()
+            .find_map(|record| match record {
+                ProvenanceLedgerRecord::OperatorOverride(receipt) => Some(receipt),
+                _ => None,
+            })
+            .expect("four keypresses leave a receipt");
+        assert_eq!(receipt.actor, "operator");
+        assert_eq!(receipt.reason_id, "evidence-satisfies");
+        assert_eq!(receipt.reason, OverrideReason::EvidenceSatisfies.summary());
+        assert_eq!(receipt.overridden_ask, XCODE_ASK);
+        assert_eq!(receipt.note.criterion_quote(), XCODE_ASK);
+    }
+
+    /// Criterion 3, as a sweep rather than a claim: every verdict a listed
+    /// ticket can hold leads somewhere on Enter, and none of them produces the
+    /// rejection that used to be the end of the road.
+    #[test]
+    fn every_listed_ticket_leads_somewhere() {
+        let verdicts = [
+            (
+                "a passing review",
+                Some(r#"{"disposition":"pass","reason":null}"#),
+            ),
+            ("a blocked review", Some(XCODE_BLOCK)),
+            ("an unreadable review", Some("{this is not JSON")),
+            ("no review at all", None),
+        ];
+
+        for (verdict_name, disposition) in verdicts {
+            let (_dir, mut state) = sealing_fixture(disposition);
+            choose_ticket(&mut state, "T-PARKED");
+
+            let sealed =
+                state.dag.get_ticket(&"T-PARKED".to_string()).unwrap().phase == Phase::Done;
+            let offers_signature = state.modal.reason_step.is_some();
+            assert!(
+                sealed || offers_signature,
+                "{verdict_name} dead-ends: neither sealed nor offering a signature"
+            );
+            assert!(
+                !state.activity_events().any(|event| matches!(
+                    event,
+                    ActivityEvent::CompletionRejected {
+                        kind: CompletionRejectionKind::DispositionBlocked,
+                        ..
+                    }
+                )),
+                "{verdict_name} still produces the retired rejection"
+            );
+            assert!(
+                !matches!(
+                    state.modal.operator_outcome.as_ref(),
+                    Some(OperatorModalOutcome::Rejected {
+                        kind: CompletionRejectionKind::DispositionBlocked,
+                        ..
+                    })
+                ),
+                "{verdict_name} still shows the rejection modal"
+            );
+        }
+    }
+
+    /// Criterion 4: no free-text input exists anywhere in the flow.
+    ///
+    /// Absence claims rot silently, so this drives every printable character
+    /// that is not a bound key into both steps and asserts nothing accumulates
+    /// and nothing seals.
+    #[test]
+    fn no_free_text_input_exists_in_the_flow() {
+        const BOUND: &[char] = &['j', 'k', 'q', 'd', 'r', 'p', 'D', ' '];
+
+        // On the ticket list.
+        let (_dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+        state.open_mark_done_modal();
+        let listed = state.modal.ticket_ids.clone();
+        for character in ('!'..='~').filter(|c| !BOUND.contains(c)) {
+            assert!(
+                !press(&mut state, BareKey::Char(character)),
+                "the ticket list consumed {character:?}"
+            );
+            assert_eq!(state.modal.ticket_ids, listed);
+            assert!(state.modal.reason_step.is_none());
+        }
+
+        // On the reason step.
+        choose_ticket(&mut state, "T-PARKED");
+        let chosen = open_step(&state).cursor;
+        for character in ('!'..='~').filter(|c| !BOUND.contains(c)) {
+            assert!(
+                !press(&mut state, BareKey::Char(character)),
+                "the reason step consumed {character:?}"
+            );
+            let step = open_step(&state);
+            assert_eq!(step.cursor, chosen, "{character:?} moved the choice");
+            assert_eq!(
+                step.choices,
+                step.ask.applicable_reasons().to_vec(),
+                "{character:?} altered the catalog"
+            );
+        }
+        assert_ne!(
+            state.dag.get_ticket(&"T-PARKED".to_string()).unwrap().phase,
+            Phase::Done,
+            "typing must never seal a ticket"
+        );
+    }
+
+    /// The structural companion: no modal field can hold typed text, so a
+    /// future edit cannot reintroduce free text without tripping this.
+    #[test]
+    fn the_modal_holds_no_typed_text() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module marker remains available")
+            .0;
+
+        let modal_start = production
+            .find("struct MarkDoneModal {")
+            .expect("the modal struct exists");
+        let modal_end = modal_start
+            + production[modal_start..]
+                .find("\n}")
+                .expect("the modal struct closes");
+        let fields = &production[modal_start..modal_end];
+
+        assert!(
+            !fields.contains(": String"),
+            "a String field on the modal is a text box waiting to happen: {fields}"
+        );
+        assert!(
+            !fields.contains("input") && !fields.contains("buffer"),
+            "the modal grew an input surface: {fields}"
+        );
+        // The reason step's own state, likewise.
+        let step_start = production
+            .find("struct ReasonStep {")
+            .expect("the reason step struct exists");
+        let step_end = step_start
+            + production[step_start..]
+                .find("\n}")
+                .expect("the reason step struct closes");
+        assert!(
+            !production[step_start..step_end].contains(": String"),
+            "the reason step must carry choices, not prose"
+        );
+    }
+
     #[test]
     fn test_mark_done_already_pending_keeps_named_correlated_rejection_visible() {
         use std::fs;
