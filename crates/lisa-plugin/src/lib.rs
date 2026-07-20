@@ -754,6 +754,72 @@ struct LoggedActivity {
     event: ActivityEvent,
 }
 
+/// Why a ready ticket did not receive a thread on a scheduling pass.
+///
+/// Recorded rather than logged. A scheduling decline is state, not news: the
+/// activity feed carries facts an operator did not already know, and a healthy
+/// in-flight thread declining to be double-spawned is neither new nor
+/// actionable — it recurs on every pass, and a pass runs on nearly every event.
+/// So it lives here and surfaces in the Shift+D dump instead. Demotion, not
+/// erasure: the question "why didn't X spawn?" still has an answer, and now it
+/// has one for every admission arm rather than only for this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclineReason {
+    /// A durable Done record masks this ticket's ready state.
+    DurableDoneMasked,
+    /// A live thread already owns this ticket. Until T-052-02-01 this was an
+    /// Info in the activity feed: "Skipping {}: thread already exists".
+    ThreadAlreadyRunning,
+    /// The global concurrency ceiling is saturated.
+    GlobalCapReached { running: usize, max: usize },
+    /// The resolved provider's sub-cap is saturated.
+    ProviderCapReached { agent: AgentClient },
+    /// No compatible or recyclable pane slot is free.
+    NoSlotAvailable,
+    /// The only candidate pane is blocked on an agent question.
+    PaneAwaitingQuestion { pane_id: u32 },
+    /// An admitted ticket failed to launch. Failures are operator news, so the
+    /// detail is logged as an `Error` as well as recorded here.
+    SpawnFailed { detail: String },
+}
+
+impl DeclineReason {
+    /// One-line rendering for the state dump.
+    fn describe(&self) -> String {
+        match self {
+            Self::DurableDoneMasked => "durable Done record masks ready state".to_string(),
+            Self::ThreadAlreadyRunning => "thread already running".to_string(),
+            Self::GlobalCapReached { running, max } => {
+                format!("global thread cap reached ({}/{})", running, max)
+            }
+            Self::ProviderCapReached { agent } => format!("{} provider cap reached", agent),
+            Self::NoSlotAvailable => "no compatible pane slot free".to_string(),
+            Self::PaneAwaitingQuestion { pane_id } => {
+                format!("pane #{} is awaiting an answer", pane_id)
+            }
+            Self::SpawnFailed { detail } => format!("spawn failed: {}", detail),
+        }
+    }
+}
+
+/// The most recent `schedule_ready_tickets` pass that ran past its guards.
+///
+/// Last-write-wins rather than append: "why didn't X spawn?" is a question
+/// about the current pass, not about history, so a chronological ring would
+/// answer it by making the reader scan for the newest mention of X. Bounded by
+/// construction — at most one entry per ready candidate, replaced every pass.
+#[derive(Debug, Clone, Default)]
+struct SchedulingPass {
+    /// Wall clock at the end of the pass, as a duration since the Unix epoch.
+    at: std::time::Duration,
+    /// Ready candidates considered.
+    ready: usize,
+    /// Tickets that received a thread on this pass.
+    spawned: Vec<TicketId>,
+    /// Tickets that did not, and why — in candidate order.
+    declined: Vec<(TicketId, DeclineReason)>,
+}
+
 /// State for the modal overlay (mark-done, reset-ticket, or quit-confirm).
 #[derive(Default)]
 struct MarkDoneModal {
@@ -833,6 +899,10 @@ pub struct State {
 
     /// Snapshot of ticket phases from last DAG build, for change detection.
     last_phases: HashMap<TicketId, Phase>,
+
+    /// Record of the most recent scheduling pass that ran past its guards.
+    /// Rendered in the Shift+D state dump; never projected to the feed.
+    last_scheduling_pass: Option<SchedulingPass>,
 
     /// The last phase transition logged for each ticket, keyed by ticket ID.
     ///
@@ -4971,6 +5041,10 @@ impl State {
 
         let ready = self.dag.get_ready_tickets();
         let mut unscheduled = 0usize;
+        let mut pass = SchedulingPass {
+            ready: ready.len(),
+            ..SchedulingPass::default()
+        };
 
         for ticket_id in ready {
             if self
@@ -4979,6 +5053,8 @@ impl State {
                 .map(CompletionJournalAggregate::masks_durable_done)
                 .unwrap_or(false)
             {
+                pass.declined
+                    .push((ticket_id.clone(), DeclineReason::DurableDoneMasked));
                 continue;
             }
 
@@ -4993,9 +5069,10 @@ impl State {
                 if is_completed {
                     self.threads.remove(&ticket_id);
                 } else {
-                    self.log_activity(ActivityEvent::Info {
-                        message: format!("Skipping {}: thread already exists", ticket_id),
-                    });
+                    // Recorded, not logged. A healthy in-flight thread declining
+                    // to be double-spawned is the same non-news on every pass.
+                    pass.declined
+                        .push((ticket_id.clone(), DeclineReason::ThreadAlreadyRunning));
                     continue;
                 }
             }
@@ -5024,6 +5101,13 @@ impl State {
                 .count()
                 + self.triage_in_flight.len();
             if running_count >= self.config.max_threads {
+                pass.declined.push((
+                    ticket_id.clone(),
+                    DeclineReason::GlobalCapReached {
+                        running: running_count,
+                        max: self.config.max_threads,
+                    },
+                ));
                 unscheduled += 1;
                 continue;
             }
@@ -5036,6 +5120,10 @@ impl State {
             // unchanged). Pure decision factored into `provider_under_cap` so it
             // is unit-testable without Zellij host calls.
             if !self.provider_under_cap(route.agent) {
+                pass.declined.push((
+                    ticket_id.clone(),
+                    DeclineReason::ProviderCapReached { agent: route.agent },
+                ));
                 unscheduled += 1;
                 continue;
             }
@@ -5048,6 +5136,8 @@ impl State {
                 Some(SlotSelection::Compatible(idx)) => (idx, false),
                 Some(SlotSelection::Recycle(idx)) => (idx, true),
                 None => {
+                    pass.declined
+                        .push((ticket_id.clone(), DeclineReason::NoSlotAvailable));
                     unscheduled += 1;
                     continue;
                 }
@@ -5073,6 +5163,10 @@ impl State {
             // but if it does, leave the slot unassigned and retry next poll rather
             // than exiting or launching over the question UI.
             if self.is_pane_awaiting(pane_id) {
+                pass.declined.push((
+                    ticket_id.clone(),
+                    DeclineReason::PaneAwaitingQuestion { pane_id },
+                ));
                 unscheduled += 1;
                 continue;
             }
@@ -5103,6 +5197,12 @@ impl State {
                             ticket_id, error
                         ),
                     });
+                    pass.declined.push((
+                        ticket_id.clone(),
+                        DeclineReason::SpawnFailed {
+                            detail: format!("failed to mint attempt lease: {}", error),
+                        },
+                    ));
                     unscheduled += 1;
                     continue;
                 }
@@ -5121,6 +5221,12 @@ impl State {
                             ticket_id, error
                         ),
                     });
+                    pass.declined.push((
+                        ticket_id.clone(),
+                        DeclineReason::SpawnFailed {
+                            detail: format!("failed to publish attempt marker: {}", error),
+                        },
+                    ));
                     unscheduled += 1;
                     continue;
                 }
@@ -5162,6 +5268,12 @@ impl State {
                             ticket_id, pane_id, error
                         ),
                     });
+                    pass.declined.push((
+                        ticket_id.clone(),
+                        DeclineReason::SpawnFailed {
+                            detail: format!("pane {}: {}", pane_id, error),
+                        },
+                    ));
                     unscheduled += 1;
                     continue;
                 }
@@ -5214,6 +5326,12 @@ impl State {
                                     ticket_id, pane_id, error
                                 ),
                             });
+                            pass.declined.push((
+                                ticket_id.clone(),
+                                DeclineReason::SpawnFailed {
+                                    detail: format!("pane {}: {}", pane_id, error),
+                                },
+                            ));
                             unscheduled += 1;
                             continue;
                         }
@@ -5264,6 +5382,12 @@ impl State {
                                         ticket_id, pane_id, error
                                     ),
                                 });
+                                pass.declined.push((
+                                    ticket_id.clone(),
+                                    DeclineReason::SpawnFailed {
+                                        detail: format!("pane {}: {}", pane_id, error),
+                                    },
+                                ));
                                 unscheduled += 1;
                                 continue;
                             }
@@ -5291,6 +5415,12 @@ impl State {
                                     ticket_id, pane_id, error
                                 ),
                             });
+                            pass.declined.push((
+                                ticket_id.clone(),
+                                DeclineReason::SpawnFailed {
+                                    detail: format!("pane {}: {}", pane_id, error),
+                                },
+                            ));
                             unscheduled += 1;
                             continue;
                         }
@@ -5390,6 +5520,7 @@ impl State {
                 pane_id,
                 command: launch_cmd,
             });
+            pass.spawned.push(ticket_id.clone());
             self.log_activity(ActivityEvent::ThreadSpawned { ticket_id, pane_id });
         }
 
@@ -5401,6 +5532,11 @@ impl State {
                 ),
             });
         }
+
+        pass.at = std::time::Duration::from_secs(provenance::system_time_to_epoch(
+            std::time::SystemTime::now(),
+        ));
+        self.last_scheduling_pass = Some(pass);
     }
 
     /// Safety sweep: release any agent slots still assigned to done tickets.
@@ -8127,6 +8263,38 @@ impl State {
         } else {
             for (tid, health) in &health_list {
                 writeln!(out, "{:<14} {:?}", tid, health).unwrap();
+            }
+        }
+        writeln!(out).unwrap();
+
+        // Last Scheduling Pass — the berth for decisions the feed no longer
+        // carries. A scheduling decline recurs on every pass, so it is not
+        // operator news; it is still the answer to "why didn't X spawn?", and
+        // this is where that answer lives.
+        writeln!(out, "=== Last Scheduling Pass ===").unwrap();
+        match &self.last_scheduling_pass {
+            None => {
+                writeln!(out, "(no scheduling pass has run)").unwrap();
+            }
+            Some(pass) => {
+                let age = epoch_secs.saturating_sub(pass.at.as_secs());
+                writeln!(
+                    out,
+                    "at:        {} (unix epoch, {}s ago)",
+                    pass.at.as_secs(),
+                    age
+                )
+                .unwrap();
+                writeln!(out, "ready:     {}", pass.ready).unwrap();
+                if pass.spawned.is_empty() {
+                    writeln!(out, "spawned:   (none)").unwrap();
+                } else {
+                    writeln!(out, "spawned:   {}", pass.spawned.join(", ")).unwrap();
+                }
+                writeln!(out, "declined:  {}", pass.declined.len()).unwrap();
+                for (tid, reason) in &pass.declined {
+                    writeln!(out, "  {:<14} {}", tid, reason.describe()).unwrap();
+                }
             }
         }
         writeln!(out).unwrap();
@@ -11994,6 +12162,128 @@ mod tests {
             feed_phase_lines(&state),
             vec!["T-001 completed Design", "T-002 completed Design"]
         );
+    }
+
+    /// A board whose ready candidates all have live threads is not news. The
+    /// pass appends nothing to the feed — not on the first pass, and not on the
+    /// hundredth.
+    #[test]
+    fn scheduling_pass_over_live_threads_appends_no_feed_entries() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        )
+        .unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.push(fresh_slot(1, None));
+        // The healthy in-flight thread whose existence was re-announced once
+        // per pass, indefinitely.
+        state
+            .threads
+            .insert("T-001".to_string(), Thread::new("T-001", 1));
+
+        let before = state.activity_log.len();
+
+        state.schedule_ready_tickets();
+        assert_eq!(
+            state.activity_log.len(),
+            before,
+            "a pass over a fully-threaded board is silent"
+        );
+
+        // The defect was recurrence, so one pass is not a sufficient assertion.
+        state.schedule_ready_tickets();
+        state.schedule_ready_tickets();
+        assert_eq!(
+            state.activity_log.len(),
+            before,
+            "and stays silent however many times it runs"
+        );
+    }
+
+    /// Demotion, not erasure (P2): the skip decision the feed stopped carrying
+    /// is still recorded, and the state dump still answers "why didn't X
+    /// spawn?" — now through its own section rather than the activity ring.
+    #[test]
+    fn declined_spawn_survives_in_the_state_dump() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        )
+        .unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        state.agent_slots.push(fresh_slot(1, None));
+        state
+            .threads
+            .insert("T-001".to_string(), Thread::new("T-001", 1));
+
+        // Before any pass, the dump says so rather than inventing a record.
+        assert!(state
+            .format_snapshot()
+            .contains("(no scheduling pass has run)"));
+
+        state.schedule_ready_tickets();
+
+        let pass = state
+            .last_scheduling_pass
+            .as_ref()
+            .expect("a pass that ran past its guards records itself");
+        assert_eq!(pass.ready, 1);
+        assert!(pass.spawned.is_empty());
+        assert_eq!(
+            pass.declined,
+            vec![("T-001".to_string(), DeclineReason::ThreadAlreadyRunning)]
+        );
+
+        let snapshot = state.format_snapshot();
+        assert!(snapshot.contains("=== Last Scheduling Pass ==="));
+        assert!(
+            snapshot
+                .lines()
+                .any(|line| line.contains("T-001") && line.contains("thread already running")),
+            "the dump must name the ticket and the reason:\n{snapshot}"
+        );
+
+        // And the feed never carried it.
+        assert!(!state
+            .activity_events()
+            .any(|e| matches!(e, ActivityEvent::Info { message } if message.contains("Skipping"))));
     }
 
     /// The guard remembers only the *previous* transition, so a ticket that is
