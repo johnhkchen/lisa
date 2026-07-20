@@ -1322,11 +1322,16 @@ fn render_dag(state: &PluginState, pane_cols: usize, pan: &mut DagPan, output: &
 ///
 /// Reached only when a condensed board still runs past the pane, which is the
 /// one case where the map cannot be made to fit. Silence there would be the map
-/// lying about its own edge, so it says how much is missing and how wide a pane
-/// would have to be. S-054-02 will add the keys for panning to this sentence.
+/// lying about its own edge, so it says how much is missing, how to go and look
+/// at it, and how wide a pane would have to be.
+///
+/// The keys come before the arithmetic because they are what the reader can act
+/// on. The count stays true at every offset: the map is `widest` and the pane is
+/// `pane_cols` wherever the viewport sits, so panning changes which columns are
+/// off-screen, never how many.
 fn dag_overflow_line(widest: usize, pane_cols: usize) -> String {
     format!(
-        "{}({} column{} off-screen — the map needs {}, the pane has {}){}",
+        "{}({} column{} off-screen — [h]/[l] to pan — the map needs {}, the pane has {}){}",
         DIM,
         widest - pane_cols,
         if widest - pane_cols == 1 { "" } else { "s" },
@@ -4278,9 +4283,45 @@ mod tests {
 
         assert_eq!(
             indicator,
-            "(23 columns off-screen — the map needs 83, the pane has 60)"
+            "(23 columns off-screen — [h]/[l] to pan — the map needs 83, the pane has 60)"
         );
         assert_no_silent_clip(&output, 60);
+    }
+
+    #[test]
+    fn the_indicator_names_the_pan_keys() {
+        // AC4. The affordance announces itself exactly where the loss is
+        // reported, so the operator learns the keys at the moment they apply.
+        let state = mixed_status_board(7);
+        let (output, pan) = render_dag_panned(&state, 60, 0);
+
+        let indicator = output
+            .iter()
+            .map(|line| strip_ansi(line))
+            .find(|line| line.contains("off-screen"))
+            .expect("an overflowing board must carry the indicator");
+
+        assert!(pan.span > 0);
+        assert!(
+            indicator.contains("[h]/[l] to pan"),
+            "the indicator does not name the keys that reach the map: {indicator}"
+        );
+    }
+
+    #[test]
+    fn the_pan_keys_are_named_only_where_they_apply() {
+        // AC4's other half. On a board that fits, the keys do nothing, so
+        // advertising them would be an affordance that lies.
+        let state = mixed_status_board(7);
+
+        for pane in [200, 1000] {
+            let (output, pan) = render_dag_panned(&state, pane, 0);
+            assert_eq!(pan.span, 0);
+            assert!(
+                !output.iter().any(|line| line.contains("to pan")),
+                "a board that fits a {pane}-column pane offered pan keys"
+            );
+        }
     }
 
     #[test]
