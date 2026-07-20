@@ -293,6 +293,42 @@ pub struct ProposalActionRecord {
     pub occurred_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatorOverrideType {
+    OperatorOverride,
+}
+
+/// One completion a person signed over a block or an unreadable review.
+///
+/// Distinct from [`ProvenanceRecord`] on purpose. That row describes an attempt
+/// that ran, and requires a live thread and a current lease to write; the
+/// tickets an override serves are precisely the ones whose agent is already
+/// gone. Synthesizing a lease to reuse the execution shape would file a
+/// fabricated run, so the receipt gets its own shape and carries only facts:
+/// who signed, which catalog reason they chose, and the ask it overrode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorOverrideRecord {
+    pub schema_version: u32,
+    /// Completion durability tier in effect when the override was signed.
+    #[serde(default)]
+    pub seal: CompletionSeal,
+    pub record_type: OperatorOverrideType,
+    pub ticket_id: String,
+    /// Who signed. `"operator"` for the mark-done key.
+    pub actor: String,
+    /// Stable catalog key, held fixed across copy rewordings.
+    pub reason_id: String,
+    /// The operator-facing copy, frozen at signing time so an old receipt stays
+    /// readable after the catalog is reworded.
+    pub reason: String,
+    /// The ask or state this signature overrode, exactly as observed.
+    pub overridden_ask: String,
+    /// The note admitted with the completion.
+    pub note: DispositionNote,
+    pub occurred_at: u64,
+}
+
 /// One late token-usage join for an already-terminal ticket-run.
 ///
 /// The terminal [`ProvenanceRecord`] is written at completion with null tokens by
@@ -354,6 +390,7 @@ pub enum ProvenanceLedgerRecord {
     ParkingTransition(ParkingTransitionRecord),
     TriageTransition(TriageTransitionRecord),
     ProposalAction(ProposalActionRecord),
+    OperatorOverride(OperatorOverrideRecord),
     UsageCorrection(UsageCorrectionRecord),
     Execution(ProvenanceRecord),
 }
@@ -550,6 +587,14 @@ pub fn append_triage_transition_record(
 pub fn append_proposal_action_record(
     path: &Path,
     record: &ProposalActionRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+/// Append one operator-signed completion override as a single JSONL row.
+pub fn append_operator_override_record(
+    path: &Path,
+    record: &OperatorOverrideRecord,
 ) -> std::io::Result<()> {
     append_serialized(path, record)
 }
@@ -1159,6 +1204,103 @@ mod tests {
                 ProvenanceLedgerRecord::UsageCorrection(correction),
             ]
         );
+    }
+
+    fn sample_operator_override(ticket_id: &str) -> OperatorOverrideRecord {
+        OperatorOverrideRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: OperatorOverrideType::OperatorOverride,
+            ticket_id: ticket_id.to_string(),
+            actor: "operator".to_string(),
+            reason_id: "cannot-verify-here".to_string(),
+            reason: "This can't be checked from this machine — accepted as far as it can be checked here.".to_string(),
+            overridden_ask: "Sign into Xcode with an Apple ID, then re-run the signed build."
+                .to_string(),
+            note: DispositionNote::new(
+                "Sign into Xcode with an Apple ID, then re-run the signed build.",
+                "docs/active/work/T-015-02-02/review-disposition.json",
+                "This can't be checked from this machine — accepted as far as it can be checked here.",
+            )
+            .unwrap(),
+            occurred_at: 1_752_800_000,
+        }
+    }
+
+    #[test]
+    fn operator_override_record_round_trips_through_the_mixed_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.jsonl");
+        let record = sample_operator_override("T-015-02-02");
+
+        append_operator_override_record(&path, &record).unwrap();
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.contains("\"record_type\":\"operator-override\""));
+        // The receipt's three obligations: who signed, which reason, what it
+        // overrode.
+        assert!(body.contains("\"actor\":\"operator\""));
+        assert!(body.contains("\"reason_id\":\"cannot-verify-here\""));
+        assert!(body.contains("Sign into Xcode with an Apple ID"));
+
+        assert_eq!(
+            serde_json::from_str::<ProvenanceLedgerRecord>(body.trim()).unwrap(),
+            ProvenanceLedgerRecord::OperatorOverride(record)
+        );
+    }
+
+    /// The untagged enum resolves by shape, so a new arm could silently absorb
+    /// existing rows or be absorbed by an earlier one. Both directions checked.
+    #[test]
+    fn operator_override_row_does_not_absorb_or_get_absorbed() {
+        let override_line =
+            serde_json::to_string(&sample_operator_override("T-015-02-02")).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ProvenanceLedgerRecord>(&override_line).unwrap(),
+            ProvenanceLedgerRecord::OperatorOverride(_)
+        ));
+
+        let existing: Vec<(&str, String)> = vec![
+            (
+                "execution",
+                serde_json::to_string(&done_row("T-A", None, None)).unwrap(),
+            ),
+            (
+                "assignment",
+                serde_json::to_string(&sample_assignment_transition()).unwrap(),
+            ),
+            (
+                "parking",
+                serde_json::to_string(&sample_parking_transition(ParkingTransitionType::Park))
+                    .unwrap(),
+            ),
+            (
+                "usage-correction",
+                serde_json::to_string(&sample_correction("T-A", 1, 2)).unwrap(),
+            ),
+        ];
+        for (label, line) in existing {
+            let parsed: ProvenanceLedgerRecord = serde_json::from_str(&line).unwrap();
+            assert!(
+                !matches!(parsed, ProvenanceLedgerRecord::OperatorOverride(_)),
+                "the new arm absorbed an existing {label} row"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_fold_ignores_operator_override_rows() {
+        let without = vec![
+            ProvenanceLedgerRecord::Execution(done_row("T-A", None, None)),
+            ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-A", 100, 10)),
+        ];
+        let mut with = without.clone();
+        with.push(ProvenanceLedgerRecord::OperatorOverride(
+            sample_operator_override("T-A"),
+        ));
+
+        assert_eq!(correct_usage(&without), correct_usage(&with));
     }
 
     fn session_correction(
