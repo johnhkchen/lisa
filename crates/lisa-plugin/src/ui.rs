@@ -1061,7 +1061,7 @@ fn render_dag_body(
 /// Filters out completed tickets to keep the view focused on active work.
 /// Uses Sugiyama layered layout via ascii-dag for crossing minimization
 /// and proper fan-in/fan-out visualization.
-fn render_dag(state: &PluginState, output: &mut Vec<String>) {
+fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
     output.push(format!("{}{}≡≡ DAG ≡≡{}", BOLD, CYAN, RESET));
     output.push(String::new());
 
@@ -1579,7 +1579,13 @@ fn render_status_line(state: &PluginState) -> String {
 /// Render the complete dashboard to a vector of lines.
 ///
 /// Dispatches to a view-specific renderer based on the active preset.
-fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> Vec<String> {
+///
+/// `pane_cols` is the pane's true width. The text presets have always laid
+/// themselves out against at most 100 columns and still do — the clamp lives
+/// here rather than at the call site so that the one view which measures itself
+/// against the real pane, the DAG, can still see it.
+fn render_dashboard_lines(state: &PluginState, pane_cols: usize, height: usize) -> Vec<String> {
+    let width = pane_cols.min(100);
     let mut output = Vec::new();
 
     // Title bar with status (always present, all views)
@@ -1593,7 +1599,7 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
     match state.active_view {
         ViewPreset::Operations => render_operations_view(state, width, height, &mut output),
         ViewPreset::Present => render_present_view(state, width, &mut output),
-        ViewPreset::Dag => render_dag_view(state, &mut output),
+        ViewPreset::Dag => render_dag_view(state, pane_cols, &mut output),
         ViewPreset::Activity => render_activity_view(state, height, &mut output),
     }
 
@@ -1629,8 +1635,12 @@ fn render_operations_view(
 }
 
 /// DAG view: full dependency graph visualization with all available space.
-fn render_dag_view(state: &PluginState, output: &mut Vec<String>) {
-    render_dag(state, output);
+///
+/// The only view handed the pane's true width rather than the clamped one: the
+/// graph decides how much of each node's name it can afford to print, and that
+/// decision is only honest against the pane it is drawn in.
+fn render_dag_view(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
+    render_dag(state, pane_cols, output);
 }
 
 /// Activity view: full activity log with all entry types.
@@ -2116,7 +2126,7 @@ pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize, scroll_off
         return;
     }
 
-    let lines = render_dashboard_lines(state, cols.min(100), rows);
+    let lines = render_dashboard_lines(state, cols, rows);
 
     // Clamp scroll so we don't scroll past content
     let max_scroll = lines.len().saturating_sub(rows);
@@ -2134,6 +2144,11 @@ pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize, scroll_off
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pane wide enough that no board in these fixtures condenses. Tests that
+    /// are about something other than fitting pass this so they keep asserting
+    /// on full labels.
+    const DAG_WIDE: usize = 1000;
 
     fn sample_state() -> PluginState {
         PluginState {
@@ -2427,7 +2442,7 @@ mod tests {
     fn test_render_dag_not_empty() {
         let state = sample_state();
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
 
         assert!(!output.is_empty());
         assert!(output[0].contains("DAG"));
@@ -2437,7 +2452,7 @@ mod tests {
     fn test_render_dag_empty() {
         let state = PluginState::default();
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
 
         assert!(output.iter().any(|line| line.contains("no tickets")));
     }
@@ -3037,7 +3052,7 @@ mod tests {
     fn test_dag_status_tokens_are_colored() {
         let state = four_status_state();
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         for (token, color, name) in [
@@ -3067,7 +3082,7 @@ mod tests {
     fn test_dag_ticket_ids_keep_phase_color() {
         let state = four_status_state();
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         for (id, phase) in [
@@ -3109,7 +3124,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         assert_eq!(
@@ -3128,7 +3143,7 @@ mod tests {
         // the rendered view reproduces those lines byte for byte.
         let state = four_status_state();
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
 
         let labels: Vec<String> = state
             .tickets
@@ -3157,6 +3172,50 @@ mod tests {
         assert_eq!(
             actual, expected,
             "coloring shifted the raw DAG content; this ticket may only insert escapes"
+        );
+    }
+
+    #[test]
+    fn text_presets_still_clamp_at_a_hundred_columns() {
+        // AC5, second half. The clamp moved one scope inward so the DAG could
+        // see past it; for the text presets it must still govern, which is
+        // observable as: below 100 the pane's width matters, above it nothing
+        // changes.
+        // An ask long enough to be cut at 80 columns and whole at 100.
+        let long_ask =
+            "Run the checkout test exactly once and then tell Lisa which of the two paths it took."
+                .to_string();
+        assert!((77..=96).contains(&long_ask.chars().count()));
+
+        let state = PluginState {
+            desk: DeskState {
+                cards: vec![DeskCard {
+                    ticket_id: "T-ASK".to_string(),
+                    title: "checkout-test".to_string(),
+                    age_stamp: Some(NOW - Duration::from_secs(7200)),
+                    kind: DeskCardKind::Block,
+                    ask: long_ask,
+                    detail: DeskDetail::default(),
+                }],
+                ..DeskState::default()
+            },
+            active_view: ViewPreset::Present,
+            current_time: NOW,
+            ..PluginState::default()
+        };
+
+        let at_80 = render_dashboard_lines(&state, 80, 40);
+        let at_100 = render_dashboard_lines(&state, 100, 40);
+        let at_200 = render_dashboard_lines(&state, 200, 40);
+
+        assert_ne!(
+            at_80, at_100,
+            "the fixture must be width-sensitive below the clamp, or this test \
+             proves nothing"
+        );
+        assert_eq!(
+            at_100, at_200,
+            "a pane past 100 columns must change nothing for a text preset"
         );
     }
 
@@ -3233,7 +3292,7 @@ mod tests {
     fn test_render_dag_filters_done_tickets() {
         let state = sample_state(); // T-001 is Done, T-002 InProgress, T-003 Blocked
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         // T-001 is Done — should be filtered out, mentioned in hidden count
@@ -3259,7 +3318,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         assert!(
@@ -3306,7 +3365,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         // All four tickets should appear (none are done)
@@ -3372,7 +3431,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         // All three roots and the leaf should appear
@@ -3435,7 +3494,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         assert!(full.contains("T-001"), "T-001 missing");
@@ -3485,7 +3544,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, &mut output);
+        render_dag(&state, DAG_WIDE, &mut output);
         let full = output.join("\n");
 
         // T-001 should be filtered
