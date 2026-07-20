@@ -300,6 +300,9 @@ pub enum ActivityType {
 #[derive(Debug, Clone)]
 pub struct ActivityEntry {
     pub timestamp: Duration,
+    /// Consecutive identical occurrences folded into this entry; always at
+    /// least 1. Greater than one renders as a trailing `(xN)` on the line.
+    pub count: u32,
     pub activity: ActivityType,
 }
 
@@ -470,6 +473,23 @@ pub(crate) fn format_age_bucket(timestamp: Duration, current_time: Duration) -> 
         60..=3599 => format!("{}m ago", secs / 60),
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// Hang the fold's multiplier on a rendered line.
+///
+/// A line that absorbed echoes says so — `sweep retried (x3)` — and one that did
+/// not is returned untouched, so an unfolded line renders byte-identically to
+/// what it rendered before folding existed.
+///
+/// Callers apply this *after* their own truncation. The multiplier is the part
+/// of the line an operator cannot reconstruct from anywhere else, so it must
+/// never be the part the `...` eats.
+pub(crate) fn with_repeat_tag(message: String, count: u32) -> String {
+    if count <= 1 {
+        message
+    } else {
+        format!("{message} (x{count})")
     }
 }
 
@@ -1019,7 +1039,11 @@ fn format_completion_rejection(
 }
 
 /// Render the activity log
-fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec<String>) {
+pub(crate) fn render_activity_log(
+    state: &PluginState,
+    max_entries: usize,
+    output: &mut Vec<String>,
+) {
     output.push(format!("{}{}=== Recent Activity ==={}", BOLD, BLUE, RESET));
     output.push(String::new());
 
@@ -1104,6 +1128,7 @@ fn render_activity_log(state: &PluginState, max_entries: usize, output: &mut Vec
             ),
         };
 
+        let message = with_repeat_tag(message, entry.count);
         output.push(format!(
             "{}{}{} {:<12} {}{}{}",
             color, icon, RESET, time_ago, color, message, RESET
@@ -1193,6 +1218,7 @@ fn render_filtered_activity_log(state: &PluginState, max_entries: usize, output:
             _ => continue,
         };
 
+        let message = with_repeat_tag(message, entry.count);
         output.push(format!(
             "{}{}{} {:<12} {}{}{}",
             color, icon, RESET, time_ago, color, message, RESET
@@ -1750,6 +1776,7 @@ mod tests {
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(30),
+                    count: 1,
                     activity: ActivityType::PhaseCompleted {
                         ticket_id: "T-001".to_string(),
                         phase: Phase::Implement,
@@ -1757,6 +1784,7 @@ mod tests {
                 },
                 ActivityEntry {
                     timestamp: Duration::from_secs(60),
+                    count: 1,
                     activity: ActivityType::ThreadStarted {
                         ticket_id: "T-002".to_string(),
                         phase: Phase::Design,
@@ -1850,6 +1878,7 @@ mod tests {
             .iter()
             .map(|(elapsed, _)| ActivityEntry {
                 timestamp: Duration::from_secs(TEST_NOW_SECS - elapsed),
+                count: 1,
                 activity: ActivityType::PhaseCompleted {
                     ticket_id: format!("T-AGE-{elapsed}"),
                     phase: Phase::Implement,
@@ -1883,6 +1912,98 @@ mod tests {
             assert!(
                 !view.contains("495696h"),
                 "{view_name} view regressed to the epoch composite: {view}"
+            );
+        }
+    }
+
+    /// Render one entry through both activity views.
+    ///
+    /// `PhaseCompleted` and `Warning` both survive the alerts-only filter, so a
+    /// single fixture drives both renderers — the pattern
+    /// `activity_feed_renders_only_bucket_shapes` established.
+    fn both_activity_views(entry: ActivityEntry) -> [(&'static str, String); 2] {
+        let state = PluginState {
+            activity_log: vec![entry],
+            current_time: Duration::from_secs(TEST_NOW_SECS),
+            ..PluginState::default()
+        };
+
+        let mut full = Vec::new();
+        render_activity_log(&state, 5, &mut full);
+        let mut alerts = Vec::new();
+        render_filtered_activity_log(&state, 5, &mut alerts);
+
+        [
+            ("full Activity", full.join("\n")),
+            ("alerts-only", alerts.join("\n")),
+        ]
+    }
+
+    #[test]
+    fn folded_entry_renders_the_multiplier_in_both_views() {
+        let views = both_activity_views(ActivityEntry {
+            timestamp: Duration::from_secs(TEST_NOW_SECS - 60),
+            count: 3,
+            activity: ActivityType::PhaseCompleted {
+                ticket_id: "T-FOLD".to_string(),
+                phase: Phase::Implement,
+            },
+        });
+
+        for (view_name, view) in views {
+            assert!(
+                view.contains("T-FOLD completed Implement (x3)"),
+                "{view_name} view dropped the multiplier: {view}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_occurrence_renders_without_a_tag() {
+        let views = both_activity_views(ActivityEntry {
+            timestamp: Duration::from_secs(TEST_NOW_SECS - 60),
+            count: 1,
+            activity: ActivityType::PhaseCompleted {
+                ticket_id: "T-ONCE".to_string(),
+                phase: Phase::Implement,
+            },
+        });
+
+        for (view_name, view) in views {
+            assert!(
+                view.contains("T-ONCE completed Implement"),
+                "{view_name} view lost the line: {view}"
+            );
+            assert!(
+                !view.contains("(x"),
+                "{view_name} view tagged an unfolded line: {view}"
+            );
+        }
+    }
+
+    /// The tag goes on after truncation. Both views cut free text (40 chars in
+    /// the full feed, 50 in alerts) — the multiplier is the one part of the line
+    /// nothing else can reconstruct, so the `...` must never eat it.
+    #[test]
+    fn the_multiplier_survives_message_truncation() {
+        let views = both_activity_views(ActivityEntry {
+            timestamp: Duration::from_secs(TEST_NOW_SECS - 60),
+            count: 2,
+            activity: ActivityType::Warning {
+                ticket_id: String::new(),
+                message: "a warning long enough to be cut by either view's truncation rule"
+                    .to_string(),
+            },
+        });
+
+        for (view_name, view) in views {
+            assert!(
+                view.contains("..."),
+                "{view_name} fixture must actually truncate: {view}"
+            );
+            assert!(
+                view.contains("... (x2)"),
+                "{view_name} view must tag after truncating, not before: {view}"
             );
         }
     }
@@ -2291,6 +2412,7 @@ mod tests {
             .enumerate()
             .map(|(index, (kind, correlation_id))| ActivityEntry {
                 timestamp: Duration::from_secs(index as u64),
+                count: 1,
                 activity: ActivityType::CompletionRejected {
                     ticket_id: format!("T-REJECT-{index}"),
                     kind: *kind,
@@ -2729,6 +2851,7 @@ mod tests {
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(50),
+                    count: 1,
                     activity: ActivityType::PhaseCompleted {
                         ticket_id: "T-001".to_string(),
                         phase: Phase::Implement,
@@ -2736,6 +2859,7 @@ mod tests {
                 },
                 ActivityEntry {
                     timestamp: Duration::from_secs(100),
+                    count: 1,
                     activity: ActivityType::ThreadStarted {
                         ticket_id: "T-002".to_string(),
                         phase: Phase::Design,
@@ -2743,6 +2867,7 @@ mod tests {
                 },
                 ActivityEntry {
                     timestamp: Duration::from_secs(120),
+                    count: 1,
                     activity: ActivityType::Error {
                         ticket_id: "T-003".to_string(),
                         message: "test error".to_string(),

@@ -9430,6 +9430,7 @@ fn activity_event_to_ui_entry(entry: &LoggedActivity) -> Option<ui::ActivityEntr
 
     Some(ui::ActivityEntry {
         timestamp: entry.at,
+        count: entry.count,
         activity,
     })
 }
@@ -11344,6 +11345,71 @@ mod tests {
             ActivityEvent::Info {
                 message: "fact-1".to_string()
             }
+        );
+    }
+
+    /// AC1 through the operator's eye rather than the struct's: what reaches the
+    /// dashboard is one line wearing an honest multiplier.
+    #[test]
+    fn folded_line_renders_one_entry_with_the_multiplier() {
+        let mut state = State::default();
+        for offset in [0, 5, 10] {
+            state.log_activity_at(
+                ActivityEvent::Warning {
+                    message: "sweep retried".to_string(),
+                },
+                feed_test_instant(offset),
+            );
+        }
+
+        let mut lines = Vec::new();
+        ui::render_activity_log(&state.to_ui_state(), 20, &mut lines);
+        let feed: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("sweep retried"))
+            .collect();
+
+        assert_eq!(feed.len(), 1, "three echoes must print one line");
+        assert!(
+            feed[0].contains("sweep retried (x3)"),
+            "the line must carry its multiplier: {}",
+            feed[0]
+        );
+    }
+
+    /// AC3/N4: the projection reads the entry it was handed and nothing else —
+    /// it neither rescans neighbours nor accumulates across calls.
+    #[test]
+    fn projection_preserves_the_count() {
+        let mut state = State::default();
+        for offset in [0, 1] {
+            state.log_activity_at(
+                ActivityEvent::Info {
+                    message: "echo".to_string(),
+                },
+                feed_test_instant(offset),
+            );
+        }
+
+        let project = |state: &State| -> Vec<(u32, std::time::Duration)> {
+            state
+                .activity_log
+                .iter()
+                .filter_map(activity_event_to_ui_entry)
+                .map(|entry| (entry.count, entry.timestamp))
+                .collect()
+        };
+
+        let first = project(&state);
+        assert_eq!(
+            first,
+            vec![(2, std::time::Duration::from_secs(FEED_TEST_NOW_SECS + 1))],
+            "the projected entry carries the envelope's count and latest stamp"
+        );
+        assert_eq!(
+            project(&state),
+            first,
+            "projecting again must yield the same counts — the map is pure"
         );
     }
 
