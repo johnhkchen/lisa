@@ -834,6 +834,14 @@ pub struct State {
     /// Snapshot of ticket phases from last DAG build, for change detection.
     last_phases: HashMap<TicketId, Phase>,
 
+    /// The last phase transition logged for each ticket, keyed by ticket ID.
+    ///
+    /// Guards against two advance detectors observing the same transition in
+    /// one tick and each announcing it. Holds only the *previous* transition
+    /// rather than a set: a ticket that is reset and re-run legitimately
+    /// repeats `Research -> Design`, and that repeat is real news.
+    logged_transitions: HashMap<TicketId, (Phase, Phase)>,
+
     /// Whether initial loading has completed.
     initialized: bool,
 
@@ -3126,15 +3134,7 @@ impl State {
         self.pending_completions.remove(ticket_id);
         self.rebuild_dag();
 
-        self.log_activity(ActivityEvent::PhaseCompleted {
-            ticket_id: ticket_id.to_string(),
-            phase: pending.prior_phase,
-        });
-        self.log_activity(ActivityEvent::TicketPhaseChanged {
-            ticket_id: ticket_id.to_string(),
-            old_phase: pending.prior_phase,
-            new_phase: Phase::Done,
-        });
+        self.log_phase_transition(ticket_id, pending.prior_phase, Phase::Done);
         self.log_activity(ActivityEvent::Info {
             message: success_message,
         });
@@ -3354,6 +3354,34 @@ impl State {
         if self.activity_log.len() > Self::MAX_ACTIVITY_LOG {
             self.activity_log.remove(0);
         }
+    }
+
+    /// Log one phase transition, exactly once.
+    ///
+    /// Emits the `PhaseCompleted` + `TicketPhaseChanged` pair the advance
+    /// detectors have always emitted — unless this exact transition was the
+    /// last one logged for this ticket, in which case a second detector is
+    /// observing a transition the first already reported and this is a no-op.
+    ///
+    /// Feed cost is one line: `TicketPhaseChanged` does not project (see
+    /// [`activity_event_to_ui_entry`]), so the pair renders as the single
+    /// "{ticket} completed {from}" headline while both events remain in the
+    /// activity ring and in the Shift+D state dump.
+    fn log_phase_transition(&mut self, ticket_id: &str, from: Phase, to: Phase) {
+        if self.logged_transitions.get(ticket_id) == Some(&(from, to)) {
+            return;
+        }
+        self.logged_transitions
+            .insert(ticket_id.to_string(), (from, to));
+        self.log_activity(ActivityEvent::PhaseCompleted {
+            ticket_id: ticket_id.to_string(),
+            phase: from,
+        });
+        self.log_activity(ActivityEvent::TicketPhaseChanged {
+            ticket_id: ticket_id.to_string(),
+            old_phase: from,
+            new_phase: to,
+        });
     }
 
     /// Iterate the bare events in the activity log, oldest first.
@@ -5577,16 +5605,8 @@ impl State {
                     continue;
                 }
 
-                // Log events
-                self.log_activity(ActivityEvent::PhaseCompleted {
-                    ticket_id: ticket_id.clone(),
-                    phase: current_phase,
-                });
-                self.log_activity(ActivityEvent::TicketPhaseChanged {
-                    ticket_id: ticket_id.clone(),
-                    old_phase: current_phase,
-                    new_phase: next_phase,
-                });
+                // Log the transition — once, however many detectors see it.
+                self.log_phase_transition(&ticket_id, current_phase, next_phase);
 
                 // Update thread phase
                 if let Some(thread) = self.threads.get_mut(&ticket_id) {
@@ -6116,15 +6136,7 @@ impl State {
                         continue;
                     }
 
-                    self.log_activity(ActivityEvent::PhaseCompleted {
-                        ticket_id: ticket_id.clone(),
-                        phase: Phase::Implement,
-                    });
-                    self.log_activity(ActivityEvent::TicketPhaseChanged {
-                        ticket_id: ticket_id.clone(),
-                        old_phase: Phase::Implement,
-                        new_phase: Phase::Review,
-                    });
+                    self.log_phase_transition(&ticket_id, Phase::Implement, Phase::Review);
 
                     if let Some(thread) = self.threads.get_mut(&ticket_id) {
                         thread.current_phase = Phase::Review;
@@ -6222,15 +6234,7 @@ impl State {
                             continue;
                         }
 
-                        self.log_activity(ActivityEvent::PhaseCompleted {
-                            ticket_id: ticket_id.clone(),
-                            phase: current_phase,
-                        });
-                        self.log_activity(ActivityEvent::TicketPhaseChanged {
-                            ticket_id: ticket_id.clone(),
-                            old_phase: current_phase,
-                            new_phase: next_phase,
-                        });
+                        self.log_phase_transition(&ticket_id, current_phase, next_phase);
 
                         if let Some(thread) = self.threads.get_mut(&ticket_id) {
                             thread.current_phase = next_phase;
@@ -8422,6 +8426,9 @@ impl State {
             });
         }
 
+        // A retry re-walks phases the pre-reset run already walked. Forget the
+        // pre-reset transition so the first one after the reset reads as news.
+        self.logged_transitions.remove(&tid);
         self.log_activity(ActivityEvent::TicketPhaseChanged {
             ticket_id: tid.clone(),
             old_phase,
@@ -11788,6 +11795,122 @@ mod tests {
         // Verify ticket file was updated
         let updated = fs::read_to_string(state.config.ticket_dir.join("T-001.md")).unwrap();
         assert!(updated.contains("phase: design"));
+    }
+
+    /// Build a state with T-001 at Research, research.md admitted, a running
+    /// thread, and an idle signal on pane 1 — enough to drive *either* the
+    /// artifact detector or the idle detector over the same transition.
+    fn research_state_reachable_by_both_detectors(dir: &std::path::Path) -> State {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let tickets_dir = dir.join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+        )
+        .unwrap();
+
+        let work_dir = dir.join("work");
+        fs::create_dir_all(work_dir.join("T-001")).unwrap();
+        fs::write(work_dir.join("T-001/research.md"), "# Research done").unwrap();
+
+        let signal_dir = dir.join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir,
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Research;
+        state.threads.insert("T-001".to_string(), thread);
+        state
+    }
+
+    fn phase_completed_count(state: &State, ticket: &str, of_phase: Phase) -> usize {
+        state
+            .activity_events()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ActivityEvent::PhaseCompleted { ticket_id, phase }
+                    if ticket_id == ticket && *phase == of_phase
+                )
+            })
+            .count()
+    }
+
+    /// Two advance detectors observing the same Research → Design transition
+    /// announce it once between them.
+    ///
+    /// The second detector is handed the pre-transition phase deliberately:
+    /// that is the shape the guard exists for — an observer that has not yet
+    /// seen what another observer already reported. `poll_tick` runs the
+    /// artifact detector before the idle detector, so without the guard each
+    /// would emit its own pair and the feed would carry the transition twice.
+    #[test]
+    fn two_detectors_observing_one_transition_announce_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = research_state_reachable_by_both_detectors(dir.path());
+
+        state.check_artifact_advances();
+        assert_eq!(
+            phase_completed_count(&state, "T-001", Phase::Research),
+            1,
+            "the first detector announces the transition"
+        );
+
+        // Second detector, still holding Research.
+        state.threads.get_mut("T-001").unwrap().current_phase = Phase::Research;
+        state.check_idle_signals();
+
+        assert_eq!(
+            phase_completed_count(&state, "T-001", Phase::Research),
+            1,
+            "the second detector must not re-announce the same transition"
+        );
+    }
+
+    /// The guard remembers only the *previous* transition, so a ticket that is
+    /// reset and re-run announces its repeated phases again.
+    #[test]
+    fn a_repeated_transition_after_other_transitions_is_announced_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = research_state_reachable_by_both_detectors(dir.path());
+
+        state.log_phase_transition("T-001", Phase::Research, Phase::Design);
+        state.log_phase_transition("T-001", Phase::Research, Phase::Design);
+        assert_eq!(phase_completed_count(&state, "T-001", Phase::Research), 1);
+
+        // An intervening transition, then the same edge again — a real repeat.
+        state.log_phase_transition("T-001", Phase::Design, Phase::Structure);
+        state.log_phase_transition("T-001", Phase::Research, Phase::Design);
+        assert_eq!(
+            phase_completed_count(&state, "T-001", Phase::Research),
+            2,
+            "a genuine repeat is news, not an echo"
+        );
     }
 
     #[test]
