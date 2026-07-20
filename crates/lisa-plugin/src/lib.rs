@@ -12111,6 +12111,76 @@ mod tests {
         assert_eq!(feed_phase_lines(&state), vec!["T-001 completed Research"]);
     }
 
+    /// The completion detector: one transition, one feed line.
+    ///
+    /// Driven through a real journal-sealed completion rather than by calling
+    /// `finish_successful_completion` directly, so the assertion covers the
+    /// path an operator's Review → Done actually takes. The success `Info` the
+    /// completion also logs is a distinct fact and is not counted here —
+    /// `feed_phase_lines` reads transition lines only.
+    #[test]
+    fn completion_advance_yields_one_feed_line() {
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        const TICKET: &str = "T-SEAL";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let tickets_dir = root.join("tickets");
+        let work_dir = root.join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join(format!("{TICKET}.md")),
+            format!(
+                "---\nid: {TICKET}\ntitle: seal\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n"
+            ),
+        )
+        .unwrap();
+
+        let mut state = State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir,
+                completion_seal: CompletionSeal::Journal,
+                lisa_bin: None,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            project_root: root.to_path_buf(),
+            git_root: PathBuf::new(),
+            attempt_dir: root.join("attempts"),
+            completion_journal_path: root.join("completion-journal.jsonl"),
+            completion_journal_healthy: true,
+            ledger_path: root.join("provenance.jsonl"),
+            ..State::default()
+        };
+        let mut thread = Thread::new(TICKET, 42);
+        thread.current_phase = Phase::Review;
+        state.threads.insert(TICKET.to_string(), thread);
+
+        let lease = install_current_attempt(&mut state, TICKET);
+        fs::create_dir_all(state.attempt_work_dir(&lease)).unwrap();
+        fs::write(
+            state.attempt_work_dir(&lease).join("review.md"),
+            "# Review\nDone.\n",
+        )
+        .unwrap();
+        write_passing_review_disposition(&state, &lease);
+
+        assert!(state.dispatch_completion(CompletionInput::Reconcile {
+            ticket_id: TICKET.to_string(),
+            source_lease: lease,
+        }));
+        assert_eq!(
+            state.dag.get_ticket(&TICKET.to_string()).unwrap().phase,
+            Phase::Done,
+            "the fixture must actually reach Done for the line count to mean anything"
+        );
+
+        assert_eq!(feed_phase_lines(&state), vec!["T-SEAL completed Review"]);
+    }
+
     /// `TicketPhaseChanged` and `ThreadExited` carry no feed shape at all, so
     /// no emitter of either can mint a second line for a transition the
     /// `PhaseCompleted` half already announced.
