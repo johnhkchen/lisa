@@ -9413,10 +9413,22 @@ impl State {
             .iter()
             .map(|thread| (thread.ticket_id.as_str(), thread))
             .collect();
+        // A card here says "Review finished — this one is waiting for you". An
+        // agent holding a running thread on the ticket makes both halves false:
+        // review has not finished, and what it waits on is that agent, not a
+        // person. Parked threads are the class this card was built for and are
+        // untouched.
+        let being_reviewed: std::collections::HashSet<&str> = self
+            .threads
+            .values()
+            .filter(|thread| thread.status == lisa_core::types::ThreadStatus::Running)
+            .map(|thread| thread.ticket_id.as_str())
+            .collect();
         let mut review_waits: Vec<ui::DeskCard> = tickets
             .iter()
             .filter(|ticket| ticket.phase == ui::Phase::Review)
             .filter(|ticket| !already_asking.contains(&ticket.id))
+            .filter(|ticket| !being_reviewed.contains(ticket.id.as_str()))
             .map(|ticket| {
                 let thread = parked_by_ticket.get(ticket.id.as_str());
                 ui::DeskCard {
@@ -10937,6 +10949,31 @@ mod tests {
         assert_eq!(state.scroll_offset, 1);
         assert_eq!(state.desk_selected, 0);
         assert!(!state.desk_expanded);
+    }
+
+    /// A review an agent is still running is not a decision waiting on anyone,
+    /// and the card would say it was. The parked class the card exists for is
+    /// unaffected.
+    #[test]
+    fn a_running_review_is_not_a_review_wait() {
+        let (_dir, mut state) = desk_state_from(&[
+            "---\nid: T-REVIEW\ntitle: in-review\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nFixture\n",
+        ]);
+        assert_eq!(state.to_ui_state().desk.cards.len(), 1);
+
+        let mut thread = lisa_core::types::Thread::new("T-REVIEW", 7);
+        thread.current_phase = Phase::Review;
+        state.threads.insert("T-REVIEW".to_string(), thread);
+        assert!(
+            state.to_ui_state().desk.cards.is_empty(),
+            "an agent is mid-review; nothing is waiting on a person"
+        );
+
+        // Parked means the agent finished and handed it up — the card returns.
+        state.threads.get_mut("T-REVIEW").unwrap().park();
+        let cards = state.to_ui_state().desk.cards;
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].kind, ui::DeskCardKind::ReviewWait);
     }
 
     /// Criterion 1: one press reaches the desk from wherever the operator is,
