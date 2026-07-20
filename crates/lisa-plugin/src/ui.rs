@@ -529,6 +529,26 @@ impl ViewPreset {
     }
 }
 
+/// The DAG's horizontal viewport: how far the operator has panned, and how far
+/// there is to pan.
+///
+/// `offset` travels in and `span` travels out. The render is the only thing that
+/// knows how wide the map came out, so it reports rather than being asked — the
+/// same instinct as the overflow indicator, which says what the render actually
+/// did instead of guessing.
+///
+/// `span` is zero in every view but the DAG and zero on a map that fits, which
+/// is what lets the pan keys be inert without the key handler needing to know
+/// which views own a graph.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DagPan {
+    /// Visible columns dropped from the left of every graph body line.
+    pub offset: usize,
+    /// `widest_visible_line − pane_cols`: the largest offset that reveals
+    /// anything, and the same number the overflow indicator prints.
+    pub span: usize,
+}
+
 /// The complete plugin state for rendering
 #[derive(Debug, Clone)]
 pub struct PluginState {
@@ -969,6 +989,83 @@ fn widest_visible_line(rendered: &str) -> usize {
     rendered.lines().map(visible_width).max().unwrap_or(0)
 }
 
+/// Drop the first `offset` visible columns from a line that may already be
+/// painted.
+///
+/// The hazard this function exists for: by the time a line is sliced it carries
+/// injected SGR escapes, and a byte or `char` cut can land inside `\u{1b}[36m`
+/// and spill the tail onto the screen as literal garbage. This walks columns the
+/// way [`visible_width`] counts them — escapes consumed whole, never counted —
+/// so a cut can only ever land between sequences.
+///
+/// Paint survives the cut. Sequences still in force where the cut lands are
+/// re-emitted at the front, so a node straddling the left edge keeps the status
+/// color that is condensed mode's only status channel. Everything past the cut
+/// is copied verbatim, escapes included, so the line's own resets arrive
+/// untouched and the function stays total over any SGR vocabulary rather than
+/// only the one we inject.
+///
+/// Nothing is truncated on the right: the terminal clips that edge today and the
+/// overflow indicator already accounts for it.
+fn pan_line(line: &str, offset: usize) -> String {
+    // The identity case, stated rather than computed: an unpanned board must be
+    // byte-for-byte what it was before this function existed.
+    if offset == 0 {
+        return line.to_string();
+    }
+
+    let mut chars = line.chars();
+    let mut column = 0;
+    // Sequences opened and not yet cancelled. A list, not "the last one seen":
+    // `{BOLD}{CYAN}` is two consecutive sequences, and remembering only the
+    // last would quietly drop the bold.
+    let mut active: Vec<String> = Vec::new();
+
+    while column < offset {
+        let Some(character) = chars.next() else {
+            // The whole line lies left of the cut. Nothing visible remains, so
+            // emit nothing — carrying color onto an empty line would be ink
+            // with nothing to paint.
+            return String::new();
+        };
+
+        if character == '\u{1b}' {
+            let mut sequence = String::from(character);
+            for escaped in chars.by_ref() {
+                sequence.push(escaped);
+                if escaped == 'm' {
+                    break;
+                }
+            }
+            if sequence == RESET {
+                active.clear();
+            } else {
+                active.push(sequence);
+            }
+            continue;
+        }
+
+        column += 1;
+    }
+
+    let remainder: String = chars.collect();
+    // Visible content, not bytes: a line cut at exactly its last column still
+    // trails the reset that closed it, and emitting color plus a reset with no
+    // glyphs between them is ink with nothing to paint.
+    if visible_width(&remainder) == 0 {
+        return String::new();
+    }
+
+    let mut out = active.concat();
+    out.push_str(&remainder);
+    // A cut can carry a color across without its closing reset ever appearing
+    // in what survived. Close it here so no ink leaks past this line.
+    if !active.is_empty() && !remainder.contains(RESET) {
+        out.push_str(RESET);
+    }
+    out
+}
+
 /// How much of a node's name the board can afford to print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LabelStyle {
@@ -1061,7 +1158,7 @@ fn render_dag_body(
 /// Filters out completed tickets to keep the view focused on active work.
 /// Uses Sugiyama layered layout via ascii-dag for crossing minimization
 /// and proper fan-in/fan-out visualization.
-fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
+fn render_dag(state: &PluginState, pane_cols: usize, pan: &mut DagPan, output: &mut Vec<String>) {
     output.push(format!("{}{}≡≡ DAG ≡≡{}", BOLD, CYAN, RESET));
     output.push(String::new());
 
@@ -1144,6 +1241,19 @@ fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
         })
         .collect();
 
+    // How much map lies outside the pane — the largest offset that reveals
+    // anything, and the same number the indicator prints below. `pane_cols == 0`
+    // is a caller that does not know the pane, so there is nothing to pan past.
+    let widest = widest_visible_line(&rendered);
+    pan.span = if pane_cols > 0 {
+        widest.saturating_sub(pane_cols)
+    } else {
+        0
+    };
+    // The renderer clamps, because the renderer is where the bound is known —
+    // the same arrangement `print_dashboard` uses for the page scroll.
+    let offset = pan.offset.min(pan.span);
+
     // Post-process: ink each node label. Matching the whole label rather than
     // the bare id keeps one ticket's id from matching inside a longer ticket's
     // label.
@@ -1161,13 +1271,16 @@ fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
                 );
             }
         }
-        output.push(colored_line);
+        // Only body lines reach here — the header, indicator, summary and legend
+        // are pushed outside this loop. That is what keeps the map moving while
+        // the line naming the pan keys, and the legend the nodes are read by,
+        // stay where the eye left them.
+        output.push(pan_line(&colored_line, offset));
     }
 
     // Guarded by the same predicate that drove condensing, so there is no
     // third outcome: either the board fits, or it has already been condensed
     // and says what is still off the edge. Clipping quietly is not reachable.
-    let widest = widest_visible_line(&rendered);
     if pane_cols > 0 && widest > pane_cols {
         output.push(dag_overflow_line(widest, pane_cols));
     }
@@ -1644,9 +1757,20 @@ fn render_status_line(state: &PluginState) -> String {
 /// themselves out against at most 100 columns and still do — the clamp lives
 /// here rather than at the call site so that the one view which measures itself
 /// against the real pane, the DAG, can still see it.
-fn render_dashboard_lines(state: &PluginState, pane_cols: usize, height: usize) -> Vec<String> {
+fn render_dashboard_lines(
+    state: &PluginState,
+    pane_cols: usize,
+    height: usize,
+    pan: &mut DagPan,
+) -> Vec<String> {
     let width = pane_cols.min(100);
     let mut output = Vec::new();
+
+    // A view with no map to pan reports no room to pan. Set before the dispatch
+    // so no arm can forget it, which is what makes the pan keys inert in the
+    // other three presets without the key handler knowing which views own a
+    // graph.
+    pan.span = 0;
 
     // Title bar with status (always present, all views)
     let status = render_status_line(state);
@@ -1659,7 +1783,7 @@ fn render_dashboard_lines(state: &PluginState, pane_cols: usize, height: usize) 
     match state.active_view {
         ViewPreset::Operations => render_operations_view(state, width, height, &mut output),
         ViewPreset::Present => render_present_view(state, width, &mut output),
-        ViewPreset::Dag => render_dag_view(state, pane_cols, &mut output),
+        ViewPreset::Dag => render_dag_view(state, pane_cols, pan, &mut output),
         ViewPreset::Activity => render_activity_view(state, height, &mut output),
     }
 
@@ -1699,8 +1823,13 @@ fn render_operations_view(
 /// The only view handed the pane's true width rather than the clamped one: the
 /// graph decides how much of each node's name it can afford to print, and that
 /// decision is only honest against the pane it is drawn in.
-fn render_dag_view(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
-    render_dag(state, pane_cols, output);
+fn render_dag_view(
+    state: &PluginState,
+    pane_cols: usize,
+    pan: &mut DagPan,
+    output: &mut Vec<String>,
+) {
+    render_dag(state, pane_cols, pan, output);
 }
 
 /// Activity view: full activity log with all entry types.
@@ -2177,8 +2306,18 @@ fn render_quit_confirm_modal(modal: &ModalState, width: usize, height: usize) ->
 /// This function is the main entry point called from the plugin's render() implementation.
 /// It takes a pre-converted PluginState structure. `scroll_offset` controls how many lines
 /// are skipped from the top of the rendered content.
-pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize, scroll_offset: usize) {
+pub fn print_dashboard(
+    state: &PluginState,
+    rows: usize,
+    cols: usize,
+    scroll_offset: usize,
+    pan: &mut DagPan,
+) {
     if state.modal.open {
+        // `pan` is left as it was: a modal is drawn over the dashboard, not
+        // instead of it, and zeroing the span here would make the pan keys inert
+        // for a frame after the modal closes. The page scroll is ignored here for
+        // the same reason.
         let lines = render_modal(&state.modal, cols.min(60), rows);
         for line in lines.iter().take(rows) {
             println!("{}", line);
@@ -2186,7 +2325,7 @@ pub fn print_dashboard(state: &PluginState, rows: usize, cols: usize, scroll_off
         return;
     }
 
-    let lines = render_dashboard_lines(state, cols, rows);
+    let lines = render_dashboard_lines(state, cols, rows, pan);
 
     // Clamp scroll so we don't scroll past content
     let max_scroll = lines.len().saturating_sub(rows);
@@ -2502,7 +2641,7 @@ mod tests {
     fn test_render_dag_not_empty() {
         let state = sample_state();
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
 
         assert!(!output.is_empty());
         assert!(output[0].contains("DAG"));
@@ -2512,7 +2651,7 @@ mod tests {
     fn test_render_dag_empty() {
         let state = PluginState::default();
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
 
         assert!(output.iter().any(|line| line.contains("no tickets")));
     }
@@ -3112,7 +3251,7 @@ mod tests {
     fn test_dag_status_tokens_are_colored() {
         let state = four_status_state();
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         for (token, color, name) in [
@@ -3142,7 +3281,7 @@ mod tests {
     fn test_dag_ticket_ids_keep_phase_color() {
         let state = four_status_state();
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         for (id, phase) in [
@@ -3184,7 +3323,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         assert_eq!(
@@ -3203,7 +3342,7 @@ mod tests {
         // the rendered view reproduces those lines byte for byte.
         let state = four_status_state();
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
 
         let labels: Vec<String> = state
             .tickets
@@ -3277,6 +3416,295 @@ mod tests {
             .collect()
     }
 
+    /// A board whose nodes do not all ink the same color.
+    ///
+    /// `fan_board` is uniformly `Ready`, so every node carries one identical
+    /// escape sequence — precisely the board on which a broken slicer can look
+    /// fine. Cycling statuses and phases means the escapes differ node to node
+    /// in both the two-channel full inking and the one-channel condensed one.
+    fn mixed_status_board(n: usize) -> PluginState {
+        let statuses = [
+            TicketStatus::Ready,
+            TicketStatus::InProgress,
+            TicketStatus::WaitingReview,
+            TicketStatus::Blocked,
+        ];
+        let phases = [
+            Phase::Research,
+            Phase::Design,
+            Phase::Implement,
+            Phase::Review,
+        ];
+
+        let tickets = (1..=n)
+            .map(|i| TicketNode {
+                id: format!("T-054-01-{:02}", i),
+                title: format!("child {}", i),
+                phase: phases[i % phases.len()].clone(),
+                status: statuses[i % statuses.len()].clone(),
+                depends_on: if i == 1 {
+                    vec![]
+                } else {
+                    vec!["T-054-01-01".to_string()]
+                },
+            })
+            .collect();
+
+        PluginState {
+            tickets,
+            ..PluginState::default()
+        }
+    }
+
+    /// The index range of the graph body within a render.
+    ///
+    /// Indices rather than the stripped strings `dag_body_lines` returns: this
+    /// ticket is about what survives on a *painted* line, and panning must be
+    /// compared line against line. The range is stable under panning because
+    /// every body line is pushed exactly once whatever the offset.
+    fn dag_body_range(output: &[String]) -> std::ops::Range<usize> {
+        let start = 2; // header, blank
+        let end = output
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, line)| {
+                let bare = strip_ansi(line);
+                bare.starts_with("Phases:") || bare.starts_with("Status:") || bare.starts_with('(')
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(output.len());
+        start..end
+    }
+
+    /// Render a board at a pane width and a pan offset.
+    fn render_dag_panned(
+        state: &PluginState,
+        pane_cols: usize,
+        offset: usize,
+    ) -> (Vec<String>, DagPan) {
+        let mut pan = DagPan { offset, span: 0 };
+        let mut output = Vec::new();
+        render_dag(state, pane_cols, &mut pan, &mut output);
+        (output, pan)
+    }
+
+    #[test]
+    fn pan_reveals_the_clipped_columns_and_returns() {
+        // AC1. A condensed board that still overflows a 60-column pane: panning
+        // right shows the columns the pane was cutting, panning back is byte for
+        // byte where it started.
+        let state = mixed_status_board(7);
+        let (unpanned, pan) = render_dag_panned(&state, 60, 0);
+        let range = dag_body_range(&unpanned);
+
+        assert!(
+            pan.span > 0,
+            "fixture must overflow even condensed, or it tests nothing"
+        );
+
+        let (panned, _) = render_dag_panned(&state, 60, 5);
+        for index in range.clone() {
+            let expected: String = strip_ansi(&unpanned[index]).chars().skip(5).collect();
+            assert_eq!(
+                strip_ansi(&panned[index]),
+                expected,
+                "line {index} did not move five columns left"
+            );
+        }
+
+        // The right edge the pane was cutting is now inside it.
+        let widest_at_rest = range
+            .clone()
+            .map(|index| visible_width(&unpanned[index]))
+            .max()
+            .unwrap();
+        let (at_edge, _) = render_dag_panned(&state, 60, pan.span);
+        let widest_at_edge = range
+            .clone()
+            .map(|index| visible_width(&at_edge[index]))
+            .max()
+            .unwrap();
+        assert_eq!(widest_at_rest, 60 + pan.span);
+        assert_eq!(
+            widest_at_edge, 60,
+            "panned fully right, the map should end exactly at the pane's edge"
+        );
+
+        let (back, _) = render_dag_panned(&state, 60, 0);
+        assert_eq!(
+            back, unpanned,
+            "panning back must restore the render exactly"
+        );
+    }
+
+    #[test]
+    fn pan_is_clamped_at_both_edges() {
+        // AC1's clamp half. Past the right edge there is nothing further to
+        // reveal, so the render stops moving rather than walking off the map.
+        let state = mixed_status_board(7);
+        let (_, pan) = render_dag_panned(&state, 60, 0);
+
+        let (at_edge, _) = render_dag_panned(&state, 60, pan.span);
+        for beyond in [pan.span + 1, pan.span + 50, usize::MAX] {
+            let (past, _) = render_dag_panned(&state, 60, beyond);
+            assert_eq!(past, at_edge, "offset {beyond} moved past the right edge");
+        }
+    }
+
+    #[test]
+    fn every_pan_offset_keeps_escapes_intact_and_text_correct() {
+        // AC2 — the ticket's negative fixture. A fully colored board walked
+        // through every valid offset: at each one, every emitted line must carry
+        // only intact escape sequences and exactly the visible text that offset
+        // asks for. A naive byte or char slicer fails this; the test below proves
+        // the fixture has the teeth to catch one.
+        let state = mixed_status_board(7);
+        let (unpanned, pan) = render_dag_panned(&state, 60, 0);
+        let range = dag_body_range(&unpanned);
+
+        assert!(pan.span > 0, "fixture must overflow, or the walk is empty");
+        assert!(
+            range
+                .clone()
+                .any(|index| unpanned[index].contains('\u{1b}')),
+            "fixture must be painted, or intact escapes prove nothing"
+        );
+
+        for offset in 0..=pan.span {
+            let (panned, _) = render_dag_panned(&state, 60, offset);
+
+            for index in range.clone() {
+                let line = &panned[index];
+                assert_escapes_intact(line, &format!("offset {offset}, line {index}"));
+
+                let expected: String = strip_ansi(&unpanned[index]).chars().skip(offset).collect();
+                assert_eq!(
+                    strip_ansi(line),
+                    expected,
+                    "offset {offset}, line {index}: wrong visible text"
+                );
+
+                // No color left open at the end of a line, which would run the
+                // ink on into whatever is drawn next.
+                assert!(
+                    ink_is_closed(line),
+                    "offset {offset}, line {index}: ink left open in {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_naive_slicer_would_fail_the_escape_walk() {
+        // The fixture above passes vacuously unless a wrong slicer actually
+        // fails it. This is that proof: the same board, cut the obvious wrong
+        // way, must shear a sequence at some offset.
+        let state = mixed_status_board(7);
+        let (unpanned, pan) = render_dag_panned(&state, 60, 0);
+        let range = dag_body_range(&unpanned);
+
+        let broke = (0..=pan.span).any(|offset| {
+            range.clone().any(|index| {
+                let naive: String = unpanned[index].chars().skip(offset).collect();
+                !pan_is_faithful(&naive, &unpanned[index], offset)
+            })
+        });
+
+        assert!(
+            broke,
+            "a naive char slice survived the whole walk — the fixture proves nothing"
+        );
+
+        // And the real slicer survives the same walk, so the difference is the
+        // slicer and not the fixture.
+        for offset in 0..=pan.span {
+            let (panned, _) = render_dag_panned(&state, 60, offset);
+            for index in range.clone() {
+                assert!(
+                    pan_is_faithful(&panned[index], &unpanned[index], offset),
+                    "offset {offset}, line {index}: {:?}",
+                    panned[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_span_is_the_indicators_number() {
+        // The clamp and the sentence report one fact, so they cannot disagree
+        // about how much map is off the pane.
+        let state = mixed_status_board(7);
+        let (output, pan) = render_dag_panned(&state, 60, 0);
+
+        let indicator = output
+            .iter()
+            .map(|line| strip_ansi(line))
+            .find(|line| line.contains("off-screen"))
+            .expect("an overflowing board must carry the indicator");
+
+        assert!(
+            indicator.starts_with(&format!("({} columns off-screen", pan.span)),
+            "span {} is not the number the indicator prints: {indicator}",
+            pan.span
+        );
+    }
+
+    #[test]
+    fn a_fitting_map_reports_no_span() {
+        // AC3's second half at the render level: a board that fits leaves no
+        // room to pan, which is what makes the keys inert.
+        let state = mixed_status_board(7);
+
+        for pane in [200, 1000] {
+            let (_, pan) = render_dag_panned(&state, pane, 0);
+            assert_eq!(
+                pan.span, 0,
+                "a board that fits {pane} columns can be panned"
+            );
+        }
+
+        // A caller that does not know the pane is not a pane one column wide.
+        let (_, unknown) = render_dag_panned(&state, 0, 0);
+        assert_eq!(unknown.span, 0);
+    }
+
+    #[test]
+    fn pan_offset_is_ignored_when_the_map_fits() {
+        // A stale offset cannot smear a board that has room — the render clamps
+        // against the span it just computed, not against what it was handed.
+        let state = mixed_status_board(7);
+        let (at_rest, _) = render_dag_panned(&state, 200, 0);
+        let (offset_but_fitting, _) = render_dag_panned(&state, 200, 25);
+
+        assert_eq!(at_rest, offset_but_fitting);
+    }
+
+    #[test]
+    fn non_dag_views_report_no_span() {
+        // The other three presets have no map, so they report no room to pan and
+        // the pan keys stay inert there without the key handler asking which
+        // views own a graph.
+        let state = mixed_status_board(7);
+
+        for preset in [
+            ViewPreset::Operations,
+            ViewPreset::Present,
+            ViewPreset::Activity,
+        ] {
+            let view_state = PluginState {
+                active_view: preset,
+                ..state.clone()
+            };
+            let mut pan = DagPan {
+                offset: 9,
+                span: 99,
+            };
+            let _ = render_dashboard_lines(&view_state, 60, 40, &mut pan);
+            assert_eq!(pan.span, 0, "{preset:?} claimed room to pan");
+        }
+    }
+
     #[test]
     fn text_presets_still_clamp_at_a_hundred_columns() {
         // AC5, second half. The clamp moved one scope inward so the DAG could
@@ -3306,9 +3734,9 @@ mod tests {
             ..PluginState::default()
         };
 
-        let at_80 = render_dashboard_lines(&state, 80, 40);
-        let at_100 = render_dashboard_lines(&state, 100, 40);
-        let at_200 = render_dashboard_lines(&state, 200, 40);
+        let at_80 = render_dashboard_lines(&state, 80, 40, &mut DagPan::default());
+        let at_100 = render_dashboard_lines(&state, 100, 40, &mut DagPan::default());
+        let at_200 = render_dashboard_lines(&state, 200, 40, &mut DagPan::default());
 
         assert_ne!(
             at_80, at_100,
@@ -3390,13 +3818,184 @@ mod tests {
         assert_eq!(widest_visible_line(""), 0);
     }
 
+    /// Every `\u{1b}` in `line` opens a sequence that terminates in `m`.
+    ///
+    /// The shape of the failure this ticket is named for: a cut landing inside
+    /// `\u{1b}[36m` leaves an opener with no terminator, and the terminal prints
+    /// the tail as literal text. Shared by the `pan_line` unit tests and the
+    /// every-offset walk below.
+    fn escapes_are_intact(line: &str) -> bool {
+        let mut chars = line.chars();
+        while let Some(character) = chars.next() {
+            if character != '\u{1b}' {
+                continue;
+            }
+            if chars.next() != Some('[') {
+                return false;
+            }
+            let mut terminated = false;
+            for escaped in chars.by_ref() {
+                // Parameter bytes of an SGR sequence, then its terminator.
+                if escaped == 'm' {
+                    terminated = true;
+                    break;
+                }
+                if !escaped.is_ascii_digit() && escaped != ';' {
+                    return false;
+                }
+            }
+            if !terminated {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn assert_escapes_intact(line: &str, context: &str) {
+        assert!(
+            escapes_are_intact(line),
+            "{context}: an escape sequence was sheared in {line:?}"
+        );
+    }
+
+    /// No color is still in force when the line ends.
+    ///
+    /// An unclosed color runs the ink on into whatever the terminal draws next.
+    /// Counting rather than checking the suffix, because a line legitimately
+    /// ends with `]` after its reset.
+    fn ink_is_closed(line: &str) -> bool {
+        let mut open = 0usize;
+        let mut chars = line.chars();
+        while let Some(character) = chars.next() {
+            if character != '\u{1b}' {
+                continue;
+            }
+            let mut sequence = String::from(character);
+            for escaped in chars.by_ref() {
+                sequence.push(escaped);
+                if escaped == 'm' {
+                    break;
+                }
+            }
+            if sequence == RESET {
+                open = 0;
+            } else {
+                open += 1;
+            }
+        }
+        open == 0
+    }
+
+    /// Is `panned` an honest pan of `original` by `offset` visible columns?
+    ///
+    /// The two properties AC2 names, plus the no-leak rule: intact sequences,
+    /// exactly the visible text that offset asks for, and nothing left open.
+    /// Used as an assertion for the real slicer and as a detector for a naive
+    /// one — a naive cut fails the *text* property even when it happens not to
+    /// shear a sequence, because dropping a lone `\u{1b}` turns the rest of the
+    /// sequence into literal `[32m` on screen.
+    fn pan_is_faithful(panned: &str, original: &str, offset: usize) -> bool {
+        let expected: String = strip_ansi(original).chars().skip(offset).collect();
+        escapes_are_intact(panned) && ink_is_closed(panned) && strip_ansi(panned) == expected
+    }
+
+    #[test]
+    fn pan_line_at_zero_is_the_line_itself() {
+        // The guarantee an unpanned board rests on: byte for byte, not merely
+        // visually the same.
+        let painted = format!(
+            "[{}054-01-02{}] → [{}054-01-03{}]",
+            GREEN, RESET, RED, RESET
+        );
+        assert_eq!(pan_line(&painted, 0), painted);
+        assert_eq!(pan_line("", 0), "");
+    }
+
+    #[test]
+    fn pan_line_counts_columns_not_bytes() {
+        // Same reason `visible_width` counts characters: the routing glyphs are
+        // multi-byte and one column wide. A byte cut would land mid-glyph.
+        let routed = "┌───→ [054-01-02]";
+        let panned = pan_line(routed, 6);
+        assert_eq!(panned, "[054-01-02]");
+        assert_eq!(visible_width(&panned), visible_width(routed) - 6);
+        assert!(
+            routed.len() > routed.chars().count(),
+            "fixture should contain multi-byte glyphs, or it proves nothing"
+        );
+    }
+
+    #[test]
+    fn pan_line_never_splits_an_escape() {
+        // The negative case at the unit level: cut at every column of a line
+        // whose escapes sit at, before, and after each boundary.
+        let painted = format!(
+            "[{}{}054-01-02{}] → [{}054-01-03{}]",
+            BOLD, CYAN, RESET, RED, RESET
+        );
+
+        for offset in 0..=visible_width(&painted) + 3 {
+            assert_escapes_intact(&pan_line(&painted, offset), &format!("offset {offset}"));
+        }
+    }
+
+    #[test]
+    fn pan_line_carries_active_color_across_the_cut() {
+        // A node straddling the left edge keeps its status color — which in
+        // condensed mode is the only status channel it has left.
+        let painted = format!("{}054-01-02{}", GREEN, RESET);
+        let panned = pan_line(&painted, 4);
+
+        assert!(
+            panned.starts_with(GREEN),
+            "the cut dropped the color that was in force: {panned:?}"
+        );
+        assert_eq!(strip_ansi(&panned), "01-02");
+    }
+
+    #[test]
+    fn pan_line_drops_color_cancelled_before_the_cut() {
+        // The mirror of the test above: a reset before the cut means no color is
+        // in force, so none is carried. Otherwise every panned line would open
+        // with stale ink.
+        let painted = format!("{}abc{}defgh", GREEN, RESET);
+        let panned = pan_line(&painted, 4);
+
+        assert_eq!(panned, "efgh", "color survived its own reset");
+    }
+
+    #[test]
+    fn pan_line_leaks_no_ink() {
+        // A cut can carry a color across without its closing reset surviving.
+        // Left open, the ink would run on past this line.
+        let painted = format!("abc{}defgh", RED);
+        let panned = pan_line(&painted, 4);
+
+        assert!(panned.starts_with(RED));
+        assert!(
+            panned.ends_with(RESET),
+            "an open color reached the end of the line: {panned:?}"
+        );
+        assert_eq!(strip_ansi(&panned), "efgh");
+    }
+
+    #[test]
+    fn pan_line_past_the_end_is_empty() {
+        // Nothing visible remains, so nothing is emitted — not a bare color code
+        // with no glyphs to paint.
+        let painted = format!("{}054-01-02{}", GREEN, RESET);
+
+        assert_eq!(pan_line(&painted, visible_width(&painted)), "");
+        assert_eq!(pan_line(&painted, 500), "");
+    }
+
     #[test]
     fn dag_wide_pane_keeps_full_labels_byte_for_byte() {
         // AC1, wide half. A pane with room to spare renders exactly what it
         // rendered before this ticket — the fit decision ran and chose Full.
         let state = fan_board(7);
         let mut output = Vec::new();
-        render_dag(&state, 200, &mut output);
+        render_dag(&state, 200, &mut DagPan::default(), &mut output);
 
         let labels: Vec<String> = state
             .tickets
@@ -3435,11 +4034,11 @@ mod tests {
         let state = fan_board(7);
 
         let mut wide = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut wide);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut wide);
         assert_eq!(widest_visible_line(&dag_body_lines(&wide).join("\n")), 119);
 
         let mut output = Vec::new();
-        render_dag(&state, 100, &mut output);
+        render_dag(&state, 100, &mut DagPan::default(), &mut output);
         let body = dag_body_lines(&output);
 
         assert_eq!(
@@ -3459,7 +4058,7 @@ mod tests {
         // `Status:` legend defines the color code and sits outside the body.
         let state = fan_board(7);
         let mut output = Vec::new();
-        render_dag(&state, 100, &mut output);
+        render_dag(&state, 100, &mut DagPan::default(), &mut output);
 
         for line in dag_body_lines(&output) {
             assert!(
@@ -3506,7 +4105,7 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        render_dag(&state, 50, &mut output); // 59 full, 41 condensed
+        render_dag(&state, 50, &mut DagPan::default(), &mut output); // 59 full, 41 condensed
         let painted = output.join("\n");
 
         for (i, status) in statuses.iter().enumerate() {
@@ -3556,7 +4155,7 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        render_dag(&state, 30, &mut output);
+        render_dag(&state, 30, &mut DagPan::default(), &mut output);
         let painted = output.join("\n");
 
         assert!(painted.contains(&format!("{}054-01-01{}", RED, RESET)));
@@ -3577,7 +4176,7 @@ mod tests {
         let mut state = fan_board(7);
         state.active_view = ViewPreset::Dag;
 
-        let lines = render_dashboard_lines(&state, 200, 60);
+        let lines = render_dashboard_lines(&state, 200, 60, &mut DagPan::default());
         let joined = lines.join("\n");
 
         assert!(
@@ -3597,7 +4196,7 @@ mod tests {
         let state = fan_board(6);
 
         let mut roomy = Vec::new();
-        render_dag(&state, 120, &mut roomy);
+        render_dag(&state, 120, &mut DagPan::default(), &mut roomy);
         assert!(
             dag_body_lines(&roomy)
                 .join("\n")
@@ -3606,7 +4205,7 @@ mod tests {
         );
 
         let mut cramped = Vec::new();
-        render_dag(&state, 90, &mut cramped);
+        render_dag(&state, 90, &mut DagPan::default(), &mut cramped);
         assert!(
             !dag_body_lines(&cramped)
                 .join("\n")
@@ -3617,7 +4216,7 @@ mod tests {
         // Either side of the boundary, and the boundary itself: 99 fits a
         // 99-column pane exactly.
         let mut exact = Vec::new();
-        render_dag(&state, 99, &mut exact);
+        render_dag(&state, 99, &mut DagPan::default(), &mut exact);
         assert!(
             dag_body_lines(&exact)
                 .join("\n")
@@ -3631,7 +4230,7 @@ mod tests {
         // A caller that does not know the pane is not a one-column pane.
         let state = fan_board(9); // 159 columns, wider than any real pane
         let mut output = Vec::new();
-        render_dag(&state, 0, &mut output);
+        render_dag(&state, 0, &mut DagPan::default(), &mut output);
 
         assert!(dag_body_lines(&output)
             .join("\n")
@@ -3669,7 +4268,7 @@ mod tests {
         // pane there is nothing left to shed, so it must say what is missing.
         let state = fan_board(7);
         let mut output = Vec::new();
-        render_dag(&state, 60, &mut output);
+        render_dag(&state, 60, &mut DagPan::default(), &mut output);
 
         let indicator = output
             .iter()
@@ -3692,7 +4291,7 @@ mod tests {
 
         for pane in [200, 100] {
             let mut output = Vec::new();
-            render_dag(&state, pane, &mut output);
+            render_dag(&state, pane, &mut DagPan::default(), &mut output);
             assert!(
                 !output.iter().any(|line| line.contains("off-screen")),
                 "a board that fits a {pane}-column pane must say nothing"
@@ -3708,7 +4307,7 @@ mod tests {
             let state = fan_board(nodes);
             for pane in [20, 60, 100, 200] {
                 let mut output = Vec::new();
-                render_dag(&state, pane, &mut output);
+                render_dag(&state, pane, &mut DagPan::default(), &mut output);
                 assert_no_silent_clip(&output, pane);
             }
         }
@@ -3718,7 +4317,7 @@ mod tests {
     fn test_render_dag_filters_done_tickets() {
         let state = sample_state(); // T-001 is Done, T-002 InProgress, T-003 Blocked
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         // T-001 is Done — should be filtered out, mentioned in hidden count
@@ -3744,7 +4343,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         assert!(
@@ -3791,7 +4390,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         // All four tickets should appear (none are done)
@@ -3857,7 +4456,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         // All three roots and the leaf should appear
@@ -3920,7 +4519,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         assert!(full.contains("T-001"), "T-001 missing");
@@ -3970,7 +4569,7 @@ mod tests {
             ..PluginState::default()
         };
         let mut output = Vec::new();
-        render_dag(&state, DAG_WIDE, &mut output);
+        render_dag(&state, DAG_WIDE, &mut DagPan::default(), &mut output);
         let full = output.join("\n");
 
         // T-001 should be filtered
@@ -4076,7 +4675,7 @@ mod tests {
                 transitioning: false,
             },
         ];
-        let lines = render_dashboard_lines(&state, 80, 40);
+        let lines = render_dashboard_lines(&state, 80, 40, &mut DagPan::default());
         let full = lines.join("\n");
 
         assert!(!lines.is_empty());
@@ -4094,7 +4693,7 @@ mod tests {
     fn test_full_dashboard_dag_view() {
         let mut state = sample_state();
         state.active_view = ViewPreset::Dag;
-        let lines = render_dashboard_lines(&state, 80, 40);
+        let lines = render_dashboard_lines(&state, 80, 40, &mut DagPan::default());
         let full = lines.join("\n");
 
         assert!(full.contains("Dashboard"), "Dashboard header missing");
@@ -4110,7 +4709,7 @@ mod tests {
     fn test_full_dashboard_activity_view() {
         let mut state = sample_state();
         state.active_view = ViewPreset::Activity;
-        let lines = render_dashboard_lines(&state, 80, 40);
+        let lines = render_dashboard_lines(&state, 80, 40, &mut DagPan::default());
         let full = lines.join("\n");
 
         assert!(full.contains("Dashboard"), "Dashboard header missing");
@@ -4205,7 +4804,7 @@ mod tests {
         // Test DAG view: done tickets filtered, active tickets shown
         let mut dag_state = state.clone();
         dag_state.active_view = ViewPreset::Dag;
-        let dag_lines = render_dashboard_lines(&dag_state, 80, 50);
+        let dag_lines = render_dashboard_lines(&dag_state, 80, 50, &mut DagPan::default());
         let dag_output = dag_lines.join("\n");
 
         // T-001 is Done — filtered out, but mentioned in hidden count
@@ -4220,7 +4819,7 @@ mod tests {
         assert!(dag_output.contains("Dashboard"), "Dashboard header missing");
 
         // Test Operations view: filtered activity should show error
-        let ops_lines = render_dashboard_lines(&state, 80, 50);
+        let ops_lines = render_dashboard_lines(&state, 80, 50, &mut DagPan::default());
         let ops_output = ops_lines.join("\n");
 
         assert!(ops_output.contains("test error"), "Error activity missing");
@@ -4323,7 +4922,7 @@ mod tests {
             ..PluginState::default()
         };
 
-        let lines = render_dashboard_lines(&state, 80, 50);
+        let lines = render_dashboard_lines(&state, 80, 50, &mut DagPan::default());
         let full = lines.join("\n");
 
         assert!(
@@ -4655,7 +5254,7 @@ mod tests {
         };
 
         // Default view is Operations
-        let lines = render_dashboard_lines(&state, 80, 50);
+        let lines = render_dashboard_lines(&state, 80, 50, &mut DagPan::default());
         let full = lines.join("\n");
 
         // Threads section should appear in Operations view
@@ -5028,7 +5627,7 @@ mod tests {
     #[test]
     fn test_compact_dashboard_fewer_lines() {
         let state = sample_state();
-        let lines = render_dashboard_lines(&state, 80, 40);
+        let lines = render_dashboard_lines(&state, 80, 40, &mut DagPan::default());
         // Count blank lines
         let blank_lines = lines.iter().filter(|l| l.is_empty()).count();
         // Compacted dashboard should have fewer blank lines than before (~12).
@@ -5043,7 +5642,7 @@ mod tests {
     #[test]
     fn test_scroll_offset_clamp() {
         let state = sample_state();
-        let lines = render_dashboard_lines(&state, 80, 40);
+        let lines = render_dashboard_lines(&state, 80, 40, &mut DagPan::default());
         let total_lines = lines.len();
 
         // Scroll offset beyond content should be clamped

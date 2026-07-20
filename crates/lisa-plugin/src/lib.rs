@@ -1054,6 +1054,15 @@ pub struct State {
     /// Scroll offset for the dashboard view (used with j/k keys).
     scroll_offset: usize,
 
+    /// How far the DAG view is panned sideways, and how far it can be — the
+    /// horizontal twin of `scroll_offset` (used with h/l keys).
+    ///
+    /// Unlike the page scroll this is per-view: only the DAG has a width that
+    /// can exceed its pane, and only the DAG reports a span for the keys to
+    /// respect. One field rather than two so the offset and the bound it is
+    /// clamped against cannot be updated out of step.
+    dag_pan: ui::DagPan,
+
     /// Panes waiting for a deferred Enter keypress.
     /// Characters are sent immediately; Enter is sent after `ENTER_DELAY_SECS`
     /// so the TUI has time to commit the text to its input field.
@@ -9449,7 +9458,7 @@ impl ZellijPlugin for State {
         }
 
         let ui_state = self.to_ui_state();
-        ui::print_dashboard(&ui_state, rows, cols, self.scroll_offset);
+        ui::print_dashboard(&ui_state, rows, cols, self.scroll_offset, &mut self.dag_pan);
     }
 }
 
