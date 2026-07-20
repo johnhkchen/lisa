@@ -162,6 +162,26 @@ impl OperatorOverride {
     pub const fn note(&self) -> &DispositionNote {
         &self.note
     }
+
+    /// Recover an override from a note that outlived it.
+    ///
+    /// A completion whose result was lost is replayed from durable history,
+    /// which stores the admitted note but not the receipt around it. Nothing has
+    /// to be invented to rebuild one: the summary is a catalog entry verbatim,
+    /// and in every shape [`build_operator_override`] produces, the overridden
+    /// ask *is* the criterion quote. A note whose summary matches no catalog
+    /// entry was authored by an agent, not signed by a person, and recovers as
+    /// `None`.
+    pub fn recover(note: &DispositionNote) -> Option<Self> {
+        let reason = OverrideReason::ALL
+            .into_iter()
+            .find(|reason| reason.summary() == note.summary())?;
+        Some(Self {
+            reason,
+            overridden_ask: note.criterion_quote().to_string(),
+            note: note.clone(),
+        })
+    }
 }
 
 /// Build an override note from an observed state and a chosen reason.
@@ -425,8 +445,7 @@ mod tests {
             ),
         ];
         for (state, reason, path) in cases {
-            let over =
-                build_operator_override("T-001", &state, reason, &paths(&[path])).unwrap();
+            let over = build_operator_override("T-001", &state, reason, &paths(&[path])).unwrap();
             let note = over.note();
             assert!(!note.criterion_quote().trim().is_empty(), "{state:?}");
             assert!(!note.evidence_citation().trim().is_empty(), "{state:?}");
@@ -447,6 +466,42 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("inspected path"), "{error}");
         }
+    }
+
+    #[test]
+    fn every_shape_recovers_from_its_own_note() {
+        let cases = [
+            (block(), OverrideReason::BeyondTicketReach, DISPOSITION_PATH),
+            (
+                OverriddenAsk::NoReviewOnFile,
+                OverrideReason::NoReviewOnFile,
+                WORK_DIR,
+            ),
+            (
+                unreadable(),
+                OverrideReason::NoReviewOnFile,
+                DISPOSITION_PATH,
+            ),
+        ];
+        for (state, reason, path) in cases {
+            let over = build_operator_override("T-001", &state, reason, &paths(&[path])).unwrap();
+            assert_eq!(
+                OperatorOverride::recover(over.note()).as_ref(),
+                Some(&over),
+                "{state:?} must survive a replay unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_authored_note_is_not_recovered_as_an_override() {
+        let agent_note = DispositionNote::new(
+            "approximately 200 MiB",
+            "docs/active/work/T-046-06-03/review.md",
+            "The 225 MiB measurement supports completion while the written gate is stale.",
+        )
+        .unwrap();
+        assert_eq!(OperatorOverride::recover(&agent_note), None);
     }
 
     #[test]

@@ -51,12 +51,15 @@ use lisa_core::diagnostics;
 use lisa_core::disposition::{
     parse_review_disposition, DispositionNote, RemedyOwner, ReviewDisposition,
 };
+use lisa_core::operator_override::{
+    build_operator_override, OperatorOverride, OverriddenAsk, OverrideReason,
+};
 use lisa_core::provenance::{
-    self, AssignmentState, AssignmentTransitionRecord, ParkingTransitionRecord,
-    ParkingTransitionType, ProposalAction, ProposalActionRecord, ProposalRecordType,
-    ProvenanceLedgerRecord, ProvenanceRecord, ProvenanceRecordType, Route, RunOutcome,
-    TriageRecordType, TriageState, TriageTransitionRecord, UsageCorrectionRecord,
-    UsageCorrectionType,
+    self, AssignmentState, AssignmentTransitionRecord, OperatorOverrideRecord,
+    OperatorOverrideType, ParkingTransitionRecord, ParkingTransitionType, ProposalAction,
+    ProposalActionRecord, ProposalRecordType, ProvenanceLedgerRecord, ProvenanceRecord,
+    ProvenanceRecordType, Route, RunOutcome, TriageRecordType, TriageState, TriageTransitionRecord,
+    UsageCorrectionRecord, UsageCorrectionType,
 };
 use lisa_core::ticket;
 use lisa_core::triage::{
@@ -699,7 +702,32 @@ enum CompletionInput {
     OperatorRequested {
         ticket_id: TicketId,
         source: OperatorRequestSource,
+        /// The catalog reason a person chose when signing over a block or an
+        /// unreadable review. `None` is an ordinary mark-done request and keeps
+        /// the fail-closed guard exactly as it was — the guard widens for a
+        /// recorded choice, never on its own.
+        override_reason: Option<OverrideReason>,
     },
+}
+
+/// What an admitted completion carries into the journal and the ledger.
+///
+/// Bundled rather than passed as two parameters so the sole effect executor
+/// keeps a reviewable signature.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AdmittedCompletion {
+    note: Option<DispositionNote>,
+    operator_override: Option<OperatorOverride>,
+}
+
+impl AdmittedCompletion {
+    /// An admission carrying only an agent-authored note (or none at all).
+    const fn from_note(note: Option<DispositionNote>) -> Self {
+        Self {
+            note,
+            operator_override: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,6 +748,9 @@ struct PendingCompletion {
     source: CompletionSource,
     authority: CompletionAuthority,
     completion_note: Option<DispositionNote>,
+    /// The operator receipt to file once this completion seals, when a person
+    /// signed it rather than an agent.
+    operator_override: Option<OperatorOverride>,
 }
 
 /// How an idle pane can satisfy an incoming provider request.
@@ -2073,6 +2104,99 @@ impl State {
         }
     }
 
+    /// Decide what an operator-requested completion may carry.
+    ///
+    /// With no chosen reason this is exactly [`Self::passing_review_disposition`]
+    /// — a Block or an unreadable review still refuses to seal. A chosen reason
+    /// widens the guard for that one recorded decision by building an operator
+    /// note from the catalog; it never weakens the no-reason path, which is what
+    /// the negative fixture pins.
+    fn admit_operator_completion(
+        &self,
+        ticket_id: &str,
+        override_reason: Option<OverrideReason>,
+    ) -> Result<AdmittedCompletion, CompletionRejection> {
+        let Some(reason) = override_reason else {
+            return self
+                .passing_review_disposition(ticket_id)
+                .map(AdmittedCompletion::from_note);
+        };
+
+        // Nothing to override: the agent's own verdict already authorizes
+        // completion and stands unaltered. An override here is inert, never an
+        // extra note.
+        let Some(state) = self.observed_override_state(ticket_id) else {
+            return self
+                .passing_review_disposition(ticket_id)
+                .map(AdmittedCompletion::from_note);
+        };
+
+        let inspected = self.inspected_paths(ticket_id, &state);
+        match build_operator_override(ticket_id, &state, reason, &inspected) {
+            Ok(operator_override) => Ok(AdmittedCompletion {
+                note: Some(operator_override.note().clone()),
+                operator_override: Some(operator_override),
+            }),
+            Err(reason) => Err(CompletionRejection::DispositionBlocked { reason }),
+        }
+    }
+
+    /// Observe what an override would be answering, or `None` when the durable
+    /// verdict already authorizes completion.
+    ///
+    /// The parser reports a missing file and an unreadable one identically, but
+    /// they are different facts about the world and are quoted differently, so
+    /// the two are told apart by asking whether the file is there — the same
+    /// observation a person makes.
+    fn observed_override_state(&self, ticket_id: &str) -> Option<OverriddenAsk> {
+        let disposition_path = self.review_disposition_path(ticket_id);
+        match parse_review_disposition(&disposition_path) {
+            ReviewDisposition::Pass | ReviewDisposition::Note(_) => None,
+            ReviewDisposition::Block { ask, reason, .. } => {
+                Some(OverriddenAsk::Block { ask, reason })
+            }
+            ReviewDisposition::Invalid { reason } => Some(if disposition_path.exists() {
+                OverriddenAsk::UnreadableReview { detail: reason }
+            } else {
+                OverriddenAsk::NoReviewOnFile
+            }),
+        }
+    }
+
+    /// The paths an operator inspected before signing, each observed to exist.
+    ///
+    /// A citation names what was actually read and nothing else — S-049-06's
+    /// rule, applied to a person's evidence rather than an agent's.
+    fn inspected_paths(&self, ticket_id: &str, state: &OverriddenAsk) -> Vec<String> {
+        let work_dir = self.config.work_dir.join(ticket_id);
+        match state {
+            OverriddenAsk::Block { .. } => [
+                self.review_disposition_path(ticket_id),
+                work_dir.join("review.md"),
+                work_dir.join("progress.md"),
+            ]
+            .into_iter()
+            .filter(|path| path.exists())
+            .map(|path| path.display().to_string())
+            .collect(),
+            OverriddenAsk::UnreadableReview { .. } => {
+                vec![self
+                    .review_disposition_path(ticket_id)
+                    .display()
+                    .to_string()]
+            }
+            // The file is not there; the directory the operator opened is.
+            OverriddenAsk::NoReviewOnFile => vec![work_dir.display().to_string()],
+        }
+    }
+
+    fn review_disposition_path(&self, ticket_id: &str) -> std::path::PathBuf {
+        self.config
+            .work_dir
+            .join(ticket_id)
+            .join("review-disposition.json")
+    }
+
     fn operator_modal_targets(&self, ticket_id: &str) -> bool {
         self.modal.open
             && self.modal.mode == ModalMode::MarkDone
@@ -2385,7 +2509,7 @@ impl State {
         now: std::time::SystemTime,
     ) -> bool {
         let now = Self::completion_time(now);
-        let (ticket_id, source, authority, effect, completion_note) = match input {
+        let (ticket_id, source, authority, effect, admitted) = match input {
             CompletionInput::Reconcile {
                 ticket_id,
                 source_lease,
@@ -2443,11 +2567,11 @@ impl State {
                     CompletionSource::Reconcile,
                     Some(CompletionAuthority::Attempt(source_lease)),
                     effect,
-                    completion_note,
+                    AdmittedCompletion::from_note(completion_note),
                 )
             }
             input => {
-                let (ticket_id, source, authority, review_lease) = match input {
+                let (ticket_id, source, authority, review_lease, override_reason) = match input {
                     CompletionInput::Artifact {
                         ticket_id,
                         source_lease,
@@ -2456,6 +2580,7 @@ impl State {
                         CompletionSource::Artifact,
                         Some(CompletionAuthority::Attempt(source_lease.clone())),
                         Some(source_lease),
+                        None,
                     ),
                     CompletionInput::Stopped {
                         ticket_id,
@@ -2466,6 +2591,7 @@ impl State {
                         CompletionSource::Stopped(pane_id),
                         Some(CompletionAuthority::Attempt(source_lease.clone())),
                         Some(source_lease),
+                        None,
                     ),
                     CompletionInput::Idle {
                         ticket_id,
@@ -2475,6 +2601,7 @@ impl State {
                         CompletionSource::Idle,
                         Some(CompletionAuthority::Attempt(source_lease.clone())),
                         Some(source_lease),
+                        None,
                     ),
                     CompletionInput::ObservedDone {
                         ticket_id,
@@ -2484,12 +2611,18 @@ impl State {
                         CompletionSource::ObservedDone,
                         source_lease.map(CompletionAuthority::Attempt),
                         None,
+                        None,
                     ),
-                    CompletionInput::OperatorRequested { ticket_id, source } => (
+                    CompletionInput::OperatorRequested {
+                        ticket_id,
+                        source,
+                        override_reason,
+                    } => (
                         ticket_id,
                         CompletionSource::OperatorRequested(source),
                         Some(CompletionAuthority::Operator),
                         None,
+                        override_reason,
                     ),
                     CompletionInput::Reconcile { .. } => unreachable!("handled above"),
                 };
@@ -2516,10 +2649,10 @@ impl State {
                 let correlation =
                     Self::completion_correlation(completion_id.clone(), attempt_id.clone());
 
-                let mut completion_note = None;
+                let mut admitted = AdmittedCompletion::default();
                 if matches!(source, CompletionSource::OperatorRequested(_)) {
-                    match self.passing_review_disposition(&ticket_id) {
-                        Ok(note) => completion_note = note,
+                    match self.admit_operator_completion(&ticket_id, override_reason) {
+                        Ok(operator_admitted) => admitted = operator_admitted,
                         Err(rejection) => {
                             self.log_completion_rejection(&ticket_id, &correlation, &rejection);
                             return false;
@@ -2528,12 +2661,14 @@ impl State {
                 }
 
                 if let Some(review_lease) = review_lease.as_ref() {
-                    completion_note = match self.admit_correlated_review(
+                    // An agent-lease admission never carries an operator
+                    // receipt, so this replaces the note and nothing else.
+                    admitted = match self.admit_correlated_review(
                         &ticket_id,
                         review_lease,
                         &correlation,
                     ) {
-                        Some(note) => note,
+                        Some(note) => AdmittedCompletion::from_note(note),
                         None => return false,
                     };
                 }
@@ -2549,19 +2684,14 @@ impl State {
                         return false;
                     }
                 };
-                (ticket_id, source, authority, effect, completion_note)
+                (ticket_id, source, authority, effect, admitted)
             }
         };
 
         match effect {
-            Some(effect) => self.execute_completion_effect(
-                effect,
-                ticket_id,
-                source,
-                authority,
-                completion_note,
-                now,
-            ),
+            Some(effect) => {
+                self.execute_completion_effect(effect, ticket_id, source, authority, admitted, now)
+            }
             None => false,
         }
     }
@@ -2574,7 +2704,7 @@ impl State {
         ticket_id: TicketId,
         source: CompletionSource,
         authority: Option<CompletionAuthority>,
-        completion_note: Option<DispositionNote>,
+        admitted: AdmittedCompletion,
         now: CompletionDeadline,
     ) -> bool {
         let (effect_attempt_id, effect_completion_id) = match &effect {
@@ -2721,7 +2851,7 @@ impl State {
                 key: completion_key.clone(),
                 prior_phase,
                 prior_status,
-                note: completion_note.clone(),
+                note: admitted.note.clone(),
             })
         {
             self.log_completion_rejection(
@@ -2765,7 +2895,8 @@ impl State {
                 prior_status,
                 source,
                 authority,
-                completion_note,
+                completion_note: admitted.note,
+                operator_override: admitted.operator_override,
             },
         );
 
@@ -2859,6 +2990,10 @@ impl State {
             None
         };
 
+        let durable_note = self
+            .completion_aggregates
+            .get(&ticket_id)
+            .and_then(CompletionJournalAggregate::completion_note);
         self.pending_completions.insert(
             ticket_id.clone(),
             PendingCompletion {
@@ -2870,11 +3005,11 @@ impl State {
                 prior_status,
                 source,
                 authority,
-                completion_note: self
-                    .completion_aggregates
-                    .get(&ticket_id)
-                    .and_then(CompletionJournalAggregate::completion_note)
-                    .cloned(),
+                completion_note: durable_note.cloned(),
+                // A replay rebuilds from durable history, which stores the note
+                // but not the receipt around it. Recovering here keeps an
+                // operator's signature from being lost to a dropped result.
+                operator_override: durable_note.and_then(OperatorOverride::recover),
             },
         );
 
@@ -3217,7 +3352,15 @@ impl State {
         if let Some(thread) = self.threads.get_mut(ticket_id) {
             thread.complete();
         }
-        self.emit_provenance_with_note(ticket_id, RunOutcome::Done, false, pending.completion_note);
+        self.emit_provenance_with_note(
+            ticket_id,
+            RunOutcome::Done,
+            false,
+            pending.completion_note.clone(),
+        );
+        if let Some(operator_override) = pending.operator_override.as_ref() {
+            self.emit_operator_override_receipt(ticket_id, operator_override);
+        }
         self.release_completed_slot_for_ticket(&ticket_id.to_string());
         self.threads.remove(ticket_id);
         self.schedule_ready_tickets();
@@ -6935,6 +7078,43 @@ impl State {
         true
     }
 
+    /// File the receipt for a completion a person signed.
+    ///
+    /// Deliberately free of the thread and lease preconditions
+    /// [`Self::emit_provenance_with_note`] enforces: the tickets an override
+    /// serves are exactly the ones whose agent is already gone, so requiring a
+    /// live attempt would drop the receipt on every case that needs one. A write
+    /// failure logs and is swallowed, never fatal to the loop.
+    fn emit_operator_override_receipt(
+        &mut self,
+        ticket_id: &str,
+        operator_override: &OperatorOverride,
+    ) -> bool {
+        if self.ledger_path.as_os_str().is_empty() {
+            return false;
+        }
+        let record = OperatorOverrideRecord {
+            schema_version: provenance::SCHEMA_VERSION,
+            seal: self.config.completion_seal,
+            record_type: OperatorOverrideType::OperatorOverride,
+            ticket_id: ticket_id.to_string(),
+            actor: "operator".to_string(),
+            reason_id: operator_override.reason().id().to_string(),
+            reason: operator_override.reason().summary().to_string(),
+            overridden_ask: operator_override.overridden_ask().to_string(),
+            note: operator_override.note().clone(),
+            occurred_at: provenance::system_time_to_epoch(std::time::SystemTime::now()),
+        };
+        if let Err(error) = provenance::append_operator_override_record(&self.ledger_path, &record)
+        {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("operator override receipt failed for {ticket_id}: {error}"),
+            });
+            return false;
+        }
+        true
+    }
+
     /// Late-join capture rows onto their owning tickets as append-only
     /// corrections (T-051-03-01).
     ///
@@ -8558,10 +8738,44 @@ impl State {
     }
 
     /// Request manual completion through the same isolated transaction.
+    ///
+    /// Unchanged behavior: with no chosen reason a Block or an unreadable review
+    /// still refuses to seal.
     fn mark_ticket_done(&mut self, ticket_id: &str) {
+        self.request_operator_completion(ticket_id, None);
+    }
+
+    /// Sign a parked ticket's completion with a catalog reason.
+    ///
+    /// The recorded authority branch: the chosen reason becomes the completion's
+    /// note and rides the ordinary sealing path. Called by the reason step the
+    /// MarkDone modal gains in T-053-01-02.
+    #[allow(dead_code)]
+    fn mark_ticket_done_with_override(&mut self, ticket_id: &str, reason: OverrideReason) {
+        self.request_operator_completion(ticket_id, Some(reason));
+    }
+
+    /// What an override on this ticket would answer, or `None` when its verdict
+    /// already authorizes completion.
+    ///
+    /// The seam T-053-01-02's reason step consumes: it asks the state what to
+    /// list ([`OverriddenAsk::applicable_reasons`]) and what to preselect
+    /// ([`OverriddenAsk::recommended_reason`]) without reaching into completion
+    /// internals.
+    #[allow(dead_code)]
+    fn override_choices_for(&self, ticket_id: &str) -> Option<OverriddenAsk> {
+        self.observed_override_state(ticket_id)
+    }
+
+    fn request_operator_completion(
+        &mut self,
+        ticket_id: &str,
+        override_reason: Option<OverrideReason>,
+    ) {
         let dispatched = self.dispatch_completion(CompletionInput::OperatorRequested {
             ticket_id: ticket_id.to_string(),
             source: OperatorRequestSource::MarkDoneKey,
+            override_reason,
         });
         if dispatched {
             let correlation_id = self
@@ -14999,6 +15213,497 @@ mod tests {
         assert!(fs::read_to_string(tickets_dir.join("T-001.md"))
             .unwrap()
             .contains("phase: review"));
+    }
+
+    // ==================================================================
+    // [d] as a signature — the operator override branch (T-053-01-01)
+    // ==================================================================
+
+    /// The field block from E-053's "Done looks like": a signed build parks
+    /// because no Apple ID is signed into Xcode on this machine.
+    const XCODE_BLOCK: &str = r#"{"disposition":"block","reason":"codesign refused: no signing identity found","remedy_owner":"operator","ask":"Sign into Xcode with an Apple ID, then re-run the signed build."}"#;
+    const XCODE_ASK: &str = "Sign into Xcode with an Apple ID, then re-run the signed build.";
+
+    /// A ticket parked in the attention box: blocked, in Review, no agent left.
+    fn parked_fixture(disposition: Option<&str>) -> (tempfile::TempDir, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        std::fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: parked\ntype: task\nstatus: blocked\npriority: high\nphase: review\n---\n\nBody\n",
+        )
+        .unwrap();
+        let state = State {
+            dag: Dag::from_tickets(lisa_core::ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: work_dir.clone(),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        std::fs::create_dir_all(work_dir.join("T-001")).unwrap();
+        if let Some(disposition) = disposition {
+            write_canonical_review_disposition(&state, "T-001", disposition);
+        }
+        (dir, state)
+    }
+
+    fn admitted_note(state: &State) -> DispositionNote {
+        state
+            .pending_completions
+            .get("T-001")
+            .expect("the override must produce a pending completion")
+            .completion_note
+            .clone()
+            .expect("an override completion carries its note")
+    }
+
+    #[test]
+    fn operator_override_admits_a_blocked_ticket_with_the_blocks_own_ask() {
+        let (_dir, mut state) = parked_fixture(Some(XCODE_BLOCK));
+
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::CannotVerifyHere),
+            })
+        );
+
+        let note = admitted_note(&state);
+        // The quote is the block's own ask, verbatim — not a paraphrase.
+        assert_eq!(note.criterion_quote(), XCODE_ASK);
+        assert!(note
+            .evidence_citation()
+            .ends_with("T-001/review-disposition.json"));
+        assert_eq!(note.summary(), OverrideReason::CannotVerifyHere.summary());
+
+        let receipt = state.pending_completions["T-001"]
+            .operator_override
+            .as_ref()
+            .expect("an override completion carries its receipt");
+        assert_eq!(receipt.reason(), OverrideReason::CannotVerifyHere);
+        assert_eq!(receipt.overridden_ask(), XCODE_ASK);
+    }
+
+    /// Criterion 2's "nothing fabricated": a citation names only what is there.
+    #[test]
+    fn operator_override_cites_review_and_progress_only_when_they_exist() {
+        let (_dir, mut state) = parked_fixture(Some(XCODE_BLOCK));
+        std::fs::write(
+            state.config.work_dir.join("T-001").join("review.md"),
+            "# Review\n",
+        )
+        .unwrap();
+
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::EvidenceSatisfies),
+            })
+        );
+
+        let citation = admitted_note(&state).evidence_citation().to_string();
+        assert!(citation.contains("review-disposition.json"), "{citation}");
+        assert!(citation.contains("review.md"), "{citation}");
+        assert!(
+            !citation.contains("progress.md"),
+            "a citation must not name a file that is not there: {citation}"
+        );
+    }
+
+    #[test]
+    fn operator_override_admits_a_missing_review_with_the_no_review_reason() {
+        let (_dir, mut state) = parked_fixture(None);
+
+        assert_eq!(
+            state.override_choices_for("T-001"),
+            Some(OverriddenAsk::NoReviewOnFile)
+        );
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::NoReviewOnFile),
+            })
+        );
+
+        let note = admitted_note(&state);
+        // The receipt says plainly that no agent review existed.
+        assert_eq!(note.criterion_quote(), "no agent review on file for T-001");
+        assert!(note.evidence_citation().ends_with("T-001"));
+        assert_eq!(note.summary(), OverrideReason::NoReviewOnFile.summary());
+    }
+
+    #[test]
+    fn operator_override_admits_an_unreadable_review_quoting_the_parse_failure() {
+        let (_dir, mut state) = parked_fixture(Some("{this is not JSON"));
+
+        assert!(matches!(
+            state.override_choices_for("T-001"),
+            Some(OverriddenAsk::UnreadableReview { .. })
+        ));
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::NoReviewOnFile),
+            })
+        );
+
+        let note = admitted_note(&state);
+        // The literal state being overridden: the reader's own failure text.
+        assert!(
+            note.criterion_quote().contains("malformed JSON"),
+            "{}",
+            note.criterion_quote()
+        );
+        assert!(note
+            .evidence_citation()
+            .ends_with("T-001/review-disposition.json"));
+    }
+
+    #[test]
+    fn operator_override_refuses_a_reason_that_does_not_fit_the_state() {
+        // Signing a real block with "no review was left" would be a fabricated
+        // receipt, so the catalog is partitioned rather than offered whole.
+        let (_dir, mut state) = parked_fixture(Some(XCODE_BLOCK));
+
+        assert!(
+            !state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::NoReviewOnFile),
+            })
+        );
+        assert!(state.pending_completions.is_empty());
+
+        let (_dir, mut state) = parked_fixture(None);
+        assert!(
+            !state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::EvidenceSatisfies),
+            })
+        );
+        assert!(state.pending_completions.is_empty());
+    }
+
+    #[test]
+    fn operator_override_on_a_passing_ticket_adds_no_note() {
+        let (_dir, mut state) = parked_fixture(Some(r#"{"disposition":"pass","reason":null}"#));
+
+        assert_eq!(state.override_choices_for("T-001"), None);
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::EvidenceSatisfies),
+            })
+        );
+
+        // The agent's own verdict stands; an override here is inert.
+        let pending = &state.pending_completions["T-001"];
+        assert_eq!(pending.completion_note, None);
+        assert_eq!(pending.operator_override, None);
+    }
+
+    /// The negative fixture (criterion 4). The guard is widened for a recorded
+    /// operator choice and never weakened: with no reason selected, a Blocked
+    /// ticket refuses to seal exactly as it does today.
+    #[test]
+    fn blocked_ticket_without_a_chosen_reason_still_refuses_to_seal() {
+        let (dir, mut state) = parked_fixture(Some(XCODE_BLOCK));
+
+        assert!(
+            !state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: None,
+            })
+        );
+
+        assert!(state.pending_completions.is_empty());
+        assert!(state.launched_completion_effects.is_empty());
+        assert!(state.activity_log.iter().any(|entry| matches!(
+            &entry.event,
+            ActivityEvent::CompletionRejected {
+                kind: CompletionRejectionKind::DispositionBlocked,
+                ..
+            }
+        )));
+        let content = std::fs::read_to_string(dir.path().join("tickets/T-001.md")).unwrap();
+        assert!(content.contains("phase: review"));
+        assert!(!content.contains("phase: done"));
+    }
+
+    /// The same refusal for the fail-closed shape.
+    #[test]
+    fn missing_review_without_a_chosen_reason_still_refuses_to_seal() {
+        let (_dir, mut state) = parked_fixture(None);
+
+        assert!(
+            !state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: None,
+            })
+        );
+        assert!(state.pending_completions.is_empty());
+        assert!(state.launched_completion_effects.is_empty());
+    }
+
+    #[test]
+    fn override_choices_for_lists_and_recommends_per_state() {
+        let (_dir, state) = parked_fixture(Some(XCODE_BLOCK));
+        let block = state.override_choices_for("T-001").unwrap();
+        assert_eq!(
+            block.applicable_reasons(),
+            &[
+                OverrideReason::EvidenceSatisfies,
+                OverrideReason::CannotVerifyHere,
+                OverrideReason::BeyondTicketReach,
+            ]
+        );
+        assert_eq!(
+            block.recommended_reason(),
+            OverrideReason::EvidenceSatisfies
+        );
+
+        let (_dir, state) = parked_fixture(None);
+        let missing = state.override_choices_for("T-001").unwrap();
+        assert_eq!(
+            missing.applicable_reasons(),
+            &[OverrideReason::NoReviewOnFile]
+        );
+        assert_eq!(missing.recommended_reason(), OverrideReason::NoReviewOnFile);
+    }
+
+    /// A parked ticket with a dependent, no thread, and journal sealing — the
+    /// shape the override actually meets in the field.
+    fn sealing_fixture(disposition: Option<&str>) -> (tempfile::TempDir, State) {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let tickets_dir = root.join("tickets");
+        let work_dir = root.join("work");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-PARKED.md"),
+            "---\nid: T-PARKED\ntitle: parked\ntype: task\nstatus: blocked\npriority: high\nphase: review\n---\n\nBody\n",
+        )
+        .unwrap();
+        fs::write(
+            tickets_dir.join("T-AFTER.md"),
+            "---\nid: T-AFTER\ntitle: dependent\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [T-PARKED]\n---\n",
+        )
+        .unwrap();
+
+        let state = State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: work_dir.clone(),
+                completion_seal: CompletionSeal::Journal,
+                lisa_bin: None,
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            project_root: root.to_path_buf(),
+            git_root: PathBuf::new(),
+            attempt_dir: root.join("attempts"),
+            completion_journal_path: root.join("completion-journal.jsonl"),
+            completion_journal_healthy: true,
+            ledger_path: root.join("provenance.jsonl"),
+            ..State::default()
+        };
+        fs::create_dir_all(work_dir.join("T-PARKED")).unwrap();
+        fs::write(
+            work_dir.join("T-PARKED").join("review.md"),
+            "# Review\nThe build itself checks out.\n",
+        )
+        .unwrap();
+        if let Some(disposition) = disposition {
+            write_canonical_review_disposition(&state, "T-PARKED", disposition);
+        }
+        (dir, state)
+    }
+
+    /// Criterion 1: the override seals through the existing path — Done,
+    /// dependents startable, seat released — with no parallel completion code.
+    #[test]
+    fn override_completion_seals_and_unblocks_dependents() {
+        let (_dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-PARKED".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::CannotVerifyHere),
+            })
+        );
+
+        let ticket = state.dag.get_ticket(&"T-PARKED".to_string()).unwrap();
+        assert_eq!(ticket.phase, Phase::Done);
+        assert_eq!(ticket.status, TicketStatus::Done);
+        assert!(state.dag.all_dependencies_done(&"T-AFTER".to_string()));
+        assert!(!state.pending_completions.contains_key("T-PARKED"));
+        assert!(!state.threads.contains_key("T-PARKED"));
+    }
+
+    /// Criterion 3, ledger half — and the gap that made this ticket necessary:
+    /// the ticket has no thread and no lease, so the execution row cannot be
+    /// written, yet the receipt still lands.
+    #[test]
+    fn override_completion_writes_an_operator_receipt_without_a_thread() {
+        let (dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+        assert!(state.threads.is_empty(), "the parked agent is already gone");
+
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-PARKED".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::CannotVerifyHere),
+            })
+        );
+
+        let records = read_mixed_ledger(&dir.path().join("provenance.jsonl"));
+        let receipts: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                ProvenanceLedgerRecord::OperatorOverride(receipt) => Some(receipt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        let receipt = receipts[0];
+
+        assert_eq!(receipt.ticket_id, "T-PARKED");
+        // Operator authority, the canned reason chosen, and the overridden ask.
+        assert_eq!(receipt.actor, "operator");
+        assert_eq!(receipt.reason_id, "cannot-verify-here");
+        assert_eq!(receipt.reason, OverrideReason::CannotVerifyHere.summary());
+        assert_eq!(receipt.overridden_ask, XCODE_ASK);
+        assert_eq!(receipt.note.criterion_quote(), XCODE_ASK);
+        assert_eq!(receipt.seal, CompletionSeal::Journal);
+
+        // No execution row was fabricated for an attempt that never ran.
+        assert!(records
+            .iter()
+            .all(|record| !matches!(record, ProvenanceLedgerRecord::Execution(_))));
+    }
+
+    /// Criterion 3, journal half — and the note-stability invariant that forces
+    /// the note to be decided before dispatch.
+    #[test]
+    fn override_completion_journals_the_same_note_at_request_and_confirm() {
+        let (dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-PARKED".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::BeyondTicketReach),
+            })
+        );
+
+        let body = std::fs::read_to_string(dir.path().join("completion-journal.jsonl")).unwrap();
+        let noted: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &serde_json::Value| row.get("note").is_some())
+            .collect();
+        assert_eq!(noted.len(), 2, "the note rides request and confirmation");
+        assert_eq!(noted[0]["state"], "requested");
+        assert_eq!(noted[1]["state"], "confirmed");
+        assert_eq!(noted[0]["note"], noted[1]["note"]);
+        assert_eq!(
+            noted[1]["note"]["summary"],
+            serde_json::json!(OverrideReason::BeyondTicketReach.summary())
+        );
+    }
+
+    /// Criterion 3, Notes-for-you: the override surfaces exactly as an agent
+    /// note does, through the projection that already exists.
+    #[test]
+    fn override_completion_surfaces_in_notes_for_you() {
+        let (dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-PARKED".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::CannotVerifyHere),
+            })
+        );
+
+        let queued = lisa_core::notes::collect_notes(
+            &dir.path().join("completion-journal.jsonl"),
+            &dir.path().join("provenance.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].key.ticket_id, "T-PARKED");
+        assert_eq!(
+            queued[0].note.summary(),
+            OverrideReason::CannotVerifyHere.summary()
+        );
+        assert_eq!(queued[0].note.criterion_quote(), XCODE_ASK);
+    }
+
+    #[test]
+    fn ordinary_completion_writes_no_operator_receipt() {
+        let (dir, mut state) = sealing_fixture(Some(r#"{"disposition":"pass","reason":null}"#));
+
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-PARKED".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: None,
+            })
+        );
+
+        assert!(read_mixed_ledger(&dir.path().join("provenance.jsonl"))
+            .iter()
+            .all(|record| !matches!(record, ProvenanceLedgerRecord::OperatorOverride(_))));
+    }
+
+    /// The entry point T-053-01-02's reason step will call.
+    #[test]
+    fn mark_ticket_done_with_override_seals_a_parked_ticket() {
+        let (dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+
+        state.mark_ticket_done_with_override("T-PARKED", OverrideReason::EvidenceSatisfies);
+
+        assert_eq!(
+            state.dag.get_ticket(&"T-PARKED".to_string()).unwrap().phase,
+            Phase::Done
+        );
+        assert!(read_mixed_ledger(&dir.path().join("provenance.jsonl"))
+            .iter()
+            .any(|record| matches!(
+                record,
+                ProvenanceLedgerRecord::OperatorOverride(receipt)
+                    if receipt.reason_id == "evidence-satisfies"
+            )));
+    }
+
+    #[test]
+    fn mark_ticket_done_keeps_its_fail_closed_behavior() {
+        let (_dir, mut state) = sealing_fixture(Some(XCODE_BLOCK));
+
+        state.mark_ticket_done("T-PARKED");
+
+        assert_ne!(
+            state.dag.get_ticket(&"T-PARKED".to_string()).unwrap().phase,
+            Phase::Done
+        );
+        assert!(state.pending_completions.is_empty());
     }
 
     #[test]
@@ -24505,6 +25210,7 @@ owned\n\
                 source: CompletionSource::Artifact,
                 authority: CompletionAuthority::Attempt(predecessor.clone()),
                 completion_note: None,
+                operator_override: None,
             },
         );
         state.handle_completion_result("T-CDX-01", Some(0), vec![b'a'; 40], Vec::new());
@@ -24545,6 +25251,7 @@ owned\n\
                 source: CompletionSource::Artifact,
                 authority: CompletionAuthority::Attempt(replacement.clone()),
                 completion_note: None,
+                operator_override: None,
             },
         );
         state.check_session_timeouts();
