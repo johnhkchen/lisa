@@ -969,18 +969,90 @@ fn widest_visible_line(rendered: &str) -> usize {
     rendered.lines().map(visible_width).max().unwrap_or(0)
 }
 
+/// How much of a node's name the board can afford to print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelStyle {
+    /// `T-054-01-02 WRK` — id in its phase color, token in its status color.
+    Full,
+    /// `054-01-02` — the `T-` prefix and the status token shed, six columns a
+    /// node, with the id recolored to carry the status the token used to.
+    Condensed,
+}
+
+/// The text of one node, and the only place that text is decided.
+///
+/// Condensing sheds ceremony, never information: the prefix every id on the
+/// board shares and a token whose meaning color already carries. The id's own
+/// digits are its name and stay whole, so prepending `T-` reads the condensed
+/// label straight back.
+fn dag_label(id: &str, status: &TicketStatus, style: LabelStyle) -> String {
+    match style {
+        LabelStyle::Full => format!("{} {}", id, status.token()),
+        // `unwrap_or` rather than a slice: an id without the prefix loses no
+        // characters instead of the wrong one.
+        LabelStyle::Condensed => id.strip_prefix("T-").unwrap_or(id).to_string(),
+    }
+}
+
 /// What the DAG post-processor needs to ink one node's label.
 ///
-/// The two colors are separate channels: the ticket id carries the phase, the
-/// status token carries the status. They are read side by side, so they must
-/// never be sourced from each other.
+/// In full mode the two colors are separate channels: the ticket id carries the
+/// phase, the status token carries the status. They are read side by side, so
+/// they must never be sourced from each other. In condensed mode the token is
+/// gone and the id is the only glyph left to paint, so status takes it.
 struct NodeInk<'a> {
     /// The exact label ascii-dag rendered, e.g. `T-054-01-01 WRK`.
     label: &'a str,
     ticket_id: &'a str,
+    /// Empty in condensed mode, where no token was rendered.
     token: &'a str,
     phase_color: &'a str,
     status_color: &'a str,
+    style: LabelStyle,
+}
+
+impl NodeInk<'_> {
+    /// The label with color inserted at the seams — and nothing else changed.
+    /// Strip the escapes and the original label comes back, character for
+    /// character.
+    fn inked(&self) -> String {
+        match self.style {
+            LabelStyle::Full => format!(
+                "{}{}{} {}{}{}",
+                self.phase_color, self.ticket_id, RESET, self.status_color, self.token, RESET
+            ),
+            // `label`, not `ticket_id` — the id here has already shed its prefix.
+            LabelStyle::Condensed => format!("{}{}{}", self.status_color, self.label, RESET),
+        }
+    }
+}
+
+/// Lay the graph out with labels in the given style.
+///
+/// The single call into ascii-dag, which stays the layout owner: this chooses
+/// label strings and nothing else. Returns the labels alongside the render
+/// because the ink map borrows them.
+fn render_dag_body(
+    active: &[&TicketNode],
+    edges: &[(usize, usize)],
+    id_to_int: &HashMap<&str, usize>,
+    style: LabelStyle,
+) -> (Vec<(usize, String)>, String) {
+    let nodes: Vec<(usize, String)> = active
+        .iter()
+        .map(|t| {
+            let label = dag_label(&t.id, &t.status, style);
+            (id_to_int[t.id.as_str()], label)
+        })
+        .collect();
+
+    let node_refs: Vec<(usize, &str)> = nodes
+        .iter()
+        .map(|(id, label)| (*id, label.as_str()))
+        .collect();
+
+    let rendered = ascii_dag::DAG::from_edges(&node_refs, edges).render();
+    (nodes, rendered)
 }
 
 /// Compute DAG layers for visualization (topological sort into layers)
@@ -1024,15 +1096,6 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
         .map(|(i, t)| (t.id.as_str(), i + 1)) // ascii-dag IDs are 1-based
         .collect();
 
-    // Build ascii-dag graph
-    let nodes: Vec<(usize, String)> = active
-        .iter()
-        .map(|t| {
-            let label = format!("{} {}", t.id, t.status.token());
-            (id_to_int[t.id.as_str()], label)
-        })
-        .collect();
-
     let mut edges: Vec<(usize, usize)> = Vec::new();
     for t in &active {
         let child_int = id_to_int[t.id.as_str()];
@@ -1045,14 +1108,8 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
         }
     }
 
-    // Build node refs for from_edges
-    let node_refs: Vec<(usize, &str)> = nodes
-        .iter()
-        .map(|(id, label)| (*id, label.as_str()))
-        .collect();
-
-    let dag = ascii_dag::DAG::from_edges(&node_refs, &edges);
-    let rendered = dag.render();
+    let style = LabelStyle::Full;
+    let (nodes, rendered) = render_dag_body(&active, &edges, &id_to_int, style);
 
     // Build the ink map for post-processing, keyed by ticket id. `label` borrows
     // the exact string handed to ascii-dag, so the substring we search for and
@@ -1066,28 +1123,26 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
                 NodeInk {
                     label: label.as_str(),
                     ticket_id: t.id.as_str(),
-                    token: t.status.token(),
+                    token: match style {
+                        LabelStyle::Full => t.status.token(),
+                        LabelStyle::Condensed => "",
+                    },
                     phase_color: t.phase.color_code(),
                     status_color: t.status.color_code(),
+                    style,
                 },
             )
         })
         .collect();
 
-    // Post-process: ink each node label — ticket id in its phase color, status
-    // token in its status color. Matching the whole label rather than the bare
-    // id keeps one ticket's id from matching inside a longer ticket's label.
+    // Post-process: ink each node label. Matching the whole label rather than
+    // the bare id keeps one ticket's id from matching inside a longer ticket's
+    // label.
     for line in rendered.lines() {
         let mut colored_line = line.to_string();
         for ink in color_map.values() {
             if colored_line.contains(ink.label) {
-                colored_line = colored_line.replace(
-                    ink.label,
-                    &format!(
-                        "{}{}{} {}{}{}",
-                        ink.phase_color, ink.ticket_id, RESET, ink.status_color, ink.token, RESET
-                    ),
-                );
+                colored_line = colored_line.replace(ink.label, &ink.inked());
             } else if colored_line.contains(ink.ticket_id) {
                 // A line carrying the id without its label: color the id alone,
                 // as this loop did before the status token was inked.
@@ -3102,6 +3157,38 @@ mod tests {
         assert_eq!(
             actual, expected,
             "coloring shifted the raw DAG content; this ticket may only insert escapes"
+        );
+    }
+
+    #[test]
+    fn dag_label_full_matches_todays_format() {
+        assert_eq!(
+            dag_label("T-054-01-02", &TicketStatus::InProgress, LabelStyle::Full),
+            "T-054-01-02 WRK"
+        );
+    }
+
+    #[test]
+    fn dag_label_condensed_sheds_prefix_and_token() {
+        // Six columns a node: `T-` is two, ` WRK` is four.
+        let full = dag_label("T-054-01-02", &TicketStatus::InProgress, LabelStyle::Full);
+        let condensed = dag_label(
+            "T-054-01-02",
+            &TicketStatus::InProgress,
+            LabelStyle::Condensed,
+        );
+
+        assert_eq!(condensed, "054-01-02");
+        assert_eq!(full.chars().count() - condensed.chars().count(), 6);
+    }
+
+    #[test]
+    fn dag_label_condensed_leaves_a_prefixless_id_whole() {
+        // An id that never carried `T-` loses no character at all — not the
+        // wrong one.
+        assert_eq!(
+            dag_label("BUG-7", &TicketStatus::Blocked, LabelStyle::Condensed),
+            "BUG-7"
         );
     }
 
