@@ -936,6 +936,39 @@ fn render_health_alerts(state: &PluginState, width: usize, output: &mut Vec<Stri
 // DAG Rendering
 // =============================================================================
 
+/// How many columns of a pane a line actually occupies.
+///
+/// Two things this is careful about, both of which byte length gets wrong:
+/// the DAG's edge routing is drawn in multi-byte single-column glyphs
+/// (`→ ┌ ─ ↓ └ ┐`), and a colored line carries SGR escapes that a terminal
+/// consumes rather than prints. Color is not ink: a line measures the same
+/// before and after it is painted.
+fn visible_width(line: &str) -> usize {
+    let mut width = 0;
+    let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            // An SGR sequence runs to its terminating `m` and shows nothing.
+            for escaped in chars.by_ref() {
+                if escaped == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
+}
+
+/// The widest line in a rendered block, in visible columns.
+///
+/// Blank lines — `ascii_dag::render()` ends with a couple — measure zero and
+/// cannot raise the maximum.
+fn widest_visible_line(rendered: &str) -> usize {
+    rendered.lines().map(visible_width).max().unwrap_or(0)
+}
+
 /// What the DAG post-processor needs to ink one node's label.
 ///
 /// The two colors are separate channels: the ticket id carries the phase, the
@@ -3070,6 +3103,43 @@ mod tests {
             actual, expected,
             "coloring shifted the raw DAG content; this ticket may only insert escapes"
         );
+    }
+
+    #[test]
+    fn visible_width_counts_characters_not_bytes() {
+        // The DAG's edge glyphs are multi-byte and one column wide. Byte length
+        // would overcount a routed board by roughly three to one.
+        let routed = "  ┌───────────────────└───────────────────┐";
+        assert_eq!(visible_width(routed), routed.chars().count());
+        assert!(
+            visible_width(routed) < routed.len(),
+            "fixture should contain multi-byte glyphs, or it proves nothing"
+        );
+    }
+
+    #[test]
+    fn visible_width_ignores_color() {
+        // AC3: a fully colored fixture measures identical to its uncolored twin.
+        let plain = "[T-054-01-02 WRK] → [T-054-01-03 BLK]";
+        let colored = format!(
+            "[{}T-054-01-02{} {}WRK{}] → [{}T-054-01-03{} {}BLK{}]",
+            MAGENTA, RESET, GREEN, RESET, BLUE, RESET, RED, RESET
+        );
+
+        assert_ne!(plain, colored.as_str(), "the twin must actually be colored");
+        assert_eq!(
+            visible_width(&colored),
+            visible_width(plain),
+            "color changed the measurement; escapes are not ink"
+        );
+    }
+
+    #[test]
+    fn widest_visible_line_ignores_blank_trailing_rows() {
+        // ascii_dag::render() ends with blank rows; the max is the content's.
+        let block = "[T-002 WRK]\n[T-003 BLK] → [T-004 RDY]\n\n\n";
+        assert_eq!(widest_visible_line(block), 25);
+        assert_eq!(widest_visible_line(""), 0);
     }
 
     #[test]
