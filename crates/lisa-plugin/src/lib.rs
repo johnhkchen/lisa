@@ -8693,6 +8693,73 @@ impl State {
             return true;
         }
 
+        // Normal mode, on the desk: the desk answers first.
+        //
+        // Ordered ahead of every global key so [d] can arrive already pointed
+        // at the selected card, and ahead of the scroll branch below so the
+        // desk's own navigation wins there and nowhere else — every other view
+        // keeps j/k scrolling untouched. Keys this block does not claim fall
+        // straight through, so [p], [space], [r], [D], and [q] still work here.
+        //
+        // The card list is built once and read twice, for the clamp and for
+        // the selected card's identity; a rebuild costs a ledger read and one
+        // disposition parse per blocked ticket.
+        if self.view_preset == ui::ViewPreset::Present {
+            let cards = self.desk_cards();
+            // Re-clamp against the live list rather than trusting a cursor a
+            // poll may have stranded past the end of a shorter desk.
+            self.desk_selected = self.desk_selected.min(cards.len().saturating_sub(1));
+            let selected = cards.get(self.desk_selected);
+            match key.bare_key {
+                BareKey::Up | BareKey::Char('k') => {
+                    self.desk_selected = self.desk_selected.saturating_sub(1);
+                    // Moving on collapses what was open: the staff work is
+                    // always something the operator asked for just now.
+                    self.desk_expanded = false;
+                    return true;
+                }
+                BareKey::Down | BareKey::Char('j') => {
+                    if self.desk_selected + 1 < cards.len() {
+                        self.desk_selected += 1;
+                    }
+                    self.desk_expanded = false;
+                    return true;
+                }
+                BareKey::Enter => {
+                    if !cards.is_empty() {
+                        self.desk_expanded = !self.desk_expanded;
+                    }
+                    return true;
+                }
+                // Sign the selected card. An empty desk, or a card naming a
+                // ticket the board cannot finish, falls through to the plain
+                // [d] below — the same modal the key opens everywhere else.
+                BareKey::Char('d') => {
+                    if let Some(ticket_id) = selected.map(|card| card.ticket_id.clone()) {
+                        self.open_desk_signature(&ticket_id);
+                        return true;
+                    }
+                }
+                // Send it back. Only where a block exists: both block kinds
+                // are built from `status: blocked` tickets, and neither a
+                // review wait nor a note ever can be.
+                BareKey::Char('s') => {
+                    let sendable = selected.filter(|card| {
+                        matches!(
+                            card.kind,
+                            ui::DeskCardKind::Block | ui::DeskCardKind::NoReviewOnFile
+                        )
+                    });
+                    let Some(ticket_id) = sendable.map(|card| card.ticket_id.clone()) else {
+                        return false;
+                    };
+                    self.send_back_for_review(&ticket_id);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         // Normal mode: 'p' goes to the desk, from anywhere, in one press.
         //
         // Already there is genuinely nothing to do — not a re-entry, which
@@ -8735,42 +8802,6 @@ impl State {
         if key.bare_key == BareKey::Char('r') {
             self.open_reset_modal();
             return true;
-        }
-
-        // Normal mode, on the desk: Up/Down pick a card, Enter opens it.
-        //
-        // Ordered before the scroll branch below so the desk's own navigation
-        // wins there and nowhere else — every other view keeps j/k scrolling
-        // untouched. Which key reaches the desk, and what [d] and [s] do once
-        // there, is the key estate's business, not this view's.
-        if self.view_preset == ui::ViewPreset::Present {
-            let card_count = self.desk_card_count();
-            // Re-clamp against the live count rather than trusting a cursor a
-            // poll may have stranded past the end of a shorter desk.
-            self.desk_selected = self.desk_selected.min(card_count.saturating_sub(1));
-            match key.bare_key {
-                BareKey::Up | BareKey::Char('k') => {
-                    self.desk_selected = self.desk_selected.saturating_sub(1);
-                    // Moving on collapses what was open: the staff work is
-                    // always something the operator asked for just now.
-                    self.desk_expanded = false;
-                    return true;
-                }
-                BareKey::Down | BareKey::Char('j') => {
-                    if self.desk_selected + 1 < card_count {
-                        self.desk_selected += 1;
-                    }
-                    self.desk_expanded = false;
-                    return true;
-                }
-                BareKey::Enter => {
-                    if card_count > 0 {
-                        self.desk_expanded = !self.desk_expanded;
-                    }
-                    return true;
-                }
-                _ => {}
-            }
         }
 
         // Normal mode: j/k scroll the dashboard
@@ -8861,6 +8892,83 @@ impl State {
             operator_outcome: None,
             reason_step: None,
         };
+    }
+
+    /// Enter the signature flow already pointed at one card's ticket.
+    ///
+    /// Supplies nothing but the cursor: the modal, the verdict branch, and the
+    /// reason step are the ones [`Self::open_mark_done_modal`] and the ticket
+    /// list already use, so the desk adds no second way to complete a ticket.
+    /// With the recommendation preselected, `[d]` then Enter signs.
+    ///
+    /// A ticket the board cannot finish — a note's ticket is usually already
+    /// Done, so the modal does not list it — leaves the modal open and
+    /// unscoped, which is exactly what the plain `[d]` does.
+    fn open_desk_signature(&mut self, ticket_id: &str) {
+        self.open_mark_done_modal();
+        if !self.modal.open {
+            return;
+        }
+        let Some(index) = self
+            .modal
+            .ticket_ids
+            .iter()
+            .position(|listed| listed == ticket_id)
+        else {
+            return;
+        };
+        self.modal.cursor = index;
+        if let Some(ask) = self.override_choices_for(ticket_id) {
+            self.open_reason_step(ticket_id.to_string(), ask);
+        }
+    }
+
+    /// Send a parked ticket back for another review pass.
+    ///
+    /// The in-plugin equivalent of `lisa unblock`'s flip (crates/lisa-cli/src/
+    /// unblock.rs): Blocked becomes open and the phase is left alone, so the
+    /// ticket re-enters at Review and the next scheduling pass starts a fresh
+    /// review rather than a rerun from Ready — which is what `[r]` is for.
+    ///
+    /// Deliberately only the flip. The CLI's optional remedy check is skipped:
+    /// send-back is the operator saying they read this and disagree, which is
+    /// the case a machine check cannot settle. Like the CLI, it writes no
+    /// ledger row; its receipt is the activity line.
+    ///
+    /// Guarded on the live ticket rather than the card that was clicked,
+    /// because a card can be one poll stale.
+    fn send_back_for_review(&mut self, ticket_id: &str) {
+        let tid = ticket_id.to_string();
+        let Some(ticket) = self.dag.get_ticket(&tid) else {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Cannot find {ticket_id} to send back"),
+            });
+            return;
+        };
+        let file_path = ticket.file_path.clone();
+        if file_path.as_os_str().is_empty() {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Cannot find the file for {ticket_id}"),
+            });
+            return;
+        }
+        if ticket.status != TicketStatus::Blocked {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!("{ticket_id} isn't waiting, so there is nothing to send back"),
+            });
+            return;
+        }
+
+        if let Err(error) = ticket::update_ticket_status(&file_path, TicketStatus::Open) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("Could not let {ticket_id} run again: {error}"),
+            });
+            return;
+        }
+        self.log_activity(ActivityEvent::Info {
+            message: format!("Sent {tid} back for another review pass"),
+        });
+        self.rebuild_dag();
     }
 
     /// Request manual completion through the same isolated transaction.
@@ -9469,14 +9577,14 @@ impl State {
         }
     }
 
-    /// How many cards the desk is showing right now.
+    /// The cards the desk is showing right now.
     ///
-    /// Recomputed rather than cached: the selection must be bounded by the desk
-    /// the operator is actually looking at, and a poll between keypresses can
-    /// change how many cards that is. This is the same work the five-second
-    /// render already does, at human keypress rate.
-    fn desk_card_count(&self) -> usize {
-        self.to_ui_state().desk.cards.len()
+    /// Recomputed rather than cached: the selection, and any key acting on it,
+    /// must be bounded by the desk the operator is actually looking at, and a
+    /// poll between keypresses can change what that is. This is the same work
+    /// the five-second render already does, at human keypress rate.
+    fn desk_cards(&self) -> Vec<ui::DeskCard> {
+        self.to_ui_state().desk.cards
     }
 
     /// The class the remedy collector cannot see: a Blocked ticket whose review
@@ -16671,6 +16779,310 @@ mod tests {
         assert_eq!(receipt.reason, OverrideReason::EvidenceSatisfies.summary());
         assert_eq!(receipt.overridden_ask, XCODE_ASK);
         assert_eq!(receipt.note.criterion_quote(), XCODE_ASK);
+    }
+
+    // =========================================================================
+    // The desk's own keys (T-053-02-02)
+    // =========================================================================
+
+    /// The sealing fixture, sitting on the desk with its one card selected.
+    fn desk_at(disposition: Option<&str>) -> (tempfile::TempDir, State) {
+        let (dir, mut state) = sealing_fixture(disposition);
+        state.view_preset = ui::ViewPreset::Present;
+        (dir, state)
+    }
+
+    /// The same, with scheduling armed so a poll can actually spawn.
+    fn armed_desk() -> (tempfile::TempDir, State) {
+        let (dir, mut state) = desk_at(Some(XCODE_BLOCK));
+        state.permissions_granted = true;
+        state.slots_discovered = true;
+        state.agent_slots.push(fresh_slot(60, None));
+        (dir, state)
+    }
+
+    /// Criterion 2: [d] arrives at the reason step already pointed at the card
+    /// the operator was looking at, with the recommendation preselected.
+    #[test]
+    fn d_on_a_desk_card_opens_the_reason_step_already_scoped_to_it() {
+        let (_dir, mut state) = desk_at(Some(XCODE_BLOCK));
+        assert_eq!(state.desk_cards()[0].ticket_id, "T-PARKED");
+
+        assert!(press(&mut state, BareKey::Char('d')));
+
+        assert!(state.modal.open);
+        assert_eq!(
+            state.modal.ticket_ids[state.modal.cursor].as_str(),
+            "T-PARKED",
+            "the ticket cursor must land on the selected card, not row zero"
+        );
+        let step = open_step(&state);
+        assert_eq!(step.ticket_id, "T-PARKED");
+        assert_eq!(step.choices[step.cursor], step.ask.recommended_reason());
+    }
+
+    /// Criterion 2, end to end: two keypresses from the desk to a sealed
+    /// ticket, driven only through `handle_key`.
+    #[test]
+    fn two_keypresses_seal_the_selected_card() {
+        let (dir, mut state) = desk_at(Some(XCODE_BLOCK));
+
+        assert!(press(&mut state, BareKey::Char('d')));
+        assert!(press(&mut state, BareKey::Enter));
+
+        let parked = state.dag.get_ticket(&"T-PARKED".to_string()).unwrap();
+        assert_eq!(parked.phase, Phase::Done);
+        assert_eq!(parked.status, TicketStatus::Done);
+        assert!(
+            state.dag.all_dependencies_done(&"T-AFTER".to_string()),
+            "the dependent goes ready on the next scheduling pass"
+        );
+        assert!(
+            read_mixed_ledger(&dir.path().join("provenance.jsonl"))
+                .iter()
+                .any(|record| matches!(
+                    record,
+                    ProvenanceLedgerRecord::OperatorOverride(receipt)
+                        if receipt.overridden_ask == XCODE_ASK && receipt.actor == "operator"
+                )),
+            "signing from the desk leaves the same receipt as signing from the board"
+        );
+    }
+
+    /// A card whose ticket the board cannot finish still gets the plain [d],
+    /// rather than a key that silently does nothing on some cards. A note's
+    /// ticket is already Done, so the modal never lists it — the real case.
+    #[test]
+    fn d_falls_back_to_the_plain_modal_for_a_ticket_the_board_cannot_finish() {
+        let (_dir, mut state) = desk_without_a_block();
+        state.desk_selected = 1;
+        assert_eq!(state.desk_cards()[1].kind, ui::DeskCardKind::Note);
+
+        assert!(press(&mut state, BareKey::Char('d')));
+
+        assert!(state.modal.open, "the ordinary modal still answers");
+        assert_eq!(
+            state.modal.ticket_ids,
+            vec!["T-REVIEW"],
+            "the note's own ticket is Done and is not offered"
+        );
+        assert!(
+            state.modal.reason_step.is_none(),
+            "nothing was scoped, so nothing was preselected"
+        );
+    }
+
+    /// Criterion 2: [s] performs `lisa unblock`'s flip, and the card is gone
+    /// once the scheduler has picked the ticket back up.
+    #[test]
+    fn s_returns_a_parked_ticket_to_review_and_its_card_leaves_on_the_next_poll() {
+        let (_dir, mut state) = armed_desk();
+        let ticket_file = state.config.ticket_dir.join("T-PARKED.md");
+        assert_eq!(state.desk_cards().len(), 1);
+        assert_eq!(state.desk_cards()[0].kind, ui::DeskCardKind::Block);
+
+        assert!(press(&mut state, BareKey::Char('s')));
+
+        // The flip is durable and the phase is untouched: another review pass,
+        // not a rerun from Ready.
+        let on_disk = std::fs::read_to_string(&ticket_file).unwrap();
+        assert!(on_disk.contains("status: open"), "{on_disk}");
+        assert!(on_disk.contains("phase: review"), "{on_disk}");
+        let parked = state.dag.get_ticket(&"T-PARKED".to_string()).unwrap();
+        assert_eq!(parked.status, TicketStatus::Open);
+        assert_eq!(parked.phase, Phase::Review);
+        assert!(
+            state
+                .desk_cards()
+                .iter()
+                .all(|card| card.kind != ui::DeskCardKind::Block),
+            "the block is settled, so no card may still ask about it"
+        );
+
+        // The next poll starts the review, and the desk is clear.
+        state.schedule_ready_tickets();
+        assert!(
+            state.threads.contains_key("T-PARKED"),
+            "the send-back must actually restart the review"
+        );
+        assert!(
+            state.desk_cards().is_empty(),
+            "the card leaves the desk on the next poll: {:?}",
+            state.desk_cards()
+        );
+    }
+
+    /// A desk holding exactly one review wait and one note, and no block.
+    fn desk_without_a_block() -> (tempfile::TempDir, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        let journal = dir.path().join("completion-journal.jsonl");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        std::fs::write(
+            tickets_dir.join("T-REVIEW.md"),
+            "---\nid: T-REVIEW\ntitle: in review\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nFixture\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tickets_dir.join("T-NOTE.md"),
+            "---\nid: T-NOTE\ntitle: note source\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nFixture\n",
+        )
+        .unwrap();
+
+        let note = DispositionNote::new(
+            "approximately 200 MiB",
+            "review.md#measurement",
+            "The recorded measurement and criterion text disagree.",
+        )
+        .unwrap();
+        let key = CompletionGenerationId::new(
+            CompletionId::new("T-NOTE"),
+            AttemptId::new("attempt-note"),
+            1,
+        );
+        let correlation = CorrelationId::new("note-correlation");
+        completion_journal::append_with_seal(
+            &journal,
+            CompletionSeal::Commit,
+            CompletionJournalTransition::Requested {
+                key: key.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+                note: Some(note.clone()),
+            },
+        )
+        .unwrap();
+        completion_journal::append_with_seal(
+            &journal,
+            CompletionSeal::Commit,
+            CompletionJournalTransition::CommandInFlight {
+                key: key.clone(),
+                correlation: correlation.clone(),
+                deadline: CompletionDeadline::from_unix_millis(42),
+            },
+        )
+        .unwrap();
+        completion_journal::append_with_seal(
+            &journal,
+            CompletionSeal::Commit,
+            CompletionJournalTransition::Confirmed {
+                key,
+                correlation,
+                receipt: CompletionSealReceipt::commit("a".repeat(40)).unwrap(),
+                note: Some(note),
+            },
+        )
+        .unwrap();
+
+        let mut state = State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            completion_journal_path: journal,
+            ledger_path: dir.path().join("provenance.jsonl"),
+            view_preset: ui::ViewPreset::Present,
+            ..State::default()
+        };
+        state.restore_completion_journal();
+        (dir, state)
+    }
+
+    /// Criterion 4: send-back exists only where a block exists. Driven through
+    /// the key handler on real cards of each kind, not on their types.
+    #[test]
+    fn s_does_nothing_on_a_note_card_or_a_review_wait_card() {
+        let (_dir, mut state) = desk_without_a_block();
+        let cards = state.desk_cards();
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| (card.ticket_id.as_str(), card.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("T-REVIEW", ui::DeskCardKind::ReviewWait),
+                ("T-NOTE", ui::DeskCardKind::Note),
+            ]
+        );
+
+        let files: Vec<(std::path::PathBuf, Vec<u8>)> = ["T-REVIEW", "T-NOTE"]
+            .iter()
+            .map(|id| {
+                let path = state.config.ticket_dir.join(format!("{id}.md"));
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+
+        for (index, kind) in [ui::DeskCardKind::ReviewWait, ui::DeskCardKind::Note]
+            .into_iter()
+            .enumerate()
+        {
+            state.desk_selected = index;
+            assert!(
+                !press(&mut state, BareKey::Char('s')),
+                "[s] on a {kind:?} card must not even redraw"
+            );
+            for (path, before) in &files {
+                assert_eq!(
+                    &std::fs::read(path).unwrap(),
+                    before,
+                    "[s] on a {kind:?} card rewrote {}",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                state.desk_cards(),
+                cards,
+                "[s] on a {kind:?} card moved the desk"
+            );
+            assert!(!state.modal.open);
+        }
+    }
+
+    /// Criterion 3: no desk key panics or hides state on an empty desk.
+    #[test]
+    fn desk_keys_are_inert_on_an_empty_desk() {
+        let (_dir, mut state) = desk_at(None);
+        ticket::update_ticket_status(
+            state.config.ticket_dir.join("T-PARKED.md"),
+            TicketStatus::Done,
+        )
+        .unwrap();
+        ticket::update_ticket_phase(state.config.ticket_dir.join("T-PARKED.md"), Phase::Done)
+            .unwrap();
+        state.rebuild_dag();
+        assert!(state.desk_cards().is_empty());
+
+        assert!(!press(&mut state, BareKey::Char('s')), "[s] has no card");
+        assert!(!state.modal.open);
+        assert_eq!(state.desk_selected, 0);
+        assert!(!state.desk_expanded);
+
+        // [d] on an empty desk is simply the global [d]: T-AFTER is listable.
+        assert!(press(&mut state, BareKey::Char('d')));
+        assert!(state.modal.open);
+        assert!(state.modal.reason_step.is_none());
+    }
+
+    /// The stale-card guard: the ticket file is the truth, not the card.
+    #[test]
+    fn send_back_refuses_a_ticket_that_is_no_longer_blocked() {
+        let (_dir, mut state) = desk_at(Some(XCODE_BLOCK));
+        let ticket_file = state.config.ticket_dir.join("T-AFTER.md");
+        let before = std::fs::read(&ticket_file).unwrap();
+
+        state.send_back_for_review("T-AFTER");
+
+        assert_eq!(std::fs::read(&ticket_file).unwrap(), before);
+        assert!(
+            state
+                .activity_events()
+                .any(|event| matches!(event, ActivityEvent::Warning { message } if message.contains("T-AFTER"))),
+            "an ignored keypress still says why"
+        );
     }
 
     /// Criterion 3, as a sweep rather than a claim: every verdict a listed
