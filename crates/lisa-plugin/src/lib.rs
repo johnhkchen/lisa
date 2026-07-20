@@ -8571,6 +8571,20 @@ impl State {
         out
     }
 
+    /// Switch to a view and arrive at the top of it.
+    ///
+    /// The one seam for "entering a view starts clean": the page scroll and the
+    /// desk's cursor and expansion all reset here, so a later view key cannot
+    /// reset half of them. Arriving mid-list, or on a card the operator picked
+    /// two views ago, is the kind of stale state that makes a dashboard feel
+    /// like it remembers things it should not.
+    fn enter_view(&mut self, preset: ui::ViewPreset) {
+        self.view_preset = preset;
+        self.scroll_offset = 0;
+        self.desk_selected = 0;
+        self.desk_expanded = false;
+    }
+
     /// Handle keyboard input. Returns true if the UI should re-render.
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
         if self.modal.open {
@@ -8679,10 +8693,22 @@ impl State {
             return true;
         }
 
-        // Normal mode: 'p' cycles preset views
+        // Normal mode: 'p' goes to the desk, from anywhere, in one press.
+        //
+        // Already there is genuinely nothing to do — not a re-entry, which
+        // would throw away the operator's place on the desk as the price of a
+        // habit keypress. Returning false says "no frame changed".
         if key.bare_key == BareKey::Char('p') {
-            self.view_preset = self.view_preset.next();
-            self.scroll_offset = 0;
+            if self.view_preset == ui::ViewPreset::Present {
+                return false;
+            }
+            self.enter_view(ui::ViewPreset::Present);
+            return true;
+        }
+
+        // Normal mode: 'v' cycles preset views, in the order [p] used to walk.
+        if key.bare_key == BareKey::Char('v') {
+            self.enter_view(self.view_preset.next());
             return true;
         }
 
@@ -10911,6 +10937,79 @@ mod tests {
         assert_eq!(state.scroll_offset, 1);
         assert_eq!(state.desk_selected, 0);
         assert!(!state.desk_expanded);
+    }
+
+    /// Criterion 1: one press reaches the desk from wherever the operator is,
+    /// and the press has nothing left to do once they are there.
+    #[test]
+    fn p_lands_on_the_desk_from_every_preset_and_rests_there() {
+        let (_dir, mut state) = desk_state_from(&[&blocked_ticket("T-ONE")]);
+
+        for preset in [
+            ui::ViewPreset::Operations,
+            ui::ViewPreset::Present,
+            ui::ViewPreset::Dag,
+            ui::ViewPreset::Activity,
+        ] {
+            state.view_preset = preset;
+            let moved = press(&mut state, BareKey::Char('p'));
+            assert_eq!(state.view_preset, ui::ViewPreset::Present, "{preset:?}");
+            assert_eq!(
+                moved,
+                preset != ui::ViewPreset::Present,
+                "{preset:?}: [p] must redraw only when it actually moved"
+            );
+        }
+
+        // On the desk it is inert, not a reset: the operator's place survives.
+        state.desk_selected = 0;
+        press(&mut state, BareKey::Down);
+        assert!(press(&mut state, BareKey::Enter));
+        assert!(state.desk_expanded);
+        assert!(!press(&mut state, BareKey::Char('p')));
+        assert!(
+            state.desk_expanded,
+            "[p] on the desk threw away the open card"
+        );
+    }
+
+    /// Criterion 1: cycling moved keys, not order.
+    #[test]
+    fn v_cycles_the_presets_in_the_old_order() {
+        let (_dir, mut state) = desk_state_from(&[]);
+
+        for expected in [
+            ui::ViewPreset::Present,
+            ui::ViewPreset::Dag,
+            ui::ViewPreset::Activity,
+            ui::ViewPreset::Operations,
+        ] {
+            assert!(press(&mut state, BareKey::Char('v')));
+            assert_eq!(state.view_preset, expected);
+        }
+    }
+
+    /// Criterion 3: cursor, expansion, and scroll all start clean on entry.
+    #[test]
+    fn entering_a_view_resets_cursor_expansion_and_scroll() {
+        let (_dir, mut state) = desk_state_from(&[
+            &blocked_ticket("T-ONE"),
+            &blocked_ticket("T-TWO"),
+            &blocked_ticket("T-THREE"),
+        ]);
+
+        for key in [BareKey::Char('v'), BareKey::Char('p')] {
+            state.view_preset = ui::ViewPreset::Operations;
+            state.desk_selected = 2;
+            state.desk_expanded = true;
+            state.scroll_offset = 7;
+
+            assert!(press(&mut state, key));
+
+            assert_eq!(state.desk_selected, 0, "{key:?} kept a stale cursor");
+            assert!(!state.desk_expanded, "{key:?} kept a card open");
+            assert_eq!(state.scroll_offset, 0, "{key:?} kept a stale scroll");
+        }
     }
 
     #[test]
