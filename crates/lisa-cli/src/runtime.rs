@@ -649,6 +649,22 @@ mod tests {
                 loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // The listener is non-blocking only so this loop can
+                            // poll its deadline, but BSD/macOS `accept()` hands
+                            // that O_NONBLOCK down to the accepted stream. Left
+                            // inherited it makes the SO_RCVTIMEO in
+                            // `read_request_headers` meaningless: the first read
+                            // returns EWOULDBLOCK, the request is abandoned
+                            // unread, and closing a socket that still holds
+                            // unconsumed inbound data makes the kernel send RST
+                            // instead of FIN — which kills the client's in-flight
+                            // body read. Whether the client drained first is pure
+                            // scheduling, so under parallel load this surfaced as
+                            // a download failure in tests asserting on later
+                            // stages (the checksum test flaked ~4/32). Restoring
+                            // blocking mode deletes the race outright; it adds no
+                            // retry, no sleep, and no widened tolerance.
+                            stream.set_nonblocking(false).unwrap();
                             thread_requests.fetch_add(1, AtomicOrdering::SeqCst);
                             read_request_headers(&mut stream);
                             match response {
@@ -1056,12 +1072,40 @@ mod tests {
         let error = ensure_managed_zellij(&executable, release).unwrap_err();
         server.join();
 
-        assert!(error.contains("Managed Zellij checksum mismatch"));
-        assert!(error.contains(&server.url));
-        assert!(error.contains(expected_sha256));
-        assert!(error.contains(&actual_sha256));
-        assert_eq!(server.request_count(), 1);
-        assert!(!executable.parent().unwrap().exists());
+        // The contract: a bad archive is rejected, and the rejection names the
+        // mismatch with both hashes and the URL so an operator can act on it.
+        // Each assertion carries the error and the request count, because the
+        // failure categories `ensure_managed_zellij` can return are all plain
+        // strings — without that context a red here cannot distinguish a broken
+        // guard from a failure upstream of the guard, which is exactly how a
+        // fixture-server transport bug once read as a checksum-guard bug.
+        let requests = server.request_count();
+        assert!(
+            error.contains("Managed Zellij checksum mismatch"),
+            "expected the checksum guard to reject the archive, got a different \
+             failure category (requests={requests}): {error}"
+        );
+        assert!(
+            error.contains(&server.url),
+            "rejection must name the source URL: {error}"
+        );
+        assert!(
+            error.contains(expected_sha256),
+            "rejection must name the expected sha256: {error}"
+        );
+        assert!(
+            error.contains(&actual_sha256),
+            "rejection must name the actual sha256: {error}"
+        );
+        assert_eq!(
+            requests, 1,
+            "fixture server should serve exactly one request"
+        );
+        assert!(
+            !executable.parent().unwrap().exists(),
+            "rejected install left {} behind",
+            executable.parent().unwrap().display()
+        );
         assert_no_install_temporary_directories(&executable);
     }
 
