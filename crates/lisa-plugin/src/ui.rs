@@ -1,7 +1,8 @@
 //! UI/Dashboard module for the Lisa Zellij plugin.
 //!
-//! Provides three preset views cycled with `[p]`:
-//! - **Operations**: Attention banner, unified thread table, filtered activity log
+//! Provides four preset views cycled with `[p]`:
+//! - **Operations**: Desk pointer, health alerts, unified thread table, filtered activity log
+//! - **Present**: The desk — one collapsed card per pending decision
 //! - **DAG**: Full dependency graph visualization
 //! - **Activity**: Complete activity log with all entry types
 //!
@@ -169,6 +170,10 @@ pub struct WaitingItem {
     pub ticket_id: String,
     pub ask: String,
     pub reason: String,
+    /// The block's own prepared steps, empty when it supplied none.
+    pub steps: Vec<String>,
+    /// The block's read-only verification command, when it supplied one.
+    pub check: Option<String>,
     pub checks_on_own: bool,
     pub proposal: Option<TriageProposal>,
 }
@@ -180,6 +185,94 @@ pub struct NoteItem {
     pub summary: String,
     pub criterion_quote: String,
     pub evidence_citation: String,
+}
+
+// =============================================================================
+// The desk
+// =============================================================================
+
+/// How a ticket with no review on file states its case, wherever it is shown.
+///
+/// One string, two readers: the reason-step modal's header and the desk card
+/// for the same ticket. A person who reaches the modal from the card must not
+/// be told two different things about the same state.
+pub(crate) const NO_REVIEW_ASK: &str = "No review was left for this ticket.";
+
+/// The same, for a review file that exists but cannot be read.
+///
+/// The reader's own parse failure never reaches this sentence — it is quoted in
+/// the card's staff work, one keypress deep, where technical detail belongs.
+pub(crate) const UNREADABLE_REVIEW_ASK: &str = "No review Lisa can read was left for this ticket.";
+
+/// What a Review-phase ticket is waiting for.
+///
+/// The one card sentence with no disposition field behind it, because a ticket
+/// still in Review has not written a verdict to quote. A fixed constant, not
+/// prose generated per ticket.
+pub(crate) const REVIEW_WAIT_ASK: &str = "Review finished — this one is waiting for you.";
+
+/// The desk with nothing on it.
+pub(crate) const EMPTY_DESK: &str = "Nothing needs you.";
+
+/// What a desk card is waiting on, which decides its framing and its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskCardKind {
+    /// An agent left a readable block naming what it needs.
+    Block,
+    /// The ticket is blocked with no review anyone can read. Invisible to the
+    /// remedy collector, and exactly what the no-review override serves.
+    NoReviewOnFile,
+    /// The ticket finished Review and is waiting to be signed.
+    ReviewWait,
+    /// A receipt from completed work. Never an action, only a read.
+    Note,
+}
+
+/// The staff work behind a card: everything an operator can ask to see, and
+/// nothing they are shown before asking.
+///
+/// Deliberately a separate struct from [`DeskCard`]: the collapsed renderer
+/// never touches it, so "no criterion quote on a collapsed card" is a property
+/// of the types rather than a rule a renderer has to keep remembering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeskDetail {
+    pub reason: Option<String>,
+    pub criterion_quote: Option<String>,
+    pub evidence_citation: Option<String>,
+    pub steps: Vec<String>,
+    pub check: Option<String>,
+    pub proposal: Option<TriageProposal>,
+    /// True for a world-owned remedy, which Lisa re-probes on its own.
+    pub checks_on_own: bool,
+}
+
+/// One pending decision, collapsed to three lines.
+///
+/// Every field is copied from something a disposition already carries. Nothing
+/// here is generated or summarized: a jargony ask surfaces verbatim, which is
+/// the disposition author's bug to fix upstream, not this view's to hide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeskCard {
+    pub ticket_id: String,
+    pub title: String,
+    /// Epoch stamp for the age line. `None` renders as [`UNKNOWN_AGE`] — a card
+    /// with no stamp says so rather than showing an invented number.
+    pub age_stamp: Option<Duration>,
+    pub kind: DeskCardKind,
+    /// The one sentence, verbatim from the field that carries it.
+    pub ask: String,
+    pub detail: DeskDetail,
+}
+
+/// The desk: every pending decision, and which one the operator is looking at.
+#[derive(Debug, Clone, Default)]
+pub struct DeskState {
+    pub cards: Vec<DeskCard>,
+    /// Index into `cards`. Clamped at render time, never trusted blindly.
+    pub selected: usize,
+    /// Whether the selected card is showing its staff work. Always one
+    /// keypress deep, never the default.
+    pub expanded: bool,
 }
 
 /// Type of health alert for the attention banner.
@@ -378,6 +471,8 @@ pub enum ViewPreset {
     /// Default operational monitoring view.
     #[default]
     Operations,
+    /// The desk: one collapsed card per pending decision.
+    Present,
     /// Dedicated DAG dependency visualization.
     Dag,
     /// Full activity log with all entry types.
@@ -388,7 +483,8 @@ impl ViewPreset {
     /// Cycle to the next view preset.
     pub fn next(self) -> Self {
         match self {
-            ViewPreset::Operations => ViewPreset::Dag,
+            ViewPreset::Operations => ViewPreset::Present,
+            ViewPreset::Present => ViewPreset::Dag,
             ViewPreset::Dag => ViewPreset::Activity,
             ViewPreset::Activity => ViewPreset::Operations,
         }
@@ -398,6 +494,7 @@ impl ViewPreset {
     pub fn label(&self) -> &'static str {
         match self {
             ViewPreset::Operations => "Operations",
+            ViewPreset::Present => "Present",
             ViewPreset::Dag => "DAG",
             ViewPreset::Activity => "Activity",
         }
@@ -410,8 +507,11 @@ pub struct PluginState {
     pub tickets: Vec<TicketNode>,
     pub active_threads: Vec<ActiveThread>,
     pub parked_threads: Vec<ParkedThread>,
-    pub waiting_items: Vec<WaitingItem>,
-    pub note_items: Vec<NoteItem>,
+    /// Every pending decision, as cards. The Present preset renders these; the
+    /// Operations view counts them. Parked remedies and completion notes reach
+    /// the screen only through here — there is one desk, so there is one place
+    /// a pending decision can be read.
+    pub desk: DeskState,
     pub activity_log: Vec<ActivityEntry>,
     pub alerts: Vec<HealthAlert>,
     pub slots: Vec<SlotInfo>,
@@ -431,8 +531,7 @@ impl Default for PluginState {
             tickets: Vec::new(),
             active_threads: Vec::new(),
             parked_threads: Vec::new(),
-            waiting_items: Vec::new(),
-            note_items: Vec::new(),
+            desk: DeskState::default(),
             activity_log: Vec::new(),
             alerts: Vec::new(),
             slots: Vec::new(),
@@ -520,93 +619,169 @@ fn render_separator(width: usize) -> String {
 }
 
 // =============================================================================
-// Waiting on you
+// The desk — one card per pending decision
 // =============================================================================
 
-/// Render the plain ask before the reviewer's raw note for durable parks.
-fn render_waiting_on_you(state: &PluginState, output: &mut Vec<String>) {
-    if state.waiting_items.is_empty() {
-        return;
-    }
+/// Indent for a card's second and third lines, and for its staff work.
+const CARD_INDENT: &str = "    ";
 
-    output.push(format!("{BOLD}Waiting on you{RESET}"));
-    for item in &state.waiting_items {
-        let suffix = if item.checks_on_own {
-            " — Lisa checks on its own."
-        } else {
-            ""
-        };
-        if let Some(proposal) = &item.proposal {
-            output.push(format!(
-                "{}  First responder: {}",
-                item.ticket_id, proposal.summary
-            ));
-            output.push(format!("       Suggested: {}", proposal.recommendation));
-            output.extend(
-                proposal
-                    .prepared_steps
-                    .iter()
-                    .map(|step| format!("       Prepared: {}", step.display())),
-            );
-            output.push(format!("       Original ask: {}", item.ask));
-        } else {
-            output.push(format!("{}  {}{}", item.ticket_id, item.ask, suffix));
-        }
-        output.push(format!("       Reviewer's note: {}", item.reason));
+/// The action a card recommends, naming a key that works today.
+///
+/// Nothing here advertises a transition the plugin refuses. `[d]` reaches the
+/// mark-done modal, which lists blocked and Review-phase tickets alike and
+/// routes one needing a signature to the reason step. A note offers only
+/// `[enter]`, because reading it is the only move a receipt has.
+fn card_action_line(card: &DeskCard) -> String {
+    match card.kind {
+        DeskCardKind::Note => "→ [enter] read it".to_string(),
+        _ if card.detail.checks_on_own => "→ [d] mark it done · Lisa checks on its own".to_string(),
+        _ => "→ [d] mark it done".to_string(),
     }
-    output.push(String::new());
 }
 
-/// Render deferred informational notes distinctly from urgent parked work.
-fn render_notes_for_you(state: &PluginState, output: &mut Vec<String>) {
-    if state.note_items.is_empty() {
+/// Render one card: three lines collapsed, plus its staff work when opened.
+///
+/// The collapsed half reads only [`DeskCard`]'s own fields and never
+/// [`DeskDetail`], so no criterion quote, evidence path, reason, or check
+/// command can reach a collapsed card by accident.
+fn desk_card_lines(
+    card: &DeskCard,
+    selected: bool,
+    expanded: bool,
+    current_time: Duration,
+    width: usize,
+) -> Vec<String> {
+    let text_width = width.min(100).saturating_sub(CARD_INDENT.len());
+    let age = format_age_bucket(card.age_stamp.unwrap_or(Duration::ZERO), current_time);
+    let marker = if selected { "▸ " } else { "  " };
+
+    let mut lines = vec![
+        format!(
+            "{marker}{BOLD}{}{RESET} · {} · {DIM}{age}{RESET}",
+            card.ticket_id, card.title
+        ),
+        format!("{CARD_INDENT}{}", fit_modal_line(&card.ask, text_width)),
+        format!(
+            "{CARD_INDENT}{DIM}{}{RESET}",
+            fit_modal_line(&card_action_line(card), text_width)
+        ),
+    ];
+
+    if !(selected && expanded) {
+        return lines;
+    }
+
+    let detail = &card.detail;
+    if let Some(proposal) = &detail.proposal {
+        lines.push(format!(
+            "{CARD_INDENT}First responder: {}",
+            proposal.summary
+        ));
+        lines.push(format!(
+            "{CARD_INDENT}Suggested: {}",
+            proposal.recommendation
+        ));
+        lines.extend(
+            proposal
+                .prepared_steps
+                .iter()
+                .map(|step| format!("{CARD_INDENT}Prepared: {}", step.display())),
+        );
+    }
+    if let Some(reason) = &detail.reason {
+        lines.push(format!("{CARD_INDENT}Reason: {reason}"));
+    }
+    if let Some(quote) = &detail.criterion_quote {
+        lines.push(format!("{CARD_INDENT}Criterion: “{quote}”"));
+    }
+    if let Some(citation) = &detail.evidence_citation {
+        lines.push(format!("{CARD_INDENT}Evidence: {citation}"));
+    }
+    lines.extend(
+        detail
+            .steps
+            .iter()
+            .map(|step| format!("{CARD_INDENT}Step: {step}")),
+    );
+    if let Some(check) = &detail.check {
+        lines.push(format!("{CARD_INDENT}Check: {check}"));
+    }
+    lines
+}
+
+/// Render the desk: every pending decision, three lines each.
+///
+/// An empty desk is one calm sentence and nothing else — no header, no counts,
+/// no box. There is nothing to organize, so there is no organizer to draw.
+fn render_present_view(state: &PluginState, width: usize, output: &mut Vec<String>) {
+    let cards = &state.desk.cards;
+    if cards.is_empty() {
+        output.push(EMPTY_DESK.to_string());
         return;
     }
 
+    let selected = state.desk.selected.min(cards.len() - 1);
+    output.push(format!("{BOLD}Your desk{RESET}"));
+    output.push(String::new());
+    for (index, card) in cards.iter().enumerate() {
+        output.extend(desk_card_lines(
+            card,
+            index == selected,
+            state.desk.expanded,
+            state.current_time,
+            width,
+        ));
+        output.push(String::new());
+    }
+}
+
+/// Render the Operations pointer: how much is waiting, and where to read it.
+///
+/// The counts come from the same card list the desk renders, so the pointer and
+/// the desk cannot disagree about how much is waiting.
+fn render_desk_pointer(state: &PluginState, output: &mut Vec<String>) {
+    let notes = state
+        .desk
+        .cards
+        .iter()
+        .filter(|card| card.kind == DeskCardKind::Note)
+        .count();
+    let waiting = state.desk.cards.len() - notes;
+    if waiting == 0 && notes == 0 {
+        return;
+    }
+
+    let mut parts = Vec::new();
+    if waiting > 0 {
+        parts.push(format!("{waiting} waiting"));
+    }
+    if notes > 0 {
+        parts.push(format!("{notes} note{}", if notes == 1 { "" } else { "s" }));
+    }
     output.push(format!(
-        "{BOLD}{CYAN}Notes for you ({}){RESET}",
-        state.note_items.len()
+        "{BOLD}{}{RESET}{DIM} — [p]{RESET}",
+        parts.join(", ")
     ));
-    for item in &state.note_items {
-        output.push(format!("{}  {}", item.ticket_id, item.summary));
-        output.push(format!("       Criterion: “{}”", item.criterion_quote));
-        output.push(format!("       Evidence: {}", item.evidence_citation));
-    }
     output.push(String::new());
 }
 
 // =============================================================================
-// Attention Banner
+// Health alerts
 // =============================================================================
 
-/// Render the "ATTENTION NEEDED" banner for tickets needing human action.
+/// Render the "ATTENTION NEEDED" banner for unhealthy agent sessions.
 ///
-/// Shows a prominent bordered box listing:
-/// 1. Tickets in review phase (with ID, title, artifact path, time waiting)
-/// 2. Health alerts for stuck/failed sessions
+/// Stuck, failed, idle, and timed-out sessions only. A session in trouble is a
+/// different thing from a decision waiting on a person: decisions are cards on
+/// the desk, and a stuck pane is not something anyone can sign. The Review-phase
+/// rows this box used to carry moved to the desk with them, and the
+/// "Press [d] to mark done" hint went with the rows it described.
 ///
-/// Appends nothing when no tickets need attention.
-fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<String>) {
-    // Collect tickets in review phase
-    let review_tickets: Vec<&TicketNode> = state
-        .tickets
-        .iter()
-        .filter(|t| t.phase == Phase::Review)
-        .collect();
-
-    let has_reviews = !review_tickets.is_empty();
-    let has_alerts = !state.alerts.is_empty();
-
-    if !has_reviews && !has_alerts {
+/// Appends nothing when every session is healthy.
+fn render_health_alerts(state: &PluginState, width: usize, output: &mut Vec<String>) {
+    if state.alerts.is_empty() {
         return;
     }
-
-    // Build lookup for parked thread data (artifact path, wait time)
-    let parked_by_ticket: HashMap<&str, &ParkedThread> = state
-        .parked_threads
-        .iter()
-        .map(|pt| (pt.ticket_id.as_str(), pt))
-        .collect();
 
     let box_w = width.min(100);
     let inner_w = box_w.saturating_sub(4); // account for "║ " and " ║"
@@ -636,56 +811,6 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
         BRIGHT_YELLOW,
         RESET
     ));
-
-    // Review ticket rows
-    for ticket in &review_tickets {
-        let parked = parked_by_ticket.get(ticket.id.as_str());
-
-        // Truncate title to 20 chars
-        let title: String = if ticket.title.chars().count() > 20 {
-            format!("{}..", ticket.title.chars().take(18).collect::<String>())
-        } else {
-            ticket.title.clone()
-        };
-
-        // Artifact: extract filename from path
-        let artifact = match parked {
-            Some(pt) => pt
-                .artifact_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&pt.artifact_path)
-                .to_string(),
-            None => "—".to_string(),
-        };
-
-        // Wait time
-        let wait_time = match parked {
-            Some(pt) => format_time_since(pt.parked_at, state.current_time),
-            None => "—".to_string(),
-        };
-
-        let content = format!(
-            "{:<10} {:<20} {:<14} {:>8}",
-            ticket.id, title, artifact, wait_time
-        );
-        let content_visible_len = content.chars().count();
-        let row_pad = inner_w.saturating_sub(content_visible_len);
-
-        output.push(format!(
-            "{}{}║{} {}{}{} {}{}{}║{}",
-            BOLD,
-            BRIGHT_YELLOW,
-            RESET,
-            YELLOW,
-            content,
-            RESET,
-            " ".repeat(row_pad.saturating_sub(1)),
-            BOLD,
-            BRIGHT_YELLOW,
-            RESET
-        ));
-    }
 
     // Health alert rows (stuck/failed sessions)
     for alert in state.alerts.iter().take(15) {
@@ -766,24 +891,6 @@ fn render_attention_banner(state: &PluginState, width: usize, output: &mut Vec<S
             RESET
         ));
     }
-
-    // Hint row
-    let hint = "Press [d] to mark done";
-    let hint_len = hint.chars().count();
-    let hint_pad = inner_w.saturating_sub(hint_len);
-    output.push(format!(
-        "{}{}║{} {}{}{} {}{}{}║{}",
-        BOLD,
-        BRIGHT_YELLOW,
-        RESET,
-        DIM,
-        hint,
-        RESET,
-        " ".repeat(hint_pad.saturating_sub(1)),
-        BOLD,
-        BRIGHT_YELLOW,
-        RESET
-    ));
 
     // Bottom border
     output.push(format!(
@@ -1323,6 +1430,7 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
 
     match state.active_view {
         ViewPreset::Operations => render_operations_view(state, width, height, &mut output),
+        ViewPreset::Present => render_present_view(state, width, &mut output),
         ViewPreset::Dag => render_dag_view(state, &mut output),
         ViewPreset::Activity => render_activity_view(state, height, &mut output),
     }
@@ -1330,21 +1438,22 @@ fn render_dashboard_lines(state: &PluginState, width: usize, height: usize) -> V
     output
 }
 
-/// Operations view: attention banner + unified threads + filtered activity log.
+/// Operations view: desk pointer + health alerts + threads + activity log.
+///
+/// What waits on a person is a count and a key here, not paragraphs. The asks,
+/// reasons, criterion quotes, and evidence paths that used to open this screen
+/// live on the desk, where they can be read one at a time on request.
 fn render_operations_view(
     state: &PluginState,
     width: usize,
     height: usize,
     output: &mut Vec<String>,
 ) {
-    // Durable parked asks are the first operational content.
-    render_waiting_on_you(state, output);
+    // How much is waiting, and where to read it.
+    render_desk_pointer(state, output);
 
-    // Informational notes follow urgent asks but never gate operations.
-    render_notes_for_you(state, output);
-
-    // Attention banner (review gate + health alerts)
-    render_attention_banner(state, width, output);
+    // Unhealthy sessions — not decisions, so not cards.
+    render_health_alerts(state, width, output);
 
     // Unified thread table
     render_threads(state, output);
@@ -1420,12 +1529,8 @@ fn wrap_modal_text(text: &str, width: usize) -> Vec<String> {
 fn ask_header_lines(ask: &OverriddenAsk, width: usize) -> Vec<String> {
     match ask {
         OverriddenAsk::Block { ask, .. } => wrap_modal_text(ask, width),
-        OverriddenAsk::NoReviewOnFile => {
-            wrap_modal_text("No review was left for this ticket.", width)
-        }
-        OverriddenAsk::UnreadableReview { .. } => {
-            wrap_modal_text("No review Lisa can read was left for this ticket.", width)
-        }
+        OverriddenAsk::NoReviewOnFile => wrap_modal_text(NO_REVIEW_ASK, width),
+        OverriddenAsk::UnreadableReview { .. } => wrap_modal_text(UNREADABLE_REVIEW_ASK, width),
     }
 }
 
@@ -1902,8 +2007,7 @@ mod tests {
                 route: None,
             }],
             parked_threads: vec![],
-            waiting_items: vec![],
-            note_items: vec![],
+            desk: DeskState::default(),
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(30),
@@ -2176,190 +2280,293 @@ mod tests {
         assert!(output.iter().any(|line| line.contains("no tickets")));
     }
 
-    #[test]
-    fn waiting_section_preserves_operator_ask_and_explains_world_waiting() {
-        let state = PluginState {
-            waiting_items: vec![
-                WaitingItem {
-                    ticket_id: "T-ASK".to_string(),
-                    ask: "Run the checkout test exactly once.".to_string(),
-                    reason: "The checkout evidence is missing.".to_string(),
-                    checks_on_own: false,
-                    proposal: None,
-                },
-                WaitingItem {
-                    ticket_id: "T-WORLD".to_string(),
-                    ask: "Wait for the release link.".to_string(),
-                    reason: "The release has not reached the mirror.".to_string(),
-                    checks_on_own: true,
-                    proposal: None,
-                },
-            ],
-            ..PluginState::default()
-        };
-        let mut output = Vec::new();
+    // =========================================================================
+    // The desk
+    // =========================================================================
 
-        render_waiting_on_you(&state, &mut output);
+    /// The jargon wall from the 0.4.4 field screenshots, kept verbatim.
+    ///
+    /// A card must be able to carry this without rewriting it: the desk's job
+    /// is to keep it off the collapsed screen, not to improve it. Fixing the
+    /// sentence is the disposition author's job, upstream.
+    const FIELD_REASON: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
 
-        let full = output.join("\n");
-        assert!(full.contains("Waiting on you"));
-        assert!(full.contains("T-ASK  Run the checkout test exactly once."));
-        assert!(full.contains("Reviewer's note: The checkout evidence is missing."));
-        assert!(full.contains("T-WORLD  Wait for the release link. — Lisa checks on its own."));
-        assert!(full.contains("Reviewer's note: The release has not reached the mirror."));
-        assert!(!full.contains("operator"));
-        assert!(!full.contains("remedy_owner"));
-    }
+    const NOW: Duration = Duration::from_secs(1_000_000);
 
-    #[test]
-    fn legacy_field_block_never_puts_the_raw_reason_first() {
-        const FIELD_REASON: &str = "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass.";
-        let state = PluginState {
-            waiting_items: vec![WaitingItem {
-                ticket_id: "T-046-06-03".to_string(),
-                ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
-                reason: FIELD_REASON.to_string(),
-                checks_on_own: false,
-                proposal: None,
-            }],
-            ..PluginState::default()
-        };
-        let mut output = Vec::new();
-
-        render_waiting_on_you(&state, &mut output);
-
-        assert_eq!(output.len(), 4);
-        assert_eq!(
-            output[1],
-            format!("T-046-06-03  {}", lisa_core::parking::LEGACY_BLOCK_ASK)
-        );
-        assert!(!output[1].contains(FIELD_REASON));
-        assert_eq!(output[2], format!("       Reviewer's note: {FIELD_REASON}"));
-        assert!(output[3].is_empty());
-    }
-
-    #[test]
-    fn waiting_section_is_empty_without_human_or_world_items() {
-        let mut output = Vec::new();
-        render_waiting_on_you(&PluginState::default(), &mut output);
-        assert!(output.is_empty());
-    }
-
-    #[test]
-    fn notes_section_leads_with_summary_then_citations() {
-        let state = PluginState {
-            note_items: vec![NoteItem {
-                ticket_id: "T-046-06-03".to_string(),
-                summary: "The recorded measurement and criterion text disagree.".to_string(),
-                criterion_quote: "approximately 200 MiB".to_string(),
-                evidence_citation: "review.md#measurement".to_string(),
-            }],
-            ..PluginState::default()
-        };
-        let mut output = Vec::new();
-
-        render_notes_for_you(&state, &mut output);
-
-        assert!(output[0].contains("Notes for you (1)"));
-        assert_eq!(
-            output[1],
-            "T-046-06-03  The recorded measurement and criterion text disagree."
-        );
-        assert_eq!(output[2], "       Criterion: “approximately 200 MiB”");
-        assert_eq!(output[3], "       Evidence: review.md#measurement");
-        assert!(output[4].is_empty());
-    }
-
-    #[test]
-    fn notes_section_is_empty_without_active_notes() {
-        let mut output = Vec::new();
-        render_notes_for_you(&PluginState::default(), &mut output);
-        assert!(output.is_empty());
-    }
-
-    #[test]
-    fn notes_are_distinct_from_urgent_waiting_and_precede_operations() {
-        let state = PluginState {
-            waiting_items: vec![WaitingItem {
-                ticket_id: "T-WAIT".to_string(),
-                ask: "Run the release check.".to_string(),
-                reason: "Release evidence is absent.".to_string(),
-                checks_on_own: false,
-                proposal: None,
-            }],
-            note_items: vec![NoteItem {
-                ticket_id: "T-NOTE".to_string(),
-                summary: "The criterion text differs from the measurement.".to_string(),
-                criterion_quote: "200 MiB".to_string(),
-                evidence_citation: "review.md#size".to_string(),
-            }],
-            alerts: vec![HealthAlert {
-                ticket_id: "T-FAILED".to_string(),
-                alert_type: AlertType::Failed,
-                detail: "Session failed".to_string(),
-                suggested_actions: vec![],
-            }],
-            ..PluginState::default()
-        };
-
-        let full = render_dashboard_lines(&state, 80, 50).join("\n");
-        let waiting = full.find("Waiting on you").unwrap();
-        let notes = full.find("Notes for you").unwrap();
-        let attention = full.find("ATTENTION NEEDED").unwrap();
-        let threads = full.find("Threads").unwrap();
-        assert!(waiting < notes);
-        assert!(notes < attention);
-        assert!(notes < threads);
-    }
-
-    #[test]
-    fn first_responder_proposal_precedes_original_ask_and_raw_reason() {
+    /// The fixture the ticket names: two parked blocks, one review wait, one
+    /// note, and one Blocked ticket with no disposition anyone can read.
+    fn desk_fixture() -> DeskState {
         use lisa_core::triage::{PreparedStep, TriageProposal};
 
-        let state = PluginState {
-            waiting_items: vec![WaitingItem {
-                ticket_id: "T-046-06-03".to_string(),
-                ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
-                reason: "225 MiB conflicts with approximately 200 MiB.".to_string(),
-                checks_on_own: false,
-                proposal: Some(TriageProposal {
-                    summary: "The written criteria conflict with the measured evidence."
-                        .to_string(),
-                    recommendation: "Amend the stale criteria.".to_string(),
-                    prepared_steps: vec![PreparedStep::FileEdit {
-                        description: "Use the calibrated bound.".to_string(),
-                        path: std::path::PathBuf::from("docs/active/tickets/T-046-06-03.md"),
-                        old: "approximately 200 MiB".to_string(),
-                        new: "the calibrated 300 MiB bound".to_string(),
-                    }],
-                }),
-            }],
-            ..PluginState::default()
-        };
-        let mut output = Vec::new();
-        render_waiting_on_you(&state, &mut output);
-        let joined = output.join("\n");
-        let summary = joined.find("First responder:").unwrap();
-        let suggested = joined.find("Suggested:").unwrap();
-        let prepared = joined.find("Prepared:").unwrap();
-        let original = joined.find("Original ask:").unwrap();
-        let raw = joined.find("Reviewer's note:").unwrap();
-        assert!(summary < suggested);
-        assert!(suggested < prepared);
-        assert!(prepared < original);
-        assert!(original < raw);
+        DeskState {
+            cards: vec![
+                DeskCard {
+                    ticket_id: "T-ASK".to_string(),
+                    title: "checkout-test".to_string(),
+                    age_stamp: Some(NOW - Duration::from_secs(7200)),
+                    kind: DeskCardKind::Block,
+                    ask: "Run the checkout test exactly once.".to_string(),
+                    detail: DeskDetail {
+                        reason: Some("The checkout evidence is missing.".to_string()),
+                        steps: vec!["Open the checkout page".to_string()],
+                        check: Some("test -f evidence/checkout.log".to_string()),
+                        ..DeskDetail::default()
+                    },
+                },
+                DeskCard {
+                    ticket_id: "T-WORLD".to_string(),
+                    title: "release-link".to_string(),
+                    age_stamp: Some(NOW - Duration::from_secs(300)),
+                    kind: DeskCardKind::Block,
+                    ask: "Wait for the release link.".to_string(),
+                    detail: DeskDetail {
+                        reason: Some(FIELD_REASON.to_string()),
+                        checks_on_own: true,
+                        proposal: Some(TriageProposal {
+                            summary: "The written criteria conflict with the measured evidence."
+                                .to_string(),
+                            recommendation: "Amend the stale criteria.".to_string(),
+                            prepared_steps: vec![PreparedStep::Command {
+                                description: "Apply the prepared amendment.".to_string(),
+                                command: "git apply amendment.patch".to_string(),
+                            }],
+                        }),
+                        ..DeskDetail::default()
+                    },
+                },
+                DeskCard {
+                    ticket_id: "T-SILENT".to_string(),
+                    title: "no-review".to_string(),
+                    age_stamp: Some(NOW - Duration::from_secs(172_800)),
+                    kind: DeskCardKind::NoReviewOnFile,
+                    ask: NO_REVIEW_ASK.to_string(),
+                    detail: DeskDetail {
+                        evidence_citation: Some("docs/active/work/T-SILENT".to_string()),
+                        ..DeskDetail::default()
+                    },
+                },
+                DeskCard {
+                    ticket_id: "T-REVIEW".to_string(),
+                    title: "waiting-review".to_string(),
+                    age_stamp: None,
+                    kind: DeskCardKind::ReviewWait,
+                    ask: REVIEW_WAIT_ASK.to_string(),
+                    detail: DeskDetail::default(),
+                },
+                DeskCard {
+                    ticket_id: "T-NOTE".to_string(),
+                    title: "size-dispute".to_string(),
+                    age_stamp: None,
+                    kind: DeskCardKind::Note,
+                    ask: "The recorded measurement and criterion text disagree.".to_string(),
+                    detail: DeskDetail {
+                        criterion_quote: Some("approximately 200 MiB".to_string()),
+                        evidence_citation: Some("review.md#measurement".to_string()),
+                        ..DeskDetail::default()
+                    },
+                },
+            ],
+            selected: 0,
+            expanded: false,
+        }
     }
 
+    fn desk_state(desk: DeskState) -> PluginState {
+        PluginState {
+            desk,
+            current_time: NOW,
+            active_view: ViewPreset::Present,
+            ..PluginState::default()
+        }
+    }
+
+    fn desk_lines(desk: DeskState) -> Vec<String> {
+        let mut output = Vec::new();
+        render_present_view(&desk_state(desk), 100, &mut output);
+        output.iter().map(|line| strip_ansi(line)).collect()
+    }
+
+    /// Criterion 1: five cards, three lines each, and no staff work anywhere.
     #[test]
-    fn waiting_section_is_first_operations_content() {
+    fn desk_renders_five_collapsed_cards_with_no_staff_work_visible() {
+        let lines = desk_lines(desk_fixture());
+        let full = lines.join("\n");
+
+        // Header, blank, then five cards of exactly three lines plus a blank.
+        assert_eq!(lines.len(), 2 + 5 * 4);
+        for card in 0..5 {
+            let start = 2 + card * 4;
+            assert!(
+                lines[start].starts_with("▸ ") || lines[start].starts_with("  "),
+                "card {card} must open with a selection marker: {:?}",
+                lines[start]
+            );
+            assert!(
+                lines[start + 3].is_empty(),
+                "card {card} must be three lines, then a break"
+            );
+        }
+
+        for hidden in [
+            "approximately 200 MiB",
+            "review.md#measurement",
+            "docs/active/work/T-SILENT",
+            "The checkout evidence is missing.",
+            "test -f evidence/checkout.log",
+            "Open the checkout page",
+            FIELD_REASON,
+            "Criterion:",
+            "Evidence:",
+            "Reason:",
+            "Check:",
+            "Step:",
+        ] {
+            assert!(
+                !full.contains(hidden),
+                "collapsed desk leaked staff work: {hidden:?}"
+            );
+        }
+    }
+
+    /// Criterion 1: a card with no stamp says so rather than inventing a number.
+    #[test]
+    fn a_card_with_no_age_source_shows_a_dash() {
+        let lines = desk_lines(desk_fixture());
+        let review = &lines[2 + 3 * 4];
+        let note = &lines[2 + 4 * 4];
+
+        for line in [review, note] {
+            assert!(line.ends_with(UNKNOWN_AGE), "expected a dash age: {line:?}");
+            assert!(
+                !line
+                    .rsplit(" · ")
+                    .next()
+                    .unwrap()
+                    .contains(|c: char| c.is_ascii_digit()),
+                "an unknown age must carry no number: {line:?}"
+            );
+        }
+        assert!(lines[2].ends_with("2h ago"));
+        assert!(lines[2 + 4].ends_with("5m ago"));
+    }
+
+    /// Criterion 2: the staff work opens for the selected card and no other.
+    #[test]
+    fn expanding_reveals_staff_work_for_the_selected_card_only() {
+        let mut desk = desk_fixture();
+        desk.selected = 0;
+        desk.expanded = true;
+        let lines = desk_lines(desk);
+        let full = lines.join("\n");
+
+        assert!(full.contains("Reason: The checkout evidence is missing."));
+        assert!(full.contains("Step: Open the checkout page"));
+        assert!(full.contains("Check: test -f evidence/checkout.log"));
+
+        // Every other card is untouched — including the note's citations and
+        // the second block's field-jargon reason.
+        assert!(!full.contains("approximately 200 MiB"));
+        assert!(!full.contains("review.md#measurement"));
+        assert!(!full.contains(FIELD_REASON));
+
+        let collapsed_cards = lines.iter().filter(|line| line.starts_with("  T-")).count();
+        assert_eq!(collapsed_cards, 4);
+    }
+
+    /// Criterion 2: a note's citations open too, and only when asked.
+    #[test]
+    fn expanding_a_note_reveals_its_criterion_and_evidence() {
+        let mut desk = desk_fixture();
+        desk.selected = 4;
+        desk.expanded = true;
+        let full = desk_lines(desk).join("\n");
+
+        assert!(full.contains("Criterion: “approximately 200 MiB”"));
+        assert!(full.contains("Evidence: review.md#measurement"));
+        assert!(!full.contains("The checkout evidence is missing."));
+    }
+
+    /// Criterion 2: collapsing restores the shape exactly, byte for byte.
+    #[test]
+    fn collapsing_restores_the_three_line_shape() {
+        let mut expanded = desk_fixture();
+        expanded.expanded = true;
+        let mut collapsed = desk_fixture();
+        collapsed.expanded = false;
+
+        assert!(desk_lines(expanded).len() > desk_lines(desk_fixture()).len());
+        assert_eq!(desk_lines(collapsed), desk_lines(desk_fixture()));
+    }
+
+    /// Criterion 4: an empty desk is one calm sentence and no chrome.
+    #[test]
+    fn empty_desk_is_one_calm_sentence() {
+        let lines = desk_lines(DeskState::default());
+        assert_eq!(lines, vec!["Nothing needs you."]);
+    }
+
+    /// Criterion 5's copy check, as an executable assertion rather than a
+    /// promise in review.md.
+    #[test]
+    fn collapsed_lines_carry_no_mechanism_vocabulary() {
+        const MECHANISM_WORDS: &[&str] = &["disposition", "frontmatter", "dag", "seal"];
+        for line in desk_lines(desk_fixture()) {
+            let lowered = line.to_lowercase();
+            for word in MECHANISM_WORDS {
+                assert!(
+                    !lowered
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .any(|token| token == *word),
+                    "a collapsed card says {word:?}, which no one says at a kitchen table: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// Criterion 5: asks are copied, never composed. The field jargon wall
+    /// survives as a reason without ever being summarized onto a card.
+    #[test]
+    fn asks_render_verbatim_from_their_disposition_fields() {
+        let mut desk = desk_fixture();
+        desk.cards[0].ask = FIELD_REASON.to_string();
+        let lines = desk_lines(desk);
+
+        // Truncated for width, but never reworded: the visible prefix is the
+        // ask's own opening characters.
+        let rendered = lines[3].trim_start();
+        let prefix: String = FIELD_REASON.chars().take(40).collect();
+        assert!(rendered.starts_with(&prefix), "{rendered:?}");
+
+        assert!(lines[2 + 4 + 1].contains("Wait for the release link."));
+        assert!(lines[2 + 2 * 4 + 1].contains(NO_REVIEW_ASK));
+        assert!(lines[2 + 3 * 4 + 1].contains(REVIEW_WAIT_ASK));
+    }
+
+    /// Every advertised key is one the plugin answers today (N3).
+    #[test]
+    fn cards_advertise_only_keys_that_work() {
+        let lines = desk_lines(desk_fixture());
+        let actions: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.trim_start().starts_with("→ "))
+            .collect();
+
+        assert_eq!(actions.len(), 5);
+        assert!(actions[1].contains("Lisa checks on its own"));
+        assert!(actions[4].contains("[enter] read it"));
+        for action in &actions[..4] {
+            assert!(action.contains("[d]"), "{action:?}");
+        }
+        // Send-back does not exist in the plugin yet, so nothing offers it.
+        assert!(!lines.join("\n").contains("[s]"));
+    }
+
+    /// Criterion 3: Operations points at the desk instead of reprinting it.
+    #[test]
+    fn operations_shows_a_pointer_line_not_paragraphs() {
         let state = PluginState {
-            waiting_items: vec![WaitingItem {
-                ticket_id: "T-ASK".to_string(),
-                ask: "Run the release test.".to_string(),
-                reason: "The release evidence is missing.".to_string(),
-                checks_on_own: false,
-                proposal: None,
-            }],
+            desk: desk_fixture(),
+            current_time: NOW,
             alerts: vec![HealthAlert {
                 ticket_id: "T-FAILED".to_string(),
                 alert_type: AlertType::Failed,
@@ -2369,12 +2576,54 @@ mod tests {
             ..PluginState::default()
         };
 
-        let full = render_dashboard_lines(&state, 80, 50).join("\n");
-        let waiting = full.find("Waiting on you").unwrap();
-        let attention = full.find("ATTENTION NEEDED").unwrap();
-        let threads = full.find("Threads").unwrap();
-        assert!(waiting < attention);
-        assert!(waiting < threads);
+        let mut output = Vec::new();
+        render_operations_view(&state, 80, 50, &mut output);
+        let full: String = output
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(full.starts_with("4 waiting, 1 note — [p]"), "{full:?}");
+        for gone in [
+            "Waiting on you",
+            "Notes for you",
+            "Reviewer's note:",
+            "Criterion:",
+            "Evidence:",
+            "Press [d] to mark done",
+            FIELD_REASON,
+        ] {
+            assert!(!full.contains(gone), "Operations still prints {gone:?}");
+        }
+        // Unhealthy sessions are not decisions, so they keep their own box.
+        assert!(full.contains("ATTENTION NEEDED"));
+        assert!(full.contains("Threads"));
+    }
+
+    /// The pointer counts what the desk shows, and says nothing when idle.
+    #[test]
+    fn the_pointer_is_silent_on_an_empty_desk() {
+        let mut output = Vec::new();
+        render_desk_pointer(&PluginState::default(), &mut output);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn the_pointer_drops_a_clause_it_has_no_count_for() {
+        let mut desk = DeskState::default();
+        desk.cards = vec![desk_fixture().cards[4].clone()];
+        let mut output = Vec::new();
+        render_desk_pointer(&desk_state(desk), &mut output);
+        assert_eq!(strip_ansi(&output[0]), "1 note — [p]");
+    }
+
+    #[test]
+    fn a_stale_selection_cannot_panic_the_desk() {
+        let mut desk = desk_fixture();
+        desk.selected = 99;
+        let lines = desk_lines(desk);
+        assert_eq!(lines.iter().filter(|l| l.starts_with("▸ ")).count(), 1);
     }
 
     #[test]
@@ -2977,8 +3226,7 @@ mod tests {
                 parked_at: Duration::from_secs(80),
                 slot_number: 2,
             }],
-            waiting_items: Vec::new(),
-            note_items: Vec::new(),
+            desk: DeskState::default(),
             activity_log: vec![
                 ActivityEntry {
                     timestamp: Duration::from_secs(50),
@@ -3040,8 +3288,10 @@ mod tests {
         assert!(ops_output.contains("Done: 1/4"), "Done count wrong");
     }
 
+    /// A Review-phase ticket is a decision, so it belongs on the desk — not in
+    /// the box that reports unhealthy sessions.
     #[test]
-    fn test_render_attention_banner_with_review_tickets() {
+    fn a_review_wait_is_a_desk_card_and_not_an_alert() {
         let state = PluginState {
             tickets: vec![TicketNode {
                 id: "T-005".to_string(),
@@ -3062,28 +3312,16 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        render_attention_banner(&state, 80, &mut output);
+        render_health_alerts(&state, 80, &mut output);
 
-        let full = output.join("\n");
-        assert!(full.contains("ATTENTION NEEDED"), "Banner header missing");
-        assert!(full.contains("T-005"), "Ticket ID missing from banner");
         assert!(
-            full.contains("review-ticket"),
-            "Ticket title missing from banner"
+            output.is_empty(),
+            "a healthy session in Review is not an alert"
         );
-        assert!(
-            full.contains("design.md"),
-            "Artifact path missing from banner"
-        );
-        // Wait time: 200 - 50 = 150s = 2m 30s
-        assert!(full.contains("2m 30s"), "Wait time missing from banner");
-        // Box drawing characters
-        assert!(full.contains("╔"), "Top border missing");
-        assert!(full.contains("╚"), "Bottom border missing");
     }
 
     #[test]
-    fn test_render_attention_banner_empty() {
+    fn health_alerts_render_nothing_when_every_session_is_healthy() {
         let state = PluginState {
             tickets: vec![TicketNode {
                 id: "T-001".to_string(),
@@ -3096,69 +3334,50 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        render_attention_banner(&state, 80, &mut output);
+        render_health_alerts(&state, 80, &mut output);
 
-        assert!(
-            output.is_empty(),
-            "Banner should not render when no review tickets"
-        );
+        assert!(output.is_empty());
     }
 
+    /// The box no longer advertises a key for rows it no longer carries — the
+    /// N3 specimen this epic was written against.
     #[test]
-    fn test_render_attention_banner_no_parked_thread() {
+    fn the_alert_box_advertises_no_mark_done_key() {
         let state = PluginState {
-            tickets: vec![TicketNode {
-                id: "T-006".to_string(),
-                title: "orphan-review".to_string(),
-                phase: Phase::Review,
-                status: TicketStatus::WaitingReview,
-                depends_on: vec![],
+            alerts: vec![HealthAlert {
+                ticket_id: "T-010".to_string(),
+                alert_type: AlertType::Failed,
+                detail: "Exit code: 1".to_string(),
+                suggested_actions: vec![],
             }],
-            parked_threads: vec![], // No matching parked thread
-            current_time: Duration::from_secs(100),
             ..PluginState::default()
         };
 
         let mut output = Vec::new();
-        render_attention_banner(&state, 80, &mut output);
+        render_health_alerts(&state, 80, &mut output);
 
         let full = output.join("\n");
-        assert!(
-            full.contains("ATTENTION NEEDED"),
-            "Banner should still render"
-        );
-        assert!(full.contains("T-006"), "Ticket ID should appear");
-        assert!(
-            full.contains("—"),
-            "Dash placeholder should appear for missing data"
-        );
+        assert!(full.contains("ATTENTION NEEDED"));
+        assert!(!full.contains("Press [d] to mark done"));
+        assert!(full.contains("╔"), "Top border missing");
+        assert!(full.contains("╚"), "Bottom border missing");
     }
 
     #[test]
-    fn test_attention_banner_in_full_dashboard() {
+    fn test_health_alerts_in_full_dashboard() {
         let state = PluginState {
-            tickets: vec![
-                TicketNode {
-                    id: "T-001".to_string(),
-                    title: "done-ticket".to_string(),
-                    phase: Phase::Done,
-                    status: TicketStatus::Done,
-                    depends_on: vec![],
-                },
-                TicketNode {
-                    id: "T-002".to_string(),
-                    title: "in-review".to_string(),
-                    phase: Phase::Review,
-                    status: TicketStatus::WaitingReview,
-                    depends_on: vec!["T-001".to_string()],
-                },
-            ],
-            parked_threads: vec![ParkedThread {
+            tickets: vec![TicketNode {
+                id: "T-001".to_string(),
+                title: "done-ticket".to_string(),
+                phase: Phase::Done,
+                status: TicketStatus::Done,
+                depends_on: vec![],
+            }],
+            alerts: vec![HealthAlert {
                 ticket_id: "T-002".to_string(),
-                phase: Phase::Review,
-                artifact_path: "docs/active/work/T-002/plan.md".to_string(),
-                parked_at: Duration::from_secs(10),
-                slot_number: 1,
+                alert_type: AlertType::Stuck,
+                detail: "No progress for 15+ min".to_string(),
+                suggested_actions: vec![],
             }],
             current_time: Duration::from_secs(100),
             ..PluginState::default()
@@ -3167,23 +3386,21 @@ mod tests {
         let lines = render_dashboard_lines(&state, 80, 50);
         let full = lines.join("\n");
 
-        // Banner should appear in Operations view
         assert!(
             full.contains("ATTENTION NEEDED"),
-            "Banner missing from full dashboard"
+            "Alert box missing from full dashboard"
         );
 
-        // Banner should appear before the Threads section
         let banner_pos = full.find("ATTENTION NEEDED").unwrap();
         let threads_pos = full.find("Threads").unwrap();
         assert!(
             banner_pos < threads_pos,
-            "Banner should appear before Threads section"
+            "Alerts should appear before the Threads section"
         );
     }
 
     #[test]
-    fn test_render_attention_banner_with_health_alerts() {
+    fn test_render_health_alerts_with_health_alerts() {
         let state = PluginState {
             alerts: vec![
                 HealthAlert {
@@ -3203,7 +3420,7 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        render_attention_banner(&state, 80, &mut output);
+        render_health_alerts(&state, 80, &mut output);
 
         let full = output.join("\n");
         assert!(full.contains("ATTENTION NEEDED"), "Banner header missing");
@@ -3216,7 +3433,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_attention_banner_alerts_only_no_reviews() {
+    fn test_render_health_alerts_alerts_only() {
         let state = PluginState {
             alerts: vec![HealthAlert {
                 ticket_id: "T-099".to_string(),
@@ -3228,7 +3445,7 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        render_attention_banner(&state, 80, &mut output);
+        render_health_alerts(&state, 80, &mut output);
 
         let full = output.join("\n");
         assert!(full.contains("ATTENTION NEEDED"));
@@ -3265,8 +3482,11 @@ mod tests {
         );
     }
 
+    /// A ticket can be both waiting on a person and running an unhealthy
+    /// session. Each surface reports its own half, and neither borrows the
+    /// other's rows.
     #[test]
-    fn test_render_attention_banner_mixed_alerts_and_reviews() {
+    fn a_review_wait_and_an_alert_land_on_different_surfaces() {
         let state = PluginState {
             tickets: vec![TicketNode {
                 id: "T-005".to_string(),
@@ -3281,26 +3501,31 @@ mod tests {
                 detail: "Session crashed".to_string(),
                 suggested_actions: vec!["Retry".to_string()],
             }],
-            parked_threads: vec![ParkedThread {
-                ticket_id: "T-005".to_string(),
-                phase: Phase::Review,
-                artifact_path: "docs/active/work/T-005/design.md".to_string(),
-                parked_at: Duration::from_secs(50),
-                slot_number: 1,
-            }],
+            desk: DeskState {
+                cards: vec![DeskCard {
+                    ticket_id: "T-005".to_string(),
+                    title: "review-ticket".to_string(),
+                    age_stamp: None,
+                    kind: DeskCardKind::ReviewWait,
+                    ask: REVIEW_WAIT_ASK.to_string(),
+                    detail: DeskDetail::default(),
+                }],
+                ..DeskState::default()
+            },
             current_time: Duration::from_secs(200),
             ..PluginState::default()
         };
 
-        let mut output = Vec::new();
-        render_attention_banner(&state, 80, &mut output);
+        let mut alerts = Vec::new();
+        render_health_alerts(&state, 80, &mut alerts);
+        let alerts = alerts.join("\n");
+        assert!(alerts.contains("T-010"), "Health alert ticket missing");
+        assert!(alerts.contains("FAILED"), "Failed indicator missing");
+        assert!(!alerts.contains("T-005"), "Review wait leaked into alerts");
 
-        let full = output.join("\n");
-        // Both health alert and review ticket should appear
-        assert!(full.contains("T-010"), "Health alert ticket missing");
-        assert!(full.contains("T-005"), "Review ticket missing");
-        assert!(full.contains("FAILED"), "Failed indicator missing");
-        assert!(full.contains("design.md"), "Review artifact missing");
+        let desk = desk_lines(state.desk.clone()).join("\n");
+        assert!(desk.contains("T-005"));
+        assert!(!desk.contains("T-010"), "an alert is not a decision");
     }
 
     #[test]

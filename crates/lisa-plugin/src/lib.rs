@@ -986,6 +986,14 @@ pub struct State {
     /// Which preset view is active on the dashboard (cycle with 'p').
     view_preset: ui::ViewPreset,
 
+    /// Which desk card the operator has selected. An index into the card list
+    /// the desk renders, clamped there rather than trusted.
+    desk_selected: usize,
+
+    /// Whether the selected desk card is showing its staff work. Reset by every
+    /// selection change, so the details are always one keypress deep.
+    desk_expanded: bool,
+
     /// Whether the loop has terminated (all tickets done).
     terminated: bool,
 
@@ -8703,6 +8711,42 @@ impl State {
             return true;
         }
 
+        // Normal mode, on the desk: Up/Down pick a card, Enter opens it.
+        //
+        // Ordered before the scroll branch below so the desk's own navigation
+        // wins there and nowhere else — every other view keeps j/k scrolling
+        // untouched. Which key reaches the desk, and what [d] and [s] do once
+        // there, is the key estate's business, not this view's.
+        if self.view_preset == ui::ViewPreset::Present {
+            let card_count = self.desk_card_count();
+            // Re-clamp against the live count rather than trusting a cursor a
+            // poll may have stranded past the end of a shorter desk.
+            self.desk_selected = self.desk_selected.min(card_count.saturating_sub(1));
+            match key.bare_key {
+                BareKey::Up | BareKey::Char('k') => {
+                    self.desk_selected = self.desk_selected.saturating_sub(1);
+                    // Moving on collapses what was open: the staff work is
+                    // always something the operator asked for just now.
+                    self.desk_expanded = false;
+                    return true;
+                }
+                BareKey::Down | BareKey::Char('j') => {
+                    if self.desk_selected + 1 < card_count {
+                        self.desk_selected += 1;
+                    }
+                    self.desk_expanded = false;
+                    return true;
+                }
+                BareKey::Enter => {
+                    if card_count > 0 {
+                        self.desk_expanded = !self.desk_expanded;
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         // Normal mode: j/k scroll the dashboard
         if key.bare_key == BareKey::Char('j') || key.bare_key == BareKey::Down {
             self.scroll_offset += 1;
@@ -9276,6 +9320,184 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Build the desk: every pending decision, as a card.
+    ///
+    /// Four sources, one shape. Cards are grouped by kind and each group is
+    /// ordered by ticket id, so a desk rendered twice from the same facts
+    /// renders the same way — which is what makes the rendered lines assertable
+    /// and, more importantly, what stops cards from shuffling under the
+    /// operator's cursor between polls.
+    fn desk_state(
+        &self,
+        waiting: &[ui::WaitingItem],
+        notes: &[ui::NoteItem],
+        tickets: &[ui::TicketNode],
+        parked: &[ui::ParkedThread],
+    ) -> ui::DeskState {
+        use std::time::Duration;
+
+        let titles: HashMap<&str, &str> = self
+            .dag
+            .tickets()
+            .map(|ticket| (ticket.id.as_str(), ticket.title.as_str()))
+            .collect();
+        let title_of = |ticket_id: &str| titles.get(ticket_id).copied().unwrap_or("").to_string();
+
+        // The durable park stamp is the only clock that survives parking: a
+        // ticket parks by having its thread removed, so nothing in memory
+        // remembers when. A ticket whose park row was never written has no
+        // stamp and says so, rather than borrowing a number from elsewhere.
+        let park_stamps = lisa_core::parking::latest_park_stamps(&self.ledger_path);
+
+        let mut cards: Vec<ui::DeskCard> = waiting
+            .iter()
+            .map(|item| ui::DeskCard {
+                ticket_id: item.ticket_id.clone(),
+                title: title_of(&item.ticket_id),
+                age_stamp: park_stamps
+                    .get(&item.ticket_id)
+                    .copied()
+                    .map(Duration::from_secs),
+                kind: ui::DeskCardKind::Block,
+                ask: item.ask.clone(),
+                detail: ui::DeskDetail {
+                    reason: Some(item.reason.clone()),
+                    steps: item.steps.clone(),
+                    check: item.check.clone(),
+                    proposal: item.proposal.clone(),
+                    checks_on_own: item.checks_on_own,
+                    ..ui::DeskDetail::default()
+                },
+            })
+            .collect();
+
+        let mut fail_closed = self.fail_closed_desk_cards(waiting, &park_stamps);
+        fail_closed.sort_by(|left, right| left.ticket_id.cmp(&right.ticket_id));
+        cards.extend(fail_closed);
+
+        // A ticket parks without leaving Review, so a blocked ticket is still
+        // sitting at `phase: review` and would otherwise be carded twice —
+        // once for what it needs and once for the phase it never left. What it
+        // needs is the real decision, so that card wins and this pass skips
+        // every ticket already asking for something.
+        let already_asking: std::collections::HashSet<String> =
+            cards.iter().map(|card| card.ticket_id.clone()).collect();
+
+        let parked_by_ticket: HashMap<&str, &ui::ParkedThread> = parked
+            .iter()
+            .map(|thread| (thread.ticket_id.as_str(), thread))
+            .collect();
+        let mut review_waits: Vec<ui::DeskCard> = tickets
+            .iter()
+            .filter(|ticket| ticket.phase == ui::Phase::Review)
+            .filter(|ticket| !already_asking.contains(&ticket.id))
+            .map(|ticket| {
+                let thread = parked_by_ticket.get(ticket.id.as_str());
+                ui::DeskCard {
+                    ticket_id: ticket.id.clone(),
+                    title: ticket.title.clone(),
+                    age_stamp: thread.map(|thread| thread.parked_at),
+                    kind: ui::DeskCardKind::ReviewWait,
+                    ask: ui::REVIEW_WAIT_ASK.to_string(),
+                    detail: ui::DeskDetail {
+                        evidence_citation: thread.map(|thread| thread.artifact_path.clone()),
+                        ..ui::DeskDetail::default()
+                    },
+                }
+            })
+            .collect();
+        review_waits.sort_by(|left, right| left.ticket_id.cmp(&right.ticket_id));
+        cards.extend(review_waits);
+
+        // Notes carry no stamp anywhere in the journal, so their age is
+        // genuinely unknown and renders as such.
+        cards.extend(notes.iter().map(|item| ui::DeskCard {
+            ticket_id: item.ticket_id.clone(),
+            title: title_of(&item.ticket_id),
+            age_stamp: None,
+            kind: ui::DeskCardKind::Note,
+            ask: item.summary.clone(),
+            detail: ui::DeskDetail {
+                criterion_quote: Some(item.criterion_quote.clone()),
+                evidence_citation: Some(item.evidence_citation.clone()),
+                ..ui::DeskDetail::default()
+            },
+        }));
+
+        ui::DeskState {
+            selected: self.desk_selected.min(cards.len().saturating_sub(1)),
+            expanded: self.desk_expanded,
+            cards,
+        }
+    }
+
+    /// How many cards the desk is showing right now.
+    ///
+    /// Recomputed rather than cached: the selection must be bounded by the desk
+    /// the operator is actually looking at, and a poll between keypresses can
+    /// change how many cards that is. This is the same work the five-second
+    /// render already does, at human keypress rate.
+    fn desk_card_count(&self) -> usize {
+        self.to_ui_state().desk.cards.len()
+    }
+
+    /// The class the remedy collector cannot see: a Blocked ticket whose review
+    /// is missing or unreadable.
+    ///
+    /// `collect_parked_remedies` keeps only readable Block dispositions, so
+    /// these tickets sit blocked with nothing on any screen explaining why —
+    /// and they are exactly the ones the no-review override was built for. They
+    /// get a card wearing that framing, quoting the sentences the reason step
+    /// already shows for the same two states.
+    fn fail_closed_desk_cards(
+        &self,
+        waiting: &[ui::WaitingItem],
+        park_stamps: &HashMap<String, u64>,
+    ) -> Vec<ui::DeskCard> {
+        use std::time::Duration;
+
+        let already_carded: std::collections::HashSet<&str> =
+            waiting.iter().map(|item| item.ticket_id.as_str()).collect();
+
+        self.dag
+            .tickets()
+            .filter(|ticket| ticket.status == lisa_core::types::TicketStatus::Blocked)
+            .filter(|ticket| !already_carded.contains(ticket.id.as_str()))
+            .filter_map(|ticket| {
+                // A `Block` here is an agent-owned remedy the collector
+                // deliberately withheld, and `None` is a verdict that already
+                // authorizes completion. Neither is this card's business.
+                let state = self.observed_override_state(&ticket.id)?;
+                let (ask, reason) = match &state {
+                    OverriddenAsk::NoReviewOnFile => (ui::NO_REVIEW_ASK, None),
+                    OverriddenAsk::UnreadableReview { detail } => {
+                        (ui::UNREADABLE_REVIEW_ASK, Some(detail.clone()))
+                    }
+                    OverriddenAsk::Block { .. } => return None,
+                };
+                Some(ui::DeskCard {
+                    ticket_id: ticket.id.clone(),
+                    title: ticket.title.clone(),
+                    age_stamp: park_stamps
+                        .get(&ticket.id)
+                        .copied()
+                        .map(Duration::from_secs),
+                    kind: ui::DeskCardKind::NoReviewOnFile,
+                    ask: ask.to_string(),
+                    detail: ui::DeskDetail {
+                        // The reader's own words about the failure, one
+                        // keypress deep — never on the collapsed card.
+                        reason,
+                        evidence_citation: Some(
+                            self.inspected_paths(&ticket.id, &state).join(", "),
+                        ),
+                        ..ui::DeskDetail::default()
+                    },
+                })
+            })
+            .collect()
+    }
+
     /// Convert internal plugin state to UI-compatible state for rendering
     fn to_ui_state(&self) -> ui::PluginState {
         use std::time::Duration;
@@ -9363,6 +9585,8 @@ impl State {
                 ticket_id: remedy.ticket_id,
                 ask: remedy.ask,
                 reason: remedy.reason,
+                steps: remedy.steps,
+                check: remedy.check,
                 checks_on_own: false,
                 proposal: remedy.proposal,
             }),
@@ -9370,6 +9594,8 @@ impl State {
                 ticket_id: remedy.ticket_id,
                 ask: remedy.ask,
                 reason: remedy.reason,
+                steps: remedy.steps,
+                check: remedy.check,
                 checks_on_own: true,
                 proposal: remedy.proposal,
             }),
@@ -9536,12 +9762,13 @@ impl State {
             })
             .collect();
 
+        let desk = self.desk_state(&waiting_items, &note_items, &tickets, &parked_threads);
+
         ui::PluginState {
             tickets,
             active_threads,
             parked_threads,
-            waiting_items,
-            note_items,
+            desk,
             activity_log,
             alerts,
             slots,
@@ -10507,6 +10734,214 @@ mod tests {
         assert!(!state.threads.contains_key("T-WORLD"));
     }
 
+    /// Build a state whose DAG is the given ticket frontmatter blocks.
+    fn desk_state_from(tickets: &[&str]) -> (tempfile::TempDir, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        std::fs::create_dir_all(&tickets_dir).unwrap();
+        for (index, body) in tickets.iter().enumerate() {
+            std::fs::write(tickets_dir.join(format!("fixture-{index}.md")), body).unwrap();
+        }
+        let state = State {
+            dag: Dag::from_tickets(ticket::scan_tickets(&tickets_dir).unwrap()).unwrap(),
+            config: PluginConfig {
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::default()
+            },
+            ledger_path: dir.path().join("provenance.jsonl"),
+            ..State::default()
+        };
+        (dir, state)
+    }
+
+    fn blocked_ticket(id: &str) -> String {
+        format!("---\nid: {id}\ntitle: {id}-title\ntype: task\nstatus: blocked\npriority: high\nphase: review\n---\n\nFixture\n")
+    }
+
+    /// The class `collect_parked_remedies` cannot see: blocked with no review
+    /// anyone can read. Without this card the ticket is invisible everywhere,
+    /// which is exactly the ticket the no-review override was built for.
+    #[test]
+    fn desk_gives_a_blocked_ticket_with_no_readable_review_its_own_card() {
+        let (_dir, state) =
+            desk_state_from(&[&blocked_ticket("T-MISSING"), &blocked_ticket("T-MALFORMED")]);
+        write_canonical_review_disposition(&state, "T-MALFORMED", "this is not json");
+
+        let cards = state.to_ui_state().desk.cards;
+        assert_eq!(cards.len(), 2);
+        for card in &cards {
+            assert_eq!(card.kind, ui::DeskCardKind::NoReviewOnFile);
+        }
+
+        let malformed = &cards[0];
+        assert_eq!(malformed.ticket_id, "T-MALFORMED");
+        assert_eq!(malformed.ask, ui::UNREADABLE_REVIEW_ASK);
+        // The reader's own parse failure is staff work, never the card's face.
+        assert!(!malformed.ask.contains("json"));
+        assert!(malformed.detail.reason.is_some());
+
+        let missing = &cards[1];
+        assert_eq!(missing.ticket_id, "T-MISSING");
+        assert_eq!(missing.ask, ui::NO_REVIEW_ASK);
+        assert!(missing.detail.reason.is_none());
+        // The citation names the directory the operator can actually open.
+        assert!(missing
+            .detail
+            .evidence_citation
+            .as_deref()
+            .unwrap()
+            .ends_with("T-MISSING"));
+    }
+
+    /// A parked ticket never leaves Review, so without deduplication it would
+    /// ask for two different things at once.
+    #[test]
+    fn a_parked_ticket_is_one_card_not_a_block_and_a_review_wait() {
+        let (_dir, state) = desk_state_from(&[&blocked_ticket("T-PARKED")]);
+        write_canonical_review_disposition(
+            &state,
+            "T-PARKED",
+            r#"{"disposition":"block","reason":"signing identity missing","remedy_owner":"operator","ask":"Sign into Xcode."}"#,
+        );
+
+        let cards = state.to_ui_state().desk.cards;
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].kind, ui::DeskCardKind::Block);
+        assert_eq!(cards[0].ask, "Sign into Xcode.");
+    }
+
+    /// The age comes from the durable park row, because parking removes the
+    /// thread and with it every in-memory clock.
+    #[test]
+    fn a_parked_block_takes_its_age_from_the_ledger_stamp() {
+        let (_dir, state) = desk_state_from(&[&blocked_ticket("T-STAMP")]);
+        write_canonical_review_disposition(
+            &state,
+            "T-STAMP",
+            r#"{"disposition":"block","reason":"needs a person","remedy_owner":"operator","ask":"Run the release check."}"#,
+        );
+
+        // No park row yet: nothing durable says when, so nothing is claimed.
+        assert_eq!(state.to_ui_state().desk.cards[0].age_stamp, None);
+
+        lisa_core::provenance::append_parking_transition_record(
+            &state.ledger_path,
+            &ParkingTransitionRecord {
+                schema_version: lisa_core::provenance::SCHEMA_VERSION,
+                seal: lisa_core::completion::CompletionSeal::Commit,
+                record_type: ParkingTransitionType::Park,
+                ticket_id: "T-STAMP".to_string(),
+                attempt_lease: AttemptLease {
+                    ticket_id: "T-STAMP".to_string(),
+                    attempt_id: 1,
+                },
+                remedy_owner: RemedyOwner::Operator,
+                retry_count: None,
+                retry_limit: None,
+                recheck_eligible: false,
+                started_at: 1_000,
+                ended_at: 1_700,
+                wall_clock_secs: 700,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.to_ui_state().desk.cards[0].age_stamp,
+            Some(std::time::Duration::from_secs(1_700))
+        );
+    }
+
+    /// Cards must not shuffle under the operator's cursor between polls.
+    #[test]
+    fn desk_cards_are_grouped_and_ordered_by_ticket_id() {
+        let (_dir, state) = desk_state_from(&[
+            &blocked_ticket("T-BBB"),
+            &blocked_ticket("T-AAA"),
+            &blocked_ticket("T-SILENT-B"),
+            &blocked_ticket("T-SILENT-A"),
+            "---\nid: T-REVIEW\ntitle: in-review\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nFixture\n",
+        ]);
+        for id in ["T-AAA", "T-BBB"] {
+            write_canonical_review_disposition(
+                &state,
+                id,
+                r#"{"disposition":"block","reason":"needs a person","remedy_owner":"operator","ask":"Run the release check."}"#,
+            );
+        }
+
+        let ids: Vec<String> = state
+            .to_ui_state()
+            .desk
+            .cards
+            .into_iter()
+            .map(|card| card.ticket_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["T-AAA", "T-BBB", "T-SILENT-A", "T-SILENT-B", "T-REVIEW"]
+        );
+    }
+
+    /// The desk's own navigation, and nobody else's view.
+    #[test]
+    fn desk_keys_select_and_expand_only_on_the_present_view() {
+        let (_dir, mut state) = desk_state_from(&[
+            &blocked_ticket("T-ONE"),
+            &blocked_ticket("T-TWO"),
+            &blocked_ticket("T-THREE"),
+        ]);
+
+        state.view_preset = ui::ViewPreset::Present;
+        assert!(press(&mut state, BareKey::Down));
+        assert_eq!(state.desk_selected, 1);
+        assert_eq!(state.scroll_offset, 0, "the desk must not scroll the page");
+
+        assert!(press(&mut state, BareKey::Enter));
+        assert!(state.desk_expanded);
+        // Moving on puts the staff work away: details are always something the
+        // operator asked for just now.
+        assert!(press(&mut state, BareKey::Up));
+        assert_eq!(state.desk_selected, 0);
+        assert!(!state.desk_expanded);
+
+        // Every other view keeps scrolling exactly as it did.
+        state.view_preset = ui::ViewPreset::Operations;
+        assert!(press(&mut state, BareKey::Down));
+        assert_eq!(state.scroll_offset, 1);
+        assert_eq!(state.desk_selected, 0);
+        assert!(!state.desk_expanded);
+    }
+
+    #[test]
+    fn desk_selection_is_clamped_to_the_cards_that_exist() {
+        let (_dir, mut state) = desk_state_from(&[&blocked_ticket("T-ONLY")]);
+        state.view_preset = ui::ViewPreset::Present;
+
+        for _ in 0..5 {
+            press(&mut state, BareKey::Down);
+        }
+        assert_eq!(state.desk_selected, 0);
+
+        // A cursor stranded past the end of a shrunken desk comes back rather
+        // than needing one Up press per phantom card.
+        state.desk_selected = 99;
+        press(&mut state, BareKey::Up);
+        assert_eq!(state.desk_selected, 0);
+        assert_eq!(state.to_ui_state().desk.selected, 0);
+    }
+
+    #[test]
+    fn an_empty_desk_swallows_its_keys_without_selecting_anything() {
+        let (_dir, mut state) = desk_state_from(&[]);
+        state.view_preset = ui::ViewPreset::Present;
+
+        assert!(press(&mut state, BareKey::Enter));
+        assert!(!state.desk_expanded, "nothing to open on an empty desk");
+        assert!(press(&mut state, BareKey::Down));
+        assert_eq!(state.desk_selected, 0);
+    }
+
     #[test]
     fn dashboard_projection_reads_the_canonical_operator_ask_for_a_durable_park() {
         let dir = tempfile::tempdir().unwrap();
@@ -10532,15 +10967,16 @@ mod tests {
             r#"{"disposition":"block","reason":"engineering reason","remedy_owner":"operator","ask":"Run the checkout test."}"#,
         );
 
+        let cards = state.to_ui_state().desk.cards;
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].ticket_id, "T-ASK");
+        assert_eq!(cards[0].kind, ui::DeskCardKind::Block);
+        assert_eq!(cards[0].ask, "Run the checkout test.");
+        assert!(!cards[0].detail.checks_on_own);
+        // The engineering reason is staff work, not the card's face.
         assert_eq!(
-            state.to_ui_state().waiting_items,
-            vec![ui::WaitingItem {
-                ticket_id: "T-ASK".to_string(),
-                ask: "Run the checkout test.".to_string(),
-                reason: "engineering reason".to_string(),
-                checks_on_own: false,
-                proposal: None,
-            }]
+            cards[0].detail.reason.as_deref(),
+            Some("engineering reason")
         );
     }
 
@@ -10614,19 +11050,28 @@ mod tests {
         };
         let mut first = make_state();
         first.restore_completion_journal();
-        assert_eq!(first.to_ui_state().note_items.len(), 1);
+        assert_eq!(first.to_ui_state().desk.cards.len(), 1);
         drop(first);
 
         let mut restarted = make_state();
         restarted.restore_completion_journal();
+        let cards = restarted.to_ui_state().desk.cards;
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].ticket_id, "T-NOTE");
+        assert_eq!(cards[0].kind, ui::DeskCardKind::Note);
         assert_eq!(
-            restarted.to_ui_state().note_items,
-            vec![ui::NoteItem {
-                ticket_id: "T-NOTE".to_string(),
-                summary: "The recorded measurement and criterion text disagree.".to_string(),
-                criterion_quote: "approximately 200 MiB".to_string(),
-                evidence_citation: "review.md#measurement".to_string(),
-            }]
+            cards[0].ask,
+            "The recorded measurement and criterion text disagree."
+        );
+        // A note carries no stamp anywhere, so it has no age to show.
+        assert_eq!(cards[0].age_stamp, None);
+        assert_eq!(
+            cards[0].detail.criterion_quote.as_deref(),
+            Some("approximately 200 MiB")
+        );
+        assert_eq!(
+            cards[0].detail.evidence_citation.as_deref(),
+            Some("review.md#measurement")
         );
         let ready_before = restarted.dag.get_ready_tickets();
         let tickets_before = std::fs::read_dir(&tickets_dir)
@@ -10640,7 +11085,7 @@ mod tests {
 
         lisa_core::notes::acknowledge_note(&journal, &ledger, "T-NOTE", None).unwrap();
 
-        assert!(restarted.to_ui_state().note_items.is_empty());
+        assert!(restarted.to_ui_state().desk.cards.is_empty());
         assert_eq!(restarted.dag.get_ready_tickets(), ready_before);
         assert!(restarted.threads.is_empty());
         assert!(restarted.agent_slots.is_empty());
@@ -10777,16 +11222,11 @@ mod tests {
             .unwrap(),
             disposition
         );
-        assert_eq!(
-            state.to_ui_state().waiting_items,
-            vec![ui::WaitingItem {
-                ticket_id: TICKET_ID.to_string(),
-                ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
-                reason: FIELD_REASON.to_string(),
-                checks_on_own: false,
-                proposal: None,
-            }]
-        );
+        let cards = state.to_ui_state().desk.cards;
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].ticket_id, TICKET_ID);
+        assert_eq!(cards[0].ask, lisa_core::parking::LEGACY_BLOCK_ASK);
+        assert_eq!(cards[0].detail.reason.as_deref(), Some(FIELD_REASON));
 
         let records = read_mixed_ledger(&state.ledger_path);
         assert_eq!(records.len(), 1);
