@@ -456,6 +456,7 @@ mod tests {
                 remedy_owner: RemedyOwner::Operator,
                 ask: "Run the checkout test exactly once.".to_string(),
                 reason: "The checkout evidence is missing.".to_string(),
+                steps: Vec::new(),
                 check: None,
                 proposal: None,
             },
@@ -464,6 +465,7 @@ mod tests {
                 remedy_owner: RemedyOwner::World,
                 ask: "Wait for the release link.".to_string(),
                 reason: "The release has not reached the mirror.".to_string(),
+                steps: Vec::new(),
                 check: Some("test -f release".to_string()),
                 proposal: None,
             },
@@ -472,6 +474,7 @@ mod tests {
                 remedy_owner: RemedyOwner::Agent,
                 ask: "Agent retry exhausted.".to_string(),
                 reason: "The agent can retry this work.".to_string(),
+                steps: Vec::new(),
                 check: None,
                 proposal: None,
             },
@@ -496,6 +499,7 @@ mod tests {
             remedy_owner: RemedyOwner::Operator,
             ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
             reason: FIELD_REASON.to_string(),
+            steps: Vec::new(),
             check: None,
             proposal: None,
         }];
@@ -522,6 +526,7 @@ mod tests {
             ask: lisa_core::parking::LEGACY_BLOCK_ASK.to_string(),
             reason: "The 225 MiB measurement conflicts with the approximately 200 MiB criterion."
                 .to_string(),
+            steps: Vec::new(),
             check: None,
             proposal: Some(TriageProposal {
                 summary: "The written criteria conflict with the measured evidence.".to_string(),

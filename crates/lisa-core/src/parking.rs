@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::disposition::{parse_review_disposition, RemedyOwner, ReviewDisposition};
-use crate::provenance::{ParkingTransitionType, ProvenanceLedgerRecord};
+use crate::provenance::{ParkingTransitionRecord, ParkingTransitionType, ProvenanceLedgerRecord};
 use crate::triage::{read_stored_proposal, ProposalState, TriageProposal, TRIAGE_PROPOSAL_FILE};
 use crate::types::{AttemptLease, Ticket, TicketStatus};
 
@@ -75,15 +75,20 @@ pub struct ParkedRemedy {
     pub remedy_owner: RemedyOwner,
     pub ask: String,
     pub reason: String,
+    /// The block's own prepared steps, empty when it supplied none. "No steps"
+    /// and "an empty step list" are the same fact to a reader, so the option is
+    /// flattened here rather than carried forward.
+    pub steps: Vec<String>,
     pub check: Option<String>,
     pub proposal: Option<TriageProposal>,
 }
 
-/// Read the latest current Park lease per ticket from the mixed provenance ledger.
+/// Read the latest current Park record per ticket from the mixed provenance ledger.
 ///
-/// This is an observational correlation aid, not scheduling authority. Missing or
-/// malformed ledger data simply cannot establish a current Park lease.
-pub fn latest_park_attempt_leases(ledger_path: &Path) -> HashMap<String, AttemptLease> {
+/// One walk serves every current-park projection. Park inserts, Unpark removes:
+/// a ticket that has been released is not currently parked, whatever earlier
+/// rows say. Missing or malformed ledger data simply cannot establish a park.
+fn latest_park_records(ledger_path: &Path) -> HashMap<String, ParkingTransitionRecord> {
     let Ok(ledger) = std::fs::read_to_string(ledger_path) else {
         return HashMap::new();
     };
@@ -94,13 +99,38 @@ pub fn latest_park_attempt_leases(ledger_path: &Path) -> HashMap<String, Attempt
     {
         if let ProvenanceLedgerRecord::ParkingTransition(record) = record {
             if record.record_type == ParkingTransitionType::Park {
-                latest.insert(record.ticket_id, record.attempt_lease);
+                latest.insert(record.ticket_id.clone(), record);
             } else {
                 latest.remove(&record.ticket_id);
             }
         }
     }
     latest
+}
+
+/// Read the latest current Park lease per ticket from the mixed provenance ledger.
+///
+/// This is an observational correlation aid, not scheduling authority. Missing or
+/// malformed ledger data simply cannot establish a current Park lease.
+pub fn latest_park_attempt_leases(ledger_path: &Path) -> HashMap<String, AttemptLease> {
+    latest_park_records(ledger_path)
+        .into_iter()
+        .map(|(ticket_id, record)| (ticket_id, record.attempt_lease))
+        .collect()
+}
+
+/// Read when each currently parked ticket was parked, in epoch seconds.
+///
+/// The durable answer to "how long has this been waiting". A ticket parks by
+/// having its thread removed, so no in-memory clock survives the transition;
+/// this row is the only stamp that does. A ticket whose park row was never
+/// written — the ledger refuses rows it cannot attribute to a current attempt —
+/// is simply absent, and its age renders as unknown rather than as a guess.
+pub fn latest_park_stamps(ledger_path: &Path) -> HashMap<String, u64> {
+    latest_park_records(ledger_path)
+        .into_iter()
+        .map(|(ticket_id, record)| (ticket_id, record.ended_at))
+        .collect()
 }
 
 /// Collect valid canonical remedies for tickets durably parked by status.
@@ -123,9 +153,9 @@ pub fn collect_parked_remedies<'a>(
                 reason,
                 remedy_owner,
                 ask,
+                steps,
                 check,
                 unstructured,
-                ..
             } = disposition
             else {
                 return None;
@@ -150,6 +180,7 @@ pub fn collect_parked_remedies<'a>(
                 remedy_owner,
                 ask,
                 reason,
+                steps: steps.unwrap_or_default(),
                 check,
                 proposal,
             })
@@ -282,6 +313,7 @@ mod tests {
                     remedy_owner: RemedyOwner::Operator,
                     ask: "Run the checkout test.".to_string(),
                     reason: "manual test missing".to_string(),
+                    steps: vec!["Open checkout".to_string()],
                     check: None,
                     proposal: None,
                 },
@@ -290,6 +322,7 @@ mod tests {
                     remedy_owner: RemedyOwner::World,
                     ask: "Wait for the release link.".to_string(),
                     reason: "release missing".to_string(),
+                    steps: Vec::new(),
                     check: Some("test -f release".to_string()),
                     proposal: None,
                 },
@@ -315,9 +348,31 @@ mod tests {
                 remedy_owner: RemedyOwner::Operator,
                 ask: LEGACY_BLOCK_ASK.to_string(),
                 reason: "  Run the old test.  ".to_string(),
+                steps: Vec::new(),
                 check: None,
                 proposal: None,
             }]
+        );
+    }
+
+    #[test]
+    fn a_blocks_prepared_steps_reach_the_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        write_disposition(
+            &work,
+            "T-STEPS",
+            r#"{"disposition":"block","reason":"signing identity missing","remedy_owner":"operator","ask":"Sign into Xcode.","steps":["Open Xcode","Add an Apple ID"],"check":"security find-identity -p codesigning"}"#,
+        );
+        let ledger = dir.path().join("provenance.jsonl");
+
+        let remedies =
+            collect_parked_remedies([&ticket("T-STEPS", TicketStatus::Blocked)], &work, &ledger);
+
+        assert_eq!(remedies[0].steps, vec!["Open Xcode", "Add an Apple ID"]);
+        assert_eq!(
+            remedies[0].check.as_deref(),
+            Some("security find-identity -p codesigning")
         );
     }
 
@@ -422,5 +477,20 @@ mod tests {
         write_parking_transition(&ledger, "T-PROPOSAL", 3, ParkingTransitionType::Unpark);
 
         assert!(latest_park_attempt_leases(&ledger).is_empty());
+    }
+
+    /// The durable park stamp follows the lease exactly: a ticket that is
+    /// currently parked has one, and a released ticket has none to render.
+    #[test]
+    fn park_stamps_track_the_current_park_and_clear_on_unpark() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("provenance.jsonl");
+        assert!(latest_park_stamps(&ledger).is_empty());
+
+        write_parking_transition(&ledger, "T-PARKED", 3, ParkingTransitionType::Park);
+        assert_eq!(latest_park_stamps(&ledger).get("T-PARKED"), Some(&1));
+
+        write_parking_transition(&ledger, "T-PARKED", 3, ParkingTransitionType::Unpark);
+        assert!(latest_park_stamps(&ledger).is_empty());
     }
 }
