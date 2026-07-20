@@ -8590,6 +8590,11 @@ impl State {
     fn enter_view(&mut self, preset: ui::ViewPreset) {
         self.view_preset = preset;
         self.scroll_offset = 0;
+        // The horizontal twin: arriving at a view mid-pan is the same stale
+        // state as arriving mid-scroll. Only `offset` is cleared — `span` is
+        // reported by the render this switch is about to trigger, and zeroing it
+        // here would only widen the window in which panning is inert.
+        self.dag_pan.offset = 0;
         self.desk_selected = 0;
         self.desk_expanded = false;
     }
@@ -8820,6 +8825,35 @@ impl State {
         }
         if key.bare_key == BareKey::Char('k') || key.bare_key == BareKey::Up {
             self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            return true;
+        }
+
+        // Normal mode: h/l pan the DAG sideways, and only where there is map to
+        // reach.
+        //
+        // Stricter than the scroll above, which increments freely and lets the
+        // renderer clamp. A pan key pressed in a view with no map, or on a map
+        // that already fits, must change nothing at all — so both questions are
+        // asked here rather than absorbed by the clamp. `span` is what the last
+        // render reported: zero in every other view, and zero when the board
+        // fits, so one field answers both.
+        //
+        // The clamp still runs at render time. This gate is about not moving
+        // state that has nowhere to go; that one is about staying correct if the
+        // board shrank since the last frame.
+        if matches!(
+            key.bare_key,
+            BareKey::Char('h') | BareKey::Char('l') | BareKey::Left | BareKey::Right
+        ) {
+            if self.view_preset != ui::ViewPreset::Dag || self.dag_pan.span == 0 {
+                return false;
+            }
+            self.dag_pan.offset = match key.bare_key {
+                BareKey::Char('l') | BareKey::Right => {
+                    (self.dag_pan.offset + 1).min(self.dag_pan.span)
+                }
+                _ => self.dag_pan.offset.saturating_sub(1),
+            };
             return true;
         }
 
@@ -11143,7 +11177,7 @@ mod tests {
         }
     }
 
-    /// Criterion 3: cursor, expansion, and scroll all start clean on entry.
+    /// Criterion 3: cursor, expansion, scroll, and pan all start clean on entry.
     #[test]
     fn entering_a_view_resets_cursor_expansion_and_scroll() {
         let (_dir, mut state) = desk_state_from(&[
@@ -11157,13 +11191,130 @@ mod tests {
             state.desk_selected = 2;
             state.desk_expanded = true;
             state.scroll_offset = 7;
+            state.dag_pan = ui::DagPan {
+                offset: 9,
+                span: 20,
+            };
 
             assert!(press(&mut state, key));
 
             assert_eq!(state.desk_selected, 0, "{key:?} kept a stale cursor");
             assert!(!state.desk_expanded, "{key:?} kept a card open");
             assert_eq!(state.scroll_offset, 0, "{key:?} kept a stale scroll");
+            assert_eq!(state.dag_pan.offset, 0, "{key:?} kept a stale pan");
         }
+    }
+
+    /// A state parked in the DAG view with a map wider than its pane, as a
+    /// render would have left it.
+    fn panned_dag_state(span: usize) -> (tempfile::TempDir, State) {
+        let (dir, mut state) = desk_state_from(&[&blocked_ticket("T-ONE")]);
+        state.view_preset = ui::ViewPreset::Dag;
+        state.dag_pan = ui::DagPan { offset: 0, span };
+        (dir, state)
+    }
+
+    #[test]
+    fn pan_keys_move_the_dag_offset() {
+        // AC1 at the key level: all four bindings, both directions.
+        for (forward, back) in [
+            (BareKey::Char('l'), BareKey::Char('h')),
+            (BareKey::Right, BareKey::Left),
+        ] {
+            let (_dir, mut state) = panned_dag_state(20);
+
+            assert!(press(&mut state, forward));
+            assert_eq!(state.dag_pan.offset, 1, "{forward:?} did not pan right");
+            assert!(press(&mut state, forward));
+            assert_eq!(state.dag_pan.offset, 2);
+
+            assert!(press(&mut state, back));
+            assert_eq!(state.dag_pan.offset, 1, "{back:?} did not pan back");
+        }
+    }
+
+    #[test]
+    fn pan_keys_clamp_at_both_edges() {
+        // AC1's clamp half. The right stop is the span the render reported; the
+        // left stop is the unpanned board.
+        let (_dir, mut state) = panned_dag_state(3);
+
+        for _ in 0..10 {
+            press(&mut state, BareKey::Char('l'));
+        }
+        assert_eq!(state.dag_pan.offset, 3, "panning ran off the right edge");
+
+        for _ in 0..10 {
+            press(&mut state, BareKey::Char('h'));
+        }
+        assert_eq!(state.dag_pan.offset, 0, "panning ran off the left edge");
+    }
+
+    #[test]
+    fn pan_keys_are_inert_outside_the_dag_view() {
+        // AC3, first half. The span is seeded non-zero so the only thing making
+        // these keys inert is the view — otherwise the test would pass for the
+        // wrong reason.
+        for preset in [
+            ui::ViewPreset::Operations,
+            ui::ViewPreset::Present,
+            ui::ViewPreset::Activity,
+        ] {
+            for key in [
+                BareKey::Char('h'),
+                BareKey::Char('l'),
+                BareKey::Left,
+                BareKey::Right,
+            ] {
+                let (_dir, mut state) = panned_dag_state(20);
+                state.view_preset = preset;
+                state.dag_pan.offset = 4;
+
+                assert!(
+                    !press(&mut state, key),
+                    "{key:?} claimed a redraw in {preset:?}"
+                );
+                assert_eq!(
+                    state.dag_pan.offset, 4,
+                    "{key:?} moved the pan in {preset:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pan_keys_are_inert_when_the_map_fits() {
+        // AC3, second half. In the DAG view, but with nothing off the pane: no
+        // state change and no redraw, rather than an offset that moves under a
+        // render that will only clamp it back.
+        for key in [
+            BareKey::Char('h'),
+            BareKey::Char('l'),
+            BareKey::Left,
+            BareKey::Right,
+        ] {
+            let (_dir, mut state) = panned_dag_state(0);
+
+            assert!(
+                !press(&mut state, key),
+                "{key:?} claimed a redraw on a map that fits"
+            );
+            assert_eq!(state.dag_pan.offset, 0, "{key:?} panned a map that fits");
+        }
+    }
+
+    #[test]
+    fn pan_keys_leave_the_page_scroll_alone() {
+        // The two viewports are independent: h/l must not disturb j/k's offset,
+        // and j/k must not disturb the pan.
+        let (_dir, mut state) = panned_dag_state(20);
+
+        press(&mut state, BareKey::Char('l'));
+        assert_eq!(state.scroll_offset, 0, "panning scrolled the page");
+
+        press(&mut state, BareKey::Char('j'));
+        assert_eq!(state.scroll_offset, 1);
+        assert_eq!(state.dag_pan.offset, 1, "scrolling moved the pan");
     }
 
     #[test]
