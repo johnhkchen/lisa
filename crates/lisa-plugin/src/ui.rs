@@ -1108,8 +1108,17 @@ fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
         }
     }
 
-    let style = LabelStyle::Full;
-    let (nodes, rendered) = render_dag_body(&active, &edges, &id_to_int, style);
+    // Full labels first, always. Condensing is an overflow response, never a
+    // default: a board that fits the pane keeps every character it has today.
+    // `pane_cols == 0` is a caller that does not know the pane, and the honest
+    // answer to not knowing is to change nothing.
+    let mut style = LabelStyle::Full;
+    let (mut nodes, mut rendered) = render_dag_body(&active, &edges, &id_to_int, style);
+
+    if pane_cols > 0 && widest_visible_line(&rendered) > pane_cols {
+        style = LabelStyle::Condensed;
+        (nodes, rendered) = render_dag_body(&active, &edges, &id_to_int, style);
+    }
 
     // Build the ink map for post-processing, keyed by ticket id. `label` borrows
     // the exact string handed to ascii-dag, so the substring we search for and
@@ -1167,19 +1176,44 @@ fn render_dag(state: &PluginState, pane_cols: usize, output: &mut Vec<String>) {
         ));
     }
     output.push(String::new());
-    output.push(format!(
-        "{}Phases: {} Rdy {} Res {} Des {} Str {} Pln {} Imp {} Rev {} Don{}",
-        DIM,
-        Phase::Ready.indicator(),
-        Phase::Research.indicator(),
-        Phase::Design.indicator(),
-        Phase::Structure.indicator(),
-        Phase::Plan.indicator(),
-        Phase::Implement.indicator(),
-        Phase::Review.indicator(),
-        Phase::Done.indicator(),
-        RESET
-    ));
+    // One legend, and always the one the board is actually using. In condensed
+    // mode a node's color means its status, so a phase legend under it would
+    // document a code the board has stopped speaking.
+    output.push(match style {
+        LabelStyle::Full => format!(
+            "{}Phases: {} Rdy {} Res {} Des {} Str {} Pln {} Imp {} Rev {} Don{}",
+            DIM,
+            Phase::Ready.indicator(),
+            Phase::Research.indicator(),
+            Phase::Design.indicator(),
+            Phase::Structure.indicator(),
+            Phase::Plan.indicator(),
+            Phase::Implement.indicator(),
+            Phase::Review.indicator(),
+            Phase::Done.indicator(),
+            RESET
+        ),
+        LabelStyle::Condensed => dag_status_legend(),
+    });
+}
+
+/// The color code condensed mode reads by: each status word in its own color.
+///
+/// Built from the same two methods the nodes are painted with, so the legend
+/// cannot drift from the paint. `Done` is absent because the graph filters it
+/// out and no node can carry it.
+fn dag_status_legend() -> String {
+    let words: Vec<String> = [
+        TicketStatus::Ready,
+        TicketStatus::InProgress,
+        TicketStatus::WaitingReview,
+        TicketStatus::Blocked,
+    ]
+    .iter()
+    .map(|status| format!("{}{}{}", status.color_code(), status.token(), RESET))
+    .collect();
+
+    format!("{}Status:{} {}", DIM, RESET, words.join(" "))
 }
 
 // =============================================================================
@@ -3175,6 +3209,48 @@ mod tests {
         );
     }
 
+    /// A root fanned out to `n - 1` children, with ids the length of real Lisa
+    /// ids. Measured against ascii-dag 0.8, full labels then condensed:
+    /// 6 nodes = 99/69, 7 = 119/83, 8 = 139/97, 9 = 159/111 columns. The saving
+    /// is six columns a node — `T-` plus ` RDY`.
+    fn fan_board(n: usize) -> PluginState {
+        let tickets = (1..=n)
+            .map(|i| TicketNode {
+                id: format!("T-054-01-{:02}", i),
+                title: format!("child {}", i),
+                phase: Phase::Research,
+                status: TicketStatus::Ready,
+                depends_on: if i == 1 {
+                    vec![]
+                } else {
+                    vec!["T-054-01-01".to_string()]
+                },
+            })
+            .collect();
+
+        PluginState {
+            tickets,
+            ..PluginState::default()
+        }
+    }
+
+    /// The rendered graph rows: everything between the `≡≡ DAG ≡≡` header and
+    /// the summary/legend chrome. AC2 and AC4 both point at these lines.
+    fn dag_body_lines(output: &[String]) -> Vec<String> {
+        output
+            .iter()
+            .skip(2) // header, blank
+            .take_while(|line| {
+                let bare = strip_ansi(line);
+                !bare.starts_with("Phases:")
+                    && !bare.starts_with("Status:")
+                    && !bare.starts_with('(')
+            })
+            .map(|line| strip_ansi(line))
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    }
+
     #[test]
     fn text_presets_still_clamp_at_a_hundred_columns() {
         // AC5, second half. The clamp moved one scope inward so the DAG could
@@ -3286,6 +3362,255 @@ mod tests {
         let block = "[T-002 WRK]\n[T-003 BLK] → [T-004 RDY]\n\n\n";
         assert_eq!(widest_visible_line(block), 25);
         assert_eq!(widest_visible_line(""), 0);
+    }
+
+    #[test]
+    fn dag_wide_pane_keeps_full_labels_byte_for_byte() {
+        // AC1, wide half. A pane with room to spare renders exactly what it
+        // rendered before this ticket — the fit decision ran and chose Full.
+        let state = fan_board(7);
+        let mut output = Vec::new();
+        render_dag(&state, 200, &mut output);
+
+        let labels: Vec<String> = state
+            .tickets
+            .iter()
+            .map(|t| format!("{} {}", t.id, t.status.token()))
+            .collect();
+        let node_refs: Vec<(usize, &str)> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| (i + 1, label.as_str()))
+            .collect();
+        let edges: Vec<(usize, usize)> = (2..=7).map(|i| (1usize, i)).collect();
+        let expected = ascii_dag::DAG::from_edges(&node_refs, &edges).render();
+        let expected: Vec<&str> = expected.lines().collect();
+
+        let stripped: Vec<String> = output.iter().map(|line| strip_ansi(line)).collect();
+        let start = stripped
+            .iter()
+            .position(|line| line == expected[0])
+            .unwrap_or_else(|| panic!("uncolored first DAG row missing from:\n{stripped:#?}"));
+        let actual: Vec<&str> = stripped[start..start + expected.len()]
+            .iter()
+            .map(|line| line.as_str())
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "a board that fits must keep today's labels, character for character"
+        );
+    }
+
+    #[test]
+    fn dag_narrow_pane_condenses_and_fits() {
+        // AC1, narrow half. The same 7-node board: 119 columns full, 83
+        // condensed. At a 100-column pane it must shed and then fit.
+        let state = fan_board(7);
+
+        let mut wide = Vec::new();
+        render_dag(&state, DAG_WIDE, &mut wide);
+        assert_eq!(widest_visible_line(&dag_body_lines(&wide).join("\n")), 119);
+
+        let mut output = Vec::new();
+        render_dag(&state, 100, &mut output);
+        let body = dag_body_lines(&output);
+
+        assert_eq!(
+            widest_visible_line(&body.join("\n")),
+            83,
+            "condensing should have bought six columns a node"
+        );
+        assert!(
+            body.iter().any(|line| line.contains("054-01-02")),
+            "condensed ids missing from:\n{body:#?}"
+        );
+    }
+
+    #[test]
+    fn condensed_labels_carry_no_prefix_and_no_status_token() {
+        // AC2, on the node text — which is what the criterion names. The
+        // `Status:` legend defines the color code and sits outside the body.
+        let state = fan_board(7);
+        let mut output = Vec::new();
+        render_dag(&state, 100, &mut output);
+
+        for line in dag_body_lines(&output) {
+            assert!(
+                !line.contains("T-"),
+                "condensed node text kept its prefix: {line}"
+            );
+            for token in ["RDY", "WRK", "REV", "BLK", "DON"] {
+                assert!(
+                    !line.contains(token),
+                    "condensed node text kept the {token} token: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn condensed_status_classes_are_distinguishable() {
+        // AC2, per class: with the token gone, color is the whole status
+        // channel, so each class must paint its condensed id differently.
+        let statuses = [
+            TicketStatus::Ready,
+            TicketStatus::InProgress,
+            TicketStatus::WaitingReview,
+            TicketStatus::Blocked,
+        ];
+        let tickets: Vec<TicketNode> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, status)| TicketNode {
+                id: format!("T-054-01-{:02}", i + 1),
+                title: format!("node {}", i),
+                phase: Phase::Research, // one phase throughout: color can only be status
+                status: status.clone(),
+                depends_on: if i == 0 {
+                    vec![]
+                } else {
+                    vec!["T-054-01-01".to_string()]
+                },
+            })
+            .collect();
+        let state = PluginState {
+            tickets,
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_dag(&state, 50, &mut output); // 59 full, 41 condensed
+        let painted = output.join("\n");
+
+        for (i, status) in statuses.iter().enumerate() {
+            let expected = format!("{}054-01-{:02}{}", status.color_code(), i + 1, RESET);
+            assert!(
+                painted.contains(&expected),
+                "{:?} did not paint its condensed id, got:\n{painted}",
+                status
+            );
+        }
+
+        let colors: std::collections::HashSet<&str> =
+            statuses.iter().map(|s| s.color_code()).collect();
+        assert_eq!(colors.len(), 4, "two status classes share a color");
+    }
+
+    #[test]
+    fn condensed_ids_carry_status_not_phase() {
+        // The test that fails if the recolor silently kept sourcing the phase.
+        // Two Blocked tickets in different phases must match; a Ready and a
+        // Blocked ticket in the same phase must not.
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-054-01-01".to_string(),
+                    title: "blocked, researching".to_string(),
+                    phase: Phase::Research,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-054-01-02".to_string(),
+                    title: "blocked, implementing".to_string(),
+                    phase: Phase::Implement,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-054-01-03".to_string(),
+                    title: "ready, implementing".to_string(),
+                    phase: Phase::Implement,
+                    status: TicketStatus::Ready,
+                    depends_on: vec![],
+                },
+            ],
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_dag(&state, 30, &mut output);
+        let painted = output.join("\n");
+
+        assert!(painted.contains(&format!("{}054-01-01{}", RED, RESET)));
+        assert!(painted.contains(&format!("{}054-01-02{}", RED, RESET)));
+        assert!(
+            painted.contains(&format!("{}054-01-03{}", CYAN, RESET)),
+            "a Ready ticket sharing a phase with a Blocked one must still read \
+             differently, got:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn dag_fit_is_not_gated_by_the_hundred_column_clamp() {
+        // AC5. A 119-column board on a 200-column pane: wider than the legacy
+        // clamp, narrower than the pane, so it keeps full labels. Driven
+        // through the real entry point, so it fails if the clamp is
+        // reintroduced anywhere along the path.
+        let mut state = fan_board(7);
+        state.active_view = ViewPreset::Dag;
+
+        let lines = render_dashboard_lines(&state, 200, 60);
+        let joined = lines.join("\n");
+
+        assert!(
+            joined.contains("T-054-01-02"),
+            "a board of 119 columns on a 200-column pane must keep full labels"
+        );
+        assert!(
+            joined.contains("RDY"),
+            "full labels keep their status token"
+        );
+    }
+
+    #[test]
+    fn condensing_triggers_on_overflow_only() {
+        // AC1: the flip threshold is the pane width itself, with no knob. The
+        // 6-node board is 99 columns full and 69 condensed.
+        let state = fan_board(6);
+
+        let mut roomy = Vec::new();
+        render_dag(&state, 120, &mut roomy);
+        assert!(
+            dag_body_lines(&roomy)
+                .join("\n")
+                .contains("T-054-01-02 RDY"),
+            "a board that fits must not condense"
+        );
+
+        let mut cramped = Vec::new();
+        render_dag(&state, 90, &mut cramped);
+        assert!(
+            !dag_body_lines(&cramped)
+                .join("\n")
+                .contains("T-054-01-02 RDY"),
+            "a board that overflows must condense"
+        );
+
+        // Either side of the boundary, and the boundary itself: 99 fits a
+        // 99-column pane exactly.
+        let mut exact = Vec::new();
+        render_dag(&state, 99, &mut exact);
+        assert!(
+            dag_body_lines(&exact)
+                .join("\n")
+                .contains("T-054-01-02 RDY"),
+            "a board exactly as wide as the pane fits it"
+        );
+    }
+
+    #[test]
+    fn zero_width_never_condenses() {
+        // A caller that does not know the pane is not a one-column pane.
+        let state = fan_board(9); // 159 columns, wider than any real pane
+        let mut output = Vec::new();
+        render_dag(&state, 0, &mut output);
+
+        assert!(dag_body_lines(&output)
+            .join("\n")
+            .contains("T-054-01-02 RDY"));
+        assert!(!output.join("\n").contains("off-screen"));
     }
 
     #[test]
