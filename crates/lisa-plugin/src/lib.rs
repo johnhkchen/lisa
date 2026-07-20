@@ -749,8 +749,14 @@ struct PendingEnter {
 /// Stamping happens here, in the plugin, which has one.
 #[derive(Debug, Clone)]
 struct LoggedActivity {
-    /// Wall clock at emit, as a duration since the Unix epoch.
+    /// Wall clock at emit, as a duration since the Unix epoch. A fold
+    /// (see [`State::log_activity_at`]) overwrites this with the latest
+    /// occurrence's instant, so the entry always wears its freshest age.
     at: std::time::Duration,
+    /// How many consecutive identical events this entry has absorbed. Always
+    /// at least 1; only `log_activity_at` writes it. Rendered as a trailing
+    /// `(xN)` on the single line the entry produces.
+    count: u32,
     event: ActivityEvent,
 }
 
@@ -3416,9 +3422,37 @@ impl State {
     /// `dispatch_completion_at` and `check_assignment_ack_timeouts_at`: the
     /// caller-facing method reads the clock, this one takes it, so tests can
     /// pin an instant without sleeping.
+    ///
+    /// **Folds echoes (T-052-02-02).** An event equal to the newest entry is not
+    /// news: it bumps that entry's `count` and refreshes its stamp instead of
+    /// pushing. A fold therefore never reaches the cap check, which is what
+    /// makes `MAX_ACTIVITY_LOG` mean a hundred distinct facts rather than a
+    /// hundred lines. A different event in between breaks the fold, so the log
+    /// stays a chronology.
+    ///
+    /// The predicate is structural equality, deliberately *not* the looser
+    /// "renders the same line". This ring backs the Shift+D dump as well as the
+    /// feed, and several variants carry fields the feed drops — `pane_id`,
+    /// `ArtifactCreated.phase`, `SessionTimedOut.elapsed_secs` (shown only in
+    /// whole minutes). Folding on rendered sameness would collapse two genuinely
+    /// different facts into one dump line, erasing the answer the dump exists to
+    /// keep (see `DeclineReason`: demotion, not erasure). Equal events are
+    /// indistinguishable everywhere — feed, dump, and `activity_events()` — so
+    /// folding them can lose nothing but the count, which this adds back.
     fn log_activity_at(&mut self, event: ActivityEvent, now: std::time::SystemTime) {
+        let at = std::time::Duration::from_secs(provenance::system_time_to_epoch(now));
+
+        if let Some(newest) = self.activity_log.last_mut() {
+            if newest.event == event {
+                newest.count = newest.count.saturating_add(1);
+                newest.at = at;
+                return;
+            }
+        }
+
         self.activity_log.push(LoggedActivity {
-            at: std::time::Duration::from_secs(provenance::system_time_to_epoch(now)),
+            at,
+            count: 1,
             event,
         });
         if self.activity_log.len() > Self::MAX_ACTIVITY_LOG {
@@ -9439,6 +9473,7 @@ mod tests {
     fn ui_entry_for(event: &ActivityEvent) -> Option<ui::ActivityEntry> {
         activity_event_to_ui_entry(&LoggedActivity {
             at: std::time::Duration::ZERO,
+            count: 1,
             event: event.clone(),
         })
     }
@@ -11194,6 +11229,185 @@ mod tests {
         );
     }
 
+    /// A repeated fact costs one entry and an honest multiplier, and the entry
+    /// wears the newest occurrence's stamp rather than the first one's.
+    #[test]
+    fn three_identical_events_fold_into_one_counted_line() {
+        let mut state = State::default();
+        let echo = || ActivityEvent::Warning {
+            message: "sweep retried".to_string(),
+        };
+
+        for offset in [0, 30, 90] {
+            state.log_activity_at(echo(), feed_test_instant(offset));
+        }
+
+        assert_eq!(
+            state.activity_log.len(),
+            1,
+            "three identical events must occupy one entry"
+        );
+        assert_eq!(state.activity_log[0].count, 3);
+        assert_eq!(
+            state.activity_log[0].at,
+            std::time::Duration::from_secs(FEED_TEST_NOW_SECS + 90),
+            "a folded entry wears the latest occurrence's stamp"
+        );
+        assert_ne!(
+            state.activity_log[0].at,
+            std::time::Duration::from_secs(FEED_TEST_NOW_SECS),
+            "the first occurrence's stamp would render a stale age"
+        );
+    }
+
+    /// The log stays a chronology: only the newest entry is a fold candidate, so
+    /// anything arriving in between starts the count over.
+    #[test]
+    fn an_intervening_event_breaks_the_fold() {
+        let mut state = State::default();
+        let a = || ActivityEvent::Warning {
+            message: "a".to_string(),
+        };
+        let b = || ActivityEvent::Warning {
+            message: "b".to_string(),
+        };
+
+        state.log_activity_at(a(), feed_test_instant(0));
+        state.log_activity_at(b(), feed_test_instant(1));
+        state.log_activity_at(a(), feed_test_instant(2));
+
+        assert_eq!(state.activity_log.len(), 3);
+        assert!(
+            state.activity_log.iter().all(|entry| entry.count == 1),
+            "no fold may span an intervening event"
+        );
+        assert_eq!(
+            state
+                .activity_log
+                .iter()
+                .map(|entry| entry.event.clone())
+                .collect::<Vec<_>>(),
+            vec![a(), b(), a()],
+            "emission order survives"
+        );
+    }
+
+    /// `MAX_ACTIVITY_LOG` counts facts, not occurrences: a hundred distinct
+    /// facts all fit no matter how many echoes each absorbed.
+    #[test]
+    fn distinct_facts_fill_the_ring_regardless_of_echoes() {
+        let mut state = State::default();
+        let cap = State::MAX_ACTIVITY_LOG;
+
+        for i in 0..cap {
+            let echoes = 2 + (i % 3);
+            for _ in 0..echoes {
+                state.log_activity_at(
+                    ActivityEvent::Info {
+                        message: format!("fact-{i}"),
+                    },
+                    feed_test_instant(i as u64),
+                );
+            }
+        }
+
+        assert_eq!(
+            state.activity_log.len(),
+            cap,
+            "echoes must not consume ring slots"
+        );
+        assert_eq!(
+            state.activity_log[0].event,
+            ActivityEvent::Info {
+                message: "fact-0".to_string()
+            },
+            "the oldest distinct fact is still here — nothing was evicted"
+        );
+        for (i, entry) in state.activity_log.iter().enumerate() {
+            assert_eq!(
+                entry.count,
+                (2 + (i % 3)) as u32,
+                "entry {i} must report its true multiplicity"
+            );
+        }
+
+        // One fact past the cap evicts the oldest fact, not an echo.
+        state.log_activity_at(
+            ActivityEvent::Info {
+                message: "fact-overflow".to_string(),
+            },
+            feed_test_instant(cap as u64),
+        );
+        assert_eq!(state.activity_log.len(), cap);
+        assert_eq!(
+            state.activity_log[0].event,
+            ActivityEvent::Info {
+                message: "fact-1".to_string()
+            }
+        );
+    }
+
+    /// The fold predicate is equality, so anything differing in any field —
+    /// rendered or not — stays two facts.
+    #[test]
+    fn near_identical_events_never_fold() {
+        let pairs: Vec<(&str, ActivityEvent, ActivityEvent)> = vec![
+            (
+                "different ticket",
+                ActivityEvent::PhaseCompleted {
+                    ticket_id: "T-001".to_string(),
+                    phase: Phase::Research,
+                },
+                ActivityEvent::PhaseCompleted {
+                    ticket_id: "T-002".to_string(),
+                    phase: Phase::Research,
+                },
+            ),
+            (
+                "different phase",
+                ActivityEvent::PhaseCompleted {
+                    ticket_id: "T-001".to_string(),
+                    phase: Phase::Research,
+                },
+                ActivityEvent::PhaseCompleted {
+                    ticket_id: "T-001".to_string(),
+                    phase: Phase::Design,
+                },
+            ),
+            (
+                "different message",
+                ActivityEvent::Warning {
+                    message: "disk almost full".to_string(),
+                },
+                ActivityEvent::Warning {
+                    message: "disk nearly full".to_string(),
+                },
+            ),
+            (
+                "different severity, same words",
+                ActivityEvent::Warning {
+                    message: "same words".to_string(),
+                },
+                ActivityEvent::Error {
+                    message: "same words".to_string(),
+                },
+            ),
+        ];
+
+        for (label, first, second) in pairs {
+            let mut state = State::default();
+            state.log_activity_at(first, feed_test_instant(0));
+            state.log_activity_at(second, feed_test_instant(1));
+
+            assert_eq!(
+                state.activity_log.len(),
+                2,
+                "{label}: two facts must stay two lines"
+            );
+            assert!(state.activity_log.iter().all(|entry| entry.count == 1));
+        }
+    }
+
     #[test]
     fn test_activity_event_to_ui_entry() {
         assert!(ui_entry_for(&ActivityEvent::PluginStarted).is_none());
@@ -12188,6 +12402,7 @@ mod tests {
     fn only_phase_completed_projects_a_transition_line() {
         let stamped = |event| LoggedActivity {
             at: std::time::Duration::from_secs(1),
+            count: 1,
             event,
         };
 
