@@ -55,6 +55,33 @@ pub enum TicketStatus {
     Done,
 }
 
+impl TicketStatus {
+    /// The three-letter token shown on a DAG node.
+    pub fn token(&self) -> &'static str {
+        match self {
+            TicketStatus::Ready => "RDY",
+            TicketStatus::InProgress => "WRK",
+            TicketStatus::WaitingReview => "REV",
+            TicketStatus::Blocked => "BLK",
+            TicketStatus::Done => "DON",
+        }
+    }
+
+    /// ANSI color for the status token.
+    ///
+    /// Done is here for completeness — the DAG filters Done tickets out before
+    /// nodes are built, so a `DON` token never reaches a rendered line.
+    pub fn color_code(&self) -> &'static str {
+        match self {
+            TicketStatus::Ready => CYAN,
+            TicketStatus::InProgress => GREEN,
+            TicketStatus::WaitingReview => BRIGHT_YELLOW,
+            TicketStatus::Blocked => RED,
+            TicketStatus::Done => BRIGHT_GREEN,
+        }
+    }
+}
+
 /// Phase in the RDSPI workflow (UI representation)
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Phase {
@@ -909,6 +936,20 @@ fn render_health_alerts(state: &PluginState, width: usize, output: &mut Vec<Stri
 // DAG Rendering
 // =============================================================================
 
+/// What the DAG post-processor needs to ink one node's label.
+///
+/// The two colors are separate channels: the ticket id carries the phase, the
+/// status token carries the status. They are read side by side, so they must
+/// never be sourced from each other.
+struct NodeInk<'a> {
+    /// The exact label ascii-dag rendered, e.g. `T-054-01-01 WRK`.
+    label: &'a str,
+    ticket_id: &'a str,
+    token: &'a str,
+    phase_color: &'a str,
+    status_color: &'a str,
+}
+
 /// Compute DAG layers for visualization (topological sort into layers)
 /// Render the DAG using ascii-dag for proper edge routing and layout.
 ///
@@ -954,14 +995,7 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
     let nodes: Vec<(usize, String)> = active
         .iter()
         .map(|t| {
-            let status_str = match &t.status {
-                TicketStatus::Ready => "RDY",
-                TicketStatus::InProgress => "WRK",
-                TicketStatus::WaitingReview => "REV",
-                TicketStatus::Blocked => "BLK",
-                TicketStatus::Done => "DON",
-            };
-            let label = format!("{} {}", t.id, status_str);
+            let label = format!("{} {}", t.id, t.status.token());
             (id_to_int[t.id.as_str()], label)
         })
         .collect();
@@ -987,28 +1021,47 @@ fn render_dag(state: &PluginState, output: &mut Vec<String>) {
     let dag = ascii_dag::DAG::from_edges(&node_refs, &edges);
     let rendered = dag.render();
 
-    // Build a color map for post-processing: ticket_id -> (phase_color, status_color)
-    let color_map: HashMap<&str, (&str, &str)> = active
+    // Build the ink map for post-processing, keyed by ticket id. `label` borrows
+    // the exact string handed to ascii-dag, so the substring we search for and
+    // the substring that was rendered cannot drift apart.
+    let color_map: HashMap<&str, NodeInk> = active
         .iter()
-        .map(|t| {
-            let status_color = match &t.status {
-                TicketStatus::Ready => CYAN,
-                TicketStatus::InProgress => GREEN,
-                TicketStatus::WaitingReview => BRIGHT_YELLOW,
-                TicketStatus::Blocked => RED,
-                TicketStatus::Done => BRIGHT_GREEN,
-            };
-            (t.id.as_str(), (t.phase.color_code(), status_color))
+        .zip(nodes.iter())
+        .map(|(t, (_, label))| {
+            (
+                t.id.as_str(),
+                NodeInk {
+                    label: label.as_str(),
+                    ticket_id: t.id.as_str(),
+                    token: t.status.token(),
+                    phase_color: t.phase.color_code(),
+                    status_color: t.status.color_code(),
+                },
+            )
         })
         .collect();
 
-    // Post-process: inject ANSI colors for ticket IDs
+    // Post-process: ink each node label — ticket id in its phase color, status
+    // token in its status color. Matching the whole label rather than the bare
+    // id keeps one ticket's id from matching inside a longer ticket's label.
     for line in rendered.lines() {
         let mut colored_line = line.to_string();
-        for (ticket_id, (phase_color, _status_color)) in &color_map {
-            if colored_line.contains(ticket_id) {
-                colored_line = colored_line
-                    .replace(ticket_id, &format!("{}{}{}", phase_color, ticket_id, RESET));
+        for ink in color_map.values() {
+            if colored_line.contains(ink.label) {
+                colored_line = colored_line.replace(
+                    ink.label,
+                    &format!(
+                        "{}{}{} {}{}{}",
+                        ink.phase_color, ink.ticket_id, RESET, ink.status_color, ink.token, RESET
+                    ),
+                );
+            } else if colored_line.contains(ink.ticket_id) {
+                // A line carrying the id without its label: color the id alone,
+                // as this loop did before the status token was inked.
+                colored_line = colored_line.replace(
+                    ink.ticket_id,
+                    &format!("{}{}{}", ink.phase_color, ink.ticket_id, RESET),
+                );
             }
         }
         output.push(colored_line);
@@ -2851,6 +2904,172 @@ mod tests {
                 "Operations activity view lost {label} or {correlation_id}: {alerts}"
             );
         }
+    }
+
+    /// A board carrying one ticket per renderable status, with phases chosen so
+    /// no phase color equals the status color beside it — a token that quietly
+    /// inherited the phase color would still look right on a matched pair.
+    fn four_status_state() -> PluginState {
+        PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-901".to_string(),
+                    title: "ready".to_string(),
+                    phase: Phase::Ready, // DIM vs status CYAN
+                    status: TicketStatus::Ready,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-902".to_string(),
+                    title: "working".to_string(),
+                    phase: Phase::Design, // MAGENTA vs status GREEN
+                    status: TicketStatus::InProgress,
+                    depends_on: vec!["T-901".to_string()],
+                },
+                TicketNode {
+                    id: "T-903".to_string(),
+                    title: "in review".to_string(),
+                    phase: Phase::Structure, // YELLOW vs status BRIGHT_YELLOW
+                    status: TicketStatus::WaitingReview,
+                    depends_on: vec!["T-901".to_string()],
+                },
+                TicketNode {
+                    id: "T-904".to_string(),
+                    title: "blocked".to_string(),
+                    phase: Phase::Plan, // BLUE vs status RED
+                    status: TicketStatus::Blocked,
+                    depends_on: vec!["T-902".to_string()],
+                },
+            ],
+            ..PluginState::default()
+        }
+    }
+
+    #[test]
+    fn test_dag_status_tokens_are_colored() {
+        let state = four_status_state();
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        for (token, color, name) in [
+            ("RDY", CYAN, "Ready"),
+            ("WRK", GREEN, "InProgress"),
+            ("REV", BRIGHT_YELLOW, "WaitingReview"),
+            ("BLK", RED, "Blocked"),
+        ] {
+            let inked = format!("{}{}{}", color, token, RESET);
+            assert!(
+                full.contains(&inked),
+                "{name} token {token} rendered without its status color, got:\n{full}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_done_status_color_is_bright_green() {
+        // Asserted at the mapping rather than on rendered output: render_dag
+        // filters Done tickets out before nodes are built, so a DON token can
+        // never appear on a rendered line.
+        assert_eq!(TicketStatus::Done.token(), "DON");
+        assert_eq!(TicketStatus::Done.color_code(), BRIGHT_GREEN);
+    }
+
+    #[test]
+    fn test_dag_ticket_ids_keep_phase_color() {
+        let state = four_status_state();
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        for (id, phase) in [
+            ("T-901", Phase::Ready),
+            ("T-902", Phase::Design),
+            ("T-903", Phase::Structure),
+            ("T-904", Phase::Plan),
+        ] {
+            let inked = format!("{}{}{}", phase.color_code(), id, RESET);
+            assert!(
+                full.contains(&inked),
+                "{id} lost its {} phase color, got:\n{full}",
+                phase.short_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_dag_status_color_is_independent_of_phase() {
+        // Two Blocked tickets in different phases: same status color, different
+        // id colors. Guards against the token sourcing the phase channel.
+        let state = PluginState {
+            tickets: vec![
+                TicketNode {
+                    id: "T-911".to_string(),
+                    title: "one".to_string(),
+                    phase: Phase::Research,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec![],
+                },
+                TicketNode {
+                    id: "T-912".to_string(),
+                    title: "two".to_string(),
+                    phase: Phase::Implement,
+                    status: TicketStatus::Blocked,
+                    depends_on: vec![],
+                },
+            ],
+            ..PluginState::default()
+        };
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+        let full = output.join("\n");
+
+        assert_eq!(
+            full.matches(&format!("{}BLK{}", RED, RESET)).count(),
+            2,
+            "both Blocked tokens should be red regardless of phase, got:\n{full}"
+        );
+        assert!(full.contains(&format!("{}T-911{}", CYAN, RESET)));
+        assert!(full.contains(&format!("{}T-912{}", GREEN, RESET)));
+    }
+
+    #[test]
+    fn test_dag_raw_content_unchanged_by_coloring() {
+        // This ticket adds color and nothing else. Rebuild the same graph
+        // through ascii-dag directly and assert that stripping the escapes from
+        // the rendered view reproduces those lines byte for byte.
+        let state = four_status_state();
+        let mut output = Vec::new();
+        render_dag(&state, &mut output);
+
+        let labels: Vec<String> = state
+            .tickets
+            .iter()
+            .map(|t| format!("{} {}", t.id, t.status.token()))
+            .collect();
+        let node_refs: Vec<(usize, &str)> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| (i + 1, label.as_str()))
+            .collect();
+        let edges = vec![(1usize, 2usize), (1, 3), (2, 4)];
+        let expected = ascii_dag::DAG::from_edges(&node_refs, &edges).render();
+        let expected: Vec<&str> = expected.lines().collect();
+
+        let stripped: Vec<String> = output.iter().map(|line| strip_ansi(line)).collect();
+        let start = stripped
+            .iter()
+            .position(|line| line == expected[0])
+            .unwrap_or_else(|| panic!("uncolored first DAG row missing from:\n{stripped:#?}"));
+        let actual: Vec<&str> = stripped[start..start + expected.len()]
+            .iter()
+            .map(|line| line.as_str())
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "coloring shifted the raw DAG content; this ticket may only insert escapes"
+        );
     }
 
     #[test]
