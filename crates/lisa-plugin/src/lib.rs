@@ -3490,8 +3490,15 @@ impl State {
 
     /// Iterate the bare events in the activity log, oldest first.
     ///
-    /// Callers that care only about *what* happened, not *when*, read through
-    /// this rather than reaching into the [`LoggedActivity`] envelope.
+    /// Callers that care only about *what* happened, not *when* or *how often*,
+    /// read through this rather than reaching into the [`LoggedActivity`]
+    /// envelope.
+    ///
+    /// Test-only since T-052-02-02. Both production readers now need the
+    /// envelope — the feed for the stamp and the state dump for the fold count —
+    /// leaving this as the assertion vocabulary of the ~40 tests that ask only
+    /// whether an event was logged.
+    #[cfg(test)]
     fn activity_events(&self) -> impl DoubleEndedIterator<Item = &ActivityEvent> {
         self.activity_log.iter().map(|entry| &entry.event)
     }
@@ -8334,13 +8341,20 @@ impl State {
         writeln!(out).unwrap();
 
         // Activity Log (last 50)
+        //
+        // Reads the envelopes rather than `activity_events()` so a folded entry
+        // can report how many occurrences it absorbed. Without the multiplier
+        // the fold would erase "this happened three times" from the one surface
+        // whose job is to still have the answer.
         writeln!(out, "=== Activity Log (last 50) ===").unwrap();
-        let log_entries: Vec<_> = self.activity_events().rev().take(50).collect();
+        let log_entries: Vec<_> = self.activity_log.iter().rev().take(50).collect();
         if log_entries.is_empty() {
             writeln!(out, "(no activity)").unwrap();
         } else {
-            for (i, event) in log_entries.iter().enumerate() {
-                writeln!(out, "{:>3}. {}", i + 1, Self::format_activity_event(event)).unwrap();
+            for (i, entry) in log_entries.iter().enumerate() {
+                let line =
+                    ui::with_repeat_tag(Self::format_activity_event(&entry.event), entry.count);
+                writeln!(out, "{:>3}. {}", i + 1, line).unwrap();
             }
         }
 
@@ -15551,6 +15565,34 @@ mod tests {
         assert!(
             snapshot.contains("  1. Info: event-99"),
             "First entry should be event-99"
+        );
+    }
+
+    /// Demotion, not erasure: a folded entry costs the feed one line, and the
+    /// audit dump still says how many times it happened.
+    #[test]
+    fn state_dump_reports_the_fold_multiplier() {
+        let mut state = State::default();
+        for offset in [0, 1, 2] {
+            state.log_activity_at(
+                ActivityEvent::Warning {
+                    message: "sweep retried".to_string(),
+                },
+                feed_test_instant(offset),
+            );
+        }
+
+        let snapshot = state.format_snapshot();
+        let hits: Vec<&str> = snapshot
+            .lines()
+            .filter(|line| line.contains("sweep retried"))
+            .collect();
+
+        assert_eq!(hits.len(), 1, "the dump folds too: {snapshot}");
+        assert!(
+            hits[0].ends_with("(x3)"),
+            "the dump must keep the multiplicity: {}",
+            hits[0]
         );
     }
 
