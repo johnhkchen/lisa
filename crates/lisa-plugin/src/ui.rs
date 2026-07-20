@@ -1,6 +1,7 @@
 //! UI/Dashboard module for the Lisa Zellij plugin.
 //!
-//! Provides four preset views cycled with `[p]`:
+//! Provides four preset views. `[p]` jumps straight to the desk from anywhere;
+//! `[v]` cycles the presets in order:
 //! - **Operations**: Desk pointer, health alerts, unified thread table, filtered activity log
 //! - **Present**: The desk — one collapsed card per pending decision
 //! - **DAG**: Full dependency graph visualization
@@ -1358,6 +1359,25 @@ fn render_filtered_activity_log(state: &PluginState, max_entries: usize, output:
 // Status Line
 // =============================================================================
 
+/// The key hints for a view, naming only keys that work in that view.
+///
+/// The estate is view-dependent, so one static line cannot be honest about it:
+/// `[p]` means "go to the desk" everywhere except the desk, where it is a
+/// no-op, and `[s]`, `[enter]`, and the arrows mean something only on the desk.
+/// A single line naming all of them would advertise send-back on the DAG view,
+/// which is the N3 sin this epic is named after.
+///
+/// `[r]` and `[p]` still work on the desk and are simply not advertised there —
+/// a key without a hint costs discoverability; a hint without a key is a lie.
+fn view_key_hints(view: ViewPreset, pause_hint: &str) -> String {
+    match view {
+        ViewPreset::Present => format!(
+            "[↑↓] pick  [enter] open  [d] done  [s] send back  [v] view  [space] {pause_hint}"
+        ),
+        _ => format!("[p] desk  [v] view  [space] {pause_hint}  [d] done  [r] reset"),
+    }
+}
+
 /// Render a compact status line for the title bar
 fn render_status_line(state: &PluginState) -> String {
     let slot_total = state.slots.len();
@@ -1392,9 +1412,10 @@ fn render_status_line(state: &PluginState) -> String {
     let pause_hint = if state.paused { "resume" } else { "pause" };
 
     let view_label = state.active_view.label();
+    let hints = view_key_hints(state.active_view, pause_hint);
 
     format!(
-        "{}[{}]{} {}{}Active: {} | Done: {}/{}{}  {}[p] view  [space] {}  [d] done  [r] reset{}",
+        "{}[{}]{} {}{}Active: {} | Done: {}/{}{}  {}{}{}",
         BOLD,
         view_label,
         RESET,
@@ -1405,7 +1426,7 @@ fn render_status_line(state: &PluginState) -> String {
         total,
         alert_str,
         DIM,
-        pause_hint,
+        hints,
         RESET
     )
 }
@@ -2557,7 +2578,9 @@ mod tests {
         for action in &actions[..4] {
             assert!(action.contains("[d]"), "{action:?}");
         }
-        // Send-back does not exist in the plugin yet, so nothing offers it.
+        // A card names one recommended move, not the whole estate. Send-back
+        // works on block cards now, but it lives on the status line — a
+        // second key here would push the world-owned suffix under truncation.
         assert!(!lines.join("\n").contains("[s]"));
     }
 
@@ -3117,8 +3140,64 @@ mod tests {
         assert!(status.contains("Active: 1"));
         assert!(status.contains("Done: 1/3"));
         assert!(status.contains("[Operations]"), "View label missing");
-        assert!(status.contains("[p] view"), "View hint missing");
+        assert!(status.contains("[p] desk"), "Desk hint missing");
+        assert!(status.contains("[v] view"), "View hint missing");
         assert!(status.contains("[space]"), "Pause hint missing");
+    }
+
+    /// Criterion 1: on the desk, every hint names a key the desk answers.
+    #[test]
+    fn the_desk_status_line_names_the_desks_own_keys() {
+        let state = PluginState {
+            active_view: ViewPreset::Present,
+            ..sample_state()
+        };
+        let status = strip_ansi(&render_status_line(&state));
+
+        for hint in [
+            "[↑↓] pick",
+            "[enter] open",
+            "[d] done",
+            "[s] send back",
+            "[v] view",
+            "[space] pause",
+        ] {
+            assert!(
+                status.contains(hint),
+                "desk hint {hint:?} missing: {status}"
+            );
+        }
+        // `[p]` is a no-op here, so the desk never offers it.
+        assert!(
+            !status.contains("[p]"),
+            "the desk still offers [p]: {status}"
+        );
+    }
+
+    /// The other half of the same criterion: no view advertises a key that
+    /// only the desk answers.
+    #[test]
+    fn off_the_desk_the_status_line_never_offers_the_desks_keys() {
+        for view in [
+            ViewPreset::Operations,
+            ViewPreset::Dag,
+            ViewPreset::Activity,
+        ] {
+            let state = PluginState {
+                active_view: view,
+                ..sample_state()
+            };
+            let status = strip_ansi(&render_status_line(&state));
+
+            assert!(status.contains("[p] desk"), "{view:?}: {status}");
+            assert!(status.contains("[v] view"), "{view:?}: {status}");
+            for desk_only in ["[s]", "[enter]", "[↑↓]"] {
+                assert!(
+                    !status.contains(desk_only),
+                    "{view:?} advertises {desk_only:?}, which does nothing here: {status}"
+                );
+            }
+        }
     }
 
     #[test]
