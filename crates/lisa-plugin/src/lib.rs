@@ -8434,6 +8434,13 @@ impl State {
             old_phase,
             new_phase: Phase::Ready,
         });
+        // `TicketPhaseChanged` no longer reaches the feed, and its old line
+        // ("{ticket} completed Ready") was wrong anyway — a ticket reset for
+        // retry has completed nothing. The operator's own action still earns a
+        // line; this is the true sentence for it.
+        self.log_activity(ActivityEvent::Info {
+            message: format!("Reset {} to Ready for retry", tid),
+        });
 
         // Kill thread and release slot if present
         if let Some(thread) = self.threads.get_mut(&tid) {
@@ -9106,6 +9113,15 @@ fn ticket_status_to_ui_status(
 /// The entry carries the emit instant recorded by `log_activity_at`; the feed
 /// renders the age from it. Before T-052-01-01 this hardcoded `Duration::ZERO`,
 /// which the feed faithfully rendered as seconds-since-1970 (`495696h 11m`).
+///
+/// **Invariant (T-052-02-01): one transition, one line.** `PhaseCompleted` and
+/// `AllTicketsDone` are the only events permitted to produce a
+/// [`ui::ActivityType::PhaseCompleted`]. `TicketPhaseChanged` accompanies every
+/// `PhaseCompleted` a detector emits, and `rebuild_dag` emits it a second time
+/// when it observes the same change on disk; projecting it too is what made one
+/// transition print "completed {old}" and then "completed {new}". It stays in
+/// the activity ring and in the Shift+D dump as the transition's audit record —
+/// demoted from the feed, not erased. Do not give it a feed shape again.
 fn activity_event_to_ui_entry(entry: &LoggedActivity) -> Option<ui::ActivityEntry> {
     let activity = match &entry.event {
         ActivityEvent::PluginStarted => return None,
@@ -9113,22 +9129,14 @@ fn activity_event_to_ui_entry(entry: &LoggedActivity) -> Option<ui::ActivityEntr
             ticket_id: ticket_id.clone(),
             phase: ui::Phase::Ready,
         },
-        ActivityEvent::ThreadExited { ticket_id, .. } => ui::ActivityType::PhaseCompleted {
-            ticket_id: ticket_id.clone(),
-            phase: ui::Phase::Done,
-        },
+        // No emitter anywhere in the workspace; it projected to a third
+        // "completed Done" shape on top of the completion path's own line.
+        ActivityEvent::ThreadExited { .. } => return None,
         ActivityEvent::PhaseCompleted { ticket_id, phase } => ui::ActivityType::PhaseCompleted {
             ticket_id: ticket_id.clone(),
             phase: phase_to_ui_phase(*phase),
         },
-        ActivityEvent::TicketPhaseChanged {
-            ticket_id,
-            new_phase,
-            ..
-        } => ui::ActivityType::PhaseCompleted {
-            ticket_id: ticket_id.clone(),
-            phase: phase_to_ui_phase(*new_phase),
-        },
+        ActivityEvent::TicketPhaseChanged { .. } => return None,
         ActivityEvent::TicketStatusChanged { .. } => return None,
         ActivityEvent::ArtifactCreated {
             ticket_id, path, ..
@@ -11848,6 +11856,27 @@ mod tests {
         state
     }
 
+    /// The transition lines this state would render into the feed, oldest
+    /// first.
+    ///
+    /// Counts through the projection rather than over `activity_events()`,
+    /// because the unit this ticket is measured in is lines an operator reads,
+    /// not entries in the ring. Comparing whole strings catches a duplicated
+    /// line *and* a wrong sentence with one assertion.
+    fn feed_phase_lines(state: &State) -> Vec<String> {
+        state
+            .activity_log
+            .iter()
+            .filter_map(activity_event_to_ui_entry)
+            .filter_map(|entry| match entry.activity {
+                ui::ActivityType::PhaseCompleted { ticket_id, phase } => {
+                    Some(format!("{} completed {}", ticket_id, phase.full_name()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn phase_completed_count(state: &State, ticket: &str, of_phase: Phase) -> usize {
         state
             .activity_events()
@@ -11889,6 +11918,81 @@ mod tests {
             phase_completed_count(&state, "T-001", Phase::Research),
             1,
             "the second detector must not re-announce the same transition"
+        );
+    }
+
+    /// The artifact detector: one transition, one feed line.
+    #[test]
+    fn artifact_advance_yields_one_feed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = research_state_reachable_by_both_detectors(dir.path());
+
+        state.check_artifact_advances();
+
+        assert_eq!(feed_phase_lines(&state), vec!["T-001 completed Research"]);
+    }
+
+    /// The idle detector: one transition, one feed line.
+    #[test]
+    fn idle_advance_yields_one_feed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = research_state_reachable_by_both_detectors(dir.path());
+
+        state.check_idle_signals();
+
+        assert_eq!(feed_phase_lines(&state), vec!["T-001 completed Research"]);
+    }
+
+    /// `TicketPhaseChanged` and `ThreadExited` carry no feed shape at all, so
+    /// no emitter of either can mint a second line for a transition the
+    /// `PhaseCompleted` half already announced.
+    #[test]
+    fn only_phase_completed_projects_a_transition_line() {
+        let stamped = |event| LoggedActivity {
+            at: std::time::Duration::from_secs(1),
+            event,
+        };
+
+        assert!(
+            activity_event_to_ui_entry(&stamped(ActivityEvent::TicketPhaseChanged {
+                ticket_id: "T-001".to_string(),
+                old_phase: Phase::Research,
+                new_phase: Phase::Design,
+            }))
+            .is_none()
+        );
+
+        assert!(
+            activity_event_to_ui_entry(&stamped(ActivityEvent::ThreadExited {
+                ticket_id: "T-001".to_string(),
+                exit_code: Some(0),
+            }))
+            .is_none()
+        );
+
+        assert!(
+            activity_event_to_ui_entry(&stamped(ActivityEvent::PhaseCompleted {
+                ticket_id: "T-001".to_string(),
+                phase: Phase::Research,
+            }))
+            .is_some(),
+            "the surviving half must still reach the feed"
+        );
+    }
+
+    /// Negative fixture: suppression is keyed by ticket, so two tickets
+    /// finishing the same phase stay two distinct facts on two distinct lines.
+    /// Nothing merges across facts.
+    #[test]
+    fn two_tickets_completing_a_phase_yield_two_distinct_lines() {
+        let mut state = State::default();
+
+        state.log_phase_transition("T-001", Phase::Design, Phase::Structure);
+        state.log_phase_transition("T-002", Phase::Design, Phase::Structure);
+
+        assert_eq!(
+            feed_phase_lines(&state),
+            vec!["T-001 completed Design", "T-002 completed Design"]
         );
     }
 
