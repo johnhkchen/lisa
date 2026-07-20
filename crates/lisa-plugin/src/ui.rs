@@ -1159,6 +1159,12 @@ fn render_dag_body(
 /// Uses Sugiyama layered layout via ascii-dag for crossing minimization
 /// and proper fan-in/fan-out visualization.
 fn render_dag(state: &PluginState, pane_cols: usize, pan: &mut DagPan, output: &mut Vec<String>) {
+    // No map drawn yet, so nothing to pan across. Set before the early returns
+    // below rather than only on the path that measures a graph: a render reports
+    // its own span on every path it can take, instead of leaving a stale one for
+    // the next keypress to believe.
+    pan.span = 0;
+
     output.push(format!("{}{}≡≡ DAG ≡≡{}", BOLD, CYAN, RESET));
     output.push(String::new());
 
@@ -3653,6 +3659,35 @@ mod tests {
             "span {} is not the number the indicator prints: {indicator}",
             pan.span
         );
+    }
+
+    #[test]
+    fn a_board_with_no_graph_reports_no_span() {
+        // The early returns draw no map, so they must not leave a span behind
+        // for the pan keys to act on. Each is handed a stale span to prove the
+        // report is written rather than merely inherited.
+        let empty = PluginState::default();
+        let all_done = PluginState {
+            tickets: vec![TicketNode {
+                id: "T-054-01-01".to_string(),
+                title: "done".to_string(),
+                phase: Phase::Done,
+                status: TicketStatus::Done,
+                depends_on: vec![],
+            }],
+            ..PluginState::default()
+        };
+
+        for state in [empty, all_done] {
+            let mut pan = DagPan {
+                offset: 7,
+                span: 99,
+            };
+            let mut output = Vec::new();
+            render_dag(&state, 60, &mut pan, &mut output);
+
+            assert_eq!(pan.span, 0, "a board with no graph claimed room to pan");
+        }
     }
 
     #[test]
