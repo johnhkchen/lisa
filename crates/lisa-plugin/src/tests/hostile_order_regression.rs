@@ -198,7 +198,7 @@ impl Scenario {
 
     fn assert_no_finish_up(&self) {
         assert!(!self.state.finish_up_sent.contains(PRIMARY));
-        assert!(!self.state.activity_log.iter().any(|event| matches!(
+        assert!(!self.state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == PRIMARY
         )));
@@ -691,7 +691,7 @@ fn passing_review_hostile_order_converges_once_and_schedules_dependent() {
         .iter()
         .any(|slot| slot.ticket_id.as_deref() == Some(DEPENDENT)));
     assert!(!restarted.finish_up_sent.contains(PRIMARY));
-    assert!(!restarted.activity_log.iter().any(|event| matches!(
+    assert!(!restarted.activity_events().any(|event| matches!(
         event,
         ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == PRIMARY
     )));
@@ -742,7 +742,7 @@ fn blocked_review_hostile_order_has_no_completion_side_effects() {
     );
     assert!(scenario.state.threads.contains_key(PRIMARY));
     assert!(!scenario.state.threads.contains_key(DEPENDENT));
-    assert!(scenario.state.activity_log.iter().any(|event| matches!(
+    assert!(scenario.state.activity_events().any(|event| matches!(
         event,
         ActivityEvent::CompletionRejected {
             kind: CompletionRejectionKind::DispositionBlocked,

@@ -302,7 +302,7 @@ fn codex_ack_requires_the_exact_tag_then_promotes_and_bumps_activity() {
         Some(SeatAssignmentState::Owned)
     );
     assert!(state.agent_slots[0].last_activity_at.is_some());
-    assert!(state.activity_log.iter().any(|event| matches!(
+    assert!(state.activity_events().any(|event| matches!(
         event,
         ActivityEvent::Info { message } if message.contains("acknowledged its assignment")
     )));
@@ -353,7 +353,7 @@ fn claim_requires_the_exact_retained_assignment_then_promotes_and_bumps_activity
         Some(SeatAssignmentState::Owned)
     );
     assert!(state.agent_slots[0].last_activity_at.is_some());
-    assert!(state.activity_log.iter().any(|event| matches!(
+    assert!(state.activity_events().any(|event| matches!(
         event,
         ActivityEvent::Info { message }
             if message.contains("claimed T-SIGNAL attempt 1 assignment")
@@ -449,7 +449,7 @@ fn error_treats_the_body_as_presence_and_reclaims_the_running_thread() {
     assert!(state.agent_slots[0].ticket_id.is_none());
     assert!(state.agent_slots[0].has_session);
     assert_eq!(state.error_alerts, vec![(TICKET_ID.to_string(), PANE_ID)]);
-    assert!(state.activity_log.iter().any(|event| matches!(
+    assert!(state.activity_events().any(|event| matches!(
         event,
         ActivityEvent::Error { message } if message.contains(TICKET_ID)
     )));

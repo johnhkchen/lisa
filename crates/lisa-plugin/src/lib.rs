@@ -741,6 +741,19 @@ struct PendingEnter {
     ready_at: std::time::SystemTime,
 }
 
+/// An activity event paired with the wall-clock instant it was emitted.
+///
+/// Time lives in this envelope rather than inside `ActivityEvent` because
+/// `lisa-core` constructs events in clock-free contexts — see
+/// `diagnostics::startup_diagnostics`, a pure function with no clock to consult.
+/// Stamping happens here, in the plugin, which has one.
+#[derive(Debug, Clone)]
+struct LoggedActivity {
+    /// Wall clock at emit, as a duration since the Unix epoch.
+    at: std::time::Duration,
+    event: ActivityEvent,
+}
+
 /// State for the modal overlay (mark-done, reset-ticket, or quit-confirm).
 #[derive(Default)]
 struct MarkDoneModal {
@@ -788,8 +801,9 @@ pub struct State {
     /// Plugin configuration (ticket directory path, etc.)
     config: PluginConfig,
 
-    /// Recent activity events for the dashboard display.
-    activity_log: Vec<ActivityEvent>,
+    /// Recent activity events for the dashboard display, each stamped with the
+    /// wall-clock instant it was emitted.
+    activity_log: Vec<LoggedActivity>,
 
     /// Pre-created terminal pane slots for agent sessions.
     /// Populated on first PaneUpdate after permissions are granted.
@@ -3325,10 +3339,29 @@ impl State {
     }
 
     fn log_activity(&mut self, event: ActivityEvent) {
-        self.activity_log.push(event);
+        self.log_activity_at(event, std::time::SystemTime::now());
+    }
+
+    /// Emit-time seam. Follows the `_at` convention used by
+    /// `dispatch_completion_at` and `check_assignment_ack_timeouts_at`: the
+    /// caller-facing method reads the clock, this one takes it, so tests can
+    /// pin an instant without sleeping.
+    fn log_activity_at(&mut self, event: ActivityEvent, now: std::time::SystemTime) {
+        self.activity_log.push(LoggedActivity {
+            at: std::time::Duration::from_secs(provenance::system_time_to_epoch(now)),
+            event,
+        });
         if self.activity_log.len() > Self::MAX_ACTIVITY_LOG {
             self.activity_log.remove(0);
         }
+    }
+
+    /// Iterate the bare events in the activity log, oldest first.
+    ///
+    /// Callers that care only about *what* happened, not *when*, read through
+    /// this rather than reaching into the [`LoggedActivity`] envelope.
+    fn activity_events(&self) -> impl DoubleEndedIterator<Item = &ActivityEvent> {
+        self.activity_log.iter().map(|entry| &entry.event)
     }
 
     /// Scan tickets directory and rebuild the DAG.
@@ -8096,7 +8129,7 @@ impl State {
 
         // Activity Log (last 50)
         writeln!(out, "=== Activity Log (last 50) ===").unwrap();
-        let log_entries: Vec<_> = self.activity_log.iter().rev().take(50).collect();
+        let log_entries: Vec<_> = self.activity_events().rev().take(50).collect();
         if log_entries.is_empty() {
             writeln!(out, "(no activity)").unwrap();
         } else {
@@ -9061,13 +9094,13 @@ fn ticket_status_to_ui_status(
     }
 }
 
-/// Convert internal activity event to UI activity entry
-fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry> {
-    use std::time::Duration;
-
-    let timestamp = Duration::ZERO;
-
-    let activity = match event {
+/// Convert a stamped internal activity event to a UI activity entry.
+///
+/// The entry carries the emit instant recorded by `log_activity_at`; the feed
+/// renders the age from it. Before T-052-01-01 this hardcoded `Duration::ZERO`,
+/// which the feed faithfully rendered as seconds-since-1970 (`495696h 11m`).
+fn activity_event_to_ui_entry(entry: &LoggedActivity) -> Option<ui::ActivityEntry> {
+    let activity = match &entry.event {
         ActivityEvent::PluginStarted => return None,
         ActivityEvent::ThreadSpawned { ticket_id, .. } => ui::ActivityType::ThreadStarted {
             ticket_id: ticket_id.clone(),
@@ -9179,7 +9212,7 @@ fn activity_event_to_ui_entry(event: &ActivityEvent) -> Option<ui::ActivityEntry
     };
 
     Some(ui::ActivityEntry {
-        timestamp,
+        timestamp: entry.at,
         activity,
     })
 }
@@ -9213,6 +9246,19 @@ mod tests {
     mod operator_recovery_matrix;
     mod signal_consumer_characterization;
     mod signal_ingestion_regression;
+
+    /// Convert a bare event for tests that assert on the rendered `activity`
+    /// and do not care when it was emitted.
+    ///
+    /// The zero stamp here is a genuine don't-care, not the production default
+    /// it used to be — `log_activity_at` is the only path that reaches the real
+    /// feed, and it always stamps. See `log_activity_uses_wall_clock_not_zero`.
+    fn ui_entry_for(event: &ActivityEvent) -> Option<ui::ActivityEntry> {
+        activity_event_to_ui_entry(&LoggedActivity {
+            at: std::time::Duration::ZERO,
+            event: event.clone(),
+        })
+    }
 
     #[test]
     fn completion_has_one_typed_request_gateway() {
@@ -9301,7 +9347,7 @@ mod tests {
         }
 
         assert_eq!(state.activity_log.len(), cases.len());
-        for (event, (_, expected_kind)) in state.activity_log.iter().zip(cases) {
+        for (event, (_, expected_kind)) in state.activity_events().zip(cases) {
             match event {
                 ActivityEvent::CompletionRejected {
                     ticket_id,
@@ -10783,7 +10829,7 @@ mod tests {
 
     fn assert_no_finish_up(state: &State, ticket_id: &str) {
         assert!(!state.finish_up_sent.contains(ticket_id));
-        assert!(!state.activity_log.iter().any(|event| matches!(
+        assert!(!state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::FinishUpPromptSent { ticket_id: actual, .. }
                 if actual == ticket_id
@@ -10796,8 +10842,7 @@ mod tests {
         correlation: &CompletionGenerationId,
     ) -> &'a ActivityEvent {
         state
-            .activity_log
-            .iter()
+            .activity_events()
             .find(|event| {
                 matches!(
                     event,
@@ -10827,7 +10872,7 @@ mod tests {
         else {
             panic!("expected completion rejection, got {event:?}");
         };
-        let entry = activity_event_to_ui_entry(event).unwrap();
+        let entry = ui_entry_for(event).unwrap();
         match entry.activity {
             ui::ActivityType::CompletionRejected {
                 ticket_id: rendered_ticket,
@@ -10894,22 +10939,90 @@ mod tests {
         );
     }
 
+    /// A fixed 2026-era wall clock, so age assertions never read the real one.
+    const FEED_TEST_NOW_SECS: u64 = 1_800_000_000;
+
+    fn feed_test_instant(offset_secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(FEED_TEST_NOW_SECS + offset_secs)
+    }
+
     #[test]
-    fn test_activity_event_to_ui_entry() {
-        assert!(activity_event_to_ui_entry(&ActivityEvent::PluginStarted).is_none());
-        assert!(
-            activity_event_to_ui_entry(&ActivityEvent::DagRecomputed { ticket_count: 5 }).is_none()
-        );
-        assert!(
-            activity_event_to_ui_entry(&ActivityEvent::TicketStatusChanged {
-                ticket_id: "T-001".to_string(),
-                old_status: TicketStatus::Open,
-                new_status: TicketStatus::InProgress,
-            })
-            .is_none()
+    fn log_activity_at_stamps_the_emit_instant() {
+        let mut state = State::default();
+        state.log_activity_at(
+            ActivityEvent::Info {
+                message: "stamped".to_string(),
+            },
+            feed_test_instant(0),
         );
 
-        let entry = activity_event_to_ui_entry(&ActivityEvent::ThreadSpawned {
+        assert_eq!(state.activity_log.len(), 1);
+        assert_eq!(
+            state.activity_log[0].at,
+            std::time::Duration::from_secs(FEED_TEST_NOW_SECS),
+            "the entry must carry the wall clock captured at emit"
+        );
+    }
+
+    #[test]
+    fn stamped_entry_renders_just_now_then_one_minute_ago() {
+        let mut state = State::default();
+        state.log_activity_at(
+            ActivityEvent::Info {
+                message: "stamped".to_string(),
+            },
+            feed_test_instant(0),
+        );
+
+        let entry =
+            activity_event_to_ui_entry(&state.activity_log[0]).expect("Info events reach the feed");
+
+        // Same instant the entry was emitted.
+        assert_eq!(
+            ui::format_age_bucket(
+                entry.timestamp,
+                std::time::Duration::from_secs(FEED_TEST_NOW_SECS)
+            ),
+            "just now"
+        );
+        // Sixty seconds later — advanced by moving the clock, never by sleeping.
+        assert_eq!(
+            ui::format_age_bucket(
+                entry.timestamp,
+                std::time::Duration::from_secs(FEED_TEST_NOW_SECS + 60)
+            ),
+            "1m ago"
+        );
+    }
+
+    #[test]
+    fn log_activity_uses_wall_clock_not_zero() {
+        // Guards the 2026-07 field bug: a feed entry emitted through the
+        // ordinary path must never carry the epoch-zero stamp that rendered as
+        // `495696h 11m`.
+        let mut state = State::default();
+        state.log_activity(ActivityEvent::Info {
+            message: "unstamped path".to_string(),
+        });
+
+        assert!(
+            state.activity_log[0].at > std::time::Duration::ZERO,
+            "log_activity must capture wall clock, not a default"
+        );
+    }
+
+    #[test]
+    fn test_activity_event_to_ui_entry() {
+        assert!(ui_entry_for(&ActivityEvent::PluginStarted).is_none());
+        assert!(ui_entry_for(&ActivityEvent::DagRecomputed { ticket_count: 5 }).is_none());
+        assert!(ui_entry_for(&ActivityEvent::TicketStatusChanged {
+            ticket_id: "T-001".to_string(),
+            old_status: TicketStatus::Open,
+            new_status: TicketStatus::InProgress,
+        })
+        .is_none());
+
+        let entry = ui_entry_for(&ActivityEvent::ThreadSpawned {
             ticket_id: "T-001".to_string(),
             pane_id: 42,
         });
@@ -10921,7 +11034,7 @@ mod tests {
             other => panic!("Expected ThreadStarted, got {:?}", other),
         }
 
-        let entry = activity_event_to_ui_entry(&ActivityEvent::PhaseCompleted {
+        let entry = ui_entry_for(&ActivityEvent::PhaseCompleted {
             ticket_id: "T-002".to_string(),
             phase: Phase::Design,
         });
@@ -10934,7 +11047,7 @@ mod tests {
             other => panic!("Expected PhaseCompleted, got {:?}", other),
         }
 
-        let entry = activity_event_to_ui_entry(&ActivityEvent::Error {
+        let entry = ui_entry_for(&ActivityEvent::Error {
             message: "something broke".to_string(),
         });
         assert!(entry.is_some());
@@ -10945,7 +11058,7 @@ mod tests {
             other => panic!("Expected Error, got {:?}", other),
         }
 
-        let entry = activity_event_to_ui_entry(&ActivityEvent::CompletionRejected {
+        let entry = ui_entry_for(&ActivityEvent::CompletionRejected {
             ticket_id: "T-003".to_string(),
             kind: CompletionRejectionKind::StaleLease,
             correlation_id: "corr-3".to_string(),
@@ -11447,7 +11560,7 @@ mod tests {
             pane_id: 42,
             command: "claude --dangerously-skip-permissions \"Read the ticket...\"".to_string(),
         };
-        let entry = activity_event_to_ui_entry(&event);
+        let entry = ui_entry_for(&event);
         assert!(entry.is_some(), "SessionLaunch should produce a UI entry");
         match &entry.unwrap().activity {
             ui::ActivityType::Info { ticket_id, message } => {
@@ -11467,7 +11580,7 @@ mod tests {
             pane_id: 7,
             command: long_command,
         };
-        let entry = activity_event_to_ui_entry(&event).unwrap();
+        let entry = ui_entry_for(&event).unwrap();
         match &entry.activity {
             ui::ActivityType::Info { message, .. } => {
                 assert!(
@@ -11661,12 +11774,12 @@ mod tests {
         assert_eq!(thread.status, ThreadStatus::Running);
 
         // Verify activity log has PhaseCompleted and TicketPhaseChanged
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { ticket_id, phase }
             if ticket_id == "T-001" && *phase == Phase::Research
         )));
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
             if ticket_id == "T-001" && *old_phase == Phase::Research && *new_phase == Phase::Design
@@ -11846,7 +11959,7 @@ mod tests {
         thread.last_activity = old;
         state.check_review_timeouts();
         assert!(!state.finish_up_sent.contains("T-LEVEL"));
-        assert!(!state.activity_log.iter().any(|event| matches!(
+        assert!(!state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-LEVEL"
         )));
@@ -12065,7 +12178,7 @@ mod tests {
         assert!(updated.contains("phase: review"));
 
         // Done transition is not logged before commit success.
-        assert!(!state.activity_log.iter().any(|e| matches!(
+        assert!(!state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
             if ticket_id == "T-001" && *old_phase == Phase::Review && *new_phase == Phase::Done
@@ -12580,7 +12693,7 @@ mod tests {
             );
             if !visible_reason.is_empty() {
                 assert!(
-                    state.activity_log.iter().any(|event| match event {
+                    state.activity_events().any(|event| match event {
                         ActivityEvent::CompletionRejected {
                             kind: CompletionRejectionKind::DispositionBlocked,
                             detail,
@@ -12684,7 +12797,7 @@ mod tests {
             !state.threads.contains_key("T-DEPENDENT"),
             "the blocked dependent must not be scheduled"
         );
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::CompletionRejected {
                 kind: CompletionRejectionKind::DispositionBlocked,
@@ -12867,7 +12980,7 @@ mod tests {
         assert_eq!(state.lease_high_water.get(&ticket_id), Some(&lease));
 
         // Error logged
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Error { message } if message.contains("stale")
         )));
@@ -12902,7 +13015,7 @@ mod tests {
 
     #[test]
     fn test_all_tickets_done_event_conversion() {
-        let entry = activity_event_to_ui_entry(&ActivityEvent::AllTicketsDone);
+        let entry = ui_entry_for(&ActivityEvent::AllTicketsDone);
         assert!(entry.is_some());
         match &entry.unwrap().activity {
             ui::ActivityType::PhaseCompleted { ticket_id, phase } => {
@@ -13060,7 +13173,7 @@ mod tests {
         state.evaluate_health();
 
         // Should have logged a HealthStateChanged event (Healthy → Stuck)
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::HealthStateChanged {
                 ticket_id,
@@ -13107,7 +13220,7 @@ mod tests {
         state.evaluate_health();
 
         // Should log Healthy → Failed transition
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::HealthStateChanged {
                 ticket_id,
@@ -13232,7 +13345,7 @@ mod tests {
     fn test_health_state_changed_event_to_ui_stuck() {
         use lisa_core::types::HealthStatus;
 
-        let entry = activity_event_to_ui_entry(&ActivityEvent::HealthStateChanged {
+        let entry = ui_entry_for(&ActivityEvent::HealthStateChanged {
             ticket_id: "T-001".to_string(),
             old_health: HealthStatus::Healthy,
             new_health: HealthStatus::Stuck,
@@ -13252,7 +13365,7 @@ mod tests {
     fn test_health_state_changed_event_to_ui_failed() {
         use lisa_core::types::HealthStatus;
 
-        let entry = activity_event_to_ui_entry(&ActivityEvent::HealthStateChanged {
+        let entry = ui_entry_for(&ActivityEvent::HealthStateChanged {
             ticket_id: "T-001".to_string(),
             old_health: HealthStatus::Healthy,
             new_health: HealthStatus::Failed,
@@ -13272,7 +13385,7 @@ mod tests {
     fn test_health_state_changed_event_to_ui_healthy_ignored() {
         use lisa_core::types::HealthStatus;
 
-        let entry = activity_event_to_ui_entry(&ActivityEvent::HealthStateChanged {
+        let entry = ui_entry_for(&ActivityEvent::HealthStateChanged {
             ticket_id: "T-001".to_string(),
             old_health: HealthStatus::Stuck,
             new_health: HealthStatus::Healthy,
@@ -13362,7 +13475,7 @@ mod tests {
         assert!(state.agent_slots[0].ticket_id.is_none());
 
         // Info log should mention pane and ticket
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Info { message }
             if message.contains("Released slot #7") && message.contains("T-001")
@@ -13387,7 +13500,7 @@ mod tests {
         state.release_slot_for_ticket(&"T-MISSING".to_string());
 
         // Info log should indicate not found
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Info { message }
             if message.contains("No slot found") && message.contains("T-MISSING")
@@ -13396,7 +13509,7 @@ mod tests {
 
     #[test]
     fn test_info_event_to_ui_entry() {
-        let entry = activity_event_to_ui_entry(&ActivityEvent::Info {
+        let entry = ui_entry_for(&ActivityEvent::Info {
             message: "test info message".to_string(),
         });
         assert!(entry.is_some());
@@ -13410,7 +13523,7 @@ mod tests {
 
     #[test]
     fn test_poll_summary_event_filtered() {
-        let entry = activity_event_to_ui_entry(&ActivityEvent::PollSummary {
+        let entry = ui_entry_for(&ActivityEvent::PollSummary {
             ready: 3,
             running: 2,
             idle_slots: 1,
@@ -13610,7 +13723,7 @@ mod tests {
             state.agent_slots[0].ticket_id.is_none(),
             "Stale slot should be released"
         );
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Error { message }
             if message.contains("stale") && message.contains("T-001") && message.contains("Slot #5")
@@ -13774,7 +13887,7 @@ mod tests {
         // Slot released
         assert!(state.agent_slots[0].ticket_id.is_none());
         // Warning logged
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Error { message }
             if message.contains("Orphaned") && message.contains("T-001")
@@ -13797,7 +13910,7 @@ mod tests {
         // Thread removed (ticket not in DAG)
         assert!(!state.threads.contains_key("T-GHOST"));
         // Warning logged
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Error { message }
             if message.contains("Orphaned") && message.contains("T-GHOST")
@@ -14136,7 +14249,7 @@ mod tests {
             Some(&lease),
             "the operator request must not consume or replace attempt authority"
         );
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::CompletionRejected {
                 ticket_id,
@@ -14152,7 +14265,7 @@ mod tests {
 
         assert!(state.pending_completions.is_empty());
         assert!(state.launched_completion_effects.is_empty());
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::CompletionRejected {
                 ticket_id,
@@ -14689,7 +14802,7 @@ mod tests {
         assert!(updated.contains("phase: review"));
 
         // Verify: activity log
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { ticket_id, phase }
             if ticket_id == "T-001" && *phase == Phase::Implement
@@ -14780,12 +14893,12 @@ mod tests {
         assert!(updated.contains("phase: review"));
 
         // Verify: only Implement completion is published before commit success.
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { phase, .. }
             if *phase == Phase::Implement
         )));
-        assert!(!state.activity_log.iter().any(|e| matches!(
+        assert!(!state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { phase, .. }
             if *phase == Phase::Review
@@ -14919,8 +15032,7 @@ mod tests {
         assert!(state.seat_is_owned(7));
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(event, ActivityEvent::Info { message } if message.contains("acknowledged its assignment")))
                 .count(),
             1
@@ -14931,8 +15043,7 @@ mod tests {
         assert!(!signal_dir.join("pane-7.ack").exists());
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(event, ActivityEvent::Info { message } if message.contains("acknowledged its assignment")))
                 .count(),
             1,
@@ -15311,7 +15422,7 @@ mod tests {
         assert!(state.idle_alerts[0].1.contains("research.md not found"));
 
         // Verify: warning in activity log
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Warning { message }
             if message.contains("T-001") && message.contains("research.md")
@@ -15392,7 +15503,7 @@ mod tests {
         assert!(updated.contains("phase: review"));
 
         // Review completion is not published early.
-        assert!(!state.activity_log.iter().any(|e| matches!(
+        assert!(!state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { ticket_id, phase }
             if ticket_id == "T-001" && *phase == Phase::Review
@@ -15563,7 +15674,7 @@ mod tests {
             message: "Scheduling paused".to_string(),
         });
         assert!(state.paused);
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Info { message } if message.contains("paused")
         )));
@@ -15574,7 +15685,7 @@ mod tests {
             message: "Scheduling resumed".to_string(),
         });
         assert!(!state.paused);
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Info { message } if message.contains("resumed")
         )));
@@ -15883,8 +15994,7 @@ mod tests {
             assert!(!launch_script.contains(" codex --dangerously"));
 
             let pane_line = state
-                .activity_log
-                .iter()
+                .activity_events()
                 .find_map(|event| match event {
                     ActivityEvent::SessionLaunch {
                         ticket_id: launched_ticket,
@@ -16156,7 +16266,7 @@ mod tests {
         assert_eq!(state.agent_slots[0].last_client, Some(AgentClient::Codex));
         assert_eq!(state.seat_assignment(PANE_ID), None);
         assert!(
-            !state.activity_log.iter().any(|event| matches!(
+            !state.activity_events().any(|event| matches!(
                 event,
                 ActivityEvent::Info { message }
                     if message.contains("Completion boundary revoked")
@@ -16522,8 +16632,7 @@ mod tests {
     fn delivery_log_count(state: &State, ticket_id: &str) -> usize {
         let needle = format!("delivering assignment for {ticket_id}");
         state
-            .activity_log
-            .iter()
+            .activity_events()
             .filter(|event| matches!(event, ActivityEvent::Info { message } if message.contains(&needle)))
             .count()
     }
@@ -16966,8 +17075,7 @@ mod tests {
         assert!(dashboard_thread_row(&state, "T-NAME").contains("starting"));
 
         let launch_count = state
-            .activity_log
-            .iter()
+            .activity_events()
             .filter(|event| {
                 matches!(
                     event,
@@ -17043,7 +17151,7 @@ mod tests {
             state.to_ui_state().seat_assignment_statuses.get(&1),
             Some(&ui::SeatAssignmentStatus::StartupFailed)
         );
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Error { message }
                 if message.contains("same-pane startup recovery failed")
@@ -17052,8 +17160,7 @@ mod tests {
         )));
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| {
                     matches!(
                         event,
@@ -17250,8 +17357,7 @@ mod tests {
             other => panic!("expected replacement Starting, got {other:?}"),
         };
         let launches_before_failure = state
-            .activity_log
-            .iter()
+            .activity_events()
             .filter(|event| matches!(event, ActivityEvent::SessionLaunch { .. }))
             .count();
         assert_eq!(launches_before_failure, 2);
@@ -17280,8 +17386,7 @@ mod tests {
         assert_eq!(state.current_leases.get("T-NAME"), None);
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(event, ActivityEvent::SessionLaunch { .. }))
                 .count(),
             launches_before_failure,
@@ -17316,8 +17421,7 @@ mod tests {
             other => panic!("expected initial chat delivery, got {other:?}"),
         };
         let launch_count = state
-            .activity_log
-            .iter()
+            .activity_events()
             .filter(|event| matches!(event, ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"))
             .count();
 
@@ -17338,8 +17442,7 @@ mod tests {
         assert!(!state.seat_is_owned(10));
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(event, ActivityEvent::Info { message } if message.contains("delivering assignment for T-NAME")))
                 .count(),
             2,
@@ -17390,8 +17493,7 @@ mod tests {
         );
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(event, ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"))
                 .count(),
             launch_count,
@@ -17677,7 +17779,7 @@ owned\n\
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
         assert!(state.seat_is_owned(10));
         assert!(dashboard_thread_row(&state, "T-NAME").contains("owned"));
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
                 if message.contains("claimed T-NAME attempt 1 assignment")
@@ -17721,7 +17823,7 @@ owned\n\
         assert!(!hook_path.exists());
         assert!(!state.signal_dir.join("pane-10.claim").exists());
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
                 if message.contains("Pane 10 acknowledged its assignment")
@@ -17814,7 +17916,7 @@ owned\n\
             std::fs::read_to_string(state.config.work_dir.join("T-NAME/research.md")).unwrap(),
             "replacement output is current\n"
         );
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
                 if message.contains("Pane 10 established ownership of T-NAME attempt 2")
@@ -17996,7 +18098,7 @@ owned\n\
             "a dropped event cannot promote the acknowledgment-gated seat"
         );
         assert!(!state.seat_is_owned(10));
-        assert!(!state.activity_log.iter().any(|event| matches!(
+        assert!(!state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
                 if message.contains("acknowledged its assignment")
@@ -18021,7 +18123,7 @@ owned\n\
             lisa_core::types::ThreadStatus::Failed
         );
         assert!(state.error_alerts.contains(&("T-NAME".to_string(), 10)));
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Error { message }
                 if message.contains("delivered assignment was not claimed") && message.contains("reset the ticket")
@@ -18054,8 +18156,7 @@ owned\n\
         let delivery_logs = delivery_log_count(&state, "T-NAME");
         let pending_enters = state.pending_enters.len();
         let launches = state
-            .activity_log
-            .iter()
+            .activity_events()
             .filter(|event| matches!(event, ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"))
             .count();
 
@@ -18074,8 +18175,7 @@ owned\n\
         assert_eq!(state.pending_enters.len(), pending_enters);
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(event, ActivityEvent::SessionLaunch { ticket_id, .. } if ticket_id == "T-NAME"))
                 .count(),
             launches
@@ -18107,14 +18207,14 @@ owned\n\
             lisa_core::types::ThreadStatus::Failed
         );
         assert!(state.error_alerts.contains(&("T-NAME".to_string(), 10)));
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Error { message }
                 if message.contains("delivered assignment was not claimed")
                     && message.contains("inspect the pane")
                     && message.contains("reset the ticket")
         )));
-        assert!(!state.activity_log.iter().any(|event| matches!(
+        assert!(!state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Error { message } if message.contains("assignment delivery failed")
         )));
@@ -18251,7 +18351,7 @@ owned\n\
             TransitionState::WaitingForExit
         );
         assert!(!state.agent_slots[0].has_session);
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
                 if message.contains("finished claude session rested")
@@ -19240,7 +19340,7 @@ owned\n\
         ));
         assert!(!state.seat_is_owned(1));
         assert_eq!(state.pending_enters.len(), 1, "fresh launch queued Enter");
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
                 if message.contains("launched codex") && message.contains("T-RECYCLE")
@@ -19422,7 +19522,7 @@ owned\n\
         assert!(state.threads.contains_key("T-001"));
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-001"));
         assert!(state.pending_completions.contains_key("T-001"));
-        assert!(!state.activity_log.iter().any(|e| matches!(
+        assert!(!state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::TicketPhaseChanged { new_phase, .. } if *new_phase == Phase::Done
         )));
@@ -19484,7 +19584,7 @@ owned\n\
         assert!(fs::read_to_string(tickets_dir.join("T-001.md"))
             .unwrap()
             .contains("phase: review"));
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::CompletionRejected {
                 kind: CompletionRejectionKind::DispositionBlocked,
@@ -19641,7 +19741,7 @@ owned\n\
         assert!(state.finish_up_sent.contains("T-001"));
 
         // Activity log should contain FinishUpPromptSent
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-001"
         )));
@@ -19680,8 +19780,7 @@ owned\n\
         assert!(state.finish_up_sent.contains(TICKET_ID));
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(
                     event,
                     ActivityEvent::FinishUpPromptSent { ticket_id, pane_id }
@@ -19729,7 +19828,7 @@ owned\n\
         state.check_review_timeouts();
 
         assert!(state.finish_up_sent.contains(TICKET_ID));
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::FinishUpPromptSent { ticket_id, pane_id }
                 if ticket_id == TICKET_ID && *pane_id == 42
@@ -20621,7 +20720,7 @@ owned\n\
         assert!(!state.agent_slots[0].has_session);
 
         // Activity log should have SessionTimedOut event
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::SessionTimedOut { ticket_id, phase, .. }
             if ticket_id == "T-001" && *phase == Phase::Implement
@@ -20683,7 +20782,7 @@ owned\n\
         assert!(state.timeout_alerts.is_empty());
 
         // A single over-budget warning is logged
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Warning { message } if message.contains("still active")
         )));
@@ -21131,7 +21230,7 @@ owned\n\
         assert!(!state.finish_up_sent.contains("T-REVIEW-ACTIVE"));
         assert!(!state.finish_up_sent.contains("T-REVIEW-HUMAN"));
         assert!(state.finish_up_sent.contains("T-REVIEW-FIRE"));
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::FinishUpPromptSent { ticket_id, pane_id }
                 if ticket_id == "T-REVIEW-FIRE" && *pane_id == 3
@@ -21171,7 +21270,7 @@ owned\n\
             state.last_health.get("T-HEALTH"),
             Some(&HealthStatus::Stuck)
         );
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::HealthStateChanged {
                 ticket_id,
@@ -21379,7 +21478,7 @@ owned\n\
             elapsed_secs: 1920, // 32 minutes
             phase: Phase::Implement,
         };
-        let entry = activity_event_to_ui_entry(&event).unwrap();
+        let entry = ui_entry_for(&event).unwrap();
         match &entry.activity {
             ui::ActivityType::Warning { ticket_id, message } => {
                 assert_eq!(ticket_id, "T-024-01");
@@ -21649,7 +21748,7 @@ owned\n\
         assert_eq!(state.error_alerts.len(), 1);
         assert_eq!(state.error_alerts[0], ("T-001".to_string(), 1));
         // Error logged
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Error { message } if message.contains("T-001") && message.contains("error")
         )));
@@ -21686,7 +21785,7 @@ owned\n\
         assert!(state.threads.contains_key("T-001"));
         assert!(state.error_alerts.is_empty());
         // Harmless info logged
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Info { message } if message.contains("pane 9") && message.contains("no running thread")
         )));
@@ -21868,7 +21967,7 @@ owned\n\
             state.threads.contains_key("T-CDX-02"),
             "dependent ticket must NOT auto-complete while its dep is open"
         );
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::CompletionRejected {
                 kind: CompletionRejectionKind::DependencyBlocked,
@@ -22002,7 +22101,7 @@ owned\n\
             state.finish_up_sent.contains("T-CDX-01"),
             "finish-up path taken"
         );
-        assert!(state.activity_log.iter().any(|e| matches!(
+        assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::FinishUpPromptSent { ticket_id, .. } if ticket_id == "T-CDX-01"
         )));
@@ -22537,7 +22636,7 @@ owned\n\
             state.threads.get(ticket_id).unwrap().attempt_lease.as_ref(),
             Some(&lease)
         );
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Error { message }
                 if message.starts_with("provenance write failed for T-PROV-FAIL: ")
@@ -22904,8 +23003,7 @@ owned\n\
         assert!(!state.claude_dir.join("quarantine.jsonl").exists());
 
         let quarantine_warnings: Vec<_> = state
-            .activity_log
-            .iter()
+            .activity_events()
             .filter(|event| {
                 matches!(
                     event,
@@ -22920,7 +23018,7 @@ owned\n\
             1,
             "ledger rescans must not duplicate quarantine visibility"
         );
-        let entry = activity_event_to_ui_entry(quarantine_warnings[0])
+        let entry = ui_entry_for(quarantine_warnings[0])
             .expect("quarantine warning should reach the dashboard activity feed");
         assert!(matches!(
             entry.activity,
@@ -23012,8 +23110,7 @@ owned\n\
         assert!(!state.codex_dir.join("last.usage.json").exists());
 
         let warning = state
-            .activity_log
-            .iter()
+            .activity_events()
             .find(|event| {
                 matches!(
                     event,
@@ -23023,7 +23120,7 @@ owned\n\
                 )
             })
             .expect("new quarantine should raise an activity warning");
-        let entry = activity_event_to_ui_entry(warning)
+        let entry = ui_entry_for(warning)
             .expect("quarantine warning should be visible in the dashboard activity feed");
         assert!(matches!(
             entry.activity,
@@ -23045,8 +23142,7 @@ owned\n\
         );
         assert_eq!(
             state
-                .activity_log
-                .iter()
+                .activity_events()
                 .filter(|event| matches!(
                     event,
                     ActivityEvent::Warning { message }
@@ -23388,7 +23484,7 @@ owned\n\
             1,
         )
         .to_string();
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::CompletionRejected {
                 kind: CompletionRejectionKind::StaleLease,
@@ -24600,7 +24696,7 @@ owned\n\
             .get_ready_tickets()
             .contains(&"T-CDX-02".to_string()));
         assert!(!ledger.exists(), "failed attempts must not emit provenance");
-        assert!(state.activity_log.iter().any(|event| matches!(
+        assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::CompletionRejected {
                 kind: CompletionRejectionKind::LaunchFailed,

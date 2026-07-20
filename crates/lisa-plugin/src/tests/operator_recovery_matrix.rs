@@ -117,8 +117,7 @@ fn assert_named_rejection(
     detail_fragment: &str,
 ) -> String {
     let event = state
-        .activity_log
-        .iter()
+        .activity_events()
         .rev()
         .find(|event| {
             matches!(
@@ -245,7 +244,7 @@ fn stale_attempt_records_do_not_override_explicit_operator_authority() {
         Some(&stale)
     );
     assert_eq!(state.agent_slots[0].attempt_lease.as_ref(), Some(&stale));
-    assert!(!state.activity_log.iter().any(|event| matches!(
+    assert!(!state.activity_events().any(|event| matches!(
         event,
         ActivityEvent::CompletionRejected {
             ticket_id,
