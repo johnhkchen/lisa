@@ -15,7 +15,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -267,6 +267,19 @@ const COMMIT_LOCK_FILE: &str = ".lisa-commit.lock";
 const COMMIT_GUARD_FILE: &str = "lisa-commit.guard";
 const COMMIT_LOCK_OWNER_SCHEMA_VERSION: u32 = 1;
 
+/// How long a commit transaction waits for the guard before calling it wedged.
+///
+/// A real critical section is roughly a dozen `git` invocations, so this is far
+/// above any honest collision and far below the loop's reconciliation deadline —
+/// expiry should always land as a named state, never as a deadline that passed.
+const COMMIT_GUARD_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// First poll interval while the guard is held. The common case is a collision of
+/// tens of milliseconds, so the first or second poll wins.
+const COMMIT_GUARD_POLL_MIN: Duration = Duration::from_millis(5);
+/// Ceiling for the doubling poll interval: bounds wakeups on a long hold while
+/// keeping hand-off latency under a twentieth of a second.
+const COMMIT_GUARD_POLL_MAX: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TransactionLockOwner {
     schema_version: u32,
@@ -374,6 +387,66 @@ fn format_lock_age(age_ms: u64) -> String {
     }
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// Deadline expiry on the guard: a named condition, distinct from the transient
+/// collision that a wait now absorbs silently.
+///
+/// Deliberately free of "temporarily locked" and "resource temporarily
+/// unavailable" — those substrings mean transient contention to the loop's
+/// completion classifier, and a guard that outlasted the whole wait is not
+/// transient. The message doubles as the operator-facing ask, so it ends with
+/// what to look for.
+fn guard_wait_timeout_error(
+    guard_path: &Path,
+    waited: Duration,
+    limit: Duration,
+) -> CommitTransactionError {
+    CommitTransactionError::new(format!(
+        "commit transaction guard wait timed out: {} was still held after waiting {} (limit {}); a transient collision would have cleared by now, so treat this guard as wedged and look for a stuck lisa process",
+        guard_path.display(),
+        format_lock_age(duration_ms(waited)),
+        format_lock_age(duration_ms(limit)),
+    ))
+}
+
+/// Take the guard exclusively, waiting out a live holder up to `guard_wait`.
+///
+/// Every attempt is still `LOCK_EX | LOCK_NB`: waiting is the change, not
+/// sharing. One attempt always precedes any sleep, so an uncontended acquire
+/// pays nothing. Returns with the guard held, or with the guard not held.
+fn lock_guard_waiting(
+    guard_file: &File,
+    guard_path: &Path,
+    guard_wait: Duration,
+) -> Result<(), CommitTransactionError> {
+    let started = Instant::now();
+    let mut interval = COMMIT_GUARD_POLL_MIN;
+    loop {
+        match guard_file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            // ENOLCK, EIO, a filesystem without locking: retrying for the whole
+            // timeout would only delay a failure that will not clear.
+            Err(e) => {
+                return Err(CommitTransactionError::new(format!(
+                    "cannot lock commit transaction guard {}: {e}",
+                    guard_path.display()
+                )));
+            }
+        }
+
+        let elapsed = started.elapsed();
+        let Some(remaining) = guard_wait.checked_sub(elapsed) else {
+            return Err(guard_wait_timeout_error(guard_path, elapsed, guard_wait));
+        };
+        std::thread::sleep(interval.min(remaining));
+        interval = (interval * 2).min(COMMIT_GUARD_POLL_MAX);
+    }
+}
+
 struct TransactionLock {
     guard_file: File,
     marker_file: File,
@@ -386,6 +459,14 @@ struct TransactionLock {
 
 impl TransactionLock {
     fn acquire(root: &Path, git_dir: &Path) -> Result<Self, CommitTransactionError> {
+        Self::acquire_waiting(root, git_dir, COMMIT_GUARD_WAIT_TIMEOUT)
+    }
+
+    fn acquire_waiting(
+        root: &Path,
+        git_dir: &Path,
+        guard_wait: Duration,
+    ) -> Result<Self, CommitTransactionError> {
         let guard_path = git_dir.join(COMMIT_GUARD_FILE);
         let guard_file = OpenOptions::new()
             .create(true)
@@ -399,12 +480,7 @@ impl TransactionLock {
                     guard_path.display()
                 ))
             })?;
-        guard_file.try_lock_exclusive().map_err(|e| {
-            CommitTransactionError::new(format!(
-                "commit transaction is temporarily locked by a live holder (guard {}): {e}",
-                guard_path.display()
-            ))
-        })?;
+        lock_guard_waiting(&guard_file, &guard_path, guard_wait)?;
 
         let path = root.join(COMMIT_LOCK_FILE);
         let marker_existed = path.exists();
@@ -1429,6 +1505,47 @@ mod tests {
         assert_eq!(fs::read(&lock_path).unwrap(), before);
         FileExt::unlock(&lock).unwrap();
         fs::remove_file(lock_path).unwrap();
+    }
+
+    #[test]
+    fn guard_wait_times_out_with_a_named_error_and_does_not_hang() {
+        let repo = GitRepo::new();
+        repo.write("ticket.txt", "base\n");
+        repo.base_commit();
+
+        let git_dir = PathBuf::from(repo.git_string(["rev-parse", "--absolute-git-dir"]));
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(git_dir.join(COMMIT_GUARD_FILE))
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+
+        let bound = Duration::from_millis(250);
+        let started = Instant::now();
+        let error = match TransactionLock::acquire_waiting(repo.root(), &git_dir, bound) {
+            Ok(_) => panic!("acquired a guard that is held for the whole test"),
+            Err(error) => error.to_string(),
+        };
+        let elapsed = started.elapsed();
+
+        assert!(error.contains("guard wait timed out"), "{error}");
+        assert!(error.contains("250ms"), "{error}");
+        assert!(!error.contains("os error 35"), "{error}");
+        assert!(
+            !error.to_ascii_lowercase().contains("temporarily"),
+            "timeout must not read as transient contention: {error}"
+        );
+        assert!(elapsed >= bound, "returned before the bound: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "hung: {elapsed:?}");
+        repo.assert_no_commit_lock();
+
+        FileExt::unlock(&holder).unwrap();
+        let mut lock = TransactionLock::acquire_waiting(repo.root(), &git_dir, bound).unwrap();
+        lock.finish().unwrap();
+        repo.assert_no_commit_lock();
     }
 
     #[test]
