@@ -1360,6 +1360,7 @@ mod tests {
                 steps: None,
                 check: None,
                 unstructured: true,
+                origin: crate::disposition::DispositionOrigin::Review,
             },
             ReviewDisposition::Invalid {
                 reason: "missing reason field".into(),

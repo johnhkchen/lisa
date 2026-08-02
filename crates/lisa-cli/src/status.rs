@@ -459,6 +459,7 @@ mod tests {
                 steps: Vec::new(),
                 check: None,
                 proposal: None,
+                origin: lisa_core::disposition::DispositionOrigin::Review,
             },
             ParkedRemedy {
                 ticket_id: "T-002".to_string(),
@@ -468,6 +469,7 @@ mod tests {
                 steps: Vec::new(),
                 check: Some("test -f release".to_string()),
                 proposal: None,
+                origin: lisa_core::disposition::DispositionOrigin::Review,
             },
             ParkedRemedy {
                 ticket_id: "T-003".to_string(),
@@ -477,6 +479,7 @@ mod tests {
                 steps: Vec::new(),
                 check: None,
                 proposal: None,
+                origin: lisa_core::disposition::DispositionOrigin::Review,
             },
         ];
 
@@ -502,6 +505,7 @@ mod tests {
             steps: Vec::new(),
             check: None,
             proposal: None,
+            origin: lisa_core::disposition::DispositionOrigin::Review,
         }];
 
         let lines = waiting_on_you_lines(&remedies);
@@ -538,6 +542,7 @@ mod tests {
                     new: "the calibrated 300 MiB bound".to_string(),
                 }],
             }),
+            origin: lisa_core::disposition::DispositionOrigin::Review,
         }];
         let lines = waiting_on_you_lines(&remedies);
         assert!(lines[0].contains("First responder"));

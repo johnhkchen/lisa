@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::disposition::{parse_review_disposition, RemedyOwner, ReviewDisposition};
+use crate::disposition::{
+    parse_review_disposition, DispositionOrigin, RemedyOwner, ReviewDisposition,
+};
 use crate::provenance::{ParkingTransitionRecord, ParkingTransitionType, ProvenanceLedgerRecord};
 use crate::triage::{read_stored_proposal, ProposalState, TriageProposal, TRIAGE_PROPOSAL_FILE};
 use crate::types::{AttemptLease, Ticket, TicketStatus};
@@ -81,6 +83,8 @@ pub struct ParkedRemedy {
     pub steps: Vec<String>,
     pub check: Option<String>,
     pub proposal: Option<TriageProposal>,
+    /// Whether a reviewer judged the work or one of Lisa's own commands failed.
+    pub origin: DispositionOrigin,
 }
 
 /// Read the latest current Park record per ticket from the mixed provenance ledger.
@@ -156,6 +160,7 @@ pub fn collect_parked_remedies<'a>(
                 steps,
                 check,
                 unstructured,
+                origin,
             } = disposition
             else {
                 return None;
@@ -183,6 +188,7 @@ pub fn collect_parked_remedies<'a>(
                 steps: steps.unwrap_or_default(),
                 check,
                 proposal,
+                origin,
             })
         })
         .collect();
@@ -251,6 +257,35 @@ mod tests {
         ticket
     }
 
+    #[test]
+    fn the_projection_says_which_parks_are_recording_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().join("work");
+        let ledger = dir.path().join("provenance.jsonl");
+        write_disposition(
+            &work_dir,
+            "T-JUDGED",
+            r#"{"disposition":"block","reason":"the new test fails","remedy_owner":"agent","ask":"Fix the failing test."}"#,
+        );
+        write_disposition(
+            &work_dir,
+            "T-UNRECORDED",
+            r#"{"disposition":"block","origin":"internal-command","reason":"Lisa could not record T-UNRECORDED's finished work.","remedy_owner":"operator","ask":"Run `lisa already-done T-UNRECORDED` if this ticket's work is already saved in history."}"#,
+        );
+        let tickets = [
+            ticket("T-JUDGED", TicketStatus::Blocked),
+            ticket("T-UNRECORDED", TicketStatus::Blocked),
+        ];
+
+        let remedies = collect_parked_remedies(tickets.iter(), &work_dir, &ledger);
+
+        assert_eq!(remedies.len(), 2);
+        assert_eq!(remedies[0].ticket_id, "T-JUDGED");
+        assert_eq!(remedies[0].origin, DispositionOrigin::Review);
+        assert_eq!(remedies[1].ticket_id, "T-UNRECORDED");
+        assert_eq!(remedies[1].origin, DispositionOrigin::InternalCommand);
+    }
+
     fn write_disposition(work_dir: &Path, ticket_id: &str, document: &str) {
         let ticket_work = work_dir.join(ticket_id);
         fs::create_dir_all(&ticket_work).unwrap();
@@ -316,6 +351,7 @@ mod tests {
                     steps: vec!["Open checkout".to_string()],
                     check: None,
                     proposal: None,
+                    origin: DispositionOrigin::Review,
                 },
                 ParkedRemedy {
                     ticket_id: "T-002".to_string(),
@@ -325,6 +361,7 @@ mod tests {
                     steps: Vec::new(),
                     check: Some("test -f release".to_string()),
                     proposal: None,
+                    origin: DispositionOrigin::Review,
                 },
             ]
         );
@@ -351,6 +388,7 @@ mod tests {
                 steps: Vec::new(),
                 check: None,
                 proposal: None,
+                origin: DispositionOrigin::Review,
             }]
         );
     }

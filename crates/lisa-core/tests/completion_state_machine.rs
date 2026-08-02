@@ -171,6 +171,7 @@ impl CompletionHarness {
                     steps: None,
                     check: None,
                     unstructured: true,
+                    origin: lisa_core::disposition::DispositionOrigin::Review,
                 },
                 None => ReviewDisposition::Invalid {
                     reason: "Review not observed".into(),

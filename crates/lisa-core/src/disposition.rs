@@ -21,6 +21,23 @@ pub enum RemedyOwner {
     World,
 }
 
+/// Who wrote a blocking disposition, and therefore what it is a statement about.
+///
+/// A reviewer's block is a judgement about the work. A block Lisa writes after
+/// one of its own commands fails is a statement about a boundary that failed —
+/// the work may be perfectly fine. The field operator read the second as the
+/// first and went looking for what was wrong with twelve recipes; nothing was.
+/// Keeping the two apart is a field, never a turn of phrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DispositionOrigin {
+    /// An agent's Review verdict on the work.
+    #[default]
+    Review,
+    /// Lisa could not run one of its own commands to completion.
+    InternalCommand,
+}
+
 /// A criteria-versus-evidence dispute that does not stop completed work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispositionNote {
@@ -78,7 +95,7 @@ pub enum ReviewDisposition {
     Pass,
     /// The work passed with a recorded criteria-versus-evidence dispute.
     Note(DispositionNote),
-    /// The agent blocked completion with an actionable reason.
+    /// Completion is blocked with an actionable reason.
     Block {
         reason: String,
         remedy_owner: RemedyOwner,
@@ -88,6 +105,8 @@ pub enum ReviewDisposition {
         /// True when missing or malformed remedy structure was replaced with
         /// the safe operator-owned legacy fallback.
         unstructured: bool,
+        /// Whether this is a reviewer's verdict or a failed internal command.
+        origin: DispositionOrigin,
     },
     /// The file could not be trusted as either valid disposition.
     Invalid { reason: String },
@@ -274,6 +293,9 @@ fn check_block_document(
         steps,
         check,
         unstructured: false,
+        // Authoring is a reviewer's act. `origin` is Lisa's to set, and the
+        // extra-field rule above already refuses a document that claims it.
+        origin: DispositionOrigin::Review,
     })
 }
 
@@ -345,6 +367,20 @@ fn validate_block_structure(
     reason: String,
     object: &mut serde_json::Map<String, Value>,
 ) -> ReviewDisposition {
+    // Read origin before the structure closure so an unreadable value fails
+    // toward Review — a document that cannot say it came from a failed command
+    // is never granted that excuse.
+    let origin = match object.remove("origin") {
+        None => Some(DispositionOrigin::Review),
+        Some(Value::String(value)) if value == "review" => Some(DispositionOrigin::Review),
+        Some(Value::String(value)) if value == "internal-command" => {
+            Some(DispositionOrigin::InternalCommand)
+        }
+        Some(_) => None,
+    };
+    let Some(origin) = origin else {
+        return unstructured_block(reason);
+    };
     let structure = (|| {
         let remedy_owner = match object.remove("remedy_owner")? {
             Value::String(owner) if owner == "agent" => RemedyOwner::Agent,
@@ -378,6 +414,7 @@ fn validate_block_structure(
             steps,
             check,
             unstructured: false,
+            origin,
         },
         None => unstructured_block(reason),
     }
@@ -398,6 +435,7 @@ fn unstructured_block(reason: String) -> ReviewDisposition {
         steps: None,
         check: None,
         unstructured: true,
+        origin: DispositionOrigin::Review,
     }
 }
 
@@ -484,6 +522,7 @@ mod tests {
                 steps: None,
                 check: None,
                 unstructured: true,
+                origin: DispositionOrigin::Review,
             }
         );
     }
@@ -506,6 +545,7 @@ mod tests {
                     steps: None,
                     check: None,
                     unstructured: false,
+                    origin: DispositionOrigin::Review,
                 }
             );
         }
@@ -527,6 +567,7 @@ mod tests {
                 ]),
                 check: Some("curl -fsS https://example.test/release".to_string()),
                 unstructured: false,
+                origin: DispositionOrigin::Review,
             }
         );
     }
@@ -546,6 +587,7 @@ mod tests {
                 steps: None,
                 check: None,
                 unstructured: true,
+                origin: DispositionOrigin::Review,
             }
         );
     }
@@ -576,6 +618,7 @@ mod tests {
                     steps: None,
                     check: None,
                     unstructured: true,
+                    origin: DispositionOrigin::Review,
                 },
                 "unexpected parse result for {document}"
             );
@@ -741,5 +784,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_recording_failure_and_a_reviewers_verdict_are_separable_by_field() {
+        let reviewer = r#"{"disposition":"block","reason":"the new test fails","remedy_owner":"agent","ask":"Fix the failing test."}"#;
+        let recording = r#"{"disposition":"block","origin":"internal-command","reason":"Lisa could not record T-002-05's finished work.","remedy_owner":"operator","ask":"Run `lisa already-done T-002-05` if this ticket's work is already saved in history."}"#;
+
+        assert!(matches!(
+            parse_document(reviewer),
+            ReviewDisposition::Block {
+                origin: DispositionOrigin::Review,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_document(recording),
+            ReviewDisposition::Block {
+                origin: DispositionOrigin::InternalCommand,
+                ..
+            }
+        ));
+        // An explicit "review" is the same fact as saying nothing.
+        assert_eq!(
+            parse_document(
+                r#"{"disposition":"block","origin":"review","reason":"the new test fails","remedy_owner":"agent","ask":"Fix the failing test."}"#
+            ),
+            parse_document(reviewer)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_origin_never_claims_to_be_a_failed_command() {
+        for document in [
+            r#"{"disposition":"block","origin":"machine","reason":"raw reason","remedy_owner":"operator","ask":"Do it."}"#,
+            r#"{"disposition":"block","origin":7,"reason":"raw reason","remedy_owner":"operator","ask":"Do it."}"#,
+            r#"{"disposition":"block","origin":null,"reason":"raw reason","remedy_owner":"operator","ask":"Do it."}"#,
+        ] {
+            assert_eq!(
+                parse_document(document),
+                ReviewDisposition::Block {
+                    reason: "raw reason".to_string(),
+                    remedy_owner: RemedyOwner::Operator,
+                    ask: "raw reason".to_string(),
+                    steps: None,
+                    check: None,
+                    unstructured: true,
+                    origin: DispositionOrigin::Review,
+                },
+                "unexpected parse result for {document}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reviewer_cannot_author_the_origin_field() {
+        // Origin is Lisa's to set. The strict authoring check's extra-field
+        // rule is what keeps an agent from writing "this was a transport
+        // failure" over its own verdict.
+        let error = check_authored_document(
+            r#"{"disposition":"block","origin":"internal-command","reason":"tests are failing","remedy_owner":"agent","ask":"Fix it."}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("remove extra block fields"), "{error}");
     }
 }
