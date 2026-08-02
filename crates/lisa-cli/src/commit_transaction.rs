@@ -1446,6 +1446,60 @@ mod tests {
                 includes: includes.iter().map(PathBuf::from).collect(),
             }
         }
+
+        /// Seed one reviewable ticket and one work artifact for `ticket_id`.
+        fn seed_ticket(&self, ticket_id: &str) {
+            self.seed_ticket_in_state(ticket_id, "open", "review");
+        }
+
+        /// Seed a ticket whose frontmatter already reads done, so that
+        /// `update_ticket_done` changes nothing and the include-path diff is
+        /// genuinely empty without any seal having happened.
+        fn seed_done_ticket(&self, ticket_id: &str) {
+            self.seed_ticket_in_state(ticket_id, "done", "done");
+        }
+
+        fn seed_ticket_in_state(&self, ticket_id: &str, status: &str, phase: &str) {
+            self.write(
+                &ticket_file(ticket_id),
+                &format!(
+                    "---\nid: {ticket_id}\ntitle: sealed\ntype: task\nstatus: {status}\npriority: high\nphase: {phase}\n---\n\nBody\n"
+                ),
+            );
+            self.write(
+                &format!("{}/review.md", work_dir(ticket_id)),
+                &format!("# Review {ticket_id}\n"),
+            );
+        }
+
+        fn complete(
+            &self,
+            ticket_id: &str,
+            key: CompletionGenerationId,
+        ) -> Result<CommitTransactionResult, CommitTransactionError> {
+            complete_ticket(CompleteTicketRequest {
+                repo_root: self.root().to_path_buf(),
+                ticket_id: ticket_id.to_string(),
+                message: format!("Complete {ticket_id}"),
+                ticket_file: PathBuf::from(ticket_file(ticket_id)),
+                work_dir: PathBuf::from(work_dir(ticket_id)),
+                completion_key: key,
+            })
+        }
+
+        fn commit_count(&self) -> usize {
+            self.git_string(["rev-list", "--count", "HEAD"])
+                .parse()
+                .unwrap()
+        }
+    }
+
+    fn ticket_file(ticket_id: &str) -> String {
+        format!("docs/active/tickets/{ticket_id}.md")
+    }
+
+    fn work_dir(ticket_id: &str) -> String {
+        format!("docs/active/work/{ticket_id}")
     }
 
     fn completion_key(
@@ -2103,6 +2157,112 @@ mod tests {
         })
         .unwrap();
         assert_eq!(replay_after_different.commit_id, first.commit_id);
+        repo.assert_no_commit_lock();
+    }
+
+    /// Both directions of an empty include-path diff, in one fixture.
+    ///
+    /// An implementation that reads emptiness as success fails the unsealed
+    /// leg; one that always errors on emptiness fails the sealed leg. Neither
+    /// half can be satisfied alone.
+    #[test]
+    fn already_sealed_ticket_converges_under_a_later_key_and_unsealed_empty_diff_still_fails() {
+        let repo = GitRepo::new();
+        repo.seed_ticket("T-055-A");
+        repo.seed_done_ticket("T-055-B");
+        repo.base_commit();
+
+        let first = repo
+            .complete("T-055-A", completion_key("T-055-A", "1", 1))
+            .unwrap();
+        let commits_after_seal = repo.commit_count();
+        let head_after_seal = repo.git_string(["rev-parse", "HEAD"]);
+
+        // The field shape: the loop retries under a key that is not the one
+        // that landed, and there is nothing left to commit.
+        let replay = repo
+            .complete("T-055-A", completion_key("T-055-A", "2", 1))
+            .unwrap();
+        assert_eq!(replay.commit_id, first.commit_id);
+        assert!(replay.committed_paths.is_empty());
+        assert_eq!(repo.commit_count(), commits_after_seal);
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head_after_seal);
+
+        // T-055-B is clean in both include paths and was never sealed. Its
+        // empty diff is a real failure and stays one.
+        let ticket_before = fs::read_to_string(repo.root().join(ticket_file("T-055-B"))).unwrap();
+        let error = repo
+            .complete("T-055-B", completion_key("T-055-B", "1", 1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no changes"), "{error}");
+        assert!(error.contains("T-055-B"), "{error}");
+        assert_eq!(repo.commit_count(), commits_after_seal);
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head_after_seal);
+        assert_eq!(
+            fs::read_to_string(repo.root().join(ticket_file("T-055-B"))).unwrap(),
+            ticket_before,
+            "a refused completion must leave the ticket as it found it"
+        );
+        repo.assert_no_commit_lock();
+    }
+
+    #[test]
+    fn empty_diff_names_the_include_paths_it_staged_from() {
+        let repo = GitRepo::new();
+        repo.seed_done_ticket("T-055-C");
+        repo.base_commit();
+
+        let error = repo
+            .complete("T-055-C", completion_key("T-055-C", "1", 1))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(&ticket_file("T-055-C")),
+            "the refusal must name the ticket path it staged from: {error}"
+        );
+        assert!(
+            error.contains(&work_dir("T-055-C")),
+            "the refusal must name the work directory it staged from: {error}"
+        );
+        repo.assert_no_commit_lock();
+    }
+
+    /// Convergence must not become a way around the ordinary-index refusal.
+    #[test]
+    fn ordinary_index_entry_under_an_include_path_refuses_even_when_sealed() {
+        let repo = GitRepo::new();
+        repo.seed_ticket("T-055-D");
+        repo.base_commit();
+
+        let sealed = repo
+            .complete("T-055-D", completion_key("T-055-D", "1", 1))
+            .unwrap();
+        let review = format!("{}/review.md", work_dir("T-055-D"));
+        let sealed_bytes = fs::read_to_string(repo.root().join(&review)).unwrap();
+
+        // Stage a differing version in the ordinary index, then restore the
+        // sealed bytes on disk: the alternate index is built from the worktree,
+        // so its diff is empty while the ordinary index still holds the path.
+        repo.write(&review, "# Review T-055-D\nstaged by someone else\n");
+        repo.git(["add", &review]);
+        repo.write(&review, &sealed_bytes);
+        let head_before = repo.git_string(["rev-parse", "HEAD"]);
+
+        let error = repo
+            .complete("T-055-D", completion_key("T-055-D", "2", 1))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("overlaps paths already staged in the ordinary index"),
+            "{error}"
+        );
+        assert!(error.contains(&review), "{error}");
+        assert!(!error.contains("has no changes"), "{error}");
+        assert_ne!(error, sealed.commit_id);
+        assert_eq!(repo.git_string(["rev-parse", "HEAD"]), head_before);
         repo.assert_no_commit_lock();
     }
 }
