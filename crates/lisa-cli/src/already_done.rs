@@ -85,9 +85,10 @@ pub fn run_already_done(
             "Lisa has no record of trying to finish {ticket_id}, so there is nothing to settle."
         )));
     };
-    if let Some(decline) = wrong_state(ticket_id, aggregate) {
-        return Ok(declined(decline));
-    }
+    let start = match recovery_start(ticket_id, aggregate) {
+        Ok(start) => start,
+        Err(decline) => return Ok(declined(decline)),
+    };
 
     let completion_id = CompletionId::new(ticket_id);
     let Some(commit_id) = find_sealed_commit(request.project_root, &completion_id)? else {
@@ -96,20 +97,34 @@ pub fn run_already_done(
         )));
     };
 
-    let recovery_key = CompletionGenerationId::new(
-        completion_id,
-        AttemptId::new(OPERATOR_ATTEMPT),
-        aggregate.completion_key().generation().saturating_add(1),
-    );
-    let correlation = CorrelationId::new(recovery_key.to_string());
+    let (recovery_key, correlation) = match &start {
+        RecoveryStart::Fresh => {
+            let key = CompletionGenerationId::new(
+                completion_id,
+                AttemptId::new(OPERATOR_ATTEMPT),
+                aggregate.completion_key().generation().saturating_add(1),
+            );
+            let correlation = CorrelationId::new(key.to_string());
+            (key, correlation)
+        }
+        // An interrupted earlier run left its own generation part-written.
+        // Finishing it is the only move: its key already owns the aggregate,
+        // and a fresh one would be refused by the fold.
+        RecoveryStart::Resume { correlation } => (
+            aggregate.completion_key().clone(),
+            correlation
+                .clone()
+                .unwrap_or_else(|| CorrelationId::new(aggregate.completion_key().to_string())),
+        ),
+    };
     let receipt = CompletionSealReceipt::commit(commit_id.clone())?;
     let prior_phase = aggregate.prior_phase();
     let prior_status = aggregate.prior_status();
 
     // A new generation is the only legal road from Rejected to Confirmed. Each
     // append re-folds, so an interruption between them leaves a state the
-    // plugin can still replay.
-    for transition in [
+    // plugin can still replay — and one this command can pick back up.
+    let pending: &[CompletionJournalTransition] = &[
         CompletionJournalTransition::Requested {
             key: recovery_key.clone(),
             prior_phase,
@@ -127,11 +142,12 @@ pub fn run_already_done(
             receipt: receipt.clone(),
             note: None,
         },
-    ] {
+    ];
+    for transition in &pending[start.already_recorded()..] {
         append_with_seal_using(
             request.journal_path,
             CompletionSeal::Commit,
-            transition,
+            transition.clone(),
             atomic_write,
         )?;
     }
@@ -157,21 +173,59 @@ fn declined(message: String) -> AlreadyDoneOutcome {
     AlreadyDoneOutcome::Declined(message)
 }
 
-/// Why this completion is not one that `already-done` can settle.
-fn wrong_state(ticket_id: &str, aggregate: &CompletionJournalAggregate) -> Option<String> {
+/// Where in the three-record sequence this run has to start.
+enum RecoveryStart {
+    /// Nothing of a recovery generation exists yet.
+    Fresh,
+    /// An earlier run of this command died part-way through.
+    Resume { correlation: Option<CorrelationId> },
+}
+
+impl RecoveryStart {
+    /// How many of the three transitions are already on disk.
+    fn already_recorded(&self) -> usize {
+        match self {
+            Self::Fresh => 0,
+            Self::Resume { correlation: None } => 1,
+            Self::Resume { .. } => 2,
+        }
+    }
+}
+
+/// Decide whether this completion can be settled, and from where.
+///
+/// The resume arm matters more than it looks. Three appends means two windows
+/// where a killed process leaves a half-written recovery generation, and a
+/// half-written one reads as `Requested` — which masks the board's Done and,
+/// without this, would be refused as "still working on it". That would be a
+/// fresh dead end inside the command built to remove dead ends.
+fn recovery_start(
+    ticket_id: &str,
+    aggregate: &CompletionJournalAggregate,
+) -> Result<RecoveryStart, String> {
     if aggregate.seal() != CompletionSeal::Commit {
-        return Some(format!(
+        return Err(format!(
             "This project records finished work in the journal, not in commits, so there is no \
              commit for {ticket_id} to find."
         ));
     }
+    let is_operator_generation =
+        aggregate.completion_key().attempt_id().as_str() == OPERATOR_ATTEMPT;
     match aggregate.state() {
         CompletionState::Rejected {
             retryability: Retryability::ActionRequired,
             ..
-        } => None,
-        CompletionState::Confirmed => Some(format!("{ticket_id} is already finished.")),
-        _ => Some(format!(
+        } => Ok(RecoveryStart::Fresh),
+        CompletionState::Requested if is_operator_generation => {
+            Ok(RecoveryStart::Resume { correlation: None })
+        }
+        CompletionState::CommandInFlight { correlation, .. } if is_operator_generation => {
+            Ok(RecoveryStart::Resume {
+                correlation: Some(correlation.clone()),
+            })
+        }
+        CompletionState::Confirmed => Err(format!("{ticket_id} is already finished.")),
+        _ => Err(format!(
             "{ticket_id} isn't stuck — Lisa is still working on finishing it."
         )),
     }

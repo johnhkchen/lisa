@@ -308,6 +308,105 @@ fn the_lost_race_that_could_not_be_recovered_now_can_be() {
     ));
 }
 
+/// A killed `already-done` must not leave a fresh dead end behind it.
+///
+/// The command writes three records, so there are two windows where a killed
+/// process leaves a half-written recovery generation. That half-written state
+/// reads as `Requested`, which masks the board's Done — exactly the shape of
+/// the problem this command exists to remove. Running it again finishes the
+/// generation it started rather than refusing it.
+#[test]
+fn an_interrupted_recovery_is_finished_by_running_it_again() {
+    for stop_after in [1, 2] {
+        let mut field = Field::new();
+        let sealing_key = CompletionGenerationId::new(
+            CompletionId::new(TICKET),
+            AttemptId::new(field.lease.attempt_id.to_string()),
+            1,
+        );
+        let correlation = CorrelationId::new(sealing_key.to_string());
+        for transition in [
+            CompletionJournalTransition::Requested {
+                key: sealing_key.clone(),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+                note: None,
+            },
+            CompletionJournalTransition::CommandInFlight {
+                key: sealing_key.clone(),
+                correlation: correlation.clone(),
+                deadline: CompletionDeadline::from_unix_millis(1),
+            },
+        ] {
+            completion_journal::append_with_seal(
+                &field.state.completion_journal_path,
+                CompletionSeal::Commit,
+                transition,
+            )
+            .unwrap();
+        }
+        field.state.restore_completion_journal();
+        let sealed = complete_ticket(CompleteTicketRequest {
+            repo_root: field.root.clone(),
+            ticket_id: TICKET.to_string(),
+            message: format!("Complete {TICKET}"),
+            ticket_file: PathBuf::from("docs/active/tickets").join(format!("{TICKET}.md")),
+            work_dir: PathBuf::from("docs/active/work").join(TICKET),
+            completion_key: sealing_key,
+        })
+        .unwrap();
+        assert!(field.state.expire_in_flight_completion(
+            TICKET,
+            correlation,
+            CompletionDeadline::from_unix_millis(1),
+        ));
+
+        // Simulate the interruption by writing only the first `stop_after`
+        // records of the recovery generation.
+        let recovery_key = CompletionGenerationId::new(
+            CompletionId::new(TICKET),
+            AttemptId::new("operator"),
+            field.after_restart().completion_key().generation() + 1,
+        );
+        let recovery_correlation = CorrelationId::new(recovery_key.to_string());
+        let partial = [
+            CompletionJournalTransition::Requested {
+                key: recovery_key.clone(),
+                prior_phase: field.after_restart().prior_phase(),
+                prior_status: field.after_restart().prior_status(),
+                note: None,
+            },
+            CompletionJournalTransition::CommandInFlight {
+                key: recovery_key,
+                correlation: recovery_correlation,
+                deadline: CompletionDeadline::from_unix_millis(0),
+            },
+        ];
+        for transition in partial.into_iter().take(stop_after) {
+            completion_journal::append_with_seal(
+                &field.state.completion_journal_path,
+                CompletionSeal::Commit,
+                transition,
+            )
+            .unwrap();
+        }
+        assert!(
+            field.after_restart().masks_durable_done(),
+            "a half-written recovery is exactly the state that hides Done"
+        );
+
+        let outcome = field.recover().unwrap();
+
+        assert!(
+            matches!(outcome, AlreadyDoneOutcome::Recovered { ref commit_id, .. }
+                if commit_id == &sealed.commit_id),
+            "stopped after {stop_after}: {outcome:?}"
+        );
+        assert_eq!(field.after_restart().state(), &CompletionState::Confirmed);
+        assert_eq!(field.board_ticket().status, TicketStatus::Done);
+    }
+}
+
 fn commit_count(root: &Path) -> usize {
     let output = Command::new("git")
         .arg("-C")
