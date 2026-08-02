@@ -313,7 +313,10 @@ only an operator can fix is retried a small fixed number of times, then the
 ticket parks under **Waiting on you** with one plain sentence naming what to do
 (the full technical detail stays in the journal). No completion failure can
 churn silently, and none leaves a state you can't recover from the dashboard or
-`lisa unblock`.
+`lisa unblock`. And when the work itself did get committed but the finishing
+record didn't, Lisa stops retrying after a couple of tries and tells you to run
+`lisa already-done` — which checks history for that work before it settles
+anything.
 
 Projects without history don't lose the seal — they get a different one. Where
 a repository exists, finished work is **commit-sealed** exactly as above. Where
@@ -441,6 +444,21 @@ own check first and tells you if the fix isn't in place yet.
 
 ```bash
 lisa unblock T-001-01
+```
+
+### `lisa already-done`
+
+Finish a ticket whose work is already saved in your project's history. Now and
+then Lisa commits a ticket's work and then can't record the finishing touch —
+the ticket sits waiting while the work itself is safely in history. This settles
+it: Lisa looks for that work, and if it's really there, marks the ticket done
+and writes the record.
+
+If Lisa can't find the work in history, nothing changes and it says so. Your
+word isn't enough — the commit has to be there.
+
+```bash
+lisa already-done T-001-01
 ```
 
 ### `lisa notes`
