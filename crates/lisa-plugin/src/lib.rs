@@ -9295,7 +9295,8 @@ impl ZellijPlugin for State {
 
         // Provenance ledger + per-provider usage-artifact directories.
         self.ledger_path = host.join(".lisa/provenance.jsonl");
-        self.completion_journal_path = host.join(".lisa/completion-journal.jsonl");
+        self.completion_journal_path =
+            host.join(lisa_core::completion_journal::COMPLETION_JOURNAL_RELATIVE_PATH);
         self.restore_completion_journal();
         self.codex_dir = host.join(".lisa/codex");
         self.claude_dir = host.join(".lisa/claude");
