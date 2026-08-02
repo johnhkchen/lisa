@@ -439,23 +439,53 @@ impl CompletionGenerationId {
 
 impl fmt::Display for CompletionGenerationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("v1:")?;
-        write_hex(f, self.completion_id.as_str().as_bytes())?;
-        f.write_str(":")?;
-        write_hex(f, self.attempt_id.as_str().as_bytes())?;
-        write!(f, ":{}", self.generation)
+        write!(
+            f,
+            "{}{}:{}",
+            completion_key_ticket_scope(&self.completion_id),
+            hex(self.attempt_id.as_str().as_bytes()),
+            self.generation
+        )
     }
 }
 
-fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rendered = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        f.write_str(
-            std::str::from_utf8(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])
-                .expect("hexadecimal digits are UTF-8"),
-        )?;
+        rendered.push(HEX[(byte >> 4) as usize] as char);
+        rendered.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    Ok(())
+    rendered
+}
+
+/// The part of a generation key shared by every generation of one ticket.
+fn completion_key_ticket_scope(completion_id: &CompletionId) -> String {
+    format!("v1:{}:", hex(completion_id.as_str().as_bytes()))
+}
+
+/// Commit-message trailer that binds one commit to one completion generation.
+///
+/// The trailer lives here, beside the key it renders, so a reader outside the
+/// commit transaction can recognize a sealed completion without owning the
+/// transaction. The transaction remains the only writer.
+pub const COMPLETION_KEY_PREFIX: &str = "Lisa-Completion-Key: ";
+
+/// Render the exact trailer line for one completion generation.
+pub fn completion_key_marker(key: &CompletionGenerationId) -> String {
+    format!("{COMPLETION_KEY_PREFIX}{key}")
+}
+
+/// Render the trailer prefix every generation of one ticket shares.
+///
+/// A completion that already sealed under *some* generation is the evidence an
+/// operator recovery stands on; the exact generation that sealed it is not
+/// knowable in advance, so recognition is by this prefix.
+pub fn completion_key_ticket_prefix(completion_id: &CompletionId) -> String {
+    format!(
+        "{COMPLETION_KEY_PREFIX}{}",
+        completion_key_ticket_scope(completion_id)
+    )
 }
 
 /// A completion artifact admitted as belonging to the authoritative attempt.
@@ -1190,6 +1220,34 @@ mod tests {
             CompletionGenerationId::new(CompletionId::new("T-042"), AttemptId::new("1"), 1,),
             key
         );
+    }
+
+    #[test]
+    fn the_commit_trailer_is_pinned_and_its_ticket_prefix_spans_every_generation() {
+        assert_eq!(COMPLETION_KEY_PREFIX, "Lisa-Completion-Key: ");
+
+        let key = CompletionGenerationId::new(CompletionId::new("T-042"), AttemptId::new("1"), 1);
+        assert_eq!(
+            completion_key_marker(&key),
+            format!("Lisa-Completion-Key: {key}")
+        );
+
+        let prefix = completion_key_ticket_prefix(&CompletionId::new("T-042"));
+        assert_eq!(prefix, "Lisa-Completion-Key: v1:542d303432:");
+        for (attempt, generation) in [("1", 1), ("operator", 7), ("2", 3)] {
+            let marker = completion_key_marker(&CompletionGenerationId::new(
+                CompletionId::new("T-042"),
+                AttemptId::new(attempt),
+                generation,
+            ));
+            assert!(marker.starts_with(&prefix), "{marker} lost {prefix}");
+        }
+        assert!(!completion_key_marker(&CompletionGenerationId::new(
+            CompletionId::new("T-043"),
+            AttemptId::new("1"),
+            1,
+        ))
+        .starts_with(&prefix));
     }
 
     #[test]
