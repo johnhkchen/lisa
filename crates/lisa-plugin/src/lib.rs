@@ -10327,6 +10327,7 @@ mod tests {
 
     mod hostile_order_regression;
     mod operator_recovery_matrix;
+    mod rejected_has_an_exit;
     mod signal_consumer_characterization;
     mod signal_ingestion_regression;
 
