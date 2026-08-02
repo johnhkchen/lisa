@@ -98,7 +98,9 @@ const MAX_COMPLETION_FAILURES: u8 = 2;
 /// the very condition its own earlier success created. Two generations is four
 /// real command attempts; past that the ticket stays parked, naming the command
 /// that clears it, and keeps neither a seat nor a pane.
-const MAX_ACTION_REQUIRED_GENERATIONS: u8 = 2;
+///
+/// Shared with `lisa unblock`, which must agree about where the bound is.
+use lisa_core::completion_journal::MAX_ACTION_REQUIRED_GENERATIONS;
 
 /// The command that finishes a ticket whose work is already in history.
 const ALREADY_DONE_COMMAND: &str = "lisa already-done";

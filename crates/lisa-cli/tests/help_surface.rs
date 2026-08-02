@@ -15,8 +15,16 @@
 use std::process::{Command, Output};
 
 /// The commands an operator runs, foregrounded in `--help`.
-const OPERATOR_COMMANDS: [&str; 8] = [
-    "init", "validate", "status", "notes", "unblock", "doctor", "proposal", "loop",
+const OPERATOR_COMMANDS: [&str; 9] = [
+    "init",
+    "validate",
+    "status",
+    "notes",
+    "unblock",
+    "already-done",
+    "doctor",
+    "proposal",
+    "loop",
 ];
 
 /// The five machinery-invoked commands: omitted from Clap's generated list but
@@ -41,15 +49,16 @@ Runs coding agents through your ticket board, so you don't have to approve every
 Usage: lisa <COMMAND>
 
 Commands:
-  init      Set up a project to run with Lisa
-  validate  Check your tickets and project setup for problems before a run
-  status    Show which tickets are ready to run and which are waiting, and why
-  notes     Read or acknowledge updates from work that kept moving
-  unblock   Verify what changed and let a waiting ticket run again
-  doctor    Check that the tools Lisa needs are installed
-  proposal  Settle a first-responder proposal for a waiting ticket
-  loop      Start a run: work through the ready tickets, in parallel where they don't collide
-  help      Print this message or the help of the given subcommand(s)
+  init          Set up a project to run with Lisa
+  validate      Check your tickets and project setup for problems before a run
+  status        Show which tickets are ready to run and which are waiting, and why
+  notes         Read or acknowledge updates from work that kept moving
+  unblock       Verify what changed and let a waiting ticket run again
+  already-done  Finish a ticket whose work is already recorded in history
+  doctor        Check that the tools Lisa needs are installed
+  proposal      Settle a first-responder proposal for a waiting ticket
+  loop          Start a run: work through the ready tickets, in parallel where they don't collide
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
@@ -68,7 +77,7 @@ struct OperatorHelpSnapshot {
     expected: &'static str,
 }
 
-const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 8] = [
+const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 9] = [
     OperatorHelpSnapshot {
         command: "init",
         expected: r#"Set up a project to run with Lisa
@@ -151,6 +160,22 @@ Example: lisa unblock T-001 --path ./my-project
 "#,
     },
     OperatorHelpSnapshot {
+        command: "already-done",
+        expected: r#"Finish a ticket whose work is already recorded in history
+
+Usage: lisa already-done [OPTIONS] <TICKET_ID>
+
+Arguments:
+  <TICKET_ID>  Ticket whose work is already saved
+
+Options:
+      --path <PATH>  Path to the project root (defaults to current directory) [default: .]
+  -h, --help         Print help
+
+Example: lisa already-done T-001 --path ./my-project
+"#,
+    },
+    OperatorHelpSnapshot {
         command: "doctor",
         expected: r#"Check that the tools Lisa needs are installed
 
@@ -197,12 +222,13 @@ Example: lisa loop --path ./my-project --max-threads 3
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 17] = [
+const OWN_COMMANDS: [&str; 18] = [
     "init",
     "validate",
     "status",
     "notes",
     "unblock",
+    "already-done",
     "doctor",
     "proposal",
     "loop",
@@ -299,14 +325,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 17 own subcommands resolves — including the hidden
+/// (a) Every one of the 18 own subcommands resolves — including the hidden
 /// four, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_seventeen_subcommands_resolve() {
+fn all_eighteen_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        17,
-        "the pinned command set must be exactly 17"
+        18,
+        "the pinned command set must be exactly 18"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);

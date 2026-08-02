@@ -32,6 +32,14 @@ const SCHEMA_VERSION: u32 = 5;
 /// Where a project keeps its completion journal, relative to the project root.
 pub const COMPLETION_JOURNAL_RELATIVE_PATH: &str = ".lisa/completion-journal.jsonl";
 
+/// Maximum generations of one completion that may end action-required before
+/// it stops being re-armed.
+///
+/// Lives beside the counter it bounds because two crates read it: the scheduler
+/// decides whether to re-arm, and `lisa unblock` decides whether reopening the
+/// ticket could possibly help.
+pub const MAX_ACTION_REQUIRED_GENERATIONS: u8 = 2;
+
 /// One durable completion transition requested by the plugin adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionJournalTransition {

@@ -186,6 +186,65 @@ fn passing_check_reopens_and_the_next_schedule_sees_the_ticket() {
     assert_ready(&root, "T-PASS", true);
 }
 
+/// Unblock's one new refusal, and the boundary of it.
+///
+/// A ticket Lisa has stopped trying to record is not waiting on its review, so
+/// reopening it would only hand it a session to fail in again. Every ticket
+/// under the bound — which is every ordinary parked ticket — keeps unblock's
+/// existing behavior exactly.
+#[test]
+fn unblock_steps_aside_only_for_a_completion_lisa_stopped_recording() {
+    let (_temp, root) = project();
+    let stuck = write_ticket(&root, "T-STUCK", "blocked");
+    let ordinary = write_ticket(&root, "T-ORDINARY", "blocked");
+    for ticket_id in ["T-STUCK", "T-ORDINARY"] {
+        write_disposition(
+            &root,
+            ticket_id,
+            r#"{"disposition":"block","origin":"internal-command","reason":"Lisa could not record this ticket's finished work.","remedy_owner":"operator","ask":"Run the recovery command."}"#,
+        );
+    }
+    fs::create_dir_all(root.join(".lisa")).unwrap();
+    // T-STUCK has spent both generations; T-ORDINARY has spent one.
+    fs::write(
+        root.join(".lisa/completion-journal.jsonl"),
+        format!(
+            "{}{}",
+            action_required_generations("T-STUCK", 2),
+            action_required_generations("T-ORDINARY", 1)
+        ),
+    )
+    .unwrap();
+
+    let stopped = unblock(&root, "T-STUCK");
+    assert!(!stopped.status.success());
+    let message = String::from_utf8_lossy(&stopped.stderr);
+    assert!(message.contains("lisa already-done T-STUCK"), "{message}");
+    assert!(message.contains("not because of the review"), "{message}");
+    assert_ticket_status(&stuck, TicketStatus::Blocked);
+
+    let under_the_bound = unblock(&root, "T-ORDINARY");
+    assert!(under_the_bound.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&under_the_bound.stdout),
+        "T-ORDINARY can run again.\n"
+    );
+    assert_ticket_status(&ordinary, TicketStatus::Open);
+}
+
+/// Journal rows folding to `count` action-required generations for one ticket.
+fn action_required_generations(ticket_id: &str, count: u64) -> String {
+    (1..=count)
+        .map(|generation| {
+            format!(
+                "{{\"schema_version\":5,\"seal\":\"commit\",\"state\":\"requested\",\"completion_id\":\"{ticket_id}\",\"attempt_id\":\"1\",\"generation\":{generation},\"prior_phase\":\"review\",\"prior_status\":\"open\"}}\n\
+                 {{\"schema_version\":5,\"seal\":\"commit\",\"state\":\"command-in-flight\",\"completion_id\":\"{ticket_id}\",\"attempt_id\":\"1\",\"generation\":{generation},\"correlation_id\":\"c{generation}\",\"reconciliation_deadline_unix_ms\":42}}\n\
+                 {{\"schema_version\":5,\"seal\":\"commit\",\"state\":\"rejected\",\"completion_id\":\"{ticket_id}\",\"attempt_id\":\"1\",\"generation\":{generation},\"correlation_id\":\"c{generation}\",\"reason\":\"no changes in the requested include paths\",\"retryability\":\"action-required\"}}\n"
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn world_owned_passing_check_self_clears_without_an_operator_command() {
     let (_temp, root) = project();

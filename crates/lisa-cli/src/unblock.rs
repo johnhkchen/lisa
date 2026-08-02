@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lisa_core::completion_journal::MAX_ACTION_REQUIRED_GENERATIONS;
 use lisa_core::parking::collect_parked_remedies;
 use lisa_core::ticket;
 use lisa_core::types::TicketStatus;
@@ -54,6 +55,9 @@ pub fn run_unblock(root: &Path, ticket_id: &str) -> Result<UnblockOutcome, Strin
         return Ok(UnblockOutcome::Declined(format!(
             "{ticket_id} isn't waiting."
         )));
+    }
+    if let Some(decline) = recording_failure_decline(root, ticket_id) {
+        return Ok(UnblockOutcome::Declined(decline));
     }
 
     let mut remedies = collect_parked_remedies(
@@ -127,6 +131,31 @@ pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
     }
 
     Ok(reopened)
+}
+
+/// The one case unblock now steps aside for.
+///
+/// Unblock's meaning is unchanged: verify what changed, and let a waiting
+/// ticket run again. But a completion Lisa has stopped trying to record is not
+/// waiting on the review, and reopening it would hand it a session to fail in
+/// again. That is a case unblock cannot fix and `already-done` can, so it says
+/// so rather than reporting success and changing nothing that matters.
+///
+/// A ticket with no journal record, or one still under the bound, is untouched
+/// by this — which is every ordinary parked ticket.
+fn recording_failure_decline(root: &Path, ticket_id: &str) -> Option<String> {
+    let journal = root.join(lisa_core::completion_journal::COMPLETION_JOURNAL_RELATIVE_PATH);
+    // A journal Lisa cannot read is not evidence of anything; unblock keeps its
+    // ordinary behavior rather than refusing on a file it failed to parse.
+    let aggregates = lisa_core::completion_journal::load(&journal).ok()?;
+    let aggregate = aggregates.get(ticket_id)?;
+    (aggregate.action_required_generations() >= MAX_ACTION_REQUIRED_GENERATIONS).then(|| {
+        format!(
+            "{ticket_id} is waiting because Lisa could not record its finished work, not because \
+             of the review. If that work is already saved in history, run: `lisa already-done \
+             {ticket_id}`."
+        )
+    })
 }
 
 fn decline_message(result: CheckResult) -> String {

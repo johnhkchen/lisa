@@ -1,4 +1,5 @@
 mod agent_exec;
+mod already_done;
 mod capture_usage;
 mod check_disposition;
 mod claim;
@@ -130,8 +131,21 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Finish a ticket whose work is already recorded in history.
+    #[command(
+        display_order = 5,
+        after_help = "Example: lisa already-done T-001 --path ./my-project"
+    )]
+    AlreadyDone {
+        /// Ticket whose work is already saved
+        ticket_id: String,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     /// Settle a first-responder proposal for a waiting ticket.
-    #[command(display_order = 6)]
+    #[command(display_order = 7)]
     Proposal {
         #[command(subcommand)]
         action: ProposalCommands,
@@ -173,7 +187,7 @@ enum Commands {
     HooksGuide,
     /// Check that the tools Lisa needs are installed.
     #[command(
-        display_order = 5,
+        display_order = 6,
         after_help = "Example: lisa doctor --path ./my-project"
     )]
     Doctor {
@@ -324,7 +338,7 @@ enum Commands {
     },
     /// Start a run: work through the ready tickets, in parallel where they don't collide.
     #[command(
-        display_order = 7,
+        display_order = 8,
         after_help = "Example: lisa loop --path ./my-project --max-threads 3"
     )]
     Loop {
@@ -601,6 +615,45 @@ fn main() {
             match unblock::run_unblock(&path, &ticket_id) {
                 Ok(unblock::UnblockOutcome::Reopened(message)) => println!("{message}"),
                 Ok(unblock::UnblockOutcome::Declined(message)) => {
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::AlreadyDone { ticket_id, path } => {
+            let path = resolve_path(&path);
+            require_lisa_project(&path);
+            let validation = match config::load_config(&path) {
+                Ok(validation) => validation,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            let resolved = config::resolve_config(&validation.config, None, None);
+            let request = already_done::AlreadyDoneRequest {
+                project_root: &path,
+                ticket_dir: &path.join(&resolved.ticket_dir),
+                journal_path: &path
+                    .join(lisa_core::completion_journal::COMPLETION_JOURNAL_RELATIVE_PATH),
+            };
+            match already_done::run_already_done(request, &ticket_id) {
+                Ok(already_done::AlreadyDoneOutcome::Recovered {
+                    ticket_id,
+                    commit_id,
+                    ticket_file_rewritten,
+                }) => {
+                    let short: String = commit_id.chars().take(8).collect();
+                    println!("{ticket_id} is finished — its work was already saved in {short}.");
+                    if ticket_file_rewritten {
+                        println!("Its ticket file now reads done, and is not committed yet.");
+                    }
+                }
+                Ok(already_done::AlreadyDoneOutcome::Declined(message)) => {
                     eprintln!("{message}");
                     std::process::exit(1);
                 }
