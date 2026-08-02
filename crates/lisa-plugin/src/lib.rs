@@ -522,25 +522,47 @@ fn completion_failure_action(
     }
 }
 
-fn completion_failure_ask(class: CompletionFailureClass, ticket_id: &str) -> Option<String> {
+/// The plain sentence a person reads when Lisa could not record finished work.
+///
+/// Every class answers. `Unrecognized` used to answer `None`, which is how the
+/// failed command's own stderr ended up standing in as the ask — and, through
+/// [`State::park_failed_completion`], as the review reason. An unknown error is
+/// still a recording failure with a known next move; the error text itself
+/// stays where it belongs, in the journal and the activity feed.
+fn completion_failure_ask(class: CompletionFailureClass, ticket_id: &str) -> String {
     match class {
-        CompletionFailureClass::OperatorHistoryOrIdentity => {
-            Some(HISTORY_IDENTITY_ASK.to_string())
-        }
-        CompletionFailureClass::OperatorRepositoryUnwritable => Some(format!(
+        CompletionFailureClass::OperatorHistoryOrIdentity => HISTORY_IDENTITY_ASK.to_string(),
+        CompletionFailureClass::OperatorRepositoryUnwritable => format!(
             "Lisa cannot write finished work in this repository. Make it writable, then run: `lisa unblock {ticket_id}`."
-        )),
-        CompletionFailureClass::OperatorStaleLock => Some(format!(
+        ),
+        CompletionFailureClass::OperatorStaleLock => format!(
             "Lisa found an old lock blocking finished work. Remove `.lisa-commit.lock`, then run: `lisa unblock {ticket_id}`."
-        )),
-        CompletionFailureClass::DeadlineExpired => Some(format!(
+        ),
+        CompletionFailureClass::DeadlineExpired => format!(
             "Lisa could not confirm whether finished work was recorded. Check the repository, then run: `lisa unblock {ticket_id}`."
-        )),
-        CompletionFailureClass::Unrecognized => None,
-        CompletionFailureClass::TransientContention => Some(format!(
+        ),
+        CompletionFailureClass::Unrecognized => format!(
+            "Run `lisa unblock {ticket_id}` to let Lisa try recording this finished work again."
+        ),
+        CompletionFailureClass::TransientContention => format!(
             "Lisa is waiting for another repository operation to finish before retrying {ticket_id}."
-        )),
+        ),
     }
+}
+
+/// What a recording failure says about the work: nothing.
+///
+/// The field disposition read
+/// `{"disposition":"block","reason":"… Error: ticket T-002-05 has no changes in
+/// the requested include paths"}`, and the operator reasonably took `block` as
+/// a verdict and went looking for what was wrong with twelve recipes. Nothing
+/// was. The command's own text stays in the journal's rejection row and the
+/// activity feed; the review reason states which boundary failed.
+fn completion_failure_reason(ticket_id: &str) -> String {
+    format!(
+        "Lisa could not record {ticket_id}'s finished work. This is a recording failure, not a \
+         judgement about the work — the exact error is in `.lisa/completion-journal.jsonl`."
+    )
 }
 
 fn review_block_action(owner: RemedyOwner, retries_consumed: u8) -> ReviewBlockAction {
@@ -3114,20 +3136,14 @@ impl State {
             return false;
         }
 
-        let ask =
-            completion_failure_ask(class, ticket_id).unwrap_or_else(|| technical_reason.clone());
-        let disposition = match completion_failure_ask(class, ticket_id) {
-            Some(structured_ask) => serde_json::json!({
-                "disposition": "block",
-                "reason": technical_reason.clone(),
-                "remedy_owner": "operator",
-                "ask": structured_ask,
-            }),
-            None => serde_json::json!({
-                "disposition": "block",
-                "reason": technical_reason.clone(),
-            }),
-        };
+        let ask = completion_failure_ask(class, ticket_id);
+        let disposition = serde_json::json!({
+            "disposition": "block",
+            "origin": "internal-command",
+            "reason": completion_failure_reason(ticket_id),
+            "remedy_owner": "operator",
+            "ask": ask.clone(),
+        });
         let disposition_bytes = match serde_json::to_vec(&disposition) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -3537,12 +3553,10 @@ impl State {
                 });
                 return;
             }
-            let ask = completion_failure_ask(class, ticket_id).unwrap_or_else(|| failure.clone());
-            let surface_detail = if ask == failure {
-                ask
-            } else {
-                format!("{ask} [{failure}]")
-            };
+            // The feed keeps both halves: the plain move and, in brackets, the
+            // exact command text the disposition no longer carries.
+            let surface_detail =
+                format!("{} [{failure}]", completion_failure_ask(class, ticket_id));
             self.log_completion_rejection(
                 ticket_id,
                 &completion_key,
@@ -10204,6 +10218,7 @@ pub extern "C" fn host_run_plugin_command() {}
 mod tests {
     use super::*;
     use lisa_core::completion::CompletionSeal;
+    use lisa_core::disposition::DispositionOrigin;
     use lisa_core::types::{ActivityEvent, Phase, TicketStatus};
 
     #[allow(dead_code)]
@@ -23355,9 +23370,8 @@ owned\n\
             assert_eq!(classify_completion_failure(detail), expected, "{detail}");
         }
         assert_eq!(
-            completion_failure_ask(CompletionFailureClass::OperatorHistoryOrIdentity, "T-ASK")
-                .as_deref(),
-            Some(HISTORY_IDENTITY_ASK)
+            completion_failure_ask(CompletionFailureClass::OperatorHistoryOrIdentity, "T-ASK"),
+            HISTORY_IDENTITY_ASK
         );
         for class in [
             CompletionFailureClass::OperatorHistoryOrIdentity,
@@ -23372,9 +23386,19 @@ owned\n\
                 completion_failure_action(class, 2),
                 CompletionFailureAction::Park
             );
-            let ask = completion_failure_ask(class, "T-ASK").unwrap();
+            let ask = completion_failure_ask(class, "T-ASK");
             assert!(ask.starts_with("Lisa"));
             assert!(!ask.contains("AttemptLease"));
+        }
+        // Every class answers, so no failure can fall back to its own stderr.
+        for class in [
+            CompletionFailureClass::Unrecognized,
+            CompletionFailureClass::TransientContention,
+            CompletionFailureClass::DeadlineExpired,
+        ] {
+            let ask = completion_failure_ask(class, "T-ASK");
+            assert!(ask.contains("T-ASK"), "{ask}");
+            assert!(!ask.trim().is_empty());
         }
         assert_eq!(
             completion_failure_action(CompletionFailureClass::TransientContention, 2),
@@ -23547,9 +23571,17 @@ owned\n\
                     remedy_owner: RemedyOwner::Operator,
                     ask,
                     unstructured: false,
+                    origin: DispositionOrigin::InternalCommand,
                     ..
-                } if reason.contains(failure) && ask == HISTORY_IDENTITY_ASK
+                } if !reason.contains(failure)
+                    && reason.contains("not a judgement about the work")
+                    && ask == HISTORY_IDENTITY_ASK
             ));
+            // The command's own text is not lost — it is in the journal, which
+            // is where the disposition now points.
+            assert!(std::fs::read_to_string(&state.completion_journal_path)
+                .unwrap()
+                .contains(failure));
             let body = std::fs::read_to_string(&journal).unwrap();
             assert_eq!(body.matches("\"state\":\"failure-observed\"").count(), 2);
             assert!(body.contains("\"failure_count\":1,\"failure_limit\":2"));
@@ -23673,11 +23705,13 @@ owned\n\
                 reason,
                 ask,
                 remedy_owner: RemedyOwner::Operator,
-                unstructured: true,
+                unstructured: false,
+                origin: DispositionOrigin::InternalCommand,
                 ..
             } if !ask.trim().is_empty()
-                && ask == reason
-                && reason.contains("discover repository root")
+                && ask.contains(TICKET_ID)
+                && !reason.contains("discover repository root")
+                && reason.contains("not a judgement about the work")
         ));
 
         let journal_body = std::fs::read_to_string(journal).unwrap();
@@ -23736,7 +23770,7 @@ owned\n\
     }
 
     #[test]
-    fn unrecognized_completion_failure_parks_with_raw_unstructured_ask() {
+    fn unrecognized_completion_failure_parks_with_a_named_move_not_its_stderr() {
         const TICKET_ID: &str = "T-UNKNOWN-GIT";
         let (mut state, lease, _dir, journal, ledger) = completion_failure_fixture(TICKET_ID);
         assert!(state.dispatch_completion(CompletionInput::Reconcile {
@@ -23764,13 +23798,17 @@ owned\n\
                 reason,
                 ask,
                 remedy_owner: RemedyOwner::Operator,
-                unstructured: true,
+                unstructured: false,
+                origin: DispositionOrigin::InternalCommand,
                 ..
-            } if ask == reason && reason.contains("fatal: a surprising ref failure")
+            } if ask != reason
+                && ask.contains(TICKET_ID)
+                && !reason.contains("fatal: a surprising ref failure")
         ));
         let body = std::fs::read_to_string(journal).unwrap();
         assert_eq!(body.matches("\"state\":\"failure-observed\"").count(), 1);
         assert!(body.contains("\"class\":\"unrecognized\""));
+        assert!(body.contains("fatal: a surprising ref failure"));
         let records = read_mixed_ledger(&ledger);
         let ProvenanceLedgerRecord::ParkingTransition(park) = &records[0] else {
             panic!("expected Park provenance")

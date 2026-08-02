@@ -355,6 +355,82 @@ fn launch_failure_rejects_operator_recovery_with_name_and_correlation() {
     );
 }
 
+/// A transport failure and a review judgement are different things, and the
+/// record says which one it is in a field.
+///
+/// The field artifact this pins is verbatim from the 0.4.4 run:
+/// `{"disposition":"block","reason":"… Error: ticket T-002-05 has no changes in
+/// the requested include paths"}`. The operator read `block` as a verdict and
+/// went looking for what was wrong with twelve recipes. Nothing was.
+#[test]
+fn a_recording_failure_is_not_a_reviewers_block() {
+    const FIELD_STDERR: &str =
+        "Error: ticket T-RECORDING has no changes in the requested include paths";
+    let (mut state, lease, _dir, journal, _ledger) = completion_failure_fixture("T-RECORDING");
+    assert!(state.dispatch_completion(CompletionInput::Reconcile {
+        ticket_id: "T-RECORDING".to_string(),
+        source_lease: lease,
+    }));
+
+    state.handle_completion_result(
+        "T-RECORDING",
+        Some(1),
+        Vec::new(),
+        FIELD_STDERR.as_bytes().to_vec(),
+    );
+
+    let published = state
+        .config
+        .work_dir
+        .join("T-RECORDING")
+        .join("review-disposition.json");
+    let ReviewDisposition::Block {
+        reason,
+        ask,
+        origin,
+        remedy_owner,
+        ..
+    } = parse_review_disposition(&published)
+    else {
+        panic!("a failed completion must park with a block");
+    };
+
+    // (a) Separable by field, without reading a word of the prose.
+    assert_eq!(origin, DispositionOrigin::InternalCommand);
+    assert_eq!(remedy_owner, RemedyOwner::Operator);
+    // (b) The reason is about the boundary, not about the work.
+    assert!(!reason.contains(FIELD_STDERR), "{reason}");
+    assert!(!reason.contains("include paths"), "{reason}");
+    assert!(
+        reason.contains("not a judgement about the work"),
+        "{reason}"
+    );
+    // (c) The ask is a move a person can make.
+    assert_eq!(
+        lisa_core::parking::validate_block_ask(&ask),
+        Ok(()),
+        "{ask}"
+    );
+    // (d) The command's own text is moved, not lost.
+    assert!(std::fs::read_to_string(&journal)
+        .unwrap()
+        .contains(FIELD_STDERR));
+
+    // A reviewer's block on the same ticket stays a reviewer's block.
+    write_canonical_review_disposition(
+        &state,
+        "T-RECORDING",
+        r#"{"disposition":"block","reason":"the checkout test fails","remedy_owner":"agent","ask":"Fix the failing checkout test."}"#,
+    );
+    assert!(matches!(
+        parse_review_disposition(&published),
+        ReviewDisposition::Block {
+            origin: DispositionOrigin::Review,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn successful_operator_recovery_accepts_the_original_correlation_and_releases() {
     let (mut state, _dir) = review_state();
