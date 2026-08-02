@@ -115,6 +115,7 @@ pub struct CompletionJournalAggregate {
     failure_count: u8,
     failure_limit: Option<u8>,
     retries_exhausted: bool,
+    action_required_generations: u8,
 }
 
 impl CompletionJournalAggregate {
@@ -148,6 +149,20 @@ impl CompletionJournalAggregate {
 
     pub fn retries_exhausted(&self) -> bool {
         self.retries_exhausted
+    }
+
+    /// How many generations of this completion have ended action-required.
+    ///
+    /// `failure_count` is bounded *within* one generation and resets whenever a
+    /// new key starts. That is why re-attempting was bounded per attempt and
+    /// unbounded across loop starts: each unpark minted a fresh generation with
+    /// a fresh budget. This counter is the one that survives the reset, so a
+    /// recovery that keeps failing can end somewhere instead of nowhere.
+    ///
+    /// Derived from the records already on disk — no record type and no schema
+    /// version changes, and an old journal folds to the same number.
+    pub fn action_required_generations(&self) -> u8 {
+        self.action_required_generations
     }
 
     pub fn confirmed_commit_id(&self) -> Option<&str> {
@@ -649,6 +664,14 @@ fn apply_transition(
                 failure_count: 0,
                 failure_limit: None,
                 retries_exhausted: false,
+                // The per-generation budget resets here — deliberately, a new
+                // generation is a new command. What must not reset is how many
+                // generations have already given up, or recovery is unbounded
+                // by construction.
+                action_required_generations: aggregates
+                    .get(&ticket_id)
+                    .map(|prior| prior.action_required_generations)
+                    .unwrap_or(0),
             }
         }
         CompletionJournalTransition::CommandInFlight {
@@ -796,6 +819,16 @@ fn apply_transition(
                     "rejected transition for {ticket_id} produced unexpected state {:?}",
                     reduced.state
                 ));
+            }
+            if matches!(
+                reduced.state,
+                CompletionState::Rejected {
+                    retryability: Retryability::ActionRequired,
+                    ..
+                }
+            ) {
+                aggregate.action_required_generations =
+                    aggregate.action_required_generations.saturating_add(1);
             }
             aggregate.state = reduced.state;
             aggregate.confirmed_receipt = None;
@@ -1285,6 +1318,77 @@ mod tests {
         assert_eq!(requested.completion_key(), &second);
         assert_eq!(requested.state(), &CompletionState::Requested);
         assert_eq!(load(&path).unwrap().get("T-RETRY"), Some(&requested));
+    }
+
+    #[test]
+    fn action_required_generations_survive_a_new_key_and_a_retryable_one_does_not_count() {
+        // The counter that makes recovery boundable. `failure_count` resets on
+        // every new key by design; this one must not, or the field's unpark →
+        // re-attempt → park cycle has no end.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completion-journal.jsonl");
+
+        let mut fail_one_generation = |generation: u64, retryability| {
+            let generation_key = key("T-BOUND", "operator", generation);
+            let command = correlation(&format!("command-{generation}"));
+            append(
+                &path,
+                CompletionJournalTransition::Requested {
+                    key: generation_key.clone(),
+                    prior_phase: Phase::Review,
+                    prior_status: TicketStatus::Open,
+                    note: None,
+                },
+            )
+            .unwrap();
+            append(
+                &path,
+                CompletionJournalTransition::CommandInFlight {
+                    key: generation_key.clone(),
+                    correlation: command.clone(),
+                    deadline: deadline(42),
+                },
+            )
+            .unwrap();
+            append(
+                &path,
+                CompletionJournalTransition::Rejected {
+                    key: generation_key,
+                    correlation: Some(command),
+                    reason: "no changes in the requested include paths".to_string(),
+                    retryability,
+                },
+            )
+            .unwrap()
+        };
+
+        // A retryable rejection is not a generation giving up.
+        let retryable = fail_one_generation(1, Retryability::Retryable);
+        assert_eq!(retryable.action_required_generations(), 0);
+
+        let first = fail_one_generation(2, Retryability::ActionRequired);
+        assert_eq!(first.action_required_generations(), 1);
+        let second = fail_one_generation(3, Retryability::ActionRequired);
+        assert_eq!(second.action_required_generations(), 2);
+
+        // Durable: a restart folds to the same number, and a fresh generation
+        // carries it forward rather than starting the budget over.
+        assert_eq!(
+            load(&path).unwrap()["T-BOUND"].action_required_generations(),
+            2
+        );
+        let reopened = append(
+            &path,
+            CompletionJournalTransition::Requested {
+                key: key("T-BOUND", "operator", 4),
+                prior_phase: Phase::Review,
+                prior_status: TicketStatus::Open,
+                note: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.action_required_generations(), 2);
+        assert_eq!(reopened.failure_count(), 0);
     }
 
     #[test]

@@ -158,6 +158,35 @@ fn assert_named_rejection_event(
     correlation_id.clone()
 }
 
+/// The same assertion for a fixture that is not [`TICKET_ID`], where the
+/// correlation is whatever the dispatcher chose rather than a known constant.
+fn assert_named_rejection_event_for(
+    state: &State,
+    ticket: &str,
+    expected_kind: CompletionRejectionKind,
+    detail_fragment: &str,
+) {
+    let found = state.activity_events().rev().any(|event| {
+        matches!(
+            event,
+            ActivityEvent::CompletionRejected {
+                ticket_id,
+                kind,
+                detail,
+                correlation_id,
+            } if ticket_id == ticket
+                && *kind == expected_kind
+                && !correlation_id.is_empty()
+                && detail.contains(detail_fragment)
+        )
+    });
+    assert!(
+        found,
+        "missing {expected_kind} rejection for {ticket} naming {detail_fragment:?}: {:?}",
+        state.activity_log
+    );
+}
+
 /// The dispatcher half plus its display: the refusal is also the thing the
 /// operator is looking at.
 fn assert_named_rejection(
@@ -352,6 +381,236 @@ fn launch_failure_rejects_operator_recovery_with_name_and_correlation() {
         &state,
         CompletionRejectionKind::LaunchFailed,
         "lisa_bin is not configured",
+    );
+}
+
+/// N2: recovery is bounded and ends in a state that names its own way out.
+///
+/// The field shape, at the adapter: the completion fails on the condition its
+/// own earlier success created, the operator signs it done, it fails again, and
+/// before this ticket that could repeat forever. Two generations is the bound.
+#[test]
+fn repeated_done_key_stops_at_the_bound_and_names_the_command() {
+    const TICKET: &str = "T-BOUNDED";
+    const FIELD_STDERR: &str =
+        "Error: ticket T-BOUNDED has no changes in the requested include paths";
+    let (mut state, lease, _dir, _journal, _ledger) = completion_failure_fixture(TICKET);
+
+    let disposition_ask = |state: &State| {
+        let ReviewDisposition::Block { ask, .. } = parse_review_disposition(
+            state
+                .config
+                .work_dir
+                .join(TICKET)
+                .join("review-disposition.json"),
+        ) else {
+            panic!("a failed completion must park with a block");
+        };
+        ask
+    };
+
+    // Generation 1: the scheduler's own attempt fails and parks.
+    assert!(state.dispatch_completion(CompletionInput::Reconcile {
+        ticket_id: TICKET.to_string(),
+        source_lease: lease.clone(),
+    }));
+    state.handle_completion_result(
+        TICKET,
+        Some(1),
+        Vec::new(),
+        FIELD_STDERR.as_bytes().to_vec(),
+    );
+    assert_eq!(state.launched_completion_effects.len(), 1);
+    assert_eq!(
+        state.completion_aggregates[TICKET].action_required_generations(),
+        1
+    );
+    assert!(
+        !disposition_ask(&state).contains("already-done"),
+        "the first park still has an ordinary move"
+    );
+
+    // Generation 2: the operator signs it done, and it fails the same way.
+    state.mark_ticket_done_with_override(TICKET, OverrideReason::EvidenceSatisfies);
+    assert_eq!(
+        state.launched_completion_effects.len(),
+        2,
+        "the operator key must still work under the bound"
+    );
+    state.handle_completion_result(
+        TICKET,
+        Some(1),
+        Vec::new(),
+        FIELD_STDERR.as_bytes().to_vec(),
+    );
+    assert_eq!(
+        state.completion_aggregates[TICKET].action_required_generations(),
+        2
+    );
+
+    // The bound. A third press launches nothing and says what does work.
+    state.mark_ticket_done_with_override(TICKET, OverrideReason::EvidenceSatisfies);
+    assert_eq!(
+        state.launched_completion_effects.len(),
+        2,
+        "past the bound the done key must not launch another completion"
+    );
+    assert_named_rejection_event_for(
+        &state,
+        TICKET,
+        CompletionRejectionKind::LaunchFailed,
+        "lisa already-done T-BOUNDED",
+    );
+
+    // It names the state it landed in, and the command that clears it.
+    let ask = disposition_ask(&state);
+    assert!(ask.contains("lisa already-done T-BOUNDED"), "{ask}");
+    assert!(ask.contains("waiting"), "{ask}");
+    assert_eq!(
+        lisa_core::parking::validate_block_ask(&ask),
+        Ok(()),
+        "{ask}"
+    );
+
+    // And it is holding neither a seat nor a pane.
+    let ticket = lisa_core::ticket::scan_tickets(&state.config.ticket_dir)
+        .unwrap()
+        .into_iter()
+        .find(|listed| listed.id == TICKET)
+        .unwrap();
+    assert_eq!(ticket.status, TicketStatus::Blocked);
+    assert!(!state.threads.contains_key(TICKET));
+    assert!(state
+        .agent_slots
+        .iter()
+        .all(|slot| slot.ticket_id.is_none()));
+}
+
+/// The loop stops re-attempting too — the "re-attempts on every loop start"
+/// half of the field report, which lives in `reconciliation_state` rather than
+/// in the done key.
+#[test]
+fn an_unpark_past_the_bound_does_not_re_arm_the_completion() {
+    const TICKET: &str = "T-UNPARKED";
+    const FIELD_STDERR: &str =
+        "Error: ticket T-UNPARKED has no changes in the requested include paths";
+    let (mut state, lease, _dir, _journal, _ledger) = completion_failure_fixture(TICKET);
+
+    // `lisa unblock`'s flip, and the only part of it the scheduler sees:
+    // blocked becomes open, the phase is left alone.
+    let unpark = |state: &mut State| {
+        lisa_core::ticket::update_ticket_status(
+            &state.config.ticket_dir.join(format!("{TICKET}.md")),
+            TicketStatus::Open,
+        )
+        .unwrap();
+        state.rebuild_dag();
+    };
+
+    // Generation 1 fails and parks.
+    assert!(state.dispatch_completion(CompletionInput::Reconcile {
+        ticket_id: TICKET.to_string(),
+        source_lease: lease.clone(),
+    }));
+    state.handle_completion_result(
+        TICKET,
+        Some(1),
+        Vec::new(),
+        FIELD_STDERR.as_bytes().to_vec(),
+    );
+    unpark(&mut state);
+
+    // Under the bound, an unpark still re-arms — this is the behavior that made
+    // the loop re-attempt on every start, kept deliberately for one more round.
+    assert_eq!(
+        state.completion_aggregates[TICKET].action_required_generations(),
+        1
+    );
+    assert_eq!(
+        state.reconciliation_state(TICKET),
+        CompletionState::Eligible
+    );
+
+    // Generation 2: the operator signs it, it fails the same way, and parks.
+    state.mark_ticket_done_with_override(TICKET, OverrideReason::EvidenceSatisfies);
+    state.handle_completion_result(
+        TICKET,
+        Some(1),
+        Vec::new(),
+        FIELD_STDERR.as_bytes().to_vec(),
+    );
+    unpark(&mut state);
+
+    // Past the bound the same unpark no longer re-arms anything.
+    assert_eq!(
+        state.completion_aggregates[TICKET].action_required_generations(),
+        2
+    );
+    assert!(matches!(
+        state.reconciliation_state(TICKET),
+        CompletionState::Rejected {
+            retryability: Retryability::ActionRequired,
+            ..
+        }
+    ));
+    let launched = state.launched_completion_effects.len();
+    assert_eq!(launched, 2);
+    assert!(!state.dispatch_completion(CompletionInput::Reconcile {
+        ticket_id: TICKET.to_string(),
+        source_lease: lease,
+    }));
+    assert_eq!(state.launched_completion_effects.len(), launched);
+}
+
+/// Send-back is for disagreeing with a review. Past the bound the review is not
+/// what is holding the ticket, so `[s]` declines rather than handing it a seat
+/// and a pane to fail in again.
+#[test]
+fn send_back_declines_past_the_bound_and_points_at_the_command() {
+    const TICKET: &str = "T-SENTBACK";
+    const FIELD_STDERR: &str =
+        "Error: ticket T-SENTBACK has no changes in the requested include paths";
+    let (mut state, lease, _dir, _journal, _ledger) = completion_failure_fixture(TICKET);
+
+    assert!(state.dispatch_completion(CompletionInput::Reconcile {
+        ticket_id: TICKET.to_string(),
+        source_lease: lease,
+    }));
+    state.handle_completion_result(
+        TICKET,
+        Some(1),
+        Vec::new(),
+        FIELD_STDERR.as_bytes().to_vec(),
+    );
+    state.mark_ticket_done_with_override(TICKET, OverrideReason::EvidenceSatisfies);
+    state.handle_completion_result(
+        TICKET,
+        Some(1),
+        Vec::new(),
+        FIELD_STDERR.as_bytes().to_vec(),
+    );
+    assert!(state.recovery_generations_exhausted(TICKET));
+
+    state.send_back_for_review(TICKET);
+
+    let ticket = lisa_core::ticket::scan_tickets(&state.config.ticket_dir)
+        .unwrap()
+        .into_iter()
+        .find(|listed| listed.id == TICKET)
+        .unwrap();
+    assert_eq!(
+        ticket.status,
+        TicketStatus::Blocked,
+        "send-back must not reopen a ticket Lisa has stopped trying to record"
+    );
+    assert!(
+        state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message }
+                if message.contains("lisa already-done T-SENTBACK")
+        )),
+        "{:?}",
+        state.activity_log
     );
 }
 

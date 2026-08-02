@@ -89,6 +89,20 @@ const COMPLETION_RECONCILIATION_TIMEOUT_SECS: u64 = 60;
 /// Maximum failed host-command observations for one completion generation.
 const MAX_COMPLETION_FAILURES: u8 = 2;
 
+/// Maximum generations of one completion that may end action-required before
+/// Lisa stops re-arming it.
+///
+/// `MAX_COMPLETION_FAILURES` bounds the commands inside one generation. It does
+/// not bound the generations, and every unpark mints a new one — which is how a
+/// completion could be re-attempted on every loop start forever, retrying on
+/// the very condition its own earlier success created. Two generations is four
+/// real command attempts; past that the ticket stays parked, naming the command
+/// that clears it, and keeps neither a seat nor a pane.
+const MAX_ACTION_REQUIRED_GENERATIONS: u8 = 2;
+
+/// The command that finishes a ticket whose work is already in history.
+const ALREADY_DONE_COMMAND: &str = "lisa already-done";
+
 /// Grace period after submitting `/exit` before typing a fresh provider launch
 /// command into the returned shell. Enter itself is deferred by
 /// `ENTER_DELAY_SECS`; using a longer grace ensures the old TUI has fully torn
@@ -530,6 +544,26 @@ fn completion_failure_action(
 /// still a recording failure with a known next move; the error text itself
 /// stays where it belongs, in the journal and the activity feed.
 fn completion_failure_ask(class: CompletionFailureClass, ticket_id: &str) -> String {
+    completion_failure_ask_at_bound(class, ticket_id, false)
+}
+
+/// The ask, with the bound taken into account.
+///
+/// Past the bound there is no point telling a person to let Lisa try again —
+/// Lisa will not. N2 asks that recovery end in a *named actionable* state, so
+/// this is the sentence that names the action that exists.
+fn completion_failure_ask_at_bound(
+    class: CompletionFailureClass,
+    ticket_id: &str,
+    exhausted: bool,
+) -> String {
+    if exhausted {
+        return format!(
+            "Run `{ALREADY_DONE_COMMAND} {ticket_id}` if this ticket's work is already saved in \
+             history. Lisa tried {MAX_ACTION_REQUIRED_GENERATIONS} times to record it and stopped; \
+             {ticket_id} is waiting and is not using a session."
+        );
+    }
     match class {
         CompletionFailureClass::OperatorHistoryOrIdentity => HISTORY_IDENTITY_ASK.to_string(),
         CompletionFailureClass::OperatorRepositoryUnwritable => format!(
@@ -2452,6 +2486,19 @@ impl State {
         }
     }
 
+    /// Whether this completion has spent its generations of action-required
+    /// rejections and must stop being re-armed.
+    ///
+    /// Read from the journal, so it survives a plugin restart. A ticket with no
+    /// aggregate — the ordinary case — is never exhausted.
+    fn recovery_generations_exhausted(&self, ticket_id: &str) -> bool {
+        self.completion_aggregates
+            .get(ticket_id)
+            .is_some_and(|aggregate| {
+                aggregate.action_required_generations() >= MAX_ACTION_REQUIRED_GENERATIONS
+            })
+    }
+
     /// Reconstruct the aggregate state from facts the adapter can currently
     /// prove. Journal state survives plugin restart; pending and DAG facts keep
     /// pre-load native fixtures and repositories without a journal compatible.
@@ -2470,7 +2517,12 @@ impl State {
                         retryability: Retryability::ActionRequired,
                         ..
                     }
-                ) && durable_ticket.is_some_and(|ticket| ticket.status == TicketStatus::Open))
+                ) && durable_ticket.is_some_and(|ticket| ticket.status == TicketStatus::Open)
+                    // An unpark reopens the ticket, and that used to be enough
+                    // to re-arm the completion on every reconcile pass — the
+                    // field's "re-attempts on every loop start". Past the bound
+                    // the rejection stands and `reconcile` returns None.
+                    && !self.recovery_generations_exhausted(ticket_id))
             {
                 CompletionState::Eligible
             } else {
@@ -2695,7 +2747,9 @@ impl State {
                     CompletionState::Rejected {
                         retryability: Retryability::ActionRequired,
                         ..
-                    } if matches!(source, CompletionSource::OperatorRequested(_)) => {
+                    } if matches!(source, CompletionSource::OperatorRequested(_))
+                        && !self.recovery_generations_exhausted(&ticket_id) =>
+                    {
                         CompletionState::Eligible
                     }
                     state => state,
@@ -2709,6 +2763,26 @@ impl State {
                 let completion_id = CompletionId::new(ticket_id.clone());
                 let correlation =
                     Self::completion_correlation(completion_id.clone(), attempt_id.clone());
+
+                // Past the bound the operator key stops re-arming, and says so
+                // by naming the command that does work. A refusal with no move
+                // in it is the named-but-not-actionable state N2 forbids.
+                if matches!(source, CompletionSource::OperatorRequested(_))
+                    && self.recovery_generations_exhausted(&ticket_id)
+                {
+                    self.log_completion_rejection(
+                        &ticket_id,
+                        &correlation,
+                        &CompletionRejection::LaunchFailed {
+                            source: LaunchFailure::new(completion_failure_ask_at_bound(
+                                CompletionFailureClass::Unrecognized,
+                                &ticket_id,
+                                true,
+                            )),
+                        },
+                    );
+                    return false;
+                }
 
                 let mut admitted = AdmittedCompletion::default();
                 if matches!(source, CompletionSource::OperatorRequested(_)) {
@@ -3136,7 +3210,14 @@ impl State {
             return false;
         }
 
-        let ask = completion_failure_ask(class, ticket_id);
+        // The rejection was journaled a moment ago, so the counter this reads
+        // already includes this park — the generation that spends the last one
+        // is the generation whose ask names `already-done`.
+        let ask = completion_failure_ask_at_bound(
+            class,
+            ticket_id,
+            self.recovery_generations_exhausted(ticket_id),
+        );
         let disposition = serde_json::json!({
             "disposition": "block",
             "origin": "internal-command",
@@ -9012,6 +9093,19 @@ impl State {
         if ticket.status != TicketStatus::Blocked {
             self.log_activity(ActivityEvent::Warning {
                 message: format!("{ticket_id} isn't waiting, so there is nothing to send back"),
+            });
+            return;
+        }
+        // Sending this one back would hand it a seat and a pane to fail in.
+        // Lisa has already stopped trying to record it; another review pass
+        // cannot change that, and `already-done` can.
+        if self.recovery_generations_exhausted(&tid) {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "{ticket_id} is waiting because Lisa could not record its finished work, not \
+                     because of the review. Run `{ALREADY_DONE_COMMAND} {ticket_id}` if that work \
+                     is already saved in history."
+                ),
             });
             return;
         }
