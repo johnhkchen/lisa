@@ -792,12 +792,43 @@ fn staged_snapshot(repo: &Repository) -> Result<StagedSnapshot, CommitTransactio
     Ok(StagedSnapshot { paths, entries })
 }
 
+/// What a transaction body did.
+///
+/// `Converged` reports a commit this transaction did not create, so nothing
+/// about `HEAD` may be rolled back on its behalf.
+enum TransactionOutcome {
+    Sealed(CommitTransactionResult),
+    Converged(String),
+}
+
+fn render_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Ordinary-index entries at or beneath one of the include paths.
+///
+/// The overlap check below compares the paths this transaction is about to
+/// commit. When it is about to commit nothing, that comparison is vacuous, so
+/// the empty-diff branch asks the same question of the include paths instead.
+fn ordinary_entries_within(ordinary: &[PathBuf], includes: &[PathBuf]) -> Vec<String> {
+    ordinary
+        .iter()
+        .filter(|staged| includes.iter().any(|include| staged.starts_with(include)))
+        .map(|staged| staged.display().to_string())
+        .collect()
+}
+
 fn run_transaction_body(
     repo: &Repository,
     request: &CommitTransactionRequest,
     includes: &[PathBuf],
     alternate_index: &Path,
-) -> Result<CommitTransactionResult, CommitTransactionError> {
+    completion_key: Option<&CompletionGenerationId>,
+) -> Result<TransactionOutcome, CommitTransactionError> {
     if head_is_unborn(repo)? {
         return Err(CommitTransactionError::new(
             "Git failed to resolve HEAD for ticket commit: the current branch does not have any commits yet",
@@ -827,9 +858,30 @@ fn run_transaction_body(
 
     let committed_paths = staged_paths(repo, Some(alternate_index))?;
     if committed_paths.is_empty() {
+        // Order matters. A repository whose ordinary index holds these paths is
+        // a different situation from a converged one and still refuses, so the
+        // overlap question is asked before the convergence question — with an
+        // empty commit set the check below this block can never fire.
+        let within = ordinary_entries_within(&original_staged.paths, includes);
+        if !within.is_empty() {
+            return Err(CommitTransactionError::new(format!(
+                "ticket {} overlaps paths already staged in the ordinary index: {}",
+                request.ticket_id,
+                within.join(", ")
+            )));
+        }
+        // Emptiness is not the evidence: the completion key is. Nothing to
+        // commit *and* this ticket's seal already in history is convergence,
+        // which is what idempotent replay was supposed to mean.
+        if let Some(key) = completion_key {
+            if let Some(commit_id) = discover_sealed_completion_commit(repo, key)? {
+                return Ok(TransactionOutcome::Converged(commit_id));
+            }
+        }
         return Err(CommitTransactionError::new(format!(
-            "ticket {} has no changes in the requested include paths",
-            request.ticket_id
+            "ticket {} has no changes in the requested include paths: {}",
+            request.ticket_id,
+            render_paths(includes)
         )));
     }
 
@@ -921,11 +973,11 @@ fn run_transaction_body(
         ));
     }
 
-    Ok(CommitTransactionResult {
+    Ok(TransactionOutcome::Sealed(CommitTransactionResult {
         commit_id,
         committed_paths,
         previous_commit_id: old_head,
-    })
+    }))
 }
 
 fn rollback_advanced_head(
@@ -1022,14 +1074,33 @@ fn head_is_unborn(repo: &Repository) -> Result<bool, CommitTransactionError> {
     }
 }
 
-fn discover_completion_commit(
+/// The `Lisa-Completion-Key:` line prefix shared by every key for one ticket.
+///
+/// Derived from the rendered key so the encoding stays owned by
+/// `CompletionGenerationId`'s `Display`. `None` when the rendering does not
+/// have the expected `v1:<completion>:<attempt>:<generation>` shape, in which
+/// case the caller matches on the exact key alone rather than guessing.
+fn completion_scope_prefix(key: &CompletionGenerationId) -> Option<String> {
+    let rendered = key.to_string();
+    let mut parts = rendered.split(':');
+    let version = parts.next()?;
+    let completion = parts.next()?;
+    if version.is_empty() || completion.is_empty() || parts.next().is_none() {
+        return None;
+    }
+    Some(format!("{COMPLETION_KEY_PREFIX}{version}:{completion}:"))
+}
+
+/// Scan history newest first for a completion commit: `grep` narrows the
+/// candidates, `predicate` over the full message body proves the match.
+fn find_completion_commit(
     repo: &Repository,
-    key: &CompletionGenerationId,
+    grep: &str,
+    predicate: impl Fn(&str) -> bool,
 ) -> Result<Option<String>, CommitTransactionError> {
     if head_is_unborn(repo)? {
         return Ok(None);
     }
-    let marker = completion_key_marker(key);
     let candidates = repo.git(
         None,
         "discover prior completion commit",
@@ -1038,7 +1109,7 @@ fn discover_completion_commit(
             OsStr::new("--format=%H"),
             OsStr::new("--fixed-strings"),
             OsStr::new("--grep"),
-            OsStr::new(&marker),
+            OsStr::new(grep),
         ],
     )?;
     let candidates = std::str::from_utf8(&candidates.stdout).map_err(|e| {
@@ -1063,12 +1134,44 @@ fn discover_completion_commit(
                 "Git output while verifying prior completion commit was not UTF-8: {e}"
             ))
         })?;
-        if message.lines().any(|line| line == marker) {
+        if predicate(message) {
             return Ok(Some(commit_id.to_string()));
         }
     }
 
     Ok(None)
+}
+
+/// The commit carrying exactly this completion key, if it is already in history.
+fn discover_completion_commit(
+    repo: &Repository,
+    key: &CompletionGenerationId,
+) -> Result<Option<String>, CommitTransactionError> {
+    let marker = completion_key_marker(key);
+    find_completion_commit(repo, &marker, |message| {
+        message.lines().any(|line| line == marker)
+    })
+}
+
+/// The commit that already carries this ticket's seal, if any.
+///
+/// This request's own key first; failing that, any completion key for the same
+/// ticket — a seal made under another attempt or generation is still this
+/// ticket's seal, and the loop retries with a key that is not always the one
+/// that landed. A key for a *different* ticket never matches.
+fn discover_sealed_completion_commit(
+    repo: &Repository,
+    key: &CompletionGenerationId,
+) -> Result<Option<String>, CommitTransactionError> {
+    if let Some(commit_id) = discover_completion_commit(repo, key)? {
+        return Ok(Some(commit_id));
+    }
+    let Some(prefix) = completion_scope_prefix(key) else {
+        return Ok(None);
+    };
+    find_completion_commit(repo, &prefix, |message| {
+        message.lines().any(|line| line.starts_with(&prefix))
+    })
 }
 
 pub fn commit_ticket(
@@ -1126,7 +1229,13 @@ fn commit_ticket_with_key(
         }
     };
 
-    let mut primary = run_transaction_body(&repo, &request, &includes, &alternate_index.path);
+    let mut primary = run_transaction_body(
+        &repo,
+        &request,
+        &includes,
+        &alternate_index.path,
+        completion_key,
+    );
     let index_cleanup = alternate_index.cleanup();
     let unlock = lock.finish();
 
@@ -1139,7 +1248,10 @@ fn commit_ticket_with_key(
     }
 
     if !cleanup_errors.is_empty() {
-        if let Ok(result) = &primary {
+        // Only a commit this transaction created may be rolled back. A
+        // convergent outcome reports someone else's commit, so a cleanup
+        // failure there is reported without touching HEAD.
+        if let Ok(TransactionOutcome::Sealed(result)) = &primary {
             let cleanup = CommitTransactionError::new(format!(
                 "transaction cleanup failed: {}",
                 cleanup_errors.join("; ")
@@ -1156,7 +1268,12 @@ fn commit_ticket_with_key(
     }
 
     match (primary, cleanup_errors.is_empty()) {
-        (Ok(result), true) => Ok(result),
+        (Ok(TransactionOutcome::Sealed(result)), true) => Ok(result),
+        (Ok(TransactionOutcome::Converged(commit_id)), true) => Ok(CommitTransactionResult {
+            previous_commit_id: commit_id.clone(),
+            commit_id,
+            committed_paths: Vec::new(),
+        }),
         (Ok(_), false) => Err(CommitTransactionError::new(format!(
             "ticket transaction completed but cleanup failed: {}",
             cleanup_errors.join("; ")
