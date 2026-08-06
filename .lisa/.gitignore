@@ -2,3 +2,5 @@ signals/
 claude/
 codex/
 attempts/
+run-events.jsonl
+run-baseline.json

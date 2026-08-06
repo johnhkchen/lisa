@@ -1,6 +1,6 @@
 # Lisa project configuration
 
-version = "0.4.0-rc.8"
+version = "0.4.4"
 [dirs]
 tickets = "docs/active/tickets"
 stories = "docs/active/stories"
@@ -13,8 +13,26 @@ max_threads = 2
 # session_timeout_secs = 3600
 # wind_down_secs = 300
 # assignment_ack_timeout_secs = 30
+# Limits how long each kind of work can run.
+# phase_timeouts = {}
+# Limits how many agents of each kind can work at once.
+# provider_caps = {}
 
 # [scheduling.phase_timeouts]
 # research = 300
 # design = 300
 # implement = 1800
+
+# [agent]
+# Chooses which coding agent Lisa drives. Omit it to detect agents on PATH; claude is the default when both are installed.
+# client = "claude"
+
+# [guards]
+# Controls how finished work is sealed. auto picks the strongest your project supports.
+# completion = "auto"
+
+# [triage]
+# Lets Lisa inspect work that needs you before asking for help.
+# enabled = true
+# Limits how long Lisa can inspect work that needs you.
+# timeout_secs = 120
