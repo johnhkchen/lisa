@@ -1,10 +1,8 @@
 //! Verify an optional parked-remedy check, then restore ordinary scheduling.
 
-use std::collections::BTreeSet;
-use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -17,8 +15,6 @@ use lisa_core::provenance::{
 };
 use lisa_core::ticket;
 use lisa_core::types::TicketStatus;
-use sha2::{Digest, Sha256};
-use tempfile::TempDir;
 
 use crate::completion_seal;
 use crate::config;
@@ -49,7 +45,6 @@ const DECLINE_FAILED: &str = "That didn't work yet — the check ran and did not
 const DECLINE_INCONCLUSIVE: &str =
     "Lisa can't tell yet — the check stopped before it could look, so this isn't a judgement on \
      your work.";
-const DECLINE_CHANGED_FILES: &str = "That didn't work yet — it tried to change project files.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnblockOutcome {
@@ -69,7 +64,6 @@ enum CheckResult {
     Failed,
     Inconclusive,
     TimedOut,
-    ChangedFiles,
 }
 
 /// One check run, and every fact needed to report it honestly.
@@ -192,13 +186,18 @@ fn record_check_override(
         .map_err(|error| format!("Could not record the override: {error}"))
 }
 
+/// Map a decline onto its ledger outcome.
+///
+/// [`CheckOverrideOutcome::ChangedFiles`] has no source any more — checks run in
+/// the project now, so Lisa no longer judges whether one wrote — but the variant
+/// stays on the wire, because ledgers written before that change contain it and
+/// must keep parsing.
 fn override_outcome(result: CheckResult) -> CheckOverrideOutcome {
     match result {
         CheckResult::Passed => unreachable!("a passing check is never overridden"),
         CheckResult::Failed => CheckOverrideOutcome::Failed,
         CheckResult::Inconclusive => CheckOverrideOutcome::Inconclusive,
         CheckResult::TimedOut => CheckOverrideOutcome::TimedOut,
-        CheckResult::ChangedFiles => CheckOverrideOutcome::ChangedFiles,
     }
 }
 
@@ -242,10 +241,7 @@ pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
             }
             // Automation never acts on a non-pass, and it gains no override:
             // an operator can say "I checked this myself", a timer cannot.
-            CheckResult::Failed
-            | CheckResult::Inconclusive
-            | CheckResult::TimedOut
-            | CheckResult::ChangedFiles => {}
+            CheckResult::Failed | CheckResult::Inconclusive | CheckResult::TimedOut => {}
         }
     }
 
@@ -294,7 +290,6 @@ fn decline_header(result: CheckResult) -> String {
         CheckResult::Failed => DECLINE_FAILED.to_string(),
         CheckResult::Inconclusive => DECLINE_INCONCLUSIVE.to_string(),
         CheckResult::TimedOut => decline_timed_out(),
-        CheckResult::ChangedFiles => DECLINE_CHANGED_FILES.to_string(),
     }
 }
 
@@ -357,11 +352,27 @@ fn decline_report(ticket_id: &str, run: &CheckRun) -> String {
     report
 }
 
+/// Run one recorded check against the project itself.
+///
+/// The check runs in `root` — the tree the operator changed, and the only tree
+/// whose state they can act on. It sees every file that is there: tracked,
+/// untracked, and gitignored alike. A relative path in a check therefore
+/// resolves the way it would in the operator's own shell, which is the whole
+/// point; checks used to run against a `git ls-files --exclude-standard` copy,
+/// where every build output and every fetched dependency was missing by
+/// construction and a check that read one reported a failure that was not true.
+///
+/// What the check gets: the project root as its working directory, a null
+/// stdin, a disposable `TMPDIR`, a time budget enforced against the whole
+/// process group, and captured output. What it does not get is protection from
+/// its own writes, and Lisa no longer judges whether it wrote. That is
+/// deliberate rather than overlooked: a before/after fingerprint of a live tree
+/// cannot tell this check's writes from a concurrent agent thread's — the
+/// scheduler fires `recheck-world` while sessions are editing the same files —
+/// and reporting another writer's changes as the check's would be the same kind
+/// of false verdict. The read-only requirement lives in the check contract that
+/// the reviewer writes against.
 fn run_check(root: &Path, check: &str, timeout: Duration) -> Result<CheckRun, String> {
-    let snapshot = ReadOnlySnapshot::new(root)
-        .map_err(|error| format!("Could not prepare a safe check: {error}"))?;
-    let before = fingerprint_tree(snapshot.path())
-        .map_err(|error| format!("Could not prepare a safe check: {error}"))?;
     let scratch =
         tempfile::tempdir().map_err(|error| format!("Could not prepare a safe check: {error}"))?;
     let mut stdout =
@@ -371,7 +382,7 @@ fn run_check(root: &Path, check: &str, timeout: Duration) -> Result<CheckRun, St
 
     // Cloned out rather than read back later: this is the directory the check is
     // about to be given, and it is what the report names.
-    let directory = snapshot.path().to_path_buf();
+    let directory = root.to_path_buf();
 
     let mut command = Command::new("/bin/sh");
     command
@@ -430,12 +441,7 @@ fn run_check(root: &Path, check: &str, timeout: Duration) -> Result<CheckRun, St
     let (result, exit_code) = if timed_out {
         (CheckResult::TimedOut, None)
     } else {
-        let after = fingerprint_tree(snapshot.path());
-        if after.as_ref().ok() != Some(&before) {
-            (CheckResult::ChangedFiles, status.code())
-        } else {
-            classify_exit(status.code())
-        }
+        classify_exit(status.code())
     };
 
     Ok(CheckRun {
@@ -535,261 +541,10 @@ fn sanitize_observation(line: &str) -> String {
         .collect()
 }
 
-struct ReadOnlySnapshot {
-    directory: TempDir,
-}
-
-impl ReadOnlySnapshot {
-    fn new(root: &Path) -> io::Result<Self> {
-        let directory = tempfile::tempdir()?;
-        snapshot_project(root, directory.path())?;
-        set_tree_read_only(directory.path(), true)?;
-        Ok(Self { directory })
-    }
-
-    fn path(&self) -> &Path {
-        self.directory.path()
-    }
-}
-
-impl Drop for ReadOnlySnapshot {
-    fn drop(&mut self) {
-        let _ = set_tree_read_only(self.directory.path(), false);
-    }
-}
-
-fn snapshot_project(root: &Path, destination: &Path) -> io::Result<()> {
-    if let Some(paths) = git_visible_paths(root) {
-        let canonical_root = root.canonicalize()?;
-        for relative in paths {
-            copy_visible_path(&canonical_root, &relative, destination)?;
-        }
-        return Ok(());
-    }
-
-    copy_small_tree(root, root, destination)
-}
-
-fn git_visible_paths(root: &Path) -> Option<Vec<PathBuf>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let mut paths = BTreeSet::new();
-    for bytes in output.stdout.split(|byte| *byte == 0) {
-        if bytes.is_empty() {
-            continue;
-        }
-        let relative = PathBuf::from(os_string_from_bytes(bytes));
-        if is_safe_relative(&relative) {
-            paths.insert(relative);
-        }
-    }
-    Some(paths.into_iter().collect())
-}
-
-#[cfg(unix)]
-fn os_string_from_bytes(bytes: &[u8]) -> OsString {
-    use std::os::unix::ffi::OsStringExt;
-    OsString::from_vec(bytes.to_vec())
-}
-
-#[cfg(not(unix))]
-fn os_string_from_bytes(bytes: &[u8]) -> OsString {
-    OsString::from(String::from_utf8_lossy(bytes).into_owned())
-}
-
-fn is_safe_relative(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn copy_visible_path(root: &Path, relative: &Path, destination: &Path) -> io::Result<()> {
-    if !is_safe_relative(relative) {
-        return Ok(());
-    }
-    let source = root.join(relative);
-    let target = destination.join(relative);
-    copy_entry(root, &source, &target)
-}
-
-fn copy_entry(root: &Path, source: &Path, target: &Path) -> io::Result<()> {
-    let metadata = match fs::symlink_metadata(source) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() {
-        let resolved = match source.canonicalize() {
-            Ok(resolved) if resolved.starts_with(root) => resolved,
-            _ => return Ok(()),
-        };
-        if fs::metadata(&resolved)?.is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(resolved, target)?;
-        }
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        fs::create_dir_all(target)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            copy_entry(root, &entry.path(), &target.join(entry.file_name()))?;
-        }
-        return Ok(());
-    }
-    if metadata.is_file() {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, target)?;
-    }
-    Ok(())
-}
-
-fn copy_small_tree(root: &Path, source: &Path, destination: &Path) -> io::Result<()> {
-    let relative = source.strip_prefix(root).unwrap_or(Path::new(""));
-    if should_skip(relative) {
-        return Ok(());
-    }
-    let target = destination.join(relative);
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink() {
-        let canonical_root = root.canonicalize()?;
-        let resolved = match source.canonicalize() {
-            Ok(resolved) if resolved.starts_with(&canonical_root) => resolved,
-            _ => return Ok(()),
-        };
-        return copy_entry(&canonical_root, &resolved, &target);
-    }
-    if metadata.is_dir() {
-        fs::create_dir_all(&target)?;
-        for entry in fs::read_dir(source)? {
-            copy_small_tree(root, &entry?.path(), destination)?;
-        }
-    } else if metadata.is_file() {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, target)?;
-    }
-    Ok(())
-}
-
-fn should_skip(relative: &Path) -> bool {
-    let mut components = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value),
-            _ => None,
-        });
-    let first = components.next();
-    let second = components.next();
-    matches!(
-        first.and_then(|value| value.to_str()),
-        Some(".git" | "target" | "node_modules")
-    ) || (first.and_then(|value| value.to_str()) == Some(".lisa")
-        && second.and_then(|value| value.to_str()) == Some("attempts"))
-}
-
-fn set_tree_read_only(path: &Path, read_only: bool) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            set_tree_read_only(&entry?.path(), read_only)?;
-        }
-    }
-
-    let mut permissions = metadata.permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = permissions.mode();
-        permissions.set_mode(if read_only {
-            mode & !0o222
-        } else {
-            mode | 0o200
-        });
-    }
-    #[cfg(not(unix))]
-    permissions.set_readonly(read_only);
-    fs::set_permissions(path, permissions)
-}
-
-fn fingerprint_tree(root: &Path) -> io::Result<Vec<u8>> {
-    let mut entries = Vec::new();
-    collect_entries(root, root, &mut entries)?;
-    entries.sort();
-
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 16 * 1024];
-    for relative in entries {
-        let path = root.join(&relative);
-        let metadata = fs::symlink_metadata(&path)?;
-        hash.update(path_bytes(&relative));
-        hash.update([0]);
-        hash.update(if metadata.is_dir() { b"d" } else { b"f" });
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            hash.update(metadata.permissions().mode().to_le_bytes());
-        }
-        if metadata.is_file() {
-            let mut file = File::open(path)?;
-            loop {
-                let read = file.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                hash.update(&buffer[..read]);
-            }
-        }
-        hash.update([0xff]);
-    }
-    Ok(hash.finalize().to_vec())
-}
-
-fn collect_entries(root: &Path, path: &Path, entries: &mut Vec<PathBuf>) -> io::Result<()> {
-    if path != root {
-        entries.push(path.strip_prefix(root).unwrap().to_path_buf());
-    }
-    if fs::symlink_metadata(path)?.is_dir() {
-        for entry in fs::read_dir(path)? {
-            collect_entries(root, &entry?.path(), entries)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes().to_vec()
-}
-
-#[cfg(not(unix))]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    path.to_string_lossy().as_bytes().to_vec()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     /// The field sentence from the 0.4.4 `tabular-recipes` run, verbatim.
@@ -898,33 +653,38 @@ mod tests {
         assert!(decline_report("T-1", &timed_out).contains("exit code: none — Lisa stopped it"));
     }
 
+    /// The root cause, at the unit level: a check reads the project it was
+    /// given, gitignored build output included.
+    ///
+    /// `out/` here is exactly the shape `--exclude-standard` used to drop —
+    /// present on disk, absent from `git ls-files` — and the check reads it and
+    /// a tracked source file in one run, from one working directory.
     #[test]
-    fn relative_write_never_reaches_live_project_and_cannot_pass() {
+    fn a_check_reads_the_project_it_runs_in() {
         let root = tempfile::tempdir().unwrap();
-        let live_sentinel = root.path().join("must-not-exist");
+        fs::create_dir(root.path().join("out")).unwrap();
+        fs::write(root.path().join("out/marker"), "built").unwrap();
+        fs::write(root.path().join(".gitignore"), "out/\n").unwrap();
+        fs::write(root.path().join("tracked.txt"), "source").unwrap();
 
-        let result = run(root.path(), "touch must-not-exist");
+        let seen = run(root.path(), "test -f out/marker && test -f tracked.txt");
 
-        assert_ne!(result.result, CheckResult::Passed);
-        assert!(!live_sentinel.exists());
+        assert_eq!(seen.result, CheckResult::Passed);
+        assert_eq!(seen.exit_code, Some(0));
     }
 
+    /// The check runs in the project, not beside it.
+    ///
+    /// Paired with [`the_reported_directory_is_the_one_the_check_observed`],
+    /// which asserts the report names whatever that directory is, this pins
+    /// both halves: the directory is the project root, and it is reported.
     #[test]
-    fn mutation_inside_disposable_state_is_detected_even_after_chmod() {
+    fn the_check_runs_in_the_project_root() {
         let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("fixture"), "before").unwrap();
 
-        let changed = run(root.path(), "chmod u+w fixture && printf after > fixture");
+        let ran = run(root.path(), "exit 1");
 
-        assert_eq!(changed.result, CheckResult::ChangedFiles);
-        assert_eq!(
-            fs::read_to_string(root.path().join("fixture")).unwrap(),
-            "before"
-        );
-        assert_eq!(
-            decline_header(CheckResult::ChangedFiles),
-            "That didn't work yet — it tried to change project files."
-        );
+        assert_eq!(ran.directory, root.path());
     }
 
     /// Every non-passing result has its own sentence, none of them is a
@@ -936,7 +696,6 @@ mod tests {
             CheckResult::Failed,
             CheckResult::Inconclusive,
             CheckResult::TimedOut,
-            CheckResult::ChangedFiles,
         ]
         .into_iter()
         .map(decline_header)
@@ -947,7 +706,7 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), headers.len(), "{headers:?}");
 
-        for check in ["exit 1", "exit 2", "chmod u+w . 2>/dev/null; touch wrote"] {
+        for check in ["exit 1", "exit 2", "./definitely-not-here"] {
             let report = decline_report("T-010-03", &run(root.path(), check));
             assert!(
                 report.ends_with("lisa unblock T-010-03 --override-check"),

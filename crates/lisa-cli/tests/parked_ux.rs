@@ -548,26 +548,6 @@ fn automatic_recheck_ignores_operator_owned_passing_checks() {
 }
 
 #[test]
-fn automatic_recheck_write_attempt_is_disposable_and_cannot_reopen() {
-    let (_temp, root) = project();
-    let ticket = write_ticket(&root, "T-AUTO-WRITE", "blocked");
-    write_disposition(
-        &root,
-        "T-AUTO-WRITE",
-        r#"{"disposition":"block","reason":"write probe","remedy_owner":"world","ask":"Wait for the marker.","check":"touch must-not-exist"}"#,
-    );
-
-    let output = recheck_world(&root);
-
-    assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
-    assert!(!root.join("must-not-exist").exists());
-    assert_ticket_status(&ticket, TicketStatus::Blocked);
-    assert_ready(&root, "T-AUTO-WRITE", false);
-}
-
-#[test]
 fn automatic_recheck_timeout_is_bounded_and_cannot_reopen() {
     let (_temp, root) = project();
     let ticket = write_ticket(&root, "T-AUTO-TIMEOUT", "blocked");
@@ -608,41 +588,6 @@ fn absent_check_reopens_without_trying_to_remediate() {
     );
     assert_ticket_status(&ticket, TicketStatus::Open);
     assert_ready(&root, "T-NOCHECK", true);
-}
-
-#[test]
-fn attempted_write_is_disposable_reported_plainly_and_does_not_reopen() {
-    let (_temp, root) = project();
-    let ticket = write_ticket(&root, "T-WRITE", "blocked");
-    write_disposition(
-        &root,
-        "T-WRITE",
-        r#"{"disposition":"block","reason":"write probe","remedy_owner":"operator","ask":"Check the marker.","check":"touch must-not-exist"}"#,
-    );
-
-    let output = unblock(&root, "T-WRITE");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success());
-    // The write lands in a disposable read-only tree, so the check itself fails
-    // rather than mutating anything. Still one plain sentence of Lisa's own,
-    // and the tool's complaint stays labelled as the tool's.
-    assert_eq!(
-        stderr.lines().next().unwrap(),
-        "That didn't work yet — the check ran and did not pass."
-    );
-    assert!(
-        stderr.contains("  what ran:  touch must-not-exist\n"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("  the check wrote to stderr:\n"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("Error:"));
-    assert!(!root.join("must-not-exist").exists());
-    assert_ticket_status(&ticket, TicketStatus::Blocked);
-    assert_ready(&root, "T-WRITE", false);
 }
 
 #[test]
