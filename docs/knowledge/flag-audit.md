@@ -44,6 +44,7 @@ rows with the live command tree and config catalog.
 | `flag:lisa/notes:--path` | Choose the project folder for notes | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/notes/ack:--generation` | Choose an exact listed note generation | working default | Without the flag, Lisa marks the oldest active note read so repeated acknowledgments drain the queue. | `two_active_notes_are_labeled_and_bare_ack_drains_oldest_first` | — |
 | `flag:lisa/notes/ack:--path` | Choose the project folder while acknowledging a note | working default | The inherited default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/unblock:--override-check` | Let a waiting ticket run again over its own check | working default | Default is off, so the ticket's check still decides unless you say you verified it yourself. | `override_check_reopens_and_leaves_a_record` | — |
 | `flag:lisa/unblock:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/already-done:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/proposal/apply:--path` | Choose the project folder for applying advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |

@@ -446,6 +446,21 @@ own check first and tells you if the fix isn't in place yet.
 lisa unblock T-001-01
 ```
 
+When the check declines, Lisa shows its work: the command as recorded, the
+folder it ran in, what it exited with, and what it printed — labelled as the
+check's words, not Lisa's finding. A check that stopped before it could look
+says so, instead of reading as a verdict on what you did.
+
+If you've done the ask and checked it yourself, you're never stuck behind a
+check that won't agree:
+
+```bash
+lisa unblock T-001-01 --override-check
+```
+
+That reopens the ticket and writes down that you overrode the check, so a forced
+unblock stays tellable apart from one that passed on its own.
+
 ### `lisa already-done`
 
 Finish a ticket whose work is already saved in your project's history. Now and

@@ -153,8 +153,9 @@ Arguments:
   <TICKET_ID>  Ticket to let run again
 
 Options:
-      --path <PATH>  Path to the project root (defaults to current directory) [default: .]
-  -h, --help         Print help
+      --override-check  Let the ticket run again even when its check says no, and record that you overrode it
+      --path <PATH>     Path to the project root (defaults to current directory) [default: .]
+  -h, --help            Print help
 
 Example: lisa unblock T-001 --path ./my-project
 "#,
