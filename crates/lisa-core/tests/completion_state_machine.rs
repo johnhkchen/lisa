@@ -170,6 +170,7 @@ impl CompletionHarness {
                     ask: "generated blocked Review".into(),
                     steps: None,
                     check: None,
+                    check_timeout_secs: None,
                     unstructured: true,
                     origin: lisa_core::disposition::DispositionOrigin::Review,
                 },

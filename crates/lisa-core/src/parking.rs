@@ -82,6 +82,9 @@ pub struct ParkedRemedy {
     /// flattened here rather than carried forward.
     pub steps: Vec<String>,
     pub check: Option<String>,
+    /// The check's declared time budget in seconds, already clamped to the
+    /// documented cap. `None` means the default budget.
+    pub check_timeout_secs: Option<u64>,
     pub proposal: Option<TriageProposal>,
     /// Whether a reviewer judged the work or one of Lisa's own commands failed.
     pub origin: DispositionOrigin,
@@ -159,6 +162,7 @@ pub fn collect_parked_remedies<'a>(
                 ask,
                 steps,
                 check,
+                check_timeout_secs,
                 unstructured,
                 origin,
             } = disposition
@@ -187,6 +191,7 @@ pub fn collect_parked_remedies<'a>(
                 reason,
                 steps: steps.unwrap_or_default(),
                 check,
+                check_timeout_secs,
                 proposal,
                 origin,
             })
@@ -350,6 +355,7 @@ mod tests {
                     reason: "manual test missing".to_string(),
                     steps: vec!["Open checkout".to_string()],
                     check: None,
+                    check_timeout_secs: None,
                     proposal: None,
                     origin: DispositionOrigin::Review,
                 },
@@ -360,6 +366,7 @@ mod tests {
                     reason: "release missing".to_string(),
                     steps: Vec::new(),
                     check: Some("test -f release".to_string()),
+                    check_timeout_secs: None,
                     proposal: None,
                     origin: DispositionOrigin::Review,
                 },
@@ -387,6 +394,7 @@ mod tests {
                 reason: "  Run the old test.  ".to_string(),
                 steps: Vec::new(),
                 check: None,
+                check_timeout_secs: None,
                 proposal: None,
                 origin: DispositionOrigin::Review,
             }]

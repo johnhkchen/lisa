@@ -1359,6 +1359,7 @@ mod tests {
                 ask: "fix the failing test".into(),
                 steps: None,
                 check: None,
+                check_timeout_secs: None,
                 unstructured: true,
                 origin: crate::disposition::DispositionOrigin::Review,
             },

@@ -11,6 +11,34 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Seconds a recorded check gets when it declares no budget of its own.
+///
+/// Right for the overwhelming majority of checks — `test -f`, `curl -fsS` — and
+/// the reason the field's twenty-minute headless sweep needs [`MAX_CHECK_BUDGET_SECS`]
+/// rather than a larger default.
+pub const DEFAULT_CHECK_BUDGET_SECS: u64 = 5;
+
+/// The most a check may declare for itself.
+///
+/// Sized from the field case: a ~20-minute verification sweep is real work and
+/// must fit with headroom, while a check still cannot hold a child process open
+/// indefinitely against a scheduler that rechecks every few seconds. Stated in
+/// `docs/knowledge/rdspi-workflow.md`, and pinned against that document by test.
+pub const MAX_CHECK_BUDGET_SECS: u64 = 1800;
+
+/// Resolve a declared budget to the seconds a check actually gets.
+///
+/// Clamping rather than trusting is deliberate: this runs over hand-edited and
+/// historical files as well as freshly authored ones, and a number in a file may
+/// never buy more child-process time than the documented cap.
+pub const fn resolve_check_budget_secs(declared: Option<u64>) -> u64 {
+    match declared {
+        None => DEFAULT_CHECK_BUDGET_SECS,
+        Some(seconds) if seconds > MAX_CHECK_BUDGET_SECS => MAX_CHECK_BUDGET_SECS,
+        Some(seconds) => seconds,
+    }
+}
+
 /// The party whose durable reality must change before a blocked ticket can
 /// make progress again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +130,9 @@ pub enum ReviewDisposition {
         ask: String,
         steps: Option<Vec<String>>,
         check: Option<String>,
+        /// Seconds the check declared for itself, already clamped to
+        /// [`MAX_CHECK_BUDGET_SECS`]. `None` means [`DEFAULT_CHECK_BUDGET_SECS`].
+        check_timeout_secs: Option<u64>,
         /// True when missing or malformed remedy structure was replaced with
         /// the safe operator-owned legacy fallback.
         unstructured: bool,
@@ -279,9 +310,32 @@ fn check_block_document(
             )
         }
     };
+    // The over-cap arm is separate from the malformed arm because the fixes are
+    // different: one is "you wrote the wrong kind of value", the other is "the
+    // value is well formed and too large".
+    let check_timeout_secs = match object.remove("check_timeout_secs") {
+        None => None,
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(seconds) if (1..=MAX_CHECK_BUDGET_SECS).contains(&seconds) => Some(seconds),
+            Some(seconds) if seconds > MAX_CHECK_BUDGET_SECS => {
+                return Err(format!(
+                    "lower check_timeout_secs to at most {MAX_CHECK_BUDGET_SECS} seconds ({} minutes); {seconds} is over the cap",
+                    MAX_CHECK_BUDGET_SECS / 60
+                ))
+            }
+            _ => return Err(whole_seconds_fix()),
+        },
+        Some(_) => return Err(whole_seconds_fix()),
+    };
+    if check_timeout_secs.is_some() && check.is_none() {
+        return Err(
+            "add a check for check_timeout_secs to budget, or remove check_timeout_secs"
+                .to_string(),
+        );
+    }
     if !object.is_empty() {
         return Err(
-            "remove extra block fields; keep only disposition, reason, remedy_owner, ask, steps, and check"
+            "remove extra block fields; keep only disposition, reason, remedy_owner, ask, steps, check, and check_timeout_secs"
                 .to_string(),
         );
     }
@@ -292,11 +346,18 @@ fn check_block_document(
         ask,
         steps,
         check,
+        check_timeout_secs,
         unstructured: false,
         // Authoring is a reviewer's act. `origin` is Lisa's to set, and the
         // extra-field rule above already refuses a document that claims it.
         origin: DispositionOrigin::Review,
     })
+}
+
+fn whole_seconds_fix() -> String {
+    format!(
+        "make check_timeout_secs a whole number of seconds from 1 to {MAX_CHECK_BUDGET_SECS}, or omit it"
+    )
 }
 
 fn take_non_empty_string(
@@ -403,16 +464,28 @@ fn validate_block_structure(
             None => None,
             Some(value) => Some(non_empty_string(value)?),
         };
-        Some((remedy_owner, ask, steps, check))
+        // Clamped, never trusted: see `resolve_check_budget_secs`. A budget that
+        // is not a whole positive number of seconds is malformed structure, and
+        // takes the same safe fallback as a malformed ask.
+        let check_timeout_secs = match object.remove("check_timeout_secs") {
+            None => None,
+            Some(Value::Number(number)) => match number.as_u64() {
+                Some(seconds) if seconds >= 1 => Some(resolve_check_budget_secs(Some(seconds))),
+                _ => return None,
+            },
+            Some(_) => return None,
+        };
+        Some((remedy_owner, ask, steps, check, check_timeout_secs))
     })();
 
     match structure {
-        Some((remedy_owner, ask, steps, check)) => ReviewDisposition::Block {
+        Some((remedy_owner, ask, steps, check, check_timeout_secs)) => ReviewDisposition::Block {
             reason,
             remedy_owner,
             ask,
             steps,
             check,
+            check_timeout_secs,
             unstructured: false,
             origin,
         },
@@ -434,6 +507,7 @@ fn unstructured_block(reason: String) -> ReviewDisposition {
         remedy_owner: RemedyOwner::Operator,
         steps: None,
         check: None,
+        check_timeout_secs: None,
         unstructured: true,
         origin: DispositionOrigin::Review,
     }
@@ -521,6 +595,7 @@ mod tests {
                 ask: "tests are failing".to_string(),
                 steps: None,
                 check: None,
+                check_timeout_secs: None,
                 unstructured: true,
                 origin: DispositionOrigin::Review,
             }
@@ -544,6 +619,7 @@ mod tests {
                     ask: "Apply the remedy.".to_string(),
                     steps: None,
                     check: None,
+                    check_timeout_secs: None,
                     unstructured: false,
                     origin: DispositionOrigin::Review,
                 }
@@ -566,6 +642,7 @@ mod tests {
                     "  Verify the URL  ".to_string(),
                 ]),
                 check: Some("curl -fsS https://example.test/release".to_string()),
+                check_timeout_secs: None,
                 unstructured: false,
                 origin: DispositionOrigin::Review,
             }
@@ -586,6 +663,7 @@ mod tests {
                 ask: reason.to_string(),
                 steps: None,
                 check: None,
+                check_timeout_secs: None,
                 unstructured: true,
                 origin: DispositionOrigin::Review,
             }
@@ -617,6 +695,7 @@ mod tests {
                     ask: "raw reason".to_string(),
                     steps: None,
                     check: None,
+                    check_timeout_secs: None,
                     unstructured: true,
                     origin: DispositionOrigin::Review,
                 },
@@ -646,6 +725,7 @@ mod tests {
             parsed,
             ReviewDisposition::Block {
                 remedy_owner: RemedyOwner::World,
+                check_timeout_secs: None,
                 unstructured: false,
                 ..
             }
@@ -717,6 +797,7 @@ mod tests {
             .unwrap(),
             ReviewDisposition::Block {
                 remedy_owner: RemedyOwner::World,
+                check_timeout_secs: None,
                 unstructured: false,
                 ..
             }
@@ -780,6 +861,7 @@ mod tests {
         assert!(matches!(
             parse_document(document),
             ReviewDisposition::Block {
+                check_timeout_secs: None,
                 unstructured: true,
                 ..
             }
@@ -829,12 +911,118 @@ mod tests {
                     ask: "raw reason".to_string(),
                     steps: None,
                     check: None,
+                    check_timeout_secs: None,
                     unstructured: true,
                     origin: DispositionOrigin::Review,
                 },
                 "unexpected parse result for {document}"
             );
         }
+    }
+
+    /// A check that needs longer than the default says so, and the number it
+    /// declares is the number it gets.
+    #[test]
+    fn a_declared_budget_inside_the_cap_reaches_the_block() {
+        let document = r#"{"disposition":"block","reason":"mobile sweep pending","remedy_owner":"operator","ask":"Run the mobile sweep.","check":"npm run verify:mobile","check_timeout_secs":1500}"#;
+
+        for parsed in [
+            parse_document(document),
+            check_authored_document(document).unwrap(),
+        ] {
+            assert!(
+                matches!(
+                    parsed,
+                    ReviewDisposition::Block {
+                        check_timeout_secs: Some(1500),
+                        unstructured: false,
+                        ..
+                    }
+                ),
+                "{parsed:?}"
+            );
+        }
+    }
+
+    /// The cap is refused at authoring time and clamped at reading time.
+    ///
+    /// The two entry points differ on purpose: a reviewer is still there to fix
+    /// the number, and a hand-edited or historical file has nobody — so it is
+    /// bounded rather than trusted, and never rejected into silence.
+    #[test]
+    fn an_over_cap_budget_is_refused_when_authored_and_clamped_when_read() {
+        let document = r#"{"disposition":"block","reason":"sweep pending","remedy_owner":"operator","ask":"Run the sweep.","check":"npm run verify:mobile","check_timeout_secs":9999}"#;
+
+        let error = check_authored_document(document).unwrap_err();
+        assert!(
+            error.contains("lower check_timeout_secs to at most 1800 seconds"),
+            "{error}"
+        );
+        assert!(error.contains("30 minutes"), "{error}");
+
+        assert!(matches!(
+            parse_document(document),
+            ReviewDisposition::Block {
+                check_timeout_secs: Some(MAX_CHECK_BUDGET_SECS),
+                check: Some(_),
+                unstructured: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_budget_that_is_not_whole_positive_seconds_is_named_then_falls_back() {
+        for document in [
+            r#"{"disposition":"block","reason":"sweep pending","remedy_owner":"operator","ask":"Run the sweep.","check":"npm run verify","check_timeout_secs":0}"#,
+            r#"{"disposition":"block","reason":"sweep pending","remedy_owner":"operator","ask":"Run the sweep.","check":"npm run verify","check_timeout_secs":"20"}"#,
+            r#"{"disposition":"block","reason":"sweep pending","remedy_owner":"operator","ask":"Run the sweep.","check":"npm run verify","check_timeout_secs":1.5}"#,
+            r#"{"disposition":"block","reason":"sweep pending","remedy_owner":"operator","ask":"Run the sweep.","check":"npm run verify","check_timeout_secs":-30}"#,
+        ] {
+            let error = check_authored_document(document).unwrap_err();
+            assert!(
+                error.contains("whole number of seconds from 1 to 1800"),
+                "{error} for {document}"
+            );
+            // The tolerant parser degrades the whole block rather than running a
+            // check on a budget it could not read.
+            assert!(
+                matches!(
+                    parse_document(document),
+                    ReviewDisposition::Block {
+                        check: None,
+                        check_timeout_secs: None,
+                        unstructured: true,
+                        ..
+                    }
+                ),
+                "{document}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_without_a_check_has_nothing_to_budget() {
+        let error = check_authored_document(
+            r#"{"disposition":"block","reason":"sweep pending","remedy_owner":"operator","ask":"Run the sweep.","check_timeout_secs":60}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("add a check"), "{error}");
+    }
+
+    #[test]
+    fn budget_resolution_defaults_and_clamps() {
+        assert_eq!(resolve_check_budget_secs(None), DEFAULT_CHECK_BUDGET_SECS);
+        assert_eq!(resolve_check_budget_secs(Some(1)), 1);
+        assert_eq!(
+            resolve_check_budget_secs(Some(MAX_CHECK_BUDGET_SECS)),
+            MAX_CHECK_BUDGET_SECS
+        );
+        assert_eq!(
+            resolve_check_budget_secs(Some(u64::MAX)),
+            MAX_CHECK_BUDGET_SECS
+        );
     }
 
     #[test]
