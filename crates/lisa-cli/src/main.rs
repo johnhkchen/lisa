@@ -127,6 +127,10 @@ enum Commands {
         /// Ticket to let run again
         ticket_id: String,
 
+        /// Let the ticket run again even when its check says no, and record that you overrode it
+        #[arg(long)]
+        override_check: bool,
+
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
@@ -610,9 +614,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Unblock { ticket_id, path } => {
+        Commands::Unblock {
+            ticket_id,
+            override_check,
+            path,
+        } => {
             let path = resolve_path(&path);
-            match unblock::run_unblock(&path, &ticket_id) {
+            match unblock::run_unblock(&path, &ticket_id, override_check) {
                 Ok(unblock::UnblockOutcome::Reopened(message)) => println!("{message}"),
                 Ok(unblock::UnblockOutcome::Declined(message)) => {
                     eprintln!("{message}");
