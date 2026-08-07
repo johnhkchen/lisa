@@ -6,21 +6,110 @@ use std::path::{Component, Path, PathBuf};
 use lisa_core::disposition::{check_review_disposition, ReviewDisposition};
 use lisa_core::parking::validate_block_ask;
 
+use crate::check_run::{
+    budget_for, format_budget, run_check, sanitize_observation, CheckResult, CheckRun,
+};
+
 const DISPOSITION_FILE: &str = "review-disposition.json";
 
 /// Validate the current attempt's disposition without publishing or acting on it.
+///
+/// A block's `check` is not merely shape-checked here: it is *run*, under the
+/// same contract `lisa unblock` will run it under. That is the whole point of
+/// this command's timing. A check that cannot pass — one that could not look, or
+/// one that outlives the budget it declared — costs one review turn when it is
+/// caught here, and costs the operator an afternoon and a hand-edited file when
+/// it is not.
 pub fn run_check_disposition(project_root: &Path, ticket_id: &str) -> Result<String, String> {
     let disposition_path = disposition_path(project_root, ticket_id).map_err(fix)?;
     let disposition = check_review_disposition(&disposition_path).map_err(fix)?;
 
-    if let ReviewDisposition::Block { ask, .. } = &disposition {
+    let mut trailer = String::new();
+    if let ReviewDisposition::Block {
+        ask,
+        check,
+        check_timeout_secs,
+        ..
+    } = &disposition
+    {
         validate_block_ask(ask).map_err(|error| fix(error.to_string()))?;
+        if let Some(check) = check {
+            let run = run_check(project_root, check, budget_for(*check_timeout_secs))?;
+            match run.result {
+                // A remedy that has not been performed yet is exactly why this
+                // ticket is blocking, so a check that ran and said no is the
+                // ordinary, healthy state at record time.
+                CheckResult::Passed | CheckResult::Failed => {
+                    trailer = format!("\n{}", ran_line(&run));
+                }
+                CheckResult::Inconclusive | CheckResult::TimedOut => {
+                    return Err(fix(unrunnable_check_message(&run)))
+                }
+            }
+        }
     }
 
     Ok(format!(
-        "Review disposition is valid for {ticket_id}: {}",
+        "Review disposition is valid for {ticket_id}: {}{trailer}",
         disposition_path.display()
     ))
+}
+
+/// The one-line receipt that the check was actually exercised.
+fn ran_line(run: &CheckRun) -> String {
+    let verdict = match run.result {
+        CheckResult::Passed => "passed",
+        _ => "did not pass — the ordinary state of a remedy nobody has done yet",
+    };
+    format!(
+        "The check ran in {} and {verdict}.",
+        run.directory.display()
+    )
+}
+
+/// What a reviewer needs to fix a check that cannot pass, while they can.
+///
+/// Deliberately not the operator's decline copy: the reader here is the person
+/// who wrote the check, so it names the class of failure, shows the run, and
+/// says what to change — rather than offering an override, which is not theirs
+/// to take.
+fn unrunnable_check_message(run: &CheckRun) -> String {
+    let (lead, remedy) = match run.result {
+        CheckResult::TimedOut => (
+            format!(
+                "the check outlived its {} budget, so it can never pass",
+                format_budget(run.budget)
+            ),
+            "make the check faster, or declare a larger check_timeout_secs (up to 1800)",
+        ),
+        _ => (
+            "the check stopped before it could look, so it can never pass".to_string(),
+            "check the command exists and runs from the project root, and that it reports a verdict rather than trouble",
+        ),
+    };
+    let mut message = format!("{lead}.\n");
+    message.push_str(&format!(
+        "  what ran:  {}\n",
+        sanitize_observation(&run.check.replace(['\n', '\r'], " "))
+    ));
+    message.push_str(&format!(
+        "  ran in:    {}\n",
+        sanitize_observation(&run.directory.display().to_string())
+    ));
+    message.push_str(&format!(
+        "  exit code: {}\n",
+        match run.exit_code {
+            Some(code) => code.to_string(),
+            None => format!("none — Lisa stopped it after {}", format_budget(run.budget)),
+        }
+    ));
+    for (label, lines) in [("stderr", &run.stderr), ("stdout", &run.stdout)] {
+        for line in lines.iter().take(3) {
+            message.push_str(&format!("  {label}:    {line}\n"));
+        }
+    }
+    message.push_str(&format!("Fix: {remedy}."));
+    message
 }
 
 fn disposition_path(project_root: &Path, ticket_id: &str) -> Result<PathBuf, String> {
