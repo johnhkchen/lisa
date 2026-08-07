@@ -39,8 +39,10 @@ use crate::types::AttemptLease;
 /// Schema version stamped on every record. Bump when the record shape changes so
 /// readers can branch (e.g. T-027-02 cost fidelity, S-026 routing splitting
 /// `requested` from `actual`). Version 9 adds the usage-correction row that late-
-/// joins a capture onto an already-completed ticket (T-051-03-01).
-pub const SCHEMA_VERSION: u32 = 9;
+/// joins a capture onto an already-completed ticket (T-051-03-01). Version 10
+/// adds the check-override row that records an operator letting a parked ticket
+/// run again over its own check (T-056-01-01).
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -329,6 +331,58 @@ pub struct OperatorOverrideRecord {
     pub occurred_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckOverrideType {
+    CheckOverride,
+}
+
+/// What the overridden check reported before a person decided anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckOverrideOutcome {
+    /// The check ran and did not pass.
+    Failed,
+    /// The check stopped before it could look, so it judged nothing.
+    Inconclusive,
+    /// The check outlived its budget and was stopped.
+    TimedOut,
+    /// The check tried to change project files.
+    ChangedFiles,
+}
+
+/// One parked ticket a person let run again over its own check.
+///
+/// Shaped like [`OperatorOverrideRecord`] and for the same reason: the attempt
+/// that parked this ticket is already gone, so there is no current lease to
+/// attribute the row to, and synthesizing one to reuse the execution shape would
+/// file a run that never happened. The row carries only what was observed — who
+/// overrode, what the check was, where it ran, and what it reported — so a
+/// forced unblock stays distinguishable afterwards from a check that passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckOverrideRecord {
+    pub schema_version: u32,
+    /// Completion durability tier in effect when the check was overridden.
+    #[serde(default)]
+    pub seal: CompletionSeal,
+    pub record_type: CheckOverrideType,
+    pub ticket_id: String,
+    /// Who overrode. `"operator"` for `lisa unblock --override-check`.
+    pub actor: String,
+    /// The check string exactly as the review disposition recorded it.
+    pub check: String,
+    /// The directory the check actually ran in.
+    pub directory: String,
+    pub result: CheckOverrideOutcome,
+    /// The check's exit code, absent when it was stopped rather than exiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The sanitized output lines the operator saw, in the order shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<String>,
+    pub occurred_at: u64,
+}
+
 /// One late token-usage join for an already-terminal ticket-run.
 ///
 /// The terminal [`ProvenanceRecord`] is written at completion with null tokens by
@@ -391,6 +445,7 @@ pub enum ProvenanceLedgerRecord {
     TriageTransition(TriageTransitionRecord),
     ProposalAction(ProposalActionRecord),
     OperatorOverride(OperatorOverrideRecord),
+    CheckOverride(CheckOverrideRecord),
     UsageCorrection(UsageCorrectionRecord),
     Execution(ProvenanceRecord),
 }
@@ -599,6 +654,14 @@ pub fn append_operator_override_record(
     append_serialized(path, record)
 }
 
+/// Append one operator-forced unblock as a single JSONL row.
+pub fn append_check_override_record(
+    path: &Path,
+    record: &CheckOverrideRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
 /// Append one late token-usage join as a single JSONL row.
 pub fn append_usage_correction_record(
     path: &Path,
@@ -731,7 +794,7 @@ mod tests {
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":9"));
+        assert!(json.contains("\"schema_version\":10"));
         assert!(json.contains("\"seal\":\"commit\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
@@ -772,7 +835,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":9"));
+        assert!(json.contains("\"schema_version\":10"));
         assert!(json.contains("\"seal\":\"journal\""));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
@@ -812,7 +875,7 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
-            assert!(json.contains("\"schema_version\":9"));
+            assert!(json.contains("\"schema_version\":10"));
             assert!(json.contains("\"seal\":\"journal\""));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",
@@ -1173,7 +1236,7 @@ mod tests {
         let record = sample_correction("T-051-03-01", 1200, 340);
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":9"));
+        assert!(json.contains("\"schema_version\":10"));
         assert!(json.contains("\"record_type\":\"usage-correction\""));
         assert!(json.contains("\"method\":\"claude\""));
         assert!(json.contains("\"source_line\":7"));
@@ -1287,6 +1350,105 @@ mod tests {
                 "the new arm absorbed an existing {label} row"
             );
         }
+    }
+
+    fn sample_check_override(ticket_id: &str) -> CheckOverrideRecord {
+        CheckOverrideRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: CheckOverrideType::CheckOverride,
+            ticket_id: ticket_id.to_string(),
+            actor: "operator".to_string(),
+            check: "node scripts/check-touch.mjs".to_string(),
+            directory: "/tmp/.tmpAbC123".to_string(),
+            result: CheckOverrideOutcome::Inconclusive,
+            exit_code: Some(2),
+            observed: vec!["No build at dist/. Run: npm run build".to_string()],
+            occurred_at: 1_752_900_000,
+        }
+    }
+
+    #[test]
+    fn check_override_record_round_trips_through_the_mixed_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.jsonl");
+        let record = sample_check_override("T-010-03");
+
+        append_check_override_record(&path, &record).unwrap();
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.contains("\"record_type\":\"check-override\""));
+        // The receipt's obligations: who overrode, what ran, where, and what it
+        // reported.
+        assert!(body.contains("\"actor\":\"operator\""));
+        assert!(body.contains("\"check\":\"node scripts/check-touch.mjs\""));
+        assert!(body.contains("\"directory\":\"/tmp/.tmpAbC123\""));
+        assert!(body.contains("\"result\":\"inconclusive\""));
+        assert!(body.contains("\"exit_code\":2"));
+        assert!(body.contains("No build at dist/"));
+
+        assert_eq!(
+            serde_json::from_str::<ProvenanceLedgerRecord>(body.trim()).unwrap(),
+            ProvenanceLedgerRecord::CheckOverride(record)
+        );
+    }
+
+    /// The same both-directions guard the operator-override arm carries: an
+    /// untagged arm must neither absorb an existing row nor be absorbed by one.
+    #[test]
+    fn check_override_row_does_not_absorb_or_get_absorbed() {
+        let line = serde_json::to_string(&sample_check_override("T-010-03")).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ProvenanceLedgerRecord>(&line).unwrap(),
+            ProvenanceLedgerRecord::CheckOverride(_)
+        ));
+
+        let existing: Vec<(&str, String)> = vec![
+            (
+                "execution",
+                serde_json::to_string(&done_row("T-A", None, None)).unwrap(),
+            ),
+            (
+                "assignment",
+                serde_json::to_string(&sample_assignment_transition()).unwrap(),
+            ),
+            (
+                "parking",
+                serde_json::to_string(&sample_parking_transition(ParkingTransitionType::Park))
+                    .unwrap(),
+            ),
+            (
+                "usage-correction",
+                serde_json::to_string(&sample_correction("T-A", 1, 2)).unwrap(),
+            ),
+            (
+                "operator-override",
+                serde_json::to_string(&sample_operator_override("T-A")).unwrap(),
+            ),
+        ];
+        for (label, line) in existing {
+            let parsed: ProvenanceLedgerRecord = serde_json::from_str(&line).unwrap();
+            assert!(
+                !matches!(parsed, ProvenanceLedgerRecord::CheckOverride(_)),
+                "the new arm absorbed an existing {label} row"
+            );
+        }
+    }
+
+    /// An overridden check is not a run, so it must not reach the token view.
+    #[test]
+    fn usage_fold_ignores_check_override_rows() {
+        let without = vec![
+            ProvenanceLedgerRecord::Execution(done_row("T-A", None, None)),
+            ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-A", 100, 10)),
+        ];
+        let mut with = without.clone();
+        with.push(ProvenanceLedgerRecord::CheckOverride(sample_check_override(
+            "T-A",
+        )));
+
+        assert_eq!(correct_usage(&without), correct_usage(&with));
     }
 
     #[test]
