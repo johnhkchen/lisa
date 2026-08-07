@@ -39,6 +39,59 @@ fn write_disposition(root: &Path, ticket_id: &str, document: &str) {
     fs::write(work.join("review-disposition.json"), document).unwrap();
 }
 
+/// Make the fixture a real git repository.
+///
+/// This is load-bearing rather than decoration. Checks used to run against a
+/// `git ls-files --cached --others --exclude-standard` copy, so the field
+/// failure needed a git repository to appear at all — and no fixture here was
+/// one, which is why twenty black-box tests could pass while a gitignored
+/// `dist/` was invisible in the field. Identity is set locally so the fixture
+/// does not depend on this machine's git config, and every step is asserted so
+/// a missing `git` fails loudly instead of quietly testing something else.
+fn git_init(root: &Path) {
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "fixture@example.test"],
+        vec!["config", "user.name", "Fixture"],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(&args)
+            .status()
+            .expect("git must be available to build this fixture");
+        assert!(status.success(), "git {args:?} failed in the fixture");
+    }
+}
+
+/// The story's fixture: `.gitignore` ignores `out/`, and `out/marker` is really
+/// on disk — present to anyone standing in the project, absent from
+/// `git ls-files --cached --others --exclude-standard`.
+fn write_ignored_marker(root: &Path) {
+    fs::write(root.join(".gitignore"), "out/\n").unwrap();
+    fs::create_dir_all(root.join("out")).unwrap();
+    fs::write(root.join("out/marker"), "built\n").unwrap();
+}
+
+/// Assert the fixture really does hide the artifact from git, so a passing
+/// unblock is evidence about the check's working directory and not about a
+/// `.gitignore` that quietly stopped applying.
+fn assert_hidden_from_git(root: &Path, relative: &str) {
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        !listed.contains(relative),
+        "{relative} must be invisible to git for this fixture to mean anything:\n{listed}"
+    );
+    assert!(root.join(relative).exists(), "{relative} must be on disk");
+}
+
 fn lisa(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lisa"))
         .args(args)
@@ -588,6 +641,179 @@ fn absent_check_reopens_without_trying_to_remediate() {
     );
     assert_ticket_status(&ticket, TicketStatus::Open);
     assert_ready(&root, "T-NOCHECK", true);
+}
+
+/// Criterion 1: the regression this story is named for.
+///
+/// A git repository that ignores `out/`, a real `out/marker` on disk, and a
+/// blocked ticket whose check is `test -f out/marker`. This declined before the
+/// fix — `That didn't work yet — the check ran and did not pass.`, exit 1, with
+/// `ran in:` naming a temp directory — because the check ran against a copy
+/// built from `git ls-files --exclude-standard`, where `out/` cannot appear.
+#[test]
+fn unblock_sees_a_gitignored_build_output_the_operator_can_see() {
+    let (_temp, root) = project();
+    git_init(&root);
+    write_ignored_marker(&root);
+    assert_hidden_from_git(&root, "out/marker");
+    let ticket = write_ticket(&root, "T-OUT", "blocked");
+    write_disposition(
+        &root,
+        "T-OUT",
+        r#"{"disposition":"block","reason":"build missing","remedy_owner":"operator","ask":"Build the site.","check":"test -f out/marker"}"#,
+    );
+
+    let output = unblock(&root, "T-OUT");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "T-OUT can run again.\n"
+    );
+    assert_ticket_status(&ticket, TicketStatus::Open);
+    assert_ready(&root, "T-OUT", true);
+    // It passed on its own merits. An override would also reopen the ticket, so
+    // without this the test could not tell the two apart.
+    assert!(check_override_rows(&root).is_empty());
+}
+
+/// Criterion 2: one run, one working directory, both kinds of file.
+///
+/// The check reads a gitignored build output, a file git has in its index, and
+/// a file the board wrote — all by relative path, all resolved the way the
+/// operator's own shell would resolve them.
+#[test]
+fn a_check_reads_a_gitignored_artifact_and_a_tracked_file_in_one_run() {
+    let (_temp, root) = project();
+    git_init(&root);
+    write_ignored_marker(&root);
+    fs::write(root.join("README.md"), "# Fixture\n").unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["add", "README.md"])
+        .status()
+        .unwrap()
+        .success());
+    let ticket = write_ticket(&root, "T-BOTH", "blocked");
+    write_disposition(
+        &root,
+        "T-BOTH",
+        r#"{"disposition":"block","reason":"sweep pending","remedy_owner":"operator","ask":"Run the sweep.","check":"test -f out/marker && test -f README.md && test -f docs/active/tickets/T-BOTH.md"}"#,
+    );
+
+    let output = unblock(&root, "T-BOTH");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ticket_status(&ticket, TicketStatus::Open);
+}
+
+/// Criterion 4: the directory Lisa reports is the directory the check observed,
+/// and it is the project.
+#[test]
+fn the_check_runs_where_lisa_says_it_ran() {
+    let (_temp, root) = project();
+    git_init(&root);
+    write_ticket(&root, "T-WHERE", "blocked");
+    write_disposition(
+        &root,
+        "T-WHERE",
+        r#"{"disposition":"block","reason":"probe pending","remedy_owner":"operator","ask":"Run the probe.","check":"pwd -P; exit 1"}"#,
+    );
+
+    let output = unblock(&root, "T-WHERE");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let seen = stderr
+        .lines()
+        .skip_while(|line| !line.starts_with("  the check wrote to stdout:"))
+        .nth(1)
+        .expect("the check's own cwd is shown")
+        .trim()
+        .to_string();
+    let reported = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("  ran in:    "))
+        .expect("the report names a directory")
+        .to_string();
+
+    // `pwd -P` resolves symlinks and the reported path does not, which on macOS
+    // is exactly the `/private` prefix — the same directory, spelled
+    // physically.
+    assert!(
+        seen == reported || seen.ends_with(&reported),
+        "check ran in {seen}, report named {reported}"
+    );
+    assert_eq!(reported, root.display().to_string());
+}
+
+/// Criterion 5: the automation entry point meets the same tree.
+///
+/// `run_world_rechecks` shares `run_check` with `run_unblock`, and this asserts
+/// that from the outside against the same fixture, so the two cannot drift into
+/// disagreeing about what a check can see.
+#[test]
+fn world_recheck_sees_the_same_tree_an_operator_unblock_does() {
+    let (_temp, root) = project();
+    git_init(&root);
+    write_ignored_marker(&root);
+    assert_hidden_from_git(&root, "out/marker");
+    let ticket = write_ticket(&root, "T-WORLD-OUT", "blocked");
+    write_disposition(
+        &root,
+        "T-WORLD-OUT",
+        r#"{"disposition":"block","reason":"build missing","remedy_owner":"world","ask":"Wait for the build.","check":"test -f out/marker"}"#,
+    );
+
+    let output = recheck_world(&root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "T-WORLD-OUT\n");
+    assert_ticket_status(&ticket, TicketStatus::Open);
+    assert_ready(&root, "T-WORLD-OUT", true);
+}
+
+/// Criterion 6: a git project and a non-git project agree.
+///
+/// They used to disagree — the snapshot's git arm dropped ignored paths and its
+/// non-git arm copied them — so the same fixture unblocked in a plain directory
+/// and declined in a repository. There is one path now, and this holds it to
+/// byte-identical behaviour rather than merely "both work".
+#[test]
+fn a_non_git_project_and_a_git_project_agree_about_what_a_check_sees() {
+    let disposition = r#"{"disposition":"block","reason":"build missing","remedy_owner":"operator","ask":"Build the site.","check":"test -f out/marker"}"#;
+
+    let (_git_temp, git_root) = project();
+    git_init(&git_root);
+    write_ignored_marker(&git_root);
+    let git_ticket = write_ticket(&git_root, "T-AGREE", "blocked");
+    write_disposition(&git_root, "T-AGREE", disposition);
+
+    let (_plain_temp, plain_root) = project();
+    write_ignored_marker(&plain_root);
+    let plain_ticket = write_ticket(&plain_root, "T-AGREE", "blocked");
+    write_disposition(&plain_root, "T-AGREE", disposition);
+    assert!(!plain_root.join(".git").exists());
+
+    let from_git = unblock(&git_root, "T-AGREE");
+    let from_plain = unblock(&plain_root, "T-AGREE");
+
+    assert_eq!(from_git.status.code(), from_plain.status.code());
+    assert_eq!(from_git.stdout, from_plain.stdout);
+    assert_eq!(from_git.stderr, from_plain.stderr);
+    assert!(from_git.status.success());
+    assert_ticket_status(&git_ticket, TicketStatus::Open);
+    assert_ticket_status(&plain_ticket, TicketStatus::Open);
 }
 
 #[test]
