@@ -47,7 +47,31 @@ fn lisa(args: &[&str]) -> Output {
 }
 
 fn unblock(root: &Path, ticket_id: &str) -> Output {
-    lisa(&["unblock", ticket_id, "--path", root.to_str().unwrap()])
+    unblock_with(root, ticket_id, &[])
+}
+
+fn unblock_with(root: &Path, ticket_id: &str, extra: &[&str]) -> Output {
+    let mut args = vec!["unblock", ticket_id, "--path", root.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    lisa(&args)
+}
+
+/// Every provenance row this project has written, in order. An absent ledger is
+/// no rows, not a failure — an ordinary unblock never creates one.
+fn provenance_rows(root: &Path) -> Vec<serde_json::Value> {
+    let Ok(body) = fs::read_to_string(root.join(".lisa/provenance.jsonl")) else {
+        return Vec::new();
+    };
+    body.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn check_override_rows(root: &Path) -> Vec<serde_json::Value> {
+    provenance_rows(root)
+        .into_iter()
+        .filter(|row| row["record_type"] == "check-override")
+        .collect()
 }
 
 fn recheck_world(root: &Path) -> Output {
@@ -151,16 +175,233 @@ fn failing_check_declines_plainly_and_leaves_the_ticket_waiting() {
     );
 
     let output = unblock(&root, "T-FAIL");
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    // Lisa's own finding leads, and the check's words stay the check's.
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "That didn't work yet — the key link still returns 404\n"
+        stderr.lines().next().unwrap(),
+        "That didn't work yet — the check ran and did not pass."
     );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("Error:"));
+    assert!(stderr.contains("  the check wrote to stderr:\n    the key link still returns 404\n    more tool output\n"), "{stderr}");
+    assert!(stderr.contains("  exit code: 1\n"), "{stderr}");
+    assert!(!stderr.contains("Error:"));
     assert_ticket_status(&ticket, TicketStatus::Blocked);
     assert_ready(&root, "T-FAIL", false);
+}
+
+/// Criterion 1: a check-caused decline shows its work — the command as
+/// recorded, the folder it ran in, the exit code, and both streams labelled.
+#[test]
+fn a_declined_check_reports_the_command_the_directory_the_code_and_both_streams() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-SHOW", "blocked");
+    write_disposition(
+        &root,
+        "T-SHOW",
+        r#"{"disposition":"block","reason":"probe missing","remedy_owner":"operator","ask":"Run the probe.","check":"pwd -P; printf 'on the error stream\n' >&2; exit 3"}"#,
+    );
+
+    let output = unblock(&root, "T-SHOW");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("  what ran:  pwd -P; printf 'on the error stream ' >&2; exit 3\n"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("  exit code: 3\n"), "{stderr}");
+    assert!(
+        stderr.contains("  the check wrote to stderr:\n    on the error stream\n"),
+        "{stderr}"
+    );
+    // The check printed its own working directory, and the report names the
+    // same one.
+    let seen = stderr
+        .lines()
+        .skip_while(|line| !line.starts_with("  the check wrote to stdout:"))
+        .nth(1)
+        .expect("the check's own cwd is shown")
+        .trim()
+        .to_string();
+    let reported = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("  ran in:    "))
+        .expect("the report names a directory")
+        .to_string();
+    assert!(
+        seen == reported || seen.ends_with(&reported),
+        "check ran in {seen}, report named {reported}"
+    );
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+}
+
+/// Criteria 2 and 6: the field line, reproduced and then improved. The script
+/// exits 2 meaning "I could not look", and Lisa no longer relays that as a
+/// verdict on work the operator has already done.
+#[test]
+fn a_check_that_cannot_look_reads_as_inconclusive_not_as_a_verdict() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-010-03", "blocked");
+    write_disposition(
+        &root,
+        "T-010-03",
+        r#"{"disposition":"block","reason":"mobile sweep pending","remedy_owner":"operator","ask":"Run the mobile check.","check":"printf 'No build at dist/. Run: npm run build\n' >&2; exit 2"}"#,
+    );
+
+    let output = unblock(&root, "T-010-03");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let header = stderr.lines().next().unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        header,
+        "Lisa can't tell yet — the check stopped before it could look, so this isn't a judgement on your work."
+    );
+    // The 0.4.4 field output, which must not come back.
+    assert!(!stderr.contains("That didn't work yet — No build at dist/"));
+    assert!(!header.contains("No build at dist/"));
+    assert!(
+        stderr
+            .contains("  what ran:  printf 'No build at dist/. Run: npm run build ' >&2; exit 2\n"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("  ran in:    /"), "{stderr}");
+    assert!(stderr.contains("  exit code: 2\n"), "{stderr}");
+    assert!(
+        stderr
+            .contains("  the check wrote to stderr:\n    No build at dist/. Run: npm run build\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with("lisa unblock T-010-03 --override-check"),
+        "{stderr}"
+    );
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+}
+
+/// Criterion 5: the sanitizer still covers everything shown.
+#[test]
+fn escape_sequences_and_tabs_are_stripped_from_everything_shown() {
+    let (_temp, root) = project();
+    write_ticket(&root, "T-ANSI", "blocked");
+    write_disposition(
+        &root,
+        "T-ANSI",
+        r#"{"disposition":"block","reason":"colourful probe","remedy_owner":"operator","ask":"Run the probe.","check":"printf '\u001b[31mred\tcolumns\u001b[0m\n' >&2; printf '\u001b[1mbold out\n'; exit 1"}"#,
+    );
+
+    let output = unblock(&root, "T-ANSI");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(!stderr.contains('\u{1b}'), "an escape reached the terminal");
+    assert!(!stderr.contains('\t'), "a tab reached the terminal");
+    assert!(
+        stderr.contains("  the check wrote to stderr:\n    red columns\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("  the check wrote to stdout:\n    bold out\n"),
+        "{stderr}"
+    );
+}
+
+/// Criteria 3 and 4: the way through always exists, and using it leaves a mark.
+#[test]
+fn override_check_reopens_and_leaves_a_record() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-FORCED", "blocked");
+    write_disposition(
+        &root,
+        "T-FORCED",
+        r#"{"disposition":"block","reason":"mobile sweep pending","remedy_owner":"operator","ask":"Run the mobile check.","check":"printf 'No build at dist/. Run: npm run build\n' >&2; exit 2"}"#,
+    );
+
+    // Without the flag: declined, still waiting, and nothing recorded.
+    let declined = unblock(&root, "T-FORCED");
+    assert!(!declined.status.success());
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+    assert!(
+        check_override_rows(&root).is_empty(),
+        "an ordinary unblock must write no override record"
+    );
+
+    // With it: reopened, exit 0, and a receipt naming who overrode what.
+    let forced = unblock_with(&root, "T-FORCED", &["--override-check"]);
+    assert!(forced.status.success());
+    assert_eq!(String::from_utf8_lossy(&forced.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&forced.stdout),
+        "T-FORCED can run again — you overrode its check.\n"
+    );
+    assert_ticket_status(&ticket, TicketStatus::Open);
+    assert_ready(&root, "T-FORCED", true);
+
+    let rows = check_override_rows(&root);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["ticket_id"], "T-FORCED");
+    assert_eq!(row["actor"], "operator");
+    assert_eq!(row["result"], "inconclusive");
+    assert_eq!(row["exit_code"], 2);
+    assert_eq!(
+        row["check"],
+        "printf 'No build at dist/. Run: npm run build\n' >&2; exit 2"
+    );
+    assert_eq!(row["observed"][0], "No build at dist/. Run: npm run build");
+    assert!(row["directory"].as_str().unwrap().starts_with('/'));
+}
+
+/// A passing check needs no override, and using the flag anyway records
+/// nothing — the receipt marks a decision, not a command line.
+#[test]
+fn override_check_records_nothing_when_the_check_passes() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-CLEAN", "blocked");
+    fs::write(root.join("release-ready"), "ready\n").unwrap();
+    write_disposition(
+        &root,
+        "T-CLEAN",
+        r#"{"disposition":"block","reason":"release missing","remedy_owner":"world","ask":"Wait for the release.","check":"test -f release-ready"}"#,
+    );
+
+    let output = unblock_with(&root, "T-CLEAN", &["--override-check"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "T-CLEAN can run again.\n"
+    );
+    assert_ticket_status(&ticket, TicketStatus::Open);
+    assert!(check_override_rows(&root).is_empty());
+}
+
+/// The override covers one gate: a check that declined. It is not a skeleton
+/// key for the declines that having done the ask would not clear.
+#[test]
+fn override_check_does_not_bypass_the_non_check_declines() {
+    let (_temp, root) = project();
+    write_ticket(&root, "T-OPEN", "open");
+    write_ticket(&root, "T-NO-REMEDY", "blocked");
+
+    let open = unblock_with(&root, "T-OPEN", &["--override-check"]);
+    assert!(!open.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&open.stderr),
+        "T-OPEN isn't waiting.\n"
+    );
+
+    let missing = unblock_with(&root, "T-NO-REMEDY", &["--override-check"]);
+    assert!(!missing.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&missing.stderr),
+        "I couldn't find what T-NO-REMEDY is waiting for.\n"
+    );
+    assert!(check_override_rows(&root).is_empty());
 }
 
 #[test]
@@ -383,8 +624,21 @@ fn attempted_write_is_disposable_reported_plainly_and_does_not_reopen() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
-    assert!(stderr.starts_with("That didn't work yet — "));
-    assert_eq!(stderr.lines().count(), 1);
+    // The write lands in a disposable read-only tree, so the check itself fails
+    // rather than mutating anything. Still one plain sentence of Lisa's own,
+    // and the tool's complaint stays labelled as the tool's.
+    assert_eq!(
+        stderr.lines().next().unwrap(),
+        "That didn't work yet — the check ran and did not pass."
+    );
+    assert!(
+        stderr.contains("  what ran:  touch must-not-exist\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("  the check wrote to stderr:\n"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("Error:"));
     assert!(!root.join("must-not-exist").exists());
     assert_ticket_status(&ticket, TicketStatus::Blocked);

@@ -1444,9 +1444,9 @@ mod tests {
             ProvenanceLedgerRecord::UsageCorrection(sample_correction("T-A", 100, 10)),
         ];
         let mut with = without.clone();
-        with.push(ProvenanceLedgerRecord::CheckOverride(sample_check_override(
-            "T-A",
-        )));
+        with.push(ProvenanceLedgerRecord::CheckOverride(
+            sample_check_override("T-A"),
+        ));
 
         assert_eq!(correct_usage(&without), correct_usage(&with));
     }

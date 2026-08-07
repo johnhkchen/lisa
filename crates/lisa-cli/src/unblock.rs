@@ -318,9 +318,11 @@ fn exit_code_line(run: &CheckRun) -> String {
 fn decline_report(ticket_id: &str, run: &CheckRun) -> String {
     let mut report = decline_header(run.result);
     report.push_str("\n\n");
+    // A recorded check may span lines; folding them to spaces before sanitizing
+    // keeps the command readable instead of running its words together.
     report.push_str(&format!(
         "  what ran:  {}\n",
-        sanitize_observation(&run.check)
+        sanitize_observation(&run.check.replace(['\n', '\r'], " "))
     ));
     report.push_str(&format!(
         "  ran in:    {}\n",
@@ -871,7 +873,11 @@ mod tests {
         }
 
         for check in ["exit 1", "exit 3"] {
-            assert_eq!(run(root.path(), check).result, CheckResult::Failed, "{check}");
+            assert_eq!(
+                run(root.path(), check).result,
+                CheckResult::Failed,
+                "{check}"
+            );
         }
     }
 
@@ -880,7 +886,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let started = Instant::now();
 
-        let timed_out = run_check(root.path(), "sleep 5 & wait", Duration::from_millis(60)).unwrap();
+        let timed_out =
+            run_check(root.path(), "sleep 5 & wait", Duration::from_millis(60)).unwrap();
 
         assert_eq!(timed_out.result, CheckResult::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -955,7 +962,10 @@ mod tests {
     fn the_field_line_is_reported_not_asserted_as_lisas_verdict() {
         let root = tempfile::tempdir().unwrap();
 
-        let inconclusive = run(root.path(), &format!("printf '{FIELD_LINE}\\n' >&2; exit 2"));
+        let inconclusive = run(
+            root.path(),
+            &format!("printf '{FIELD_LINE}\\n' >&2; exit 2"),
+        );
         let report = decline_report("T-010-03", &inconclusive);
         let header = report.lines().next().unwrap();
 
@@ -967,7 +977,10 @@ mod tests {
         assert!(report.contains("exit code: 2"), "{report}");
         assert!(report.contains("  what ran:  printf"), "{report}");
         assert!(
-            report.contains(&format!("  ran in:    {}", inconclusive.directory.display())),
+            report.contains(&format!(
+                "  ran in:    {}",
+                inconclusive.directory.display()
+            )),
             "{report}"
         );
     }
