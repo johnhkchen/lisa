@@ -779,7 +779,7 @@ mod tests {
             r#"{"disposition":"note","reason":null,"criterion_quote":"<exact disputed criterion>","evidence_citation":"<repository-relative evidence path>","summary":"<plain one-sentence summary>"}"#
         ));
         assert!(RDSPI_WORKFLOW.contains(
-            r#"{"disposition":"block","reason":"<non-empty actionable reason>","remedy_owner":"<agent|operator|world>","ask":"<one-sentence action>","steps":["<optional exact step>"],"check":"<read-only verification command>"}"#
+            r#"{"disposition":"block","reason":"<non-empty actionable reason>","remedy_owner":"<agent|operator|world>","ask":"<one-sentence action>","steps":["<optional exact step>"],"check":"<read-only verification command>","check_timeout_secs":<optional seconds the check needs>}"#
         ));
         assert!(RDSPI_WORKFLOW
             .contains("A pass with a reason, or a block without a non-empty reason, is invalid."));
@@ -804,6 +804,58 @@ mod tests {
         ));
         assert!(RDSPI_WORKFLOW.contains("lisa check-disposition <ticket-id>"));
         assert!(RDSPI_WORKFLOW.contains("Correct every reported issue before finishing Review."));
+    }
+
+    /// The check contract a reviewer writes against, asserted against the code
+    /// that enforces it.
+    ///
+    /// Every number here is formatted from the constant rather than copied, so
+    /// the document cannot quietly drift from the runtime. That drift is the
+    /// failure this ticket exists to prevent: the constraints were real, nobody
+    /// had written them down, and the person who found them was the one who
+    /// could not fix them.
+    #[test]
+    fn the_documented_check_contract_matches_the_code_that_enforces_it() {
+        use lisa_core::disposition::{DEFAULT_CHECK_BUDGET_SECS, MAX_CHECK_BUDGET_SECS};
+
+        // Where it runs and what it sees — the T-056-01-02 root cause, stated.
+        assert!(RDSPI_WORKFLOW.contains(
+            "**Where it runs:** the project root, the same directory you are working in."
+        ));
+        assert!(RDSPI_WORKFLOW.contains(
+            "**What it sees:** every file that is really there — build output, fetched dependencies, and anything else `.gitignore` hides from git."
+        ));
+
+        // Whether a check may write, decided and stated.
+        assert!(RDSPI_WORKFLOW.contains(
+            "**Writes:** a check must only look. Lisa runs it in the live project and cannot stop it writing"
+        ));
+        assert!(RDSPI_WORKFLOW.contains("`npm run build && npm run verify` is not a check"));
+
+        // The budget, in the document, equal to the constants in force.
+        assert!(
+            RDSPI_WORKFLOW.contains(&format!(
+                "**How long:** {DEFAULT_CHECK_BUDGET_SECS} seconds."
+            )),
+            "the documented default budget must equal DEFAULT_CHECK_BUDGET_SECS"
+        );
+        assert!(
+            RDSPI_WORKFLOW.contains(&format!(
+                "declares `\"check_timeout_secs\": <seconds>`, up to {MAX_CHECK_BUDGET_SECS} ({} minutes)",
+                MAX_CHECK_BUDGET_SECS / 60
+            )),
+            "the documented cap must equal MAX_CHECK_BUDGET_SECS"
+        );
+        assert!(RDSPI_WORKFLOW.contains("Lisa stops the check and says how long it waited."));
+
+        // The exit codes the runner distinguishes.
+        assert!(RDSPI_WORKFLOW
+            .contains("`2`, `126`, `127`, or death by a signal mean the check could not look"));
+
+        // And that recording a check now runs it.
+        assert!(RDSPI_WORKFLOW.contains(
+            "`lisa check-disposition` runs your recorded check under exactly this contract and refuses one that can never pass"
+        ));
     }
 
     #[test]
