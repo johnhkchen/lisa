@@ -127,6 +127,13 @@ fn check_override_rows(root: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn world_recheck_rows(root: &Path) -> Vec<serde_json::Value> {
+    provenance_rows(root)
+        .into_iter()
+        .filter(|row| row["record_type"] == "world-recheck")
+        .collect()
+}
+
 fn recheck_world(root: &Path) -> Output {
     lisa(&["recheck-world", "--path", root.to_str().unwrap()])
 }
@@ -814,6 +821,140 @@ fn a_non_git_project_and_a_git_project_agree_about_what_a_check_sees() {
     assert!(from_git.status.success());
     assert_ticket_status(&git_ticket, TicketStatus::Open);
     assert_ticket_status(&plain_ticket, TicketStatus::Open);
+}
+
+/// The story's fixture with every ceiling in place at once.
+///
+/// A git repository that ignores `out/`, a real `out/marker` on disk, and a
+/// check that takes longer than the default five seconds — the exact composite
+/// the field run would have hit next once the working directory was fixed. It
+/// unblocks cleanly under a declared budget: exit 0, ticket open, ready in the
+/// DAG, and no override receipt, because it passed on its own merits.
+#[test]
+fn a_slow_check_reading_a_gitignored_artifact_unblocks_under_a_declared_budget() {
+    let (_temp, root) = project();
+    git_init(&root);
+    write_ignored_marker(&root);
+    assert_hidden_from_git(&root, "out/marker");
+    let ticket = write_ticket(&root, "T-SLOW", "blocked");
+    write_disposition(
+        &root,
+        "T-SLOW",
+        r#"{"disposition":"block","reason":"mobile sweep pending","remedy_owner":"operator","ask":"Run the mobile sweep.","check":"sleep 6; test -f out/marker","check_timeout_secs":60}"#,
+    );
+    let started = Instant::now();
+
+    let output = unblock(&root, "T-SLOW");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "the check really did outlive the default budget"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "T-SLOW can run again.\n"
+    );
+    assert_ticket_status(&ticket, TicketStatus::Open);
+    assert_ready(&root, "T-SLOW", true);
+    assert!(check_override_rows(&root).is_empty());
+}
+
+/// A check still cannot outlive the budget it declared — and the refusal names
+/// that budget rather than the default.
+#[test]
+fn a_check_that_outlives_its_declared_budget_names_that_budget() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-BUDGET", "blocked");
+    write_disposition(
+        &root,
+        "T-BUDGET",
+        r#"{"disposition":"block","reason":"slow probe","remedy_owner":"operator","ask":"Run the probe.","check":"sleep 30","check_timeout_secs":1}"#,
+    );
+    let started = Instant::now();
+
+    let output = unblock(&root, "T-BUDGET");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(5), "{stderr}");
+    assert_eq!(
+        stderr.lines().next().unwrap(),
+        "That didn't work yet — it took longer than 1 second."
+    );
+    assert!(
+        stderr.contains("exit code: none — Lisa stopped it after 1 second"),
+        "{stderr}"
+    );
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+}
+
+/// A world remedy whose check can never clear stops parking in silence.
+///
+/// Automation still does not act on a non-pass — the ticket is untouched, and
+/// nothing is printed — but the ledger now names the remedy, what the check
+/// reported, and how many times it has now reported it. Rows land on a doubling
+/// schedule, so three rechecks leave two rows rather than three: the scheduler
+/// rechecks every few seconds, and a row per poll would bury the ledger.
+#[test]
+fn a_world_remedy_that_never_clears_becomes_a_durable_record() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-STUCK-WORLD", "blocked");
+    write_disposition(
+        &root,
+        "T-STUCK-WORLD",
+        r#"{"disposition":"block","reason":"release absent","remedy_owner":"world","ask":"Wait for the release link.","check":"printf 'still 404\n' >&2; exit 1"}"#,
+    );
+
+    for _ in 0..3 {
+        let output = recheck_world(&root);
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    }
+
+    let rows = world_recheck_rows(&root);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (row, expected_count) in rows.iter().zip([1, 2]) {
+        assert_eq!(row["ticket_id"], "T-STUCK-WORLD");
+        assert_eq!(row["check"], "printf 'still 404\n' >&2; exit 1");
+        assert_eq!(row["result"], "failed");
+        assert_eq!(row["exit_code"], 1);
+        assert_eq!(row["observed"][0], "still 404");
+        assert_eq!(row["non_pass_count"], expected_count);
+        assert!(row["directory"].as_str().unwrap().starts_with('/'));
+    }
+
+    // Recording is not acting: the ticket is exactly where it was.
+    assert_ticket_status(&ticket, TicketStatus::Blocked);
+    assert_ready(&root, "T-STUCK-WORLD", false);
+    assert!(check_override_rows(&root).is_empty());
+}
+
+/// A world check that passes reopens the ticket and records nothing — the
+/// record exists for the results automation used to discard, not for its wins.
+#[test]
+fn a_world_recheck_that_passes_writes_no_non_pass_record() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-CLEARS", "blocked");
+    fs::write(root.join("release-ready"), "ready\n").unwrap();
+    write_disposition(
+        &root,
+        "T-CLEARS",
+        r#"{"disposition":"block","reason":"release absent","remedy_owner":"world","ask":"Wait for the release.","check":"test -f release-ready"}"#,
+    );
+
+    let output = recheck_world(&root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "T-CLEARS\n");
+    assert_ticket_status(&ticket, TicketStatus::Open);
+    assert!(world_recheck_rows(&root).is_empty());
 }
 
 #[test]
