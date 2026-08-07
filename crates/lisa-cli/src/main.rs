@@ -2,6 +2,7 @@ mod agent_exec;
 mod already_done;
 mod capture_usage;
 mod check_disposition;
+mod check_run;
 mod claim;
 mod codex_launcher;
 mod completion_seal;

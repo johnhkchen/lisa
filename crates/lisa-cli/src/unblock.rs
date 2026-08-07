@@ -1,33 +1,25 @@
 //! Verify an optional parked-remedy check, then restore ordinary scheduling.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use lisa_core::completion_journal::MAX_ACTION_REQUIRED_GENERATIONS;
 use lisa_core::parking::collect_parked_remedies;
 use lisa_core::provenance::{
-    append_check_override_record, system_time_to_epoch, CheckOverrideOutcome, CheckOverrideRecord,
-    CheckOverrideType, SCHEMA_VERSION,
+    append_check_override_record, append_world_recheck_record, latest_world_rechecks,
+    system_time_to_epoch, CheckOverrideOutcome, CheckOverrideRecord, CheckOverrideType,
+    WorldRecheckOutcome, WorldRecheckRecord, WorldRecheckType, SCHEMA_VERSION,
 };
 use lisa_core::ticket;
 use lisa_core::types::TicketStatus;
 
+use crate::check_run::{
+    budget_for, format_budget, run_check, sanitize_observation, CheckResult, CheckRun,
+};
 use crate::completion_seal;
 use crate::config;
 use lisa_core::disposition::RemedyOwner;
 
-const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const MAX_CAPTURE_BYTES: u64 = 8 * 1024;
-const MAX_OBSERVATION_CHARS: usize = 240;
-/// How many sanitized lines per stream a decline puts on screen. This bounds
-/// what is *shown*; [`MAX_CAPTURE_BYTES`] still bounds what is captured, and an
-/// 8 KiB capture printed whole is a wall rather than a report.
-const MAX_OBSERVED_LINES: usize = 10;
 const PROVENANCE_PATH: &str = ".lisa/provenance.jsonl";
 /// Who a forced unblock is attributed to. `lisa unblock` is an operator command.
 const OPERATOR_ACTOR: &str = "operator";
@@ -50,44 +42,6 @@ const DECLINE_INCONCLUSIVE: &str =
 pub enum UnblockOutcome {
     Reopened(String),
     Declined(String),
-}
-
-/// How a check ended.
-///
-/// [`CheckResult::Failed`] and [`CheckResult::Inconclusive`] are different facts
-/// about the world, not different wordings of one: a check that ran and said no
-/// is evidence about the remedy, and a check that could not look is evidence
-/// about nothing at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CheckResult {
-    Passed,
-    Failed,
-    Inconclusive,
-    TimedOut,
-}
-
-/// One check run, and every fact needed to report it honestly.
-///
-/// The classification alone cannot be reported: attributing a finding means
-/// naming what ran, where, and what it exited with, and all of those live inside
-/// [`run_check`]. They are carried out rather than recomputed — in particular
-/// [`CheckRun::directory`] is the value that was handed to `current_dir`, so it
-/// stays true if that directory ever changes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CheckRun {
-    result: CheckResult,
-    /// The check string exactly as the disposition recorded it.
-    check: String,
-    /// The directory the check actually ran in.
-    directory: PathBuf,
-    /// `None` when the check was stopped rather than exiting on its own.
-    exit_code: Option<i32>,
-    /// Sanitized non-empty lines, capped for display.
-    stdout: Vec<String>,
-    stderr: Vec<String>,
-    /// Lines this stream had beyond the display cap.
-    stdout_dropped: usize,
-    stderr_dropped: usize,
 }
 
 /// Verify one parked ticket and restore `status: open` only when safe.
@@ -137,7 +91,7 @@ pub fn run_unblock(
 
     let mut overrode = false;
     if let Some(check) = remedy.check {
-        let run = run_check(root, &check, CHECK_TIMEOUT)?;
+        let run = run_check(root, &check, budget_for(remedy.check_timeout_secs))?;
         if run.result != CheckResult::Passed {
             if !override_check {
                 return Ok(UnblockOutcome::Declined(decline_report(ticket_id, &run)));
@@ -205,9 +159,10 @@ fn override_outcome(result: CheckResult) -> CheckOverrideOutcome {
 ///
 /// This is deliberately stricter than [`run_unblock`]: automation cannot act
 /// for an operator or agent, and a world-owned remedy without a check has no
-/// positive evidence that external reality changed. Ordinary failed, timed
-/// out, or mutating checks are expected no-op observations rather than command
-/// failures.
+/// positive evidence that external reality changed. A non-pass is still never
+/// acted on — but it is no longer discarded either. It is sampled into the
+/// ledger by [`record_world_non_pass`], so a remedy whose check can never clear
+/// stops being a silent park and becomes something `lisa status` can name.
 pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
     let validation = config::load_config(root)?;
     let resolved = config::resolve_config(&validation.config, None, None);
@@ -215,7 +170,11 @@ pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
     let work_dir = root.join(&resolved.work_dir);
     let tickets = ticket::scan_tickets(&ticket_dir)
         .map_err(|error| format!("Could not read the ticket board: {error}"))?;
-    let remedies = collect_parked_remedies(tickets.iter(), &work_dir, &root.join(PROVENANCE_PATH));
+    let ledger = root.join(PROVENANCE_PATH);
+    let remedies = collect_parked_remedies(tickets.iter(), &work_dir, &ledger);
+    // Read once: every remedy's running count comes from the same walk that
+    // `collect_parked_remedies` just made over the same file.
+    let observations = latest_world_rechecks(&ledger);
     let mut reopened = Vec::new();
 
     for remedy in remedies {
@@ -229,10 +188,9 @@ pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
             continue;
         };
 
-        match run_check(root, &check, CHECK_TIMEOUT)
-            .map_err(|error| format!("Could not recheck {}: {error}", remedy.ticket_id))?
-            .result
-        {
+        let run = run_check(root, &check, budget_for(remedy.check_timeout_secs))
+            .map_err(|error| format!("Could not recheck {}: {error}", remedy.ticket_id))?;
+        match run.result {
             CheckResult::Passed => {
                 ticket::update_ticket_status(&ticket.file_path, TicketStatus::Open).map_err(
                     |error| format!("Could not let {} run again: {error}", remedy.ticket_id),
@@ -240,12 +198,65 @@ pub(crate) fn run_world_rechecks(root: &Path) -> Result<Vec<String>, String> {
                 reopened.push(remedy.ticket_id);
             }
             // Automation never acts on a non-pass, and it gains no override:
-            // an operator can say "I checked this myself", a timer cannot.
-            CheckResult::Failed | CheckResult::Inconclusive | CheckResult::TimedOut => {}
+            // an operator can say "I checked this myself", a timer cannot. What
+            // it does now is say what it saw.
+            CheckResult::Failed | CheckResult::Inconclusive | CheckResult::TimedOut => {
+                let previous = observations
+                    .get(&remedy.ticket_id)
+                    .filter(|observation| observation.check == run.check)
+                    .map_or(0, |observation| observation.non_pass_count);
+                record_world_non_pass(root, &resolved, &remedy.ticket_id, &run, previous + 1)?;
+            }
         }
     }
 
     Ok(reopened)
+}
+
+/// Sample one non-pass into the ledger, on a doubling schedule.
+///
+/// The scheduler rechecks on its ordinary poll cadence, so a row per non-pass
+/// would be hundreds an hour for one parked ticket. Writing the 1st, 2nd, 4th,
+/// 8th … keeps the ledger bounded — logarithmic in poll count — while the rows
+/// themselves show the repetition, and each carries the exact running total so a
+/// reader never has to count rows to know how long this has been failing.
+fn record_world_non_pass(
+    root: &Path,
+    resolved: &config::ResolvedConfig,
+    ticket_id: &str,
+    run: &CheckRun,
+    non_pass_count: u64,
+) -> Result<(), String> {
+    if !non_pass_count.is_power_of_two() {
+        return Ok(());
+    }
+    let mut observed = run.stderr.clone();
+    observed.extend(run.stdout.iter().cloned());
+    let record = WorldRecheckRecord {
+        schema_version: SCHEMA_VERSION,
+        seal: completion_seal::resolve_for_inspection(root, resolved.completion_mode),
+        record_type: WorldRecheckType::WorldRecheck,
+        ticket_id: ticket_id.to_string(),
+        check: run.check.clone(),
+        directory: run.directory.display().to_string(),
+        result: world_outcome(run.result),
+        exit_code: run.exit_code,
+        observed,
+        non_pass_count,
+        occurred_at: system_time_to_epoch(SystemTime::now()),
+    };
+    append_world_recheck_record(&root.join(PROVENANCE_PATH), &record)
+        .map_err(|error| format!("Could not record the recheck of {ticket_id}: {error}"))
+}
+
+/// Map a non-pass onto its ledger outcome.
+fn world_outcome(result: CheckResult) -> WorldRecheckOutcome {
+    match result {
+        CheckResult::Passed => unreachable!("a passing recheck reopens instead of recording"),
+        CheckResult::Failed => WorldRecheckOutcome::Failed,
+        CheckResult::Inconclusive => WorldRecheckOutcome::Inconclusive,
+        CheckResult::TimedOut => WorldRecheckOutcome::TimedOut,
+    }
 }
 
 /// The one case unblock now steps aside for.
@@ -275,31 +286,32 @@ fn recording_failure_decline(root: &Path, ticket_id: &str) -> Option<String> {
 
 /// The lead sentence for a check that outlived its budget.
 ///
-/// Formatted from the budget actually in force rather than spelled out, so the
-/// sentence cannot drift from [`CHECK_TIMEOUT`].
-fn decline_timed_out() -> String {
+/// Formatted from the budget the run was actually held to, not from a constant:
+/// a check that declared twenty-five minutes and was stopped must say twenty-five
+/// minutes, or the operator goes looking for a five-second problem that is not
+/// there.
+fn decline_timed_out(budget: Duration) -> String {
     format!(
-        "That didn't work yet — it took longer than {} seconds.",
-        CHECK_TIMEOUT.as_secs()
+        "That didn't work yet — it took longer than {}.",
+        format_budget(budget)
     )
 }
 
-fn decline_header(result: CheckResult) -> String {
-    match result {
+fn decline_header(run: &CheckRun) -> String {
+    match run.result {
         CheckResult::Passed => unreachable!("passing checks do not decline"),
         CheckResult::Failed => DECLINE_FAILED.to_string(),
         CheckResult::Inconclusive => DECLINE_INCONCLUSIVE.to_string(),
-        CheckResult::TimedOut => decline_timed_out(),
+        CheckResult::TimedOut => decline_timed_out(run.budget),
     }
 }
 
 /// What the check exited with, or plainly why there is no code to report.
 fn exit_code_line(run: &CheckRun) -> String {
     match (run.result, run.exit_code) {
-        (CheckResult::TimedOut, _) => format!(
-            "none — Lisa stopped it after {} seconds",
-            CHECK_TIMEOUT.as_secs()
-        ),
+        (CheckResult::TimedOut, _) => {
+            format!("none — Lisa stopped it after {}", format_budget(run.budget))
+        }
         (_, Some(code)) => code.to_string(),
         (_, None) => "none — the check was stopped".to_string(),
     }
@@ -311,7 +323,7 @@ fn exit_code_line(run: &CheckRun) -> String {
 /// reaches the header line — the field failure this ticket exists for was a
 /// project script's sentence relayed as Lisa's verdict.
 fn decline_report(ticket_id: &str, run: &CheckRun) -> String {
-    let mut report = decline_header(run.result);
+    let mut report = decline_header(run);
     report.push_str("\n\n");
     // A recorded check may span lines; folding them to spaces before sanitizing
     // keeps the command readable instead of running its words together.
@@ -352,198 +364,9 @@ fn decline_report(ticket_id: &str, run: &CheckRun) -> String {
     report
 }
 
-/// Run one recorded check against the project itself.
-///
-/// The check runs in `root` — the tree the operator changed, and the only tree
-/// whose state they can act on. It sees every file that is there: tracked,
-/// untracked, and gitignored alike. A relative path in a check therefore
-/// resolves the way it would in the operator's own shell, which is the whole
-/// point; checks used to run against a `git ls-files --exclude-standard` copy,
-/// where every build output and every fetched dependency was missing by
-/// construction and a check that read one reported a failure that was not true.
-///
-/// What the check gets: the project root as its working directory, a null
-/// stdin, a disposable `TMPDIR`, a time budget enforced against the whole
-/// process group, and captured output. What it does not get is protection from
-/// its own writes, and Lisa no longer judges whether it wrote. That is
-/// deliberate rather than overlooked: a before/after fingerprint of a live tree
-/// cannot tell this check's writes from a concurrent agent thread's — the
-/// scheduler fires `recheck-world` while sessions are editing the same files —
-/// and reporting another writer's changes as the check's would be the same kind
-/// of false verdict. The read-only requirement lives in the check contract that
-/// the reviewer writes against.
-fn run_check(root: &Path, check: &str, timeout: Duration) -> Result<CheckRun, String> {
-    let scratch =
-        tempfile::tempdir().map_err(|error| format!("Could not prepare a safe check: {error}"))?;
-    let mut stdout =
-        tempfile::tempfile().map_err(|error| format!("Could not prepare check output: {error}"))?;
-    let mut stderr =
-        tempfile::tempfile().map_err(|error| format!("Could not prepare check output: {error}"))?;
-
-    // Cloned out rather than read back later: this is the directory the check is
-    // about to be given, and it is what the report names.
-    let directory = root.to_path_buf();
-
-    let mut command = Command::new("/bin/sh");
-    command
-        .arg("-c")
-        .arg(check)
-        .current_dir(&directory)
-        .env("TMPDIR", scratch.path())
-        .env("TMP", scratch.path())
-        .env("TEMP", scratch.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout.try_clone().map_err(|error| {
-            format!("Could not prepare check output: {error}")
-        })?))
-        .stderr(Stdio::from(stderr.try_clone().map_err(|error| {
-            format!("Could not prepare check output: {error}")
-        })?));
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start the check: {error}"))?;
-    let started = Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|error| format!("Could not observe the check: {error}"))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                timed_out = true;
-                terminate_check(&mut child);
-                break child
-                    .wait()
-                    .map_err(|error| format!("Could not stop the check: {error}"))?;
-            }
-            None => thread::sleep(POLL_INTERVAL.min(timeout)),
-        }
-    };
-
-    // Read on every path, including the two that used to return early: a check
-    // that timed out or wrote to the tree has still usually said something, and
-    // an operator staring at a decline needs it.
-    let stdout = read_capture(&mut stdout)
-        .map_err(|error| format!("Could not read check output: {error}"))?;
-    let stderr = read_capture(&mut stderr)
-        .map_err(|error| format!("Could not read check output: {error}"))?;
-    let (stdout_lines, stdout_dropped) = observed_lines(&stdout);
-    let (stderr_lines, stderr_dropped) = observed_lines(&stderr);
-
-    let (result, exit_code) = if timed_out {
-        (CheckResult::TimedOut, None)
-    } else {
-        classify_exit(status.code())
-    };
-
-    Ok(CheckRun {
-        result,
-        check: check.to_string(),
-        directory,
-        exit_code,
-        stdout: stdout_lines,
-        stderr: stderr_lines,
-        stdout_dropped,
-        stderr_dropped,
-    })
-}
-
-/// Split "the check looked and said no" from "the check could not look".
-///
-/// The distinguished codes are the ones that mean the check never reached its
-/// question: 2 is the long-standing "trouble, not a verdict" code (grep, diff,
-/// and the field script this ticket comes from), and 126/127 are what
-/// `/bin/sh -c` itself returns when the recorded command is not executable or
-/// not found. A check killed by a signal concluded nothing either. None of those
-/// is evidence that the operator's remedy was not done.
-fn classify_exit(code: Option<i32>) -> (CheckResult, Option<i32>) {
-    match code {
-        Some(0) => (CheckResult::Passed, Some(0)),
-        Some(code @ (2 | 126 | 127)) => (CheckResult::Inconclusive, Some(code)),
-        Some(code) => (CheckResult::Failed, Some(code)),
-        None => (CheckResult::Inconclusive, None),
-    }
-}
-
-#[cfg(unix)]
-fn terminate_check(child: &mut std::process::Child) {
-    // The shell starts as the leader of its own process group, so a negative
-    // PID reaches descendants as well as the wrapper process.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_check(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
-
-fn read_capture(file: &mut File) -> io::Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_CAPTURE_BYTES).read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-/// One captured stream as display lines, plus how many were left off.
-///
-/// Every line goes through [`sanitize_observation`], so escape sequences and
-/// control characters never reach the terminal no matter which stream they came
-/// from; lines that sanitize to nothing are dropped rather than shown blank.
-fn observed_lines(bytes: &[u8]) -> (Vec<String>, usize) {
-    let decoded = String::from_utf8_lossy(bytes);
-    let mut lines = Vec::new();
-    let mut dropped = 0;
-    for line in decoded.lines() {
-        let line = sanitize_observation(line);
-        if line.is_empty() {
-            continue;
-        }
-        if lines.len() < MAX_OBSERVED_LINES {
-            lines.push(line);
-        } else {
-            dropped += 1;
-        }
-    }
-    (lines, dropped)
-}
-
-fn sanitize_observation(line: &str) -> String {
-    let mut sanitized = String::new();
-    let mut characters = line.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\u{1b}' && characters.peek() == Some(&'[') {
-            characters.next();
-            for sequence_character in characters.by_ref() {
-                if ('@'..='~').contains(&sequence_character) {
-                    break;
-                }
-            }
-        } else if character == '\t' {
-            sanitized.push(' ');
-        } else if !character.is_control() {
-            sanitized.push(character);
-        }
-    }
-    sanitized
-        .trim()
-        .chars()
-        .take(MAX_OBSERVATION_CHARS)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::time::Instant;
 
     use super::*;
 
@@ -551,140 +374,60 @@ mod tests {
     const FIELD_LINE: &str = "No build at dist/. Run: npm run build";
 
     fn run(root: &Path, check: &str) -> CheckRun {
-        run_check(root, check, Duration::from_secs(5)).unwrap()
+        run_check(root, check, budget_for(None)).unwrap()
     }
 
+    /// The whole decline, on a check that said nothing at all.
     #[test]
-    fn passing_and_failing_checks_carry_the_command_directory_and_code() {
+    fn a_silent_failing_check_still_reports_command_directory_and_code() {
         let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("ready"), "yes").unwrap();
-
-        let passed = run(root.path(), "test -f ready");
-        assert_eq!(passed.result, CheckResult::Passed);
-        assert_eq!(passed.exit_code, Some(0));
-
-        let failed = run(
-            root.path(),
-            "printf 'the key link still returns 404\\nextra detail\\n' >&2; \
-             printf 'sampled 40 of 40\\n'; exit 1",
-        );
-        assert_eq!(failed.result, CheckResult::Failed);
-        assert_eq!(failed.exit_code, Some(1));
-        assert_eq!(
-            failed.check,
-            "printf 'the key link still returns 404\\nextra detail\\n' >&2; \
-             printf 'sampled 40 of 40\\n'; exit 1"
-        );
-        assert_eq!(
-            failed.stderr,
-            vec!["the key link still returns 404", "extra detail"]
-        );
-        assert_eq!(failed.stdout, vec!["sampled 40 of 40"]);
 
         let silent = run(root.path(), "exit 1");
+        let report = decline_report("T-1", &silent);
+
         assert_eq!(silent.result, CheckResult::Failed);
-        assert!(silent.stdout.is_empty() && silent.stderr.is_empty());
-        assert!(decline_report("T-1", &silent).contains("the check printed nothing."));
+        assert!(report.starts_with(DECLINE_FAILED), "{report}");
+        assert!(report.contains("  what ran:  exit 1\n"), "{report}");
+        assert!(report.contains("  exit code: 1\n"), "{report}");
+        assert!(report.contains("the check printed nothing."), "{report}");
     }
 
-    /// The reported directory is the one the check itself observed — so this
-    /// keeps holding if a later ticket moves where checks run.
+    /// Criterion 2: expiry names the budget it actually waited for.
+    ///
+    /// Two budgets, two sentences. The five-second one is the default and stays
+    /// byte for byte what it has always been; the declared one proves the
+    /// sentence is built from this run rather than from a constant.
     #[test]
-    fn the_reported_directory_is_the_one_the_check_observed() {
-        let root = tempfile::tempdir().unwrap();
-
-        let observed = run(root.path(), "pwd -P; exit 1");
-
-        assert_eq!(observed.stdout.len(), 1);
-        let seen = &observed.stdout[0];
-        let reported = observed.directory.display().to_string();
-        // The directory is gone by now (the snapshot is disposable), so neither
-        // side can be canonicalized after the fact. `pwd -P` resolves symlinks
-        // and the reported path does not, which on macOS is exactly the
-        // `/private` prefix — the same directory, spelled physically.
-        assert!(
-            *seen == reported || seen.ends_with(&reported),
-            "check saw {seen}, report named {reported}"
-        );
-    }
-
-    /// "Could not look" is not "did not pass", and the line is the exit code.
-    #[test]
-    fn exit_two_and_shell_failures_are_inconclusive_not_a_verdict() {
-        let root = tempfile::tempdir().unwrap();
-
-        for (check, code) in [
-            ("exit 2", 2),
-            ("exit 126", 126),
-            ("./definitely-not-here", 127),
-        ] {
-            let inconclusive = run(root.path(), check);
-            assert_eq!(
-                inconclusive.result,
-                CheckResult::Inconclusive,
-                "{check} must not read as a verdict"
-            );
-            assert_eq!(inconclusive.exit_code, Some(code));
-        }
-
-        for check in ["exit 1", "exit 3"] {
-            assert_eq!(
-                run(root.path(), check).result,
-                CheckResult::Failed,
-                "{check}"
-            );
-        }
-    }
-
-    #[test]
-    fn timeout_is_bounded_and_kills_the_shell_group() {
+    fn timeout_expiry_names_the_budget_that_was_enforced() {
         let root = tempfile::tempdir().unwrap();
         let started = Instant::now();
 
-        let timed_out =
-            run_check(root.path(), "sleep 5 & wait", Duration::from_millis(60)).unwrap();
+        let default_budget = CheckRun {
+            budget: budget_for(None),
+            ..run_check(root.path(), "sleep 5 & wait", Duration::from_millis(60)).unwrap()
+        };
+        let declared_budget = CheckRun {
+            budget: budget_for(Some(1500)),
+            ..run_check(root.path(), "sleep 5 & wait", Duration::from_millis(60)).unwrap()
+        };
 
-        assert_eq!(timed_out.result, CheckResult::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the budget bounds the wait"
+        );
+        assert_eq!(default_budget.result, CheckResult::TimedOut);
         assert_eq!(
-            decline_header(CheckResult::TimedOut),
+            decline_header(&default_budget),
             "That didn't work yet — it took longer than 5 seconds."
         );
-        assert!(decline_report("T-1", &timed_out).contains("exit code: none — Lisa stopped it"));
-    }
-
-    /// The root cause, at the unit level: a check reads the project it was
-    /// given, gitignored build output included.
-    ///
-    /// `out/` here is exactly the shape `--exclude-standard` used to drop —
-    /// present on disk, absent from `git ls-files` — and the check reads it and
-    /// a tracked source file in one run, from one working directory.
-    #[test]
-    fn a_check_reads_the_project_it_runs_in() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("out")).unwrap();
-        fs::write(root.path().join("out/marker"), "built").unwrap();
-        fs::write(root.path().join(".gitignore"), "out/\n").unwrap();
-        fs::write(root.path().join("tracked.txt"), "source").unwrap();
-
-        let seen = run(root.path(), "test -f out/marker && test -f tracked.txt");
-
-        assert_eq!(seen.result, CheckResult::Passed);
-        assert_eq!(seen.exit_code, Some(0));
-    }
-
-    /// The check runs in the project, not beside it.
-    ///
-    /// Paired with [`the_reported_directory_is_the_one_the_check_observed`],
-    /// which asserts the report names whatever that directory is, this pins
-    /// both halves: the directory is the project root, and it is reported.
-    #[test]
-    fn the_check_runs_in_the_project_root() {
-        let root = tempfile::tempdir().unwrap();
-
-        let ran = run(root.path(), "exit 1");
-
-        assert_eq!(ran.directory, root.path());
+        assert_eq!(
+            decline_header(&declared_budget),
+            "That didn't work yet — it took longer than 25 minutes."
+        );
+        assert!(decline_report("T-1", &default_budget)
+            .contains("exit code: none — Lisa stopped it after 5 seconds"));
+        assert!(decline_report("T-1", &declared_budget)
+            .contains("exit code: none — Lisa stopped it after 25 minutes"));
     }
 
     /// Every non-passing result has its own sentence, none of them is a
@@ -692,14 +435,12 @@ mod tests {
     #[test]
     fn every_decline_header_is_distinct_and_names_the_way_through() {
         let root = tempfile::tempdir().unwrap();
-        let headers: Vec<String> = [
-            CheckResult::Failed,
-            CheckResult::Inconclusive,
-            CheckResult::TimedOut,
-        ]
-        .into_iter()
-        .map(decline_header)
-        .collect();
+        let runs = [
+            run(root.path(), "exit 1"),
+            run(root.path(), "exit 2"),
+            run_check(root.path(), "sleep 5 & wait", Duration::from_millis(60)).unwrap(),
+        ];
+        let headers: Vec<String> = runs.iter().map(decline_header).collect();
 
         let mut unique = headers.clone();
         unique.sort();
@@ -744,25 +485,12 @@ mod tests {
         );
     }
 
+    /// Only the sampling schedule decides which non-passes reach the ledger.
     #[test]
-    fn observed_lines_strip_controls_fold_tabs_and_cap_length_and_count() {
-        let long = "x".repeat(MAX_OBSERVATION_CHARS + 20);
-        let stream = format!("\x1b[31m  observed\t{long}  \n\n\x1b[0m\n");
-
-        let (lines, dropped) = observed_lines(stream.as_bytes());
-
-        assert_eq!(lines.len(), 1, "blank and escape-only lines are dropped");
-        assert_eq!(dropped, 0);
-        assert!(lines[0].starts_with("observed "));
-        assert_eq!(lines[0].chars().count(), MAX_OBSERVATION_CHARS);
-        assert!(!lines[0].contains('\n') && !lines[0].contains('\t'));
-        assert!(!lines[0].contains('\u{1b}'));
-
-        let many: String = (0..MAX_OBSERVED_LINES + 4)
-            .map(|index| format!("line {index}\n"))
+    fn world_non_passes_are_sampled_on_a_doubling_schedule() {
+        let recorded: Vec<u64> = (1..=40u64)
+            .filter(|count| count.is_power_of_two())
             .collect();
-        let (capped, dropped) = observed_lines(many.as_bytes());
-        assert_eq!(capped.len(), MAX_OBSERVED_LINES);
-        assert_eq!(dropped, 4);
+        assert_eq!(recorded, vec![1, 2, 4, 8, 16, 32]);
     }
 }

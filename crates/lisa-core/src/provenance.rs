@@ -383,6 +383,108 @@ pub struct CheckOverrideRecord {
     pub occurred_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorldRecheckType {
+    WorldRecheck,
+}
+
+/// What an automated world recheck saw.
+///
+/// There is no `passed` variant on purpose: a pass reopens the ticket, which is
+/// already durable and already visible, so this type exists only for the results
+/// automation used to discard. `changed-files` is absent for the same reason it
+/// is gone from the runner — Lisa no longer judges whether a check wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorldRecheckOutcome {
+    /// The check ran and did not pass.
+    Failed,
+    /// The check stopped before it could look, so it judged nothing.
+    Inconclusive,
+    /// The check outlived its budget and was stopped.
+    TimedOut,
+}
+
+/// One sampled observation of a world-owned remedy that did not clear.
+///
+/// The scheduler rechecks an observable world park on its ordinary poll
+/// cadence — every few seconds, for as long as the ticket stays parked — so
+/// recording every non-pass would bury the ledger. Rows are written on a
+/// doubling schedule (the 1st, 2nd, 4th, 8th … non-pass), and each carries
+/// [`Self::non_pass_count`], the running total at the moment it was written. The
+/// result is bounded in the number of rows and exact in what it reports: a
+/// remedy that can never clear becomes visible instead of parking in silence.
+///
+/// Shaped like [`CheckOverrideRecord`] and for the same reason — the attempt
+/// that parked the ticket is long gone, so there is no lease to attribute this
+/// to and synthesizing one would file a run that never happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldRecheckRecord {
+    pub schema_version: u32,
+    /// Completion durability tier in effect when the recheck ran.
+    #[serde(default)]
+    pub seal: CompletionSeal,
+    pub record_type: WorldRecheckType,
+    pub ticket_id: String,
+    /// The check string exactly as the review disposition recorded it.
+    pub check: String,
+    /// The directory the check actually ran in.
+    pub directory: String,
+    pub result: WorldRecheckOutcome,
+    /// The check's exit code, absent when it was stopped rather than exiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The sanitized output lines the check produced, in the order shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<String>,
+    /// How many times this exact remedy check has now reported a non-pass.
+    pub non_pass_count: u64,
+    pub occurred_at: u64,
+}
+
+/// The latest recorded non-pass for one remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldRecheckObservation {
+    /// The check the count belongs to. A disposition rewritten with a different
+    /// check is a different claim about the world, and starts a fresh count.
+    pub check: String,
+    pub result: WorldRecheckOutcome,
+    pub non_pass_count: u64,
+    pub occurred_at: u64,
+}
+
+/// Fold the ledger into the latest recorded non-pass per ticket.
+///
+/// Append order is chronological, so the last row wins. A missing or unreadable
+/// ledger establishes no observations rather than failing — the same stance
+/// every other projection here takes.
+pub fn latest_world_rechecks(
+    ledger_path: &Path,
+) -> std::collections::HashMap<String, WorldRecheckObservation> {
+    let Ok(ledger) = fs::read_to_string(ledger_path) else {
+        return std::collections::HashMap::new();
+    };
+    let mut latest = std::collections::HashMap::new();
+    for record in ledger
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ProvenanceLedgerRecord>(line).ok())
+    {
+        if let ProvenanceLedgerRecord::WorldRecheck(record) = record {
+            latest.insert(
+                record.ticket_id,
+                WorldRecheckObservation {
+                    check: record.check,
+                    result: record.result,
+                    non_pass_count: record.non_pass_count,
+                    occurred_at: record.occurred_at,
+                },
+            );
+        }
+    }
+    latest
+}
+
 /// One late token-usage join for an already-terminal ticket-run.
 ///
 /// The terminal [`ProvenanceRecord`] is written at completion with null tokens by
@@ -446,6 +548,7 @@ pub enum ProvenanceLedgerRecord {
     ProposalAction(ProposalActionRecord),
     OperatorOverride(OperatorOverrideRecord),
     CheckOverride(CheckOverrideRecord),
+    WorldRecheck(WorldRecheckRecord),
     UsageCorrection(UsageCorrectionRecord),
     Execution(ProvenanceRecord),
 }
@@ -658,6 +761,14 @@ pub fn append_operator_override_record(
 pub fn append_check_override_record(
     path: &Path,
     record: &CheckOverrideRecord,
+) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+/// Append one sampled world-recheck non-pass as a single JSONL row.
+pub fn append_world_recheck_record(
+    path: &Path,
+    record: &WorldRecheckRecord,
 ) -> std::io::Result<()> {
     append_serialized(path, record)
 }
@@ -1392,6 +1503,88 @@ mod tests {
             serde_json::from_str::<ProvenanceLedgerRecord>(body.trim()).unwrap(),
             ProvenanceLedgerRecord::CheckOverride(record)
         );
+    }
+
+    fn sample_world_recheck(ticket_id: &str, non_pass_count: u64) -> WorldRecheckRecord {
+        WorldRecheckRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: WorldRecheckType::WorldRecheck,
+            ticket_id: ticket_id.to_string(),
+            check: "curl -fsS https://example.test/release".to_string(),
+            directory: "/Users/j/project".to_string(),
+            result: WorldRecheckOutcome::Failed,
+            exit_code: Some(22),
+            observed: vec!["curl: (22) The requested URL returned 404".to_string()],
+            non_pass_count,
+            occurred_at: 1_752_900_000,
+        }
+    }
+
+    #[test]
+    fn world_recheck_record_round_trips_and_stays_its_own_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.jsonl");
+        let record = sample_world_recheck("T-WORLD", 8);
+
+        append_world_recheck_record(&path, &record).unwrap();
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.contains("\"record_type\":\"world-recheck\""));
+        // What makes a silent park visible: the remedy, what the check reported,
+        // and how many times it has now reported it.
+        assert!(body.contains("\"ticket_id\":\"T-WORLD\""));
+        assert!(body.contains("\"check\":\"curl -fsS https://example.test/release\""));
+        assert!(body.contains("\"result\":\"failed\""));
+        assert!(body.contains("\"exit_code\":22"));
+        assert!(body.contains("\"non_pass_count\":8"));
+        assert!(body.contains("returned 404"));
+
+        // A check-override row is the nearest shape on the wire; the two must
+        // not read as each other.
+        assert_eq!(
+            serde_json::from_str::<ProvenanceLedgerRecord>(body.trim()).unwrap(),
+            ProvenanceLedgerRecord::WorldRecheck(record)
+        );
+        let override_line = serde_json::to_string(&sample_check_override("T-WORLD")).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ProvenanceLedgerRecord>(&override_line).unwrap(),
+            ProvenanceLedgerRecord::CheckOverride(_)
+        ));
+    }
+
+    #[test]
+    fn the_world_recheck_projection_keeps_the_latest_row_per_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.jsonl");
+        assert!(
+            latest_world_rechecks(&path).is_empty(),
+            "no ledger, no facts"
+        );
+
+        for count in [1, 2, 4] {
+            append_world_recheck_record(&path, &sample_world_recheck("T-WORLD", count)).unwrap();
+        }
+        append_world_recheck_record(&path, &sample_world_recheck("T-OTHER", 1)).unwrap();
+        // Unrelated rows and unparseable lines establish nothing and break nothing.
+        append_check_override_record(&path, &sample_check_override("T-WORLD")).unwrap();
+        fs::write(
+            &path,
+            format!("{}not json\n", fs::read_to_string(&path).unwrap()),
+        )
+        .unwrap();
+
+        let latest = latest_world_rechecks(&path);
+
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest["T-WORLD"].non_pass_count, 4);
+        assert_eq!(latest["T-WORLD"].result, WorldRecheckOutcome::Failed);
+        assert_eq!(
+            latest["T-WORLD"].check,
+            "curl -fsS https://example.test/release"
+        );
+        assert_eq!(latest["T-OTHER"].non_pass_count, 1);
     }
 
     /// The same both-directions guard the operator-override arm carries: an
