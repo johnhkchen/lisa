@@ -6,7 +6,19 @@ use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
 use lisa_core::disposition::RemedyOwner;
 use lisa_core::notes::{collect_notes, QueuedNote};
 use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
-use lisa_core::provenance::{correct_usage, usage_gap, ProvenanceLedgerRecord};
+use lisa_core::provenance::{
+    correct_usage, latest_world_rechecks, usage_gap, ProvenanceLedgerRecord,
+    WorldRecheckObservation,
+};
+use std::collections::HashMap;
+
+/// How many recorded non-passes make a world remedy worth naming as stuck.
+///
+/// Rows land on a doubling schedule, so this is the fourth one. Below it a
+/// world remedy that has not cleared is simply waiting for the world, which is
+/// what a world remedy is *for*; at it, the check has kept saying no long enough
+/// that the check itself is the likelier problem.
+const STUCK_NON_PASS_COUNT: u64 = 8;
 
 /// Group a token count with thousands separators so big numbers stay legible.
 fn group_thousands(value: u64) -> String {
@@ -84,7 +96,31 @@ fn print_token_usage(ledger_path: &Path) {
     println!();
 }
 
-fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
+/// The two lines a world remedy earns once its check has kept saying no.
+///
+/// Automation never acts on a non-pass — that policy is unchanged — so the only
+/// thing that can change is the silence. This says what Lisa has seen and names
+/// the one command that ends the wait, addressed to the person who can decide
+/// the check is wrong.
+fn stuck_world_lines(remedy: &ParkedRemedy, seen: &WorldRecheckObservation) -> Vec<String> {
+    // "at least": rows are sampled, so the last recorded total is a floor rather
+    // than a live count, and saying otherwise would overstate what Lisa knows.
+    vec![
+        format!(
+            "       Lisa has checked at least {} times and it still isn't passing.",
+            seen.non_pass_count
+        ),
+        format!(
+            "       If you have checked this yourself, run: lisa unblock {} --override-check",
+            remedy.ticket_id
+        ),
+    ]
+}
+
+fn waiting_on_you_lines(
+    remedies: &[ParkedRemedy],
+    rechecks: &HashMap<String, WorldRecheckObservation>,
+) -> Vec<String> {
     remedies
         .iter()
         .flat_map(|remedy| {
@@ -96,6 +132,15 @@ fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
                 ),
                 RemedyOwner::Agent => return Vec::new(),
             };
+            // The count belongs to one check. A rewritten disposition is a
+            // different claim about the world, and inherits nothing.
+            let stuck = (remedy.remedy_owner == RemedyOwner::World)
+                .then(|| rechecks.get(&remedy.ticket_id))
+                .flatten()
+                .filter(|seen| {
+                    remedy.check.as_deref() == Some(seen.check.as_str())
+                        && seen.non_pass_count >= STUCK_NON_PASS_COUNT
+                });
             let mut lines = Vec::new();
             if let Some(proposal) = &remedy.proposal {
                 lines.push(format!(
@@ -113,14 +158,20 @@ fn waiting_on_you_lines(remedies: &[ParkedRemedy]) -> Vec<String> {
             } else {
                 lines.push(lead);
             }
+            if let Some(seen) = stuck {
+                lines.extend(stuck_world_lines(remedy, seen));
+            }
             lines.push(format!("       Reviewer's note: {}", remedy.reason));
             lines
         })
         .collect()
 }
 
-fn print_waiting_on_you(remedies: &[ParkedRemedy]) {
-    let lines = waiting_on_you_lines(remedies);
+fn print_waiting_on_you(
+    remedies: &[ParkedRemedy],
+    rechecks: &HashMap<String, WorldRecheckObservation>,
+) {
+    let lines = waiting_on_you_lines(remedies, rechecks);
     if lines.is_empty() {
         println!("Waiting on you");
         println!("Nothing waiting.\n");
@@ -191,12 +242,10 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     let tickets = lisa_core::ticket::scan_tickets(&ticket_dir)
         .map_err(|e| format!("Failed to scan tickets: {}", e))?;
 
-    let parked_remedies = collect_parked_remedies(
-        tickets.iter(),
-        &root.join(&work_dir_rel),
-        &root.join(".lisa/provenance.jsonl"),
-    );
-    print_waiting_on_you(&parked_remedies);
+    let ledger_path = root.join(".lisa/provenance.jsonl");
+    let parked_remedies =
+        collect_parked_remedies(tickets.iter(), &root.join(&work_dir_rel), &ledger_path);
+    print_waiting_on_you(&parked_remedies, &latest_world_rechecks(&ledger_path));
     let notes = collect_notes(
         &root.join(".lisa/completion-journal.jsonl"),
         &root.join(".lisa/provenance.jsonl"),
@@ -487,12 +536,121 @@ mod tests {
         ];
 
         assert_eq!(
-            waiting_on_you_lines(&remedies),
+            waiting_on_you_lines(&remedies, &HashMap::new()),
             vec![
                 "T-001  Run the checkout test exactly once.",
                 "       Reviewer's note: The checkout evidence is missing.",
                 "T-002  Wait for the release link. — Lisa checks on its own.",
                 "       Reviewer's note: The release has not reached the mirror.",
+            ]
+        );
+    }
+
+    /// A world remedy whose check keeps saying no stops being silent — but only
+    /// once it has said so enough times to mean something.
+    #[test]
+    fn a_world_remedy_that_never_clears_says_so_and_names_the_way_through() {
+        let remedies = vec![ParkedRemedy {
+            ticket_id: "T-WORLD".to_string(),
+            remedy_owner: RemedyOwner::World,
+            ask: "Wait for the release link.".to_string(),
+            reason: "The release has not reached the mirror.".to_string(),
+            steps: Vec::new(),
+            check: Some("curl -fsS https://example.test/release".to_string()),
+            check_timeout_secs: None,
+            proposal: None,
+            origin: lisa_core::disposition::DispositionOrigin::Review,
+        }];
+        let observation = |count, check: &str| {
+            HashMap::from([(
+                "T-WORLD".to_string(),
+                WorldRecheckObservation {
+                    check: check.to_string(),
+                    result: lisa_core::provenance::WorldRecheckOutcome::Failed,
+                    non_pass_count: count,
+                    occurred_at: 1_752_900_000,
+                },
+            )])
+        };
+        let quiet = vec![
+            "T-WORLD  Wait for the release link. — Lisa checks on its own.".to_string(),
+            "       Reviewer's note: The release has not reached the mirror.".to_string(),
+        ];
+
+        // Below the threshold, and for a check the count does not belong to,
+        // nothing changes: waiting for the world is what a world remedy does.
+        assert_eq!(
+            waiting_on_you_lines(&remedies, &HashMap::new()),
+            quiet,
+            "no observation"
+        );
+        assert_eq!(
+            waiting_on_you_lines(
+                &remedies,
+                &observation(
+                    STUCK_NON_PASS_COUNT - 1,
+                    "curl -fsS https://example.test/release"
+                )
+            ),
+            quiet,
+            "under the threshold"
+        );
+        assert_eq!(
+            waiting_on_you_lines(
+                &remedies,
+                &observation(STUCK_NON_PASS_COUNT, "test -f some-older-check")
+            ),
+            quiet,
+            "a count belonging to a different check"
+        );
+
+        assert_eq!(
+            waiting_on_you_lines(
+                &remedies,
+                &observation(
+                    STUCK_NON_PASS_COUNT,
+                    "curl -fsS https://example.test/release"
+                )
+            ),
+            vec![
+                "T-WORLD  Wait for the release link. — Lisa checks on its own.",
+                "       Lisa has checked at least 8 times and it still isn't passing.",
+                "       If you have checked this yourself, run: lisa unblock T-WORLD --override-check",
+                "       Reviewer's note: The release has not reached the mirror.",
+            ]
+        );
+    }
+
+    /// The count is a world remedy's fact. An operator-owned park is theirs to
+    /// clear, and Lisa never rechecks one, so it never accumulates a count.
+    #[test]
+    fn an_operator_owned_remedy_never_shows_a_recheck_count() {
+        let remedies = vec![ParkedRemedy {
+            ticket_id: "T-OPERATOR".to_string(),
+            remedy_owner: RemedyOwner::Operator,
+            ask: "Run the checkout test.".to_string(),
+            reason: "The checkout evidence is missing.".to_string(),
+            steps: Vec::new(),
+            check: Some("test -f evidence".to_string()),
+            check_timeout_secs: None,
+            proposal: None,
+            origin: lisa_core::disposition::DispositionOrigin::Review,
+        }];
+        let rechecks = HashMap::from([(
+            "T-OPERATOR".to_string(),
+            WorldRecheckObservation {
+                check: "test -f evidence".to_string(),
+                result: lisa_core::provenance::WorldRecheckOutcome::Failed,
+                non_pass_count: 64,
+                occurred_at: 1_752_900_000,
+            },
+        )]);
+
+        assert_eq!(
+            waiting_on_you_lines(&remedies, &rechecks),
+            vec![
+                "T-OPERATOR  Run the checkout test.",
+                "       Reviewer's note: The checkout evidence is missing.",
             ]
         );
     }
@@ -512,7 +670,7 @@ mod tests {
             origin: lisa_core::disposition::DispositionOrigin::Review,
         }];
 
-        let lines = waiting_on_you_lines(&remedies);
+        let lines = waiting_on_you_lines(&remedies, &HashMap::new());
 
         assert_eq!(
             lines,
@@ -549,7 +707,7 @@ mod tests {
             }),
             origin: lisa_core::disposition::DispositionOrigin::Review,
         }];
-        let lines = waiting_on_you_lines(&remedies);
+        let lines = waiting_on_you_lines(&remedies, &HashMap::new());
         assert!(lines[0].contains("First responder"));
         assert!(lines[0].contains("criteria"));
         assert!(lines[0].contains("evidence"));
