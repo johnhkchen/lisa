@@ -4221,4 +4221,505 @@ depends_on: [T-999]
         assert_eq!(result.ticket_count, 3);
         assert_eq!(result.ready_count, 2);
     }
+
+    // ---- Retiring what init once wrote (T-057-02-02) ----------------------
+
+    /// The `.lisa.toml` a 0.4.4 project actually has: comments the operator
+    /// wrote, a custom value, a section Lisa has never heard of, and the dead
+    /// key sitting among them.
+    const FIXTURE_CONFIG: &str = r#"# Two agents is all this laptop can take.
+version = "0.4.0"
+
+[dirs]
+tickets = "docs/active/tickets"   # unchanged, but we said so out loud
+
+[scheduling]
+max_threads = 2
+# Left over from 0.4 — nobody remembers turning it on.
+auto_advance = true
+review_timeout_secs = 900
+
+[experimental]
+my_own_setting = "keep me"
+"#;
+
+    const TICKET_AT_RETIRED_PHASE: &str = "---\nid: T-024-01\nstory: S-024\ntitle: migrate-climate-calls\ntype: task\nstatus: open\npriority: high\nphase: structure\ndepends_on: []\n---\n\n## Context\n\nWork.\n";
+
+    /// A `CLAUDE.md` exactly as a 0.4.4 `generate_claude_md` wrote it.
+    fn generated_claude_md() -> String {
+        format!(
+            "{}my-app (Rust) — TODO: add a one-line project description here.\n\n### Build and Test\n\n```bash\n# Build\ncargo build\n\n# Run tests\ncargo test\n\n# Lint\ncargo clippy\n```\n\n### Source Layout\n\n```\nsrc:\n  main.rs\n```\n\n{}",
+            include_str!("../data/legacy/claude-md-header-v0.4.4.md"),
+            include_str!("../data/legacy/claude-md-tail.md"),
+        )
+    }
+
+    /// A project shaped like one 0.4.4 left behind, carrying every subject this
+    /// ticket retires at once.
+    fn upgrade_fixture(root: &Path) {
+        fs::create_dir_all(root.join("docs/knowledge")).unwrap();
+        fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+        fs::create_dir_all(root.join(".lisa/hooks")).unwrap();
+        fs::write(root.join(".lisa.toml"), FIXTURE_CONFIG).unwrap();
+        fs::write(
+            root.join("docs/knowledge/rdspi-workflow.md"),
+            templates::LEGACY_WORKFLOWS[2],
+        )
+        .unwrap();
+        fs::write(
+            root.join(".lisa/hooks/on-stop.sh"),
+            templates::LEGACY_ON_STOP_HOOKS[0],
+        )
+        .unwrap();
+        fs::write(root.join("CLAUDE.md"), generated_claude_md()).unwrap();
+        fs::write(
+            root.join("AGENTS.md"),
+            crate::legacy_context::LEGACY_AGENTS_CONTEXTS[1],
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/active/tickets/T-024-01.md"),
+            TICKET_AT_RETIRED_PHASE,
+        )
+        .unwrap();
+    }
+
+    /// Every file under `root`, by relative path and exact bytes.
+    fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.push((
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        fs::read(&path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn init_output(root: &Path, dry_run: bool) -> String {
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_init_with_io(
+            root,
+            dry_run,
+            HistoryPreference::NoHistory,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    fn mutating(plan: &[InitAction]) -> Vec<&InitAction> {
+        plan.iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    InitAction::CreateDir(_)
+                        | InitAction::CreateFile { .. }
+                        | InitAction::UpdateFile { .. }
+                        | InitAction::RemoveFile { .. }
+                        | InitAction::RetireConfigKey { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// `--dry-run` is the load-bearing flag now that init can remove things:
+    /// it is what an operator reads before letting an upgrade touch a
+    /// repository they have work in. Every retirement has to be in it, named,
+    /// with its reason — and nothing on disk may move.
+    #[test]
+    fn dry_run_names_every_retirement_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        upgrade_fixture(dir.path());
+        let before = tree_snapshot(dir.path());
+
+        let preview = init_output(dir.path(), true);
+
+        for subject in [
+            "rdspi-workflow.md",
+            "CLAUDE.md",
+            "AGENTS.md",
+            "[scheduling] auto_advance",
+            "T-024-01.md",
+        ] {
+            assert!(
+                preview.contains(subject),
+                "the preview must name {subject}:\n{preview}"
+            );
+        }
+        for reason in [
+            "superseded by docs/knowledge/lisa-workflow.md",
+            "generated by Lisa and unedited since",
+            "Lisa stopped reading this setting in 0.5.0",
+            "your board is not Lisa's to rewrite",
+        ] {
+            assert!(
+                preview.contains(reason),
+                "every retirement must carry its reason; missing {reason:?}:\n{preview}"
+            );
+        }
+        assert!(preview.contains("Dry run complete. No changes made."));
+
+        assert_eq!(
+            tree_snapshot(dir.path()),
+            before,
+            "--dry-run must leave the tree byte-identical"
+        );
+    }
+
+    /// End to end: a project 0.4.4 set up becomes a current one through a
+    /// single `lisa init`, with no hand edits.
+    #[test]
+    fn one_init_brings_a_0_4_4_project_current() {
+        let dir = tempfile::tempdir().unwrap();
+        upgrade_fixture(dir.path());
+
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+
+        assert!(!dir.path().join("docs/knowledge/rdspi-workflow.md").exists());
+        assert!(!dir.path().join("CLAUDE.md").exists());
+        assert!(!dir.path().join("AGENTS.md").exists());
+        assert!(dir.path().join("docs/knowledge/lisa-workflow.md").exists());
+
+        let currency = crate::currency::inventory(dir.path());
+        let carried: Vec<_> = currency
+            .findings
+            .iter()
+            .filter(|finding| finding.kind != crate::currency::CurrencyKind::StaleContent)
+            .collect();
+        assert!(
+            carried.is_empty(),
+            "nothing behind or retired survives one init: {carried:#?}"
+        );
+        // What is left is the board, which no Lisa command rewrites — the
+        // operator's own edit, and the one thing T-057-02-03 will not take
+        // either.
+        assert!(currency
+            .findings
+            .iter()
+            .all(|finding| matches!(finding.remedy, crate::currency::Remedy::Operator(_))));
+        assert_eq!(
+            currency.recorded_version,
+            crate::currency::RecordedVersion::Current {
+                recorded: config::LISA_VERSION.to_string()
+            }
+        );
+    }
+
+    /// No retirement fires twice.
+    #[test]
+    fn a_second_consecutive_run_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        upgrade_fixture(dir.path());
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+        let after_first = tree_snapshot(dir.path());
+
+        let plan = plan_init_actions(dir.path());
+        let still_to_do = mutating(&plan);
+        assert!(
+            still_to_do.is_empty(),
+            "a second run has nothing left to do: {still_to_do:#?}"
+        );
+
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+        assert_eq!(tree_snapshot(dir.path()), after_first);
+    }
+
+    /// And on a project this binary itself created, the plan is nothing but
+    /// no-ops — not a skip, not a report, nothing to read at all.
+    #[test]
+    fn init_on_an_already_current_project_is_all_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+        for action in plan_init_actions(dir.path()) {
+            assert!(matches!(action, InitAction::NoOp { .. }), "{action}");
+        }
+    }
+
+    /// `docs/active/tickets/` is the operator's board, not a Lisa-owned
+    /// template. A retired phase value still loads — it reads as `implement` —
+    /// and init rewriting frontmatter in bulk would be a far larger claim on
+    /// the repository than anything init does today.
+    #[test]
+    fn a_ticket_at_a_retired_phase_is_reported_and_never_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        upgrade_fixture(dir.path());
+        let ticket = dir.path().join("docs/active/tickets/T-024-01.md");
+
+        let reported = plan_init_actions(dir.path())
+            .into_iter()
+            .filter(|action| {
+                matches!(action, InitAction::SafetySkip { path, reason }
+                    if path == &ticket && reason.contains("phase: structure"))
+            })
+            .count();
+        assert_eq!(reported, 1, "the ticket is reported, once");
+
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+        assert_eq!(
+            fs::read_to_string(&ticket).unwrap(),
+            TICKET_AT_RETIRED_PHASE,
+            "init must not touch a byte of the board"
+        );
+    }
+
+    /// A board with two hundred retired phases would push the removals off the
+    /// top of the preview, which is the part an operator is reading it for.
+    #[test]
+    fn a_board_full_of_retired_phases_previews_a_few_and_counts_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        upgrade_fixture(dir.path());
+        for index in 2..=9 {
+            fs::write(
+                dir.path()
+                    .join(format!("docs/active/tickets/T-024-{index:02}.md")),
+                TICKET_AT_RETIRED_PHASE.replace("T-024-01", &format!("T-024-{index:02}")),
+            )
+            .unwrap();
+        }
+
+        let preview = init_output(dir.path(), true);
+        let listed = preview.matches("records `phase: structure`").count();
+        assert_eq!(listed, 5, "five listed, then a count:\n{preview}");
+        assert!(
+            preview.contains("4 more tickets record a retired phase; `lisa doctor` lists them"),
+            "the rest are counted, not dropped silently:\n{preview}"
+        );
+
+        // The cap is a preview decision. Doctor still gets all nine.
+        assert_eq!(
+            crate::currency::inventory(dir.path())
+                .findings
+                .iter()
+                .filter(|finding| finding.kind == crate::currency::CurrencyKind::StaleContent)
+                .count(),
+            9
+        );
+    }
+
+    /// `.lisa.toml` is a file the operator edits. A rewrite that strips their
+    /// comments is a worse outcome than the dead key sitting inert, so the
+    /// removal is one line lifted out and nothing else.
+    #[test]
+    fn the_dead_config_key_goes_and_every_other_byte_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        upgrade_fixture(dir.path());
+
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+        let updated = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
+
+        assert!(!updated.contains("auto_advance"), "{updated}");
+        for kept in [
+            "# Two agents is all this laptop can take.",
+            "tickets = \"docs/active/tickets\"   # unchanged, but we said so out loud",
+            "max_threads = 2",
+            "# Left over from 0.4 — nobody remembers turning it on.",
+            "review_timeout_secs = 900",
+            "[experimental]",
+            "my_own_setting = \"keep me\"",
+        ] {
+            assert!(updated.contains(kept), "lost {kept:?} from:\n{updated}");
+        }
+
+        // Key order, not just key survival: every surviving original line is
+        // still in its original position relative to the others.
+        let mut cursor = 0;
+        for line in FIXTURE_CONFIG
+            .lines()
+            .filter(|line| !line.contains("auto_advance") && !line.starts_with("version"))
+            .filter(|line| !line.trim().is_empty())
+        {
+            let at = updated[cursor..]
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} moved or vanished from:\n{updated}"));
+            cursor += at + line.len();
+        }
+
+        // And it is still a config Lisa can load.
+        let validation = config::load_config(dir.path()).expect("the rewritten file must load");
+        assert_eq!(validation.config.scheduling.max_threads, Some(2));
+        assert!(
+            validation
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("auto_advance")),
+            "the warning goes with the key: {:?}",
+            validation.warnings
+        );
+    }
+
+    /// When the key cannot be lifted out without reformatting the operator's
+    /// file, init does not do it. It says so and leaves the bytes alone.
+    #[test]
+    fn a_config_that_cannot_be_edited_surgically_is_left_alone_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        upgrade_fixture(dir.path());
+        // An inline table: the setting has no line of its own.
+        let inline = "version = \"0.4.0\"\nscheduling = { auto_advance = true, max_threads = 2 }\n";
+        fs::write(dir.path().join(".lisa.toml"), inline).unwrap();
+
+        let preview = init_output(dir.path(), true);
+        assert!(
+            preview.contains("preserved: [scheduling] auto_advance is inert since 0.5.0, but"),
+            "the refusal must be reported, with its reason:\n{preview}"
+        );
+        assert!(
+            !preview.contains("] auto_advance (Lisa stopped reading"),
+            "no removal may be announced:\n{preview}"
+        );
+
+        run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+        let after = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
+        assert!(
+            after.contains("scheduling = { auto_advance = true, max_threads = 2 }"),
+            "the operator's line survives byte-identical:\n{after}"
+        );
+    }
+
+    /// The consent rule this ticket turns on, both directions, both files.
+    #[test]
+    fn a_generated_context_file_goes_and_an_edited_one_stays() {
+        for (name, generated, edited) in [
+            (
+                "CLAUDE.md",
+                generated_claude_md(),
+                generated_claude_md().replace(
+                    "TODO: add a one-line project description here.",
+                    "A scheduler for climate model runs.",
+                ),
+            ),
+            (
+                "AGENTS.md",
+                crate::legacy_context::LEGACY_AGENTS_CONTEXTS[1].to_string(),
+                format!(
+                    "{}\nAnd read the runbook before touching the scheduler.\n",
+                    crate::legacy_context::LEGACY_AGENTS_CONTEXTS[1]
+                ),
+            ),
+        ] {
+            // Byte-identical to a generation Lisa shipped: Lisa's litter, and
+            // Lisa's to retire.
+            let dir = tempfile::tempdir().unwrap();
+            upgrade_fixture(dir.path());
+            fs::write(dir.path().join(name), &generated).unwrap();
+            run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+            assert!(
+                !dir.path().join(name).exists(),
+                "a proven, unedited {name} is removed"
+            );
+
+            // One line different: the operator's file now, kept exactly, and
+            // reported so they know Lisa looked and declined.
+            let dir = tempfile::tempdir().unwrap();
+            upgrade_fixture(dir.path());
+            fs::write(dir.path().join(name), &edited).unwrap();
+            // Keep the other half of the pair out of it — the pointer rule has
+            // its own test.
+            let other = if name == "CLAUDE.md" {
+                "AGENTS.md"
+            } else {
+                "CLAUDE.md"
+            };
+            fs::remove_file(dir.path().join(other)).unwrap();
+
+            let preview = init_output(dir.path(), true);
+            assert!(
+                preview.contains(&format!(
+                    "{} (preserved: edited since Lisa generated it, so it is yours now)",
+                    dir.path().join(name).display()
+                )),
+                "{name} must be reported as preserved, with a reason:\n{preview}"
+            );
+
+            run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.path().join(name)).unwrap(),
+                edited,
+                "an edited {name} survives byte-identical"
+            );
+        }
+    }
+
+    /// The mixed case. Both frozen `AGENTS.md` generations end by pointing at
+    /// `CLAUDE.md`, so the two files are not symmetric: removing the pointer
+    /// is harmless, removing its target while something still points at it is
+    /// the dangling reference the ticket forbids.
+    #[test]
+    fn a_pointer_target_is_retired_only_when_nothing_points_at_it() {
+        let generated_claude = generated_claude_md();
+        let generated_agents = crate::legacy_context::LEGACY_AGENTS_CONTEXTS[1];
+        let hand_written_agents = "# AGENTS.md\n\nRead CLAUDE.md first, then the README.\n";
+        let unrelated_agents = "# AGENTS.md\n\nStart with the README.\n";
+
+        // (CLAUDE.md, AGENTS.md) → (does CLAUDE.md survive, does AGENTS.md)
+        let cases: [(Option<&str>, Option<&str>, bool, bool); 5] = [
+            // The pair goes together.
+            (
+                Some(&generated_claude),
+                Some(generated_agents),
+                false,
+                false,
+            ),
+            // Something is left pointing at it, so the target stays.
+            (
+                Some(&generated_claude),
+                Some(hand_written_agents),
+                true,
+                true,
+            ),
+            // Nothing points at it: the pointer was the operator's and says
+            // nothing about CLAUDE.md.
+            (Some(&generated_claude), Some(unrelated_agents), false, true),
+            // The pointer alone is Lisa's to remove.
+            (
+                Some("# CLAUDE.md\n\nOur own house rules.\n"),
+                Some(generated_agents),
+                true,
+                false,
+            ),
+            (None, Some(generated_agents), false, false),
+        ];
+
+        for (claude, agents, claude_survives, agents_survives) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            upgrade_fixture(dir.path());
+            match claude {
+                Some(content) => fs::write(dir.path().join("CLAUDE.md"), content).unwrap(),
+                None => fs::remove_file(dir.path().join("CLAUDE.md")).unwrap(),
+            }
+            fs::write(dir.path().join("AGENTS.md"), agents.unwrap()).unwrap();
+
+            run_init(dir.path(), false, HistoryPreference::NoHistory).unwrap();
+
+            let claude_left = dir.path().join("CLAUDE.md").exists();
+            let agents_left = dir.path().join("AGENTS.md").exists();
+            assert_eq!(claude_left, claude_survives, "CLAUDE.md, given {agents:?}");
+            assert_eq!(agents_left, agents_survives, "AGENTS.md, given {claude:?}");
+
+            // The invariant, checked on the tree rather than on the plan: no
+            // run leaves an AGENTS.md pointing at a CLAUDE.md that is gone.
+            if agents_left {
+                let left = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+                assert!(
+                    !left.contains("CLAUDE.md") || claude_left,
+                    "left a dangling pointer:\n{left}"
+                );
+            }
+        }
+    }
 }
