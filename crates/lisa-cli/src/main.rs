@@ -4,6 +4,7 @@ mod capture_usage;
 mod check_disposition;
 mod check_run;
 mod claim;
+mod clean;
 mod codex_launcher;
 mod completion_seal;
 mod config;
@@ -151,8 +152,26 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Remove what an older Lisa left behind, once you have read the list.
+    #[command(
+        display_order = 7,
+        after_help = "A bare run prints the list and changes nothing. Add --remove to carry it out.\n\nExample: lisa clean --path ./my-project"
+    )]
+    Clean {
+        /// Remove the listed files instead of only listing them
+        #[arg(long, conflicts_with = "dry_run")]
+        remove: bool,
+
+        /// Print the list and change nothing, which is what a bare run does
+        #[arg(long, conflicts_with = "remove")]
+        dry_run: bool,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     /// Settle a first-responder proposal for a waiting ticket.
-    #[command(display_order = 7)]
+    #[command(display_order = 8)]
     Proposal {
         #[command(subcommand)]
         action: ProposalCommands,
@@ -345,7 +364,7 @@ enum Commands {
     },
     /// Start a run: work through the ready tickets, in parallel where they don't collide.
     #[command(
-        display_order = 8,
+        display_order = 9,
         after_help = "Example: lisa loop --path ./my-project --max-threads 3"
     )]
     Loop {
@@ -569,6 +588,21 @@ fn main() {
                 init::HistoryPreference::Ask
             };
             if let Err(e) = init::run_init(&path, dry_run, history) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Clean {
+            remove,
+            dry_run: _,
+            path,
+        } => {
+            // `--dry-run` is the default said out loud, so there is nothing to
+            // read here. It earns its place by conflicting with `--remove`, which
+            // Clap enforces before this arm runs.
+            let path = resolve_path(&path);
+            require_lisa_project(&path);
+            if let Err(e) = clean::run_clean(&path, remove) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

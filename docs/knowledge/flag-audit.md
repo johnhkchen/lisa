@@ -50,6 +50,9 @@ rows with the live command tree and config catalog.
 | `flag:lisa/proposal/apply:--path` | Choose the project folder for applying advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
 | `flag:lisa/proposal/dismiss:--path` | Choose the project folder for dismissing advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
 | `flag:lisa/doctor:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/clean:--dry-run` | Say out loud that this run only prints the list | working default | Default is off, and a bare run already prints the list; passing it refuses to be combined with `--remove`. | `a_bare_run_prints_the_plan_and_changes_not_one_byte` | — |
+| `flag:lisa/clean:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/clean:--remove` | Carry out the list instead of printing it | working default | Default is off, so Lisa prints what it would remove and removes nothing until you ask. | `every_removed_path_was_named_in_the_plan_first` | — |
 | `flag:lisa/loop:--client` | Override the detected coding agent | working default | Without the flag, explicit config wins, then Lisa detects installed agents and prefers Claude when both are present. | `test_resolve_client_from_detected_availability` | — |
 | `flag:lisa/loop:--dry-run` | Preview a run | working default | Default is off, so Lisa starts the run unless a preview is requested. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/loop:--max-threads` | Override the concurrent-agent limit | working default | Without the flag, Lisa uses `.lisa.toml` and then the default of `2`. | `test_resolve_cli_overrides_default` | — |

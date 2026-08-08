@@ -1,7 +1,7 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 17 of Lisa's own subcommands still resolve,
+//!   (a) all 19 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
 //!   (d) the five machinery-invoked plumbing commands stay outside the
@@ -15,7 +15,7 @@
 use std::process::{Command, Output};
 
 /// The commands an operator runs, foregrounded in `--help`.
-const OPERATOR_COMMANDS: [&str; 9] = [
+const OPERATOR_COMMANDS: [&str; 10] = [
     "init",
     "validate",
     "status",
@@ -23,6 +23,7 @@ const OPERATOR_COMMANDS: [&str; 9] = [
     "unblock",
     "already-done",
     "doctor",
+    "clean",
     "proposal",
     "loop",
 ];
@@ -56,6 +57,7 @@ Commands:
   unblock       Verify what changed and let a waiting ticket run again
   already-done  Finish a ticket whose work is already recorded in history
   doctor        Check that the tools Lisa needs are installed
+  clean         Remove what an older Lisa left behind, once you have read the list
   proposal      Settle a first-responder proposal for a waiting ticket
   loop          Start a run: work through the ready tickets, in parallel where they don't collide
   help          Print this message or the help of the given subcommand(s)
@@ -77,7 +79,7 @@ struct OperatorHelpSnapshot {
     expected: &'static str,
 }
 
-const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 9] = [
+const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 10] = [
     OperatorHelpSnapshot {
         command: "init",
         expected: r#"Set up a project to run with Lisa
@@ -190,6 +192,23 @@ Example: lisa doctor --path ./my-project
 "#,
     },
     OperatorHelpSnapshot {
+        command: "clean",
+        expected: r#"Remove what an older Lisa left behind, once you have read the list
+
+Usage: lisa clean [OPTIONS]
+
+Options:
+      --remove       Remove the listed files instead of only listing them
+      --dry-run      Print the list and change nothing, which is what a bare run does
+      --path <PATH>  Path to the project root (defaults to current directory) [default: .]
+  -h, --help         Print help
+
+A bare run prints the list and changes nothing. Add --remove to carry it out.
+
+Example: lisa clean --path ./my-project
+"#,
+    },
+    OperatorHelpSnapshot {
         command: "proposal",
         expected: r#"Settle a first-responder proposal for a waiting ticket
 
@@ -223,7 +242,7 @@ Example: lisa loop --path ./my-project --max-threads 3
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 18] = [
+const OWN_COMMANDS: [&str; 19] = [
     "init",
     "validate",
     "status",
@@ -231,6 +250,7 @@ const OWN_COMMANDS: [&str; 18] = [
     "unblock",
     "already-done",
     "doctor",
+    "clean",
     "proposal",
     "loop",
     "agent-exec",
@@ -326,14 +346,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 18 own subcommands resolves — including the hidden
+/// (a) Every one of the 19 own subcommands resolves — including the hidden
 /// four, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_eighteen_subcommands_resolve() {
+fn all_nineteen_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        18,
-        "the pinned command set must be exactly 18"
+        19,
+        "the pinned command set must be exactly 19"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);

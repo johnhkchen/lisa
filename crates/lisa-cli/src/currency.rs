@@ -629,6 +629,26 @@ fn retirement_findings(retired: &[Retirement], plan: &[InitAction]) -> Vec<Curre
                     )))
                 }
 
+                // `lisa clean` removes files; it never rewrites the contents of
+                // one. When the key lifts out surgically, init has already done
+                // it and the remedy is init. When it does not, Lisa has already
+                // concluded it cannot edit this file without reformatting bytes
+                // the operator wrote — so the remedy is their one-line edit, not
+                // a deleting command taking a second opinion on the same file.
+                RetirementKind::ConfigKey if !resolved_by_init => Some(CurrencyFinding {
+                    kind: CurrencyKind::Retired,
+                    subject: retirement.subject.clone(),
+                    detail: "Lisa stopped reading this setting in 0.5.0. It is inert, not harmful \
+                             — the board advances on its artifacts either way — and init could not \
+                             lift the line out without reformatting the rest of your file."
+                        .to_string(),
+                    remedy: Remedy::Operator(format!(
+                        "no Lisa command rewrites your settings. Delete the `{RETIRED_CONFIG_KEY}` \
+                         line from [{}] in .lisa.toml yourself; nothing reads it",
+                        config::RETIRED_SCHEDULING_SECTION
+                    )),
+                }),
+
                 RetirementKind::ConfigKey => Some(carried_forward(
                     "Lisa stopped reading this setting in 0.5.0. It is inert, not harmful — the \
                      board advances on its artifacts either way."
