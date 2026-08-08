@@ -112,6 +112,14 @@ impl AttemptLease {
     }
 }
 
+/// The four phase names retired in 0.5.0.
+///
+/// Still accepted everywhere a phase is read — they map forward to
+/// [`Phase::Implement`] — and never written again. One list, because two
+/// places that disagree about which words are retired is how a board starts
+/// warning about frontmatter that was correct when it was written.
+pub const RETIRED_PHASE_NAMES: &[&str] = &["research", "design", "structure", "plan"];
+
 /// The phase of work a ticket is currently in.
 ///
 /// Phases run Ready -> Implement -> Review -> Done. Ready is the initial state
@@ -233,7 +241,7 @@ impl Phase {
             "implement" => Some(Phase::Implement),
             "review" => Some(Phase::Review),
             "done" => Some(Phase::Done),
-            "research" | "design" | "structure" | "plan" => Some(Phase::Implement),
+            retired if RETIRED_PHASE_NAMES.contains(&retired) => Some(Phase::Implement),
             _ => None,
         }
     }

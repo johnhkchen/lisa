@@ -484,6 +484,70 @@ fn check_project_version(root: &Path) -> CheckReport {
     }
 }
 
+/// How many stale-ticket findings are listed before the rest are counted.
+///
+/// A board can carry hundreds of tickets at a retired phase, and a page of
+/// identical lines is a section an operator scrolls past. The count still says
+/// how many there are.
+const MAX_LISTED_PER_KIND: usize = 5;
+
+/// Render the project-currency inventory as one more doctor section.
+///
+/// Doctor's shape is one line per check, a verdict, and — when something is
+/// wrong — the command that fixes it. Project currency is the same shape asked
+/// of the project rather than the machine. Every judgment here comes from
+/// [`crate::currency::inventory`]; this function only decides how much of it a
+/// person should read at once.
+fn format_project_currency(currency: &crate::currency::ProjectCurrency) -> String {
+    use crate::currency::CurrencyKind;
+
+    let mut out = String::from("\n\nChecking project currency...\n\n");
+
+    if currency.is_current() {
+        out.push_str(&format!(
+            "  This project is current with Lisa {}.\n",
+            currency.current_version
+        ));
+        return out;
+    }
+
+    let mut listed_per_kind = std::collections::HashMap::new();
+    let mut suppressed: Vec<(CurrencyKind, usize)> = Vec::new();
+
+    for finding in &currency.findings {
+        let listed = listed_per_kind.entry(finding.kind).or_insert(0usize);
+        if *listed >= MAX_LISTED_PER_KIND {
+            match suppressed
+                .iter_mut()
+                .find(|(kind, _)| *kind == finding.kind)
+            {
+                Some((_, count)) => *count += 1,
+                None => suppressed.push((finding.kind, 1)),
+            }
+            continue;
+        }
+        *listed += 1;
+
+        out.push_str(&format!(
+            "  {:<8} {}\n    {}\n    Remedy: {}\n",
+            finding.kind.label(),
+            finding.subject,
+            finding.detail,
+            finding.remedy.line()
+        ));
+    }
+
+    for (kind, count) in suppressed {
+        out.push_str(&format!(
+            "  {:<8} ... and {} more like the above\n",
+            kind.label(),
+            count
+        ));
+    }
+
+    out
+}
+
 /// Return the Zellij plugin cache directory using Zellij 0.43's project identity.
 fn zellij_cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("org", "Zellij Contributors", "Zellij")
@@ -686,6 +750,10 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     if has_project {
         output.push_str("\n\nChecking project...\n\n");
         output.push_str(&format!("{}\n", project_report));
+        // Informational on purpose: a project three versions behind still runs,
+        // and refusing to work is not doctor's job. Nothing below changes the
+        // exit code.
+        output.push_str(&format_project_currency(&crate::currency::inventory(root)));
     }
     append_completion_seal_report(&mut output, &completion);
     reports.push(project_report);
@@ -1695,5 +1763,122 @@ mod tests {
         let content = std::fs::read_to_string(&perms_path).unwrap();
         assert!(content.contains("lisa-plugin-old.wasm"));
         assert!(content.contains("lisa-plugin-new.wasm"));
+    }
+
+    /// The tool section is the part of `lisa doctor` people already know, and
+    /// project currency was added beside it rather than into it. Pinned whole,
+    /// byte for byte, so a change to that section has to be deliberate.
+    #[test]
+    fn test_tool_section_output_is_byte_identical() {
+        let reports = run_checks(vec![
+            mock_found("zellij", "zellij 0.43.0"),
+            mock_found("git", "git version 2.39.5"),
+            mock_found("claude", "claude 1.2.3"),
+            mock_skipped("wasm target", "rustup not found"),
+            mock_not_found("codex", "https://github.com/openai/codex"),
+            mock_unsupported(
+                "zellij",
+                "detected Zellij 0.40.1; supported range >= 0.43.0",
+                ZELLIJ_INSTALL_REMEDY,
+            ),
+        ]);
+
+        assert_eq!(
+            format_report(&reports),
+            "Checking dependencies...\n\
+             \n\
+             \x20 zellij       zellij 0.43.0  OK\n\
+             \x20 git          git version 2.39.5 OK\n\
+             \x20 claude       claude 1.2.3   OK\n\
+             \x20 wasm target  skipped (rustup not found)\n\
+             \x20 codex        not found\n\
+             \x20   Install: https://github.com/openai/codex\n\
+             \x20 zellij       unsupported\n\
+             \x20   detected Zellij 0.40.1; supported range >= 0.43.0\n\
+             \x20   Remedy: Use Zellij's prebuilt static binaries: https://github.com/zellij-org/zellij/releases\n\
+             \n\
+             Some required dependencies are unavailable or unsupported. Lisa requires supported versions of all required tools to run."
+        );
+    }
+
+    #[test]
+    fn test_fresh_init_project_gets_one_current_line() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init::run_init(dir.path(), false, crate::init::HistoryPreference::NoHistory)
+            .expect("init must succeed in an empty directory");
+
+        assert_eq!(
+            format_project_currency(&crate::currency::inventory(dir.path())),
+            format!(
+                "\n\nChecking project currency...\n\n  This project is current with Lisa {}.\n",
+                config::LISA_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn test_every_rendered_finding_names_its_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        std::fs::write(
+            dir.path().join(".lisa.toml"),
+            "version = \"0.4.0\"\n\n[scheduling]\nmax_threads = 2\nauto_advance = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            crate::templates::LEGACY_WORKFLOWS[2],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docs/active/tickets/T-024-01.md"),
+            "---\nid: T-024-01\nphase: structure\n---\n\n## Context\n",
+        )
+        .unwrap();
+
+        let section = format_project_currency(&crate::currency::inventory(dir.path()));
+
+        assert!(section.starts_with("\n\nChecking project currency...\n\n"));
+        assert!(!section.contains("This project is current"));
+        // Doctor's rule: never a finding without the thing to do about it.
+        let subject_lines = section
+            .lines()
+            .filter(|line| {
+                ["behind", "retired", "ticket"]
+                    .iter()
+                    .any(|kind| line.starts_with(&format!("  {kind}")))
+            })
+            .count();
+        assert_eq!(subject_lines, section.matches("    Remedy: ").count());
+        assert!(subject_lines >= 3, "rendered section: {section}");
+        assert!(section.contains("run `lisa init`"));
+        assert!(section.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(section.contains("auto_advance"));
+        assert!(section.contains("docs/active/tickets/T-024-01.md"));
+    }
+
+    /// A project too old to record a version is old, not broken. Doctor says so
+    /// and still exits successfully — nothing in the currency inventory feeds
+    /// [`has_failures`], and the project check itself is informational.
+    #[test]
+    fn test_pre_versioning_project_does_not_fail_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".lisa.toml"),
+            "[scheduling]\nmax_threads = 2\n",
+        )
+        .unwrap();
+
+        let mut reports = run_checks(vec![
+            mock_found("zellij", "zellij 0.43.0"),
+            mock_found("git", "git version 2.39.5"),
+        ]);
+        reports.push(check_project_version(dir.path()));
+        assert!(!has_failures(&reports));
+
+        let section = format_project_currency(&crate::currency::inventory(dir.path()));
+        assert!(section.contains("Set up before Lisa recorded a version"));
+        assert!(section.contains("run `lisa init`"));
     }
 }
