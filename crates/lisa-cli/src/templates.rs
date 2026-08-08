@@ -1,19 +1,26 @@
 use lisa_core::context::PURPOSE_PARAGRAPH;
 use std::sync::LazyLock;
 
-/// The RDSPI workflow document, embedded at compile time
-pub static RDSPI_WORKFLOW: LazyLock<String> = LazyLock::new(|| {
+/// Lisa's workflow document, embedded at compile time
+pub static LISA_WORKFLOW: LazyLock<String> = LazyLock::new(|| {
     format!(
         "{PURPOSE_PARAGRAPH}\n\n{}",
-        include_str!("../data/rdspi-workflow.md")
+        include_str!("../data/lisa-workflow.md")
     )
 });
 
 /// Exact outgoing Lisa templates accepted as proof of an unmodified install.
 /// Keep only byte-distinct generations; current content is handled separately.
-pub(crate) const LEGACY_RDSPI_WORKFLOWS: &[&str] = &[
+///
+/// This list is also the removal warrant for a project's stale
+/// `docs/knowledge/rdspi-workflow.md`: 0.5.0 installs the document under a new
+/// name, and only bytes on this list may be deleted from the old one. The files
+/// keep their original names because that is what they are — the generations
+/// Lisa shipped while the document was called `rdspi-workflow.md`.
+pub(crate) const LEGACY_WORKFLOWS: &[&str] = &[
     include_str!("../data/legacy/rdspi-workflow-v0.2.md"),
     include_str!("../data/legacy/rdspi-workflow-v0.4.md"),
+    include_str!("../data/legacy/rdspi-workflow-v0.4.4.md"),
 ];
 
 /// The hooks setup guide, embedded at compile time. Printed by `lisa hooks-guide`.
@@ -642,54 +649,93 @@ mod tests {
     use std::process::Command;
 
     #[test]
-    fn test_rdspi_workflow_embedded() {
-        assert!(RDSPI_WORKFLOW.contains("RDSPI Workflow"));
-        assert!(RDSPI_WORKFLOW.contains("Research"));
-        assert!(RDSPI_WORKFLOW.contains("Design"));
-        assert!(RDSPI_WORKFLOW.contains("Structure"));
-        assert!(RDSPI_WORKFLOW.contains("Plan"));
-        assert!(RDSPI_WORKFLOW.contains("Implement"));
-        assert!(RDSPI_WORKFLOW.contains("Review"));
+    fn test_workflow_document_embedded() {
+        assert!(LISA_WORKFLOW.contains("How a ticket moves"));
+        assert!(LISA_WORKFLOW.contains("Implement"));
+        assert!(LISA_WORKFLOW.contains("Review"));
         assert_eq!(
-            RDSPI_WORKFLOW.as_str(),
-            include_str!("../../../docs/knowledge/rdspi-workflow.md"),
+            LISA_WORKFLOW.as_str(),
+            include_str!("../../../docs/knowledge/lisa-workflow.md"),
             "checked-in project context must match the rendered template"
+        );
+    }
+
+    /// The document describes the board Lisa actually runs: four states, one
+    /// artifact pair, no phase that exists to be written about.
+    ///
+    /// The four retired phases were most of the outgoing document's bulk, and a
+    /// replacement that quietly refilled it would satisfy every other assertion
+    /// here while undoing the point — hence the length bound, measured against
+    /// the 146-line document this one replaces.
+    #[test]
+    fn the_workflow_document_describes_the_board_lisa_actually_runs() {
+        let document = LISA_WORKFLOW.as_str();
+
+        // Four states, named in order, and the retired four gone entirely.
+        let phase_line = "`phase`: `ready` | `implement` | `review` | `done`";
+        assert!(document.contains(phase_line), "phase list must be the four live states");
+        for retired in ["research.md", "design.md", "structure.md", "plan.md"] {
+            assert!(
+                !document.contains(retired),
+                "{retired} is not an artifact any more"
+            );
+        }
+
+        // One artifact pair, and no per-phase writing duty besides it.
+        assert!(document.contains("Implement produces no document. The commits are the record."));
+        assert!(document.contains("`review.md` and `review-disposition.json`"));
+
+        // Lisa still detects the artifact and advances the ticket itself.
+        assert!(document.contains(
+            "Lisa detects `review.md` and advances the ticket's `phase` field in the YAML frontmatter automatically."
+        ));
+
+        // What replaced the artifacts-are-insurance promise, stated where the
+        // person it affects reads it.
+        assert!(document.contains("Nothing in your work directory\nis a resume point."));
+        assert!(document.contains("every\n  `lisa commit-ticket` you ran is already on the branch."));
+        assert!(document.contains("The ticket restarts from the beginning."));
+
+        assert!(
+            document.lines().count() < 146,
+            "the document must be shorter than the 146-line original, got {}",
+            document.lines().count()
         );
     }
 
     #[test]
     fn test_review_disposition_contract_is_injected() {
-        assert!(RDSPI_WORKFLOW.contains("review-disposition.json"));
-        assert!(RDSPI_WORKFLOW.contains(r#"{"disposition":"pass","reason":null}"#));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains("review-disposition.json"));
+        assert!(LISA_WORKFLOW.contains(r#"{"disposition":"pass","reason":null}"#));
+        assert!(LISA_WORKFLOW.contains(
             r#"{"disposition":"note","reason":null,"criterion_quote":"<exact disputed criterion>","evidence_citation":"<repository-relative evidence path>","summary":"<plain one-sentence summary>"}"#
         ));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             r#"{"disposition":"block","reason":"<non-empty actionable reason>","remedy_owner":"<agent|operator|world>","ask":"<one-sentence action>","steps":["<optional exact step>"],"check":"<read-only verification command>","check_timeout_secs":<optional seconds the check needs>}"#
         ));
-        assert!(RDSPI_WORKFLOW
+        assert!(LISA_WORKFLOW
             .contains("A pass with a reason, or a block without a non-empty reason, is invalid."));
-        assert!(RDSPI_WORKFLOW.contains("Choose `remedy_owner` honestly"));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains("Choose `remedy_owner` honestly"));
+        assert!(LISA_WORKFLOW.contains(
             "`agent` when another coding attempt can perform the remedy, `operator` when a person must act, and `world` when external reality must change"
         ));
-        assert!(RDSPI_WORKFLOW
+        assert!(LISA_WORKFLOW
             .contains("Supply a `check` whenever the remedy is externally observable"));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             "Write the `ask` as one sentence addressed to a person who didn't do the work, naming the action rather than the subsystem."
         ));
-        assert!(RDSPI_WORKFLOW.contains("no stable Pages artifact has been deployed"));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains("no stable Pages artifact has been deployed"));
+        assert!(LISA_WORKFLOW.contains(
             "Lisa needs the release published; run: just release. Lisa will notice on its own once it's live."
         ));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             "Write for a bystander: say plainly what they should do. Keep subsystem names, measurements, and other jargon in `reason` or `steps`, not the `ask`."
         ));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             "The Codex closing leg measured 225 MiB against the ticket/story's approximately 200 MiB gate after which the runbook was raised to 300 MiB, and the seeded Zellij 0.40.1 variant bypassed the old binary through managed mode instead of recording the required recovery through Lisa's error strings; John must either provide conforming reruns or explicitly amend both acceptance requirements before Review can pass."
         ));
-        assert!(RDSPI_WORKFLOW.contains("lisa check-disposition <ticket-id>"));
-        assert!(RDSPI_WORKFLOW.contains("Correct every reported issue before finishing Review."));
+        assert!(LISA_WORKFLOW.contains("lisa check-disposition <ticket-id>"));
+        assert!(LISA_WORKFLOW.contains("Correct every reported issue before finishing Review."));
     }
 
     /// The check contract a reviewer writes against, asserted against the code
@@ -705,41 +751,41 @@ mod tests {
         use lisa_core::disposition::{DEFAULT_CHECK_BUDGET_SECS, MAX_CHECK_BUDGET_SECS};
 
         // Where it runs and what it sees — the T-056-01-02 root cause, stated.
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             "**Where it runs:** the project root, the same directory you are working in."
         ));
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             "**What it sees:** every file that is really there — build output, fetched dependencies, and anything else `.gitignore` hides from git."
         ));
 
         // Whether a check may write, decided and stated.
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             "**Writes:** a check must only look. Lisa runs it in the live project and cannot stop it writing"
         ));
-        assert!(RDSPI_WORKFLOW.contains("`npm run build && npm run verify` is not a check"));
+        assert!(LISA_WORKFLOW.contains("`npm run build && npm run verify` is not a check"));
 
         // The budget, in the document, equal to the constants in force.
         assert!(
-            RDSPI_WORKFLOW.contains(&format!(
+            LISA_WORKFLOW.contains(&format!(
                 "**How long:** {DEFAULT_CHECK_BUDGET_SECS} seconds."
             )),
             "the documented default budget must equal DEFAULT_CHECK_BUDGET_SECS"
         );
         assert!(
-            RDSPI_WORKFLOW.contains(&format!(
+            LISA_WORKFLOW.contains(&format!(
                 "declares `\"check_timeout_secs\": <seconds>`, up to {MAX_CHECK_BUDGET_SECS} ({} minutes)",
                 MAX_CHECK_BUDGET_SECS / 60
             )),
             "the documented cap must equal MAX_CHECK_BUDGET_SECS"
         );
-        assert!(RDSPI_WORKFLOW.contains("Lisa stops the check and says how long it waited."));
+        assert!(LISA_WORKFLOW.contains("Lisa stops the check and says how long it waited."));
 
         // The exit codes the runner distinguishes.
-        assert!(RDSPI_WORKFLOW
+        assert!(LISA_WORKFLOW
             .contains("`2`, `126`, `127`, or death by a signal mean the check could not look"));
 
         // And that recording a check now runs it.
-        assert!(RDSPI_WORKFLOW.contains(
+        assert!(LISA_WORKFLOW.contains(
             "`lisa check-disposition` runs your recorded check under exactly this contract and refuses one that can never pass"
         ));
     }
@@ -764,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_injected_context_is_purpose_first_and_copy_is_single_sourced() {
-        for (name, context) in [("RDSPI workflow", RDSPI_WORKFLOW.as_str())] {
+        for (name, context) in [("workflow document", LISA_WORKFLOW.as_str())] {
             assert_eq!(
                 context.matches(PURPOSE_PARAGRAPH).count(),
                 1,
@@ -786,7 +832,7 @@ mod tests {
             include_str!("../../lisa-core/src/context.rs"),
             include_str!("../../lisa-plugin/src/lib.rs"),
             include_str!("templates.rs"),
-            include_str!("../data/rdspi-workflow.md"),
+            include_str!("../data/lisa-workflow.md"),
         ];
         assert_eq!(
             template_sources

@@ -363,8 +363,8 @@ pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
     let workflow_path = root.join("docs/knowledge/rdspi-workflow.md");
     actions.push(plan_owned_template(
         workflow_path,
-        templates::RDSPI_WORKFLOW.as_str(),
-        templates::LEGACY_RDSPI_WORKFLOWS,
+        templates::LISA_WORKFLOW.as_str(),
+        templates::LEGACY_WORKFLOWS,
     ));
 
     // .lisa.toml
@@ -2832,7 +2832,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
             dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            templates::RDSPI_WORKFLOW.as_str(),
+            templates::LISA_WORKFLOW.as_str(),
         )
         .unwrap();
 
@@ -2852,7 +2852,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(
             dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            templates::LEGACY_RDSPI_WORKFLOWS[0],
+            templates::LEGACY_WORKFLOWS[0],
         )
         .unwrap();
         for (name, content) in [
@@ -2885,13 +2885,13 @@ depends_on: [T-999]
     #[test]
     fn test_plan_init_updates_every_known_rdspi_template() {
         assert!(
-            templates::LEGACY_RDSPI_WORKFLOWS
+            templates::LEGACY_WORKFLOWS
                 .iter()
-                .all(|legacy| *legacy != templates::RDSPI_WORKFLOW.as_str()),
+                .all(|legacy| *legacy != templates::LISA_WORKFLOW.as_str()),
             "legacy workflow fixtures must be byte-distinct from current content"
         );
 
-        for legacy in templates::LEGACY_RDSPI_WORKFLOWS {
+        for legacy in templates::LEGACY_WORKFLOWS {
             let dir = tempfile::tempdir().unwrap();
             fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
             fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), legacy).unwrap();
@@ -2902,7 +2902,7 @@ depends_on: [T-999]
                 actions.iter().any(
                     |action| matches!(action, InitAction::UpdateFile { path, content }
                         if path.ends_with("rdspi-workflow.md")
-                            && content == templates::RDSPI_WORKFLOW.as_str())
+                            && content == templates::LISA_WORKFLOW.as_str())
                 ),
                 "every exact prior Lisa workflow must upgrade to the current template"
             );
@@ -2916,7 +2916,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(
             dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            templates::RDSPI_WORKFLOW.as_str(),
+            templates::LISA_WORKFLOW.as_str(),
         )
         .unwrap();
         for (name, content) in [
@@ -3119,7 +3119,7 @@ depends_on: [T-999]
 
         let workflow = format!(
             "{}\n## Story Layer\n\nRead the parent story before every ticket.\n",
-            templates::RDSPI_WORKFLOW.as_str()
+            templates::LISA_WORKFLOW.as_str()
         );
         let stop_hook = format!(
             "{}\n# Project addition: notify the local supervisor.\n",
