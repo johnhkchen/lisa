@@ -49,7 +49,8 @@ fn section_init(root: &Path) -> GuideSection {
          | `docs/archive/` | Completed tickets, stories, and work |\n\
          | `.lisa/hooks/` | Signal hooks (`on-idle.sh`, `on-stop.sh`, `on-clear.sh`, `on-heartbeat.sh`) |\n\
          | `.lisa/signals/` | Ephemeral signal files (gitignored) |\n\
-         | `.claude/settings.local.json` | Claude Code hook integration |\n\n\
+         | `.claude/settings.local.json` | Claude Code hook integration |\n\
+         | `.codex/hooks.json` | Codex hook integration |\n\n\
          `.lisa.toml` is the only file `lisa init` puts in the project root. Your agent \
          context file is not on this list, and Step 3 explains why."
             .to_string()
