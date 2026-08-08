@@ -57,18 +57,6 @@ impl AgentClient {
             AgentClient::Codex => "codex",
         }
     }
-
-    /// The project-context filename this client auto-loads: Claude Code reads
-    /// `CLAUDE.md`; Codex reads `AGENTS.md` (a Linux-Foundation standard, see
-    /// codex-client doc 06). The RDSPI ticket prompt points each agent at the
-    /// file its own client loads — the two files share one source of truth
-    /// (`lisa init` scaffolds `AGENTS.md` as a pointer to `CLAUDE.md`).
-    pub fn context_file(&self) -> &'static str {
-        match self {
-            AgentClient::Claude => "CLAUDE.md",
-            AgentClient::Codex => "AGENTS.md",
-        }
-    }
 }
 
 impl fmt::Display for AgentClient {
@@ -128,11 +116,5 @@ mod tests {
     #[test]
     fn display_matches_as_str() {
         assert_eq!(AgentClient::Codex.to_string(), "codex");
-    }
-
-    #[test]
-    fn context_file_per_client() {
-        assert_eq!(AgentClient::Claude.context_file(), "CLAUDE.md");
-        assert_eq!(AgentClient::Codex.context_file(), "AGENTS.md");
     }
 }

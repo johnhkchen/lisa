@@ -113,16 +113,15 @@ const AGENT_EXIT_GRACE_SECS: u64 = 8;
 
 /// The prompt text sent to an agent for a ticket.
 ///
-/// `context_file` is the per-client project-context filename the agent should
-/// read (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex — see
-/// [`AgentClient::context_file`]). The prompt body is otherwise identical across
-/// clients, so it stays single-sourced here.
-pub(crate) fn ticket_prompt(
-    ticket_dir: &Path,
-    ticket_id: &str,
-    context_file: &str,
-    artifact_dir: &Path,
-) -> String {
+/// Every client receives this exact text: no per-client substitution, and no
+/// instruction to read a project-context file. Claude Code loads `CLAUDE.md` on
+/// its own and Codex loads `AGENTS.md` on its own, so naming either would say
+/// only that Lisa owns a file it does not.
+///
+/// What survives is Lisa's contract, which an agent cannot infer: where its
+/// attempt directory is and that `docs/active/work/` is Lisa's to publish, how
+/// to commit, the two Review artifacts and their check, and where to stop.
+pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, artifact_dir: &Path) -> String {
     let ticket = lisa_core::ticket::scan_tickets(ticket_dir)
         .ok()
         .and_then(|tickets| tickets.into_iter().find(|ticket| ticket.id == ticket_id));
@@ -136,33 +135,27 @@ pub(crate) fn ticket_prompt(
             " Recovery case: this ticket already starts in Review. Inspect any existing \
              docs/active/work/{ticket_id}/review.md and the committed ticket-owned changes, then immediately \
              write a current-attempt review.md and review-disposition.json under {}/. Do not wait for a timeout, \
-             redo earlier phases, or change source unless that Review finds a real defect.",
+             redo earlier work, or change source unless that Review finds a real defect.",
             artifact_dir.display(),
         )
     } else {
         String::new()
     };
     format!(
-        "{purpose}\n\nRead the ticket at {path}, {context}, and docs/knowledge/rdspi-workflow.md. \
-         Your job: start from the current phase in the ticket frontmatter and work through ALL remaining phases \
-         (Research, Design, Structure, Plan, Implement, Review) without stopping between phases. \
-         For each phase, write the artifact to {artifact_dir}/ then immediately continue to the next phase. \
-         This directory is private to your current attempt; Lisa publishes admitted artifacts to \
-         docs/active/work/{id}/ after verifying your lease. Do not write phase artifacts directly to that shared path. \
-         Do NOT update the ticket's phase or status fields in the frontmatter — \
-         Lisa detects your artifacts and handles all phase transitions automatically. \
-         During Implement, commit each meaningful ticket-owned source unit only with \
-         lisa commit-ticket and exact repository-relative --include paths. Do not use ordinary-index git add, \
-         git add -A, or git commit for ticket work, and do not leave ticket-owned files staged, modified, or untracked. \
-         During Review, write review.md summarizing changes, test coverage, and open concerns, and also write \
-         {artifact_dir}/review-disposition.json with exactly {pass_json} when the work is ready to complete, \
-         or {block_json} with a non-empty actionable reason when it is blocked. Both Review artifacts are required. \
-         After Review is complete, \
-         remain on this ticket and stop. Do not start another ticket until Lisa confirms the completion commit; \
-         Lisa handles Done publication and seat release.{review_recovery}",
+        "{purpose}\n\nRead the ticket at {path} and docs/knowledge/lisa-workflow.md, then do what it asks. \
+         Write your files for this attempt under {artifact_dir}/, which is private to it; Lisa publishes \
+         admitted artifacts to docs/active/work/{id}/ after verifying your lease, so never write there yourself. \
+         Commit each meaningful ticket-owned unit with lisa commit-ticket and exact repository-relative \
+         --include paths; do not use ordinary-index git add, git add -A, or git commit for ticket work, \
+         and do not leave ticket-owned files staged, modified, or untracked. \
+         Finish with two files: {artifact_dir}/review.md — what changed, how it is tested, what still concerns you — \
+         and {artifact_dir}/review-disposition.json, exactly {pass_json} when the work is ready to complete \
+         or {block_json} when it is blocked; then run lisa check-disposition {id} and correct what it reports. \
+         Do not edit the ticket's phase or status fields, and do not publish completion yourself: once both files \
+         are written, stop and wait while Lisa advances the phase, commits Done, and releases the seat.\
+         {review_recovery}",
         path = ticket_path.display(),
         purpose = PURPOSE_PARAGRAPH,
-        context = context_file,
         id = ticket_id,
         artifact_dir = artifact_dir.display(),
         pass_json = r#"{"disposition":"pass","reason":null}"#,
@@ -12838,7 +12831,7 @@ mod tests {
     #[test]
     fn test_build_claude_command_excludes_assignment_reference() {
         let cmd = build_claude_command("T-001", 1, 1, None, None);
-        assert!(!cmd.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(!cmd.contains("docs/knowledge/lisa-workflow.md"));
         assert!(!cmd.contains("assignment.md"));
     }
 
@@ -13311,34 +13304,74 @@ mod tests {
         }
     }
 
+    /// Wrapped-line budget for the rendered Implement prompt, measured at
+    /// [`PROMPT_WRAP_COLUMNS`].
+    ///
+    /// The 0.4.4 prompt this replaced measured 21 such lines for the same
+    /// ticket; the text that replaced it measures 17 with a descriptive ticket
+    /// filename and 16 with a bare one. The budget sits between the two, so
+    /// passing it *is* the claim that the prompt got shorter. The one line of
+    /// slack absorbs a longer attempt path, not another instruction: restoring
+    /// the phase recital alone costs five lines and breaks this.
+    const PROMPT_LINE_BUDGET: usize = 18;
+
+    /// The width the assignment file is read at.
+    const PROMPT_WRAP_COLUMNS: usize = 100;
+
+    /// Greedy whitespace wrap; an empty paragraph still occupies a line.
+    fn wrapped_line_count(text: &str, columns: usize) -> usize {
+        text.split('\n')
+            .map(|paragraph| {
+                let mut lines = 1;
+                let mut width = 0;
+                for word in paragraph.split_whitespace() {
+                    let next = if width == 0 {
+                        word.chars().count()
+                    } else {
+                        width + 1 + word.chars().count()
+                    };
+                    if next > columns && width > 0 {
+                        lines += 1;
+                        width = word.chars().count();
+                    } else {
+                        width = next;
+                    }
+                }
+                lines
+            })
+            .sum()
+    }
+
     #[test]
     fn test_ticket_prompt_content() {
         let dir = Path::new("docs/active/tickets");
-        let prompt = ticket_prompt(
-            dir,
-            "T-024-03",
-            AgentClient::Claude.context_file(),
-            Path::new(".lisa/attempts/T-024-03/1/work"),
-        );
+        let prompt = ticket_prompt(dir, "T-024-03", Path::new(".lisa/attempts/T-024-03/1/work"));
 
+        // Where to read.
         assert!(prompt.contains("docs/active/tickets/T-024-03.md"));
-        assert!(prompt.contains("CLAUDE.md"));
-        assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
+        assert!(prompt.contains("docs/knowledge/lisa-workflow.md"));
+        // Where to write, and the boundary Lisa owns.
         assert!(prompt.contains(".lisa/attempts/T-024-03/1/work"));
-        assert!(prompt.contains("Do not write phase artifacts directly"));
-        assert!(prompt.contains("current phase"));
+        assert!(prompt.contains("docs/active/work/T-024-03/"));
+        assert!(prompt.contains("never write there yourself"));
+        // How to commit.
         assert!(prompt.contains("lisa commit-ticket"));
         assert!(prompt.contains("exact repository-relative --include paths"));
-        assert!(prompt.contains("Do not use ordinary-index git add"));
+        assert!(prompt.contains("do not use ordinary-index git add"));
         assert!(prompt.contains("git add -A"));
         assert!(prompt.contains("do not leave ticket-owned files staged, modified, or untracked"));
-        assert!(prompt.contains("review-disposition.json"));
+        // How to finish.
+        assert!(prompt.contains(".lisa/attempts/T-024-03/1/work/review.md"));
+        assert!(prompt.contains(".lisa/attempts/T-024-03/1/work/review-disposition.json"));
         assert!(prompt.contains(r#"{"disposition":"pass","reason":null}"#));
         assert!(
             prompt.contains(r#"{"disposition":"block","reason":"<non-empty actionable reason>"}"#)
         );
-        assert!(prompt.contains("Both Review artifacts are required"));
-        assert!(prompt.contains("Do not start another ticket until Lisa confirms"));
+        assert!(prompt.contains("lisa check-disposition T-024-03"));
+        // Where to stop.
+        assert!(prompt.contains("Do not edit the ticket's phase or status fields"));
+        assert!(prompt.contains("do not publish completion yourself"));
+        assert!(prompt.contains("stop and wait"));
     }
 
     #[test]
@@ -13346,7 +13379,6 @@ mod tests {
         let prompt = ticket_prompt(
             Path::new("docs/active/tickets"),
             "T-024-03",
-            AgentClient::Claude.context_file(),
             Path::new(".lisa/attempts/T-024-03/1/work"),
         );
         assert!(prompt.starts_with(PURPOSE_PARAGRAPH));
@@ -13363,19 +13395,66 @@ mod tests {
         }
     }
 
+    /// The prompt names no project-context file, for any client, and no phase
+    /// sequence. Each client already loads its own context file natively, and
+    /// the board has one working phase — naming either would describe apparatus
+    /// Lisa does not own and a march it does not run.
     #[test]
-    fn test_ticket_prompt_uses_given_context_file() {
-        let dir = Path::new("docs/active/tickets");
-        // Codex's context file replaces CLAUDE.md in the shared prompt body.
+    fn test_ticket_prompt_names_no_context_file_and_no_phase_sequence() {
         let prompt = ticket_prompt(
-            dir,
+            Path::new("docs/active/tickets"),
             "T-024-03",
-            "AGENTS.md",
             Path::new(".lisa/attempts/T-024-03/1/work"),
         );
-        assert!(prompt.contains("AGENTS.md"));
-        assert!(!prompt.contains("CLAUDE.md"));
-        assert!(prompt.contains("docs/knowledge/rdspi-workflow.md"));
+
+        assert!(!prompt.contains("CLAUDE.md"), "got: {prompt}");
+        assert!(!prompt.contains("AGENTS.md"), "got: {prompt}");
+        for retired in [
+            "Research",
+            "Design",
+            "Structure",
+            "Plan",
+            "each phase",
+            "next phase",
+            "remaining phases",
+            "rdspi",
+        ] {
+            assert!(!prompt.contains(retired), "prompt still says {retired}");
+        }
+    }
+
+    /// The property behind "write the prompt shorter than the one it replaces":
+    /// the Implement prompt fits in one screenful of contract. See
+    /// [`PROMPT_LINE_BUDGET`] for the number and why it is that number.
+    #[test]
+    fn implement_prompt_fits_the_line_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("tickets");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        // A descriptive filename, so the budget is measured against the longer
+        // of the two substitution shapes rather than the shortest one.
+        std::fs::write(
+            ticket_dir.join("T-057-01-04-the-prompt-says-less.md"),
+            "---\nid: T-057-01-04\ntitle: the-prompt-says-less\ntype: task\nstatus: open\npriority: critical\nphase: implement\n---\n",
+        )
+        .unwrap();
+
+        let prompt = ticket_prompt(
+            &ticket_dir,
+            "T-057-01-04",
+            Path::new(".lisa/attempts/T-057-01-04/1/work"),
+        );
+
+        // The fixture's ticket directory is an absolute temp path whose length
+        // varies by platform; an agent is handed the repository-relative one.
+        // Measure what the agent sees, so the budget means the same on every host.
+        let prompt = prompt.replace(&ticket_dir.display().to_string(), "docs/active/tickets");
+        let lines = wrapped_line_count(&prompt, PROMPT_WRAP_COLUMNS);
+        assert!(
+            lines <= PROMPT_LINE_BUDGET,
+            "Implement prompt is {lines} lines at {PROMPT_WRAP_COLUMNS} columns, \
+             over the {PROMPT_LINE_BUDGET}-line budget:\n{prompt}"
+        );
     }
 
     #[test]
@@ -13392,7 +13471,6 @@ mod tests {
         let prompt = ticket_prompt(
             &ticket_dir,
             "T-024-03",
-            "AGENTS.md",
             Path::new(".lisa/attempts/T-024-03/1/work"),
         );
 
@@ -13413,7 +13491,7 @@ mod tests {
         .unwrap();
         let artifact_dir = Path::new(".lisa/attempts/T-RECOVER/2/work");
 
-        let prompt = ticket_prompt(&ticket_dir, "T-RECOVER", "AGENTS.md", artifact_dir);
+        let prompt = ticket_prompt(&ticket_dir, "T-RECOVER", artifact_dir);
 
         assert!(prompt.contains("Recovery case: this ticket already starts in Review"));
         assert!(prompt.contains("docs/active/work/T-RECOVER/review.md"));
@@ -13421,6 +13499,10 @@ mod tests {
         assert!(prompt.contains("review-disposition.json"));
         assert!(prompt.contains("Do not wait for a timeout"));
         assert!(prompt.contains(".lisa/attempts/T-RECOVER/2/work/"));
+        // The recovery clause is the tail of this prompt, and the prompt it is
+        // the tail of names the workflow document under its current name only.
+        assert!(prompt.contains("docs/knowledge/lisa-workflow.md"));
+        assert!(!prompt.contains("rdspi"), "got: {prompt}");
     }
 
     #[test]
@@ -19476,7 +19558,10 @@ mod tests {
 
             let assignment_body = std::fs::read_to_string(&assignment_ref.path).unwrap();
             assert!(assignment_body.contains("Read the ticket"));
-            assert!(assignment_body.contains("AGENTS.md"));
+            // End-to-end proof for the parity assertion: the file a Codex agent
+            // actually opens names neither context file.
+            assert!(!assignment_body.contains("AGENTS.md"));
+            assert!(!assignment_body.contains("CLAUDE.md"));
 
             let launch_path = state
                 .attempt_work_dir(&lease)
@@ -19494,7 +19579,6 @@ mod tests {
                 shell_quote(&pane_assignment_path.to_string_lossy())
             )));
             assert!(!launch_script.contains("Read the ticket"));
-            assert!(!launch_script.contains("AGENTS.md"));
             assert!(!launch_script.contains(" codex --dangerously"));
 
             let pane_line = state
@@ -19518,7 +19602,6 @@ mod tests {
                 )
             );
             assert!(!pane_line.contains("Read the ticket"));
-            assert!(!pane_line.contains("AGENTS.md"));
             assert!(!pane_line.contains("launch-codex"));
 
             let slot = state

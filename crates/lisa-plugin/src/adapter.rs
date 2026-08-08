@@ -296,12 +296,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 
     fn assignment_text(&self, ctx: &SpawnContext) -> String {
-        ticket_prompt(
-            ctx.ticket_dir,
-            ctx.ticket_id,
-            AgentClient::Claude.context_file(),
-            ctx.artifact_dir,
-        )
+        ticket_prompt(ctx.ticket_dir, ctx.ticket_id, ctx.artifact_dir)
     }
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
@@ -432,12 +427,7 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn assignment_text(&self, ctx: &SpawnContext) -> String {
-        ticket_prompt(
-            ctx.ticket_dir,
-            ctx.ticket_id,
-            AgentClient::Codex.context_file(),
-            ctx.artifact_dir,
-        )
+        ticket_prompt(ctx.ticket_dir, ctx.ticket_id, ctx.artifact_dir)
     }
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
@@ -597,12 +587,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
             ClaudeCodeAdapter::default().reuse_prompt(&ctx),
-            ticket_prompt(
-                dir,
-                "T-042-01",
-                AgentClient::Claude.context_file(),
-                ctx.artifact_dir,
-            )
+            ticket_prompt(dir, "T-042-01", ctx.artifact_dir)
         );
     }
 
@@ -781,28 +766,37 @@ mod tests {
         assert!(!cmd.contains("codex --dangerously-bypass"));
         assert!(cmd.contains(".lisa/signals/pane-7.error"));
         assert!(!cmd.contains("Read the ticket"));
-        assert!(!cmd.contains("AGENTS.md"));
         assert!(!cmd.contains("LISA_ASSIGNMENT"));
     }
 
+    /// The parity assertion (P3): one contract boundary, one text, no per-client
+    /// substitution. The three one-sided tests this replaced ("Codex's prompt
+    /// does not mention CLAUDE.md") were each satisfiable by a prompt that still
+    /// hard-coded the *other* filename; equality plus a two-sided absence is not.
+    ///
+    /// Parity is only of the assignment text. The adapters keep every difference
+    /// that is real — launch line, reset strategy, completion exit (N1) — and the
+    /// launch commands still carry a path, never the prompt.
     #[test]
-    fn provider_assignment_text_uses_its_context_file_while_launch_is_path_only() {
+    fn both_providers_get_the_same_assignment_text_naming_no_context_file() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 1);
 
         let codex = CodexAdapter::new(Some("/abs/lisa"), None);
-        assert!(codex.assignment_text(&ctx).contains("AGENTS.md"));
-        assert!(!codex.assignment_text(&ctx).contains("CLAUDE.md"));
-        assert!(!codex
-            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH))
-            .contains("AGENTS.md"));
-
         let claude = ClaudeCodeAdapter::default();
-        assert!(claude.assignment_text(&ctx).contains("CLAUDE.md"));
-        assert!(!claude.assignment_text(&ctx).contains("AGENTS.md"));
-        assert!(!claude
-            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH))
-            .contains("CLAUDE.md"));
+
+        for text in [claude.assignment_text(&ctx), codex.assignment_text(&ctx)] {
+            assert!(!text.contains("CLAUDE.md"), "got: {text}");
+            assert!(!text.contains("AGENTS.md"), "got: {text}");
+        }
+        assert_eq!(claude.assignment_text(&ctx), codex.assignment_text(&ctx));
+
+        for launch in [
+            claude.launch_command(&ctx, Path::new(ASSIGNMENT_PATH)),
+            codex.launch_command(&ctx, Path::new(ASSIGNMENT_PATH)),
+        ] {
+            assert!(!launch.contains("Read the ticket"), "got: {launch}");
+        }
     }
 
     #[test]
@@ -832,12 +826,7 @@ mod tests {
         let a = CodexAdapter::new(Some("/abs/lisa"), None);
         assert_eq!(
             a.reuse_prompt(&ctx),
-            ticket_prompt(
-                dir,
-                "T-042-01",
-                AgentClient::Codex.context_file(),
-                ctx.artifact_dir,
-            )
+            ticket_prompt(dir, "T-042-01", ctx.artifact_dir)
         );
         assert!(!a.reuse_prompt(&ctx).contains(" codex "));
     }
