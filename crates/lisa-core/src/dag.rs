@@ -286,8 +286,7 @@ impl Dag {
 
     /// Gets all tickets currently in progress (active phases).
     ///
-    /// This includes tickets in Research, Design, Structure, Plan, Implement,
-    /// or Review phases.
+    /// This includes tickets in the Implement or Review phases.
     pub fn get_in_progress_tickets(&self) -> Vec<TicketId> {
         self.nodes
             .values()
@@ -654,15 +653,8 @@ mod tests {
 
     #[test]
     fn test_active_phase_tickets_are_startable() {
-        // Ready through Implement are schedulable
-        for phase in &[
-            Phase::Ready,
-            Phase::Research,
-            Phase::Design,
-            Phase::Structure,
-            Phase::Plan,
-            Phase::Implement,
-        ] {
+        // Ready through Review are schedulable
+        for phase in &[Phase::Ready, Phase::Implement, Phase::Review] {
             let ticket = make_ticket("T-001", *phase, vec![], vec![]);
             let dag = Dag::from_tickets(vec![ticket]).unwrap();
             assert!(
@@ -714,7 +706,7 @@ mod tests {
     #[test]
     fn test_multiple_dependencies_partial() {
         let t1 = make_ticket("T-001", Phase::Done, vec![], vec![]);
-        let t2 = make_ticket("T-002", Phase::Research, vec![], vec![]);
+        let t2 = make_ticket("T-002", Phase::Implement, vec![], vec![]);
         let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001", "T-002"], vec![]);
 
         let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
@@ -733,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_get_blocked_by() {
-        let t1 = make_ticket("T-001", Phase::Research, vec![], vec!["T-002", "T-003"]);
+        let t1 = make_ticket("T-001", Phase::Implement, vec![], vec!["T-002", "T-003"]);
         let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
         let t3 = make_ticket("T-003", Phase::Ready, vec!["T-001"], vec![]);
 
@@ -845,7 +837,7 @@ mod tests {
     #[test]
     fn test_stats() {
         let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
-        let t2 = make_ticket("T-002", Phase::Research, vec!["T-001"], vec!["T-003"]);
+        let t2 = make_ticket("T-002", Phase::Implement, vec!["T-001"], vec!["T-003"]);
         let t3 = make_ticket("T-003", Phase::Ready, vec!["T-002"], vec![]);
 
         let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
@@ -853,7 +845,7 @@ mod tests {
 
         assert_eq!(stats.total_tickets, 3);
         assert_eq!(stats.done_tickets, 1);
-        assert_eq!(stats.in_progress_tickets, 1); // T-002 is in Research
+        assert_eq!(stats.in_progress_tickets, 1); // T-002 is in Implement
         assert_eq!(stats.critical_path_length, 3);
     }
 
@@ -968,7 +960,7 @@ mod tests {
     fn test_runnable_tickets() {
         let t1 = make_ticket("T-001", Phase::Done, vec![], vec!["T-002"]);
         let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
-        let t3 = make_ticket("T-003", Phase::Research, vec![], vec![]);
+        let t3 = make_ticket("T-003", Phase::Implement, vec![], vec![]);
 
         let dag = Dag::from_tickets(vec![t1, t2, t3]).unwrap();
         let mut runnable = dag.get_runnable_tickets();
@@ -1156,7 +1148,7 @@ mod tests {
 
     #[test]
     fn test_all_ancestors_done_direct_dep_not_done() {
-        let t1 = make_ticket("T-001", Phase::Research, vec![], vec![]);
+        let t1 = make_ticket("T-001", Phase::Implement, vec![], vec![]);
         let t2 = make_ticket("T-002", Phase::Ready, vec!["T-001"], vec![]);
         let dag = Dag::from_tickets(vec![t1, t2]).unwrap();
         assert!(!dag.all_ancestors_done(&"T-002".to_string()));
@@ -1165,7 +1157,7 @@ mod tests {
     #[test]
     fn test_all_ancestors_done_transitive_gap() {
         // A(open) → B(done) → C(ready): C should NOT be schedulable
-        let a = make_ticket("A", Phase::Research, vec![], vec![]);
+        let a = make_ticket("A", Phase::Implement, vec![], vec![]);
         let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
         let c = make_ticket("C", Phase::Ready, vec!["B"], vec![]);
         let dag = Dag::from_tickets(vec![a, b, c]).unwrap();
@@ -1191,7 +1183,7 @@ mod tests {
         //     D(ready)
         let a = make_ticket("A", Phase::Done, vec![], vec![]);
         let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
-        let c = make_ticket("C", Phase::Research, vec!["A"], vec![]);
+        let c = make_ticket("C", Phase::Implement, vec!["A"], vec![]);
         let d = make_ticket("D", Phase::Ready, vec!["B", "C"], vec![]);
         let dag = Dag::from_tickets(vec![a, b, c, d]).unwrap();
         // C is not done, so D should not be schedulable
@@ -1219,13 +1211,13 @@ mod tests {
         // A(open) → B(done) → C(ready)
         // C's direct dep B is done, but B's dep A is not.
         // can_start should return false for C.
-        let a = make_ticket("A", Phase::Research, vec![], vec![]);
+        let a = make_ticket("A", Phase::Implement, vec![], vec![]);
         let b = make_ticket("B", Phase::Done, vec!["A"], vec![]);
         let c = make_ticket("C", Phase::Ready, vec!["B"], vec![]);
         let dag = Dag::from_tickets(vec![a, b, c]).unwrap();
 
         assert!(!dag.can_start(&"C".to_string()));
-        // A is still runnable (Research, no deps), but C must not appear
+        // A is still runnable (Implement, no deps), but C must not appear
         let ready = dag.get_ready_tickets();
         assert!(!ready.contains(&"C".to_string()));
     }

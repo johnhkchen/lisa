@@ -114,23 +114,27 @@ impl AttemptLease {
 
 /// The phase of work a ticket is currently in.
 ///
-/// Phases follow the RDSPIR workflow: Research -> Design -> Structure -> Plan -> Implement -> Review.
-/// Ready is the initial state and Done is terminal.
+/// Phases run Ready -> Implement -> Review -> Done. Ready is the initial state
+/// and Done is terminal; the two in between are the only ones an agent works in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
     /// Ticket is ready to be picked up but work has not started
     #[default]
     Ready,
-    /// Descriptive mapping of codebase - what exists, where, how it connects
-    Research,
-    /// Options explored, tradeoffs evaluated, decision with rationale
-    Design,
-    /// File-level changes, architecture, component boundaries, ordering
-    Structure,
-    /// Sequenced implementation steps, testing strategy, verification criteria
-    Plan,
-    /// Active implementation work
+    /// Active implementation work.
+    ///
+    /// The aliases are the four phase names retired in 0.5.0. `Phase` is
+    /// serde-persisted — the completion journal records `prior_phase`, and
+    /// journal replay is fail-closed — so a line written by a 0.4 board must
+    /// still deserialize or the whole board stops scheduling. Serialization is
+    /// unaffected: only `implement` is ever written back.
+    #[serde(
+        alias = "research",
+        alias = "design",
+        alias = "structure",
+        alias = "plan"
+    )]
     Implement,
     /// Agent self-review: produces review.md artifact
     Review,
@@ -142,10 +146,6 @@ impl fmt::Display for Phase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Phase::Ready => write!(f, "ready"),
-            Phase::Research => write!(f, "research"),
-            Phase::Design => write!(f, "design"),
-            Phase::Structure => write!(f, "structure"),
-            Phase::Plan => write!(f, "plan"),
             Phase::Implement => write!(f, "implement"),
             Phase::Review => write!(f, "review"),
             Phase::Done => write!(f, "done"),
@@ -157,11 +157,7 @@ impl Phase {
     /// Returns the next phase in the workflow, or None if already Done.
     pub fn next(&self) -> Option<Phase> {
         match self {
-            Phase::Ready => Some(Phase::Research),
-            Phase::Research => Some(Phase::Design),
-            Phase::Design => Some(Phase::Structure),
-            Phase::Structure => Some(Phase::Plan),
-            Phase::Plan => Some(Phase::Implement),
+            Phase::Ready => Some(Phase::Implement),
             Phase::Implement => Some(Phase::Review),
             Phase::Review => Some(Phase::Done),
             Phase::Done => None,
@@ -169,30 +165,20 @@ impl Phase {
     }
 
     /// Returns the artifact filename for this phase, if any.
+    ///
+    /// Only `Review` has one. `Implement` deliberately returns `None`: its
+    /// living `progress.md` was never a phase edge, and the scheduler has
+    /// always routed Implement's advancement through `review.md` instead.
     pub fn artifact_filename(&self) -> Option<&'static str> {
         match self {
-            Phase::Research => Some("research.md"),
-            Phase::Design => Some("design.md"),
-            Phase::Structure => Some("structure.md"),
-            Phase::Plan => Some("plan.md"),
-            Phase::Implement => Some("progress.md"),
             Phase::Review => Some("review.md"),
-            Phase::Ready | Phase::Done => None,
+            Phase::Ready | Phase::Implement | Phase::Done => None,
         }
     }
 
     /// Returns all phases in workflow order.
     pub fn all() -> &'static [Phase] {
-        &[
-            Phase::Ready,
-            Phase::Research,
-            Phase::Design,
-            Phase::Structure,
-            Phase::Plan,
-            Phase::Implement,
-            Phase::Review,
-            Phase::Done,
-        ]
+        &[Phase::Ready, Phase::Implement, Phase::Review, Phase::Done]
     }
 
     /// Returns true if this phase indicates the ticket can be scheduled.
@@ -204,17 +190,9 @@ impl Phase {
 
     /// Returns true if this phase indicates active work is happening.
     ///
-    /// Research, Design, Structure, Plan, Implement, and Review are active phases.
+    /// Implement and Review are active phases.
     pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            Phase::Research
-                | Phase::Design
-                | Phase::Structure
-                | Phase::Plan
-                | Phase::Implement
-                | Phase::Review
-        )
+        matches!(self, Phase::Implement | Phase::Review)
     }
 
     /// Returns true if this phase is complete.
@@ -223,16 +201,23 @@ impl Phase {
     }
 
     /// Parse a phase from its lowercase string name.
+    ///
+    /// This is the single phase-name table in the codebase; `ticket::parse_phase`
+    /// delegates here so the two entry points cannot drift apart.
+    ///
+    /// `research`, `design`, `structure` and `plan` are the four phase names
+    /// retired in 0.5.0. They are still accepted and map forward to `Implement`,
+    /// so a board written against 0.4 keeps loading without hand-edited
+    /// frontmatter. They are never emitted again — `Display` and
+    /// `ticket::phase_to_string` have no arm for them — so a board self-heals to
+    /// the current vocabulary the first time Lisa rewrites any row.
     pub fn from_name(s: &str) -> Option<Phase> {
         match s {
             "ready" => Some(Phase::Ready),
-            "research" => Some(Phase::Research),
-            "design" => Some(Phase::Design),
-            "structure" => Some(Phase::Structure),
-            "plan" => Some(Phase::Plan),
             "implement" => Some(Phase::Implement),
             "review" => Some(Phase::Review),
             "done" => Some(Phase::Done),
+            "research" | "design" | "structure" | "plan" => Some(Phase::Implement),
             _ => None,
         }
     }
@@ -1155,25 +1140,33 @@ mod tests {
 
     #[test]
     fn test_phase_next() {
-        assert_eq!(Phase::Ready.next(), Some(Phase::Research));
-        assert_eq!(Phase::Research.next(), Some(Phase::Design));
-        assert_eq!(Phase::Design.next(), Some(Phase::Structure));
-        assert_eq!(Phase::Structure.next(), Some(Phase::Plan));
-        assert_eq!(Phase::Plan.next(), Some(Phase::Implement));
+        assert_eq!(Phase::Ready.next(), Some(Phase::Implement));
         assert_eq!(Phase::Implement.next(), Some(Phase::Review));
         assert_eq!(Phase::Review.next(), Some(Phase::Done));
         assert_eq!(Phase::Done.next(), None);
+
+        // The same chain walked from the front, so `all()` and `next()` cannot
+        // describe different workflows.
+        let mut walked = vec![Phase::Ready];
+        while let Some(next) = walked.last().unwrap().next() {
+            walked.push(next);
+        }
+        assert_eq!(walked, Phase::all());
+        assert_eq!(
+            walked,
+            vec![Phase::Ready, Phase::Implement, Phase::Review, Phase::Done]
+        );
     }
 
     #[test]
     fn test_phase_artifact_filename() {
-        assert_eq!(Phase::Research.artifact_filename(), Some("research.md"));
-        assert_eq!(Phase::Design.artifact_filename(), Some("design.md"));
-        assert_eq!(Phase::Structure.artifact_filename(), Some("structure.md"));
-        assert_eq!(Phase::Plan.artifact_filename(), Some("plan.md"));
-        assert_eq!(Phase::Implement.artifact_filename(), Some("progress.md"));
-        assert_eq!(Phase::Ready.artifact_filename(), None);
+        // Review is the only phase an artifact advances. Implement returning
+        // None is the point of the collapse, not an oversight: progress.md was
+        // never a phase edge, and Implement's advancement runs through
+        // review.md.
         assert_eq!(Phase::Review.artifact_filename(), Some("review.md"));
+        assert_eq!(Phase::Ready.artifact_filename(), None);
+        assert_eq!(Phase::Implement.artifact_filename(), None);
         assert_eq!(Phase::Done.artifact_filename(), None);
     }
 
@@ -1227,6 +1220,9 @@ mod tests {
             "status": "running"
         }"#;
         let thread: Thread = serde_json::from_str(json).unwrap();
+        // The persisted phase name is one of the four retired in 0.5.0; it
+        // deserializes forward rather than failing the whole record.
+        assert_eq!(thread.current_phase, Phase::Implement);
         assert_eq!(thread.attempt_lease, None);
         assert_eq!(thread.client, AgentClient::default());
         assert_eq!(thread.concurrency_at_spawn, 0);
@@ -1258,12 +1254,29 @@ mod tests {
 
     #[test]
     fn test_phase_serde() {
-        let phase = Phase::Research;
+        let phase = Phase::Implement;
         let json = serde_json::to_string(&phase).unwrap();
-        assert_eq!(json, "\"research\"");
+        assert_eq!(json, "\"implement\"");
 
-        let parsed: Phase = serde_json::from_str("\"design\"").unwrap();
-        assert_eq!(parsed, Phase::Design);
+        let parsed: Phase = serde_json::from_str("\"review\"").unwrap();
+        assert_eq!(parsed, Phase::Review);
+    }
+
+    /// The third migration surface, alongside the two string parsers: `Phase`
+    /// is serde-persisted in the completion journal, whose replay is
+    /// fail-closed. A 0.4 record must deserialize forward, and must never be
+    /// written back under its old name.
+    #[test]
+    fn retired_phase_names_deserialize_forward_and_are_never_reserialized() {
+        for name in ["research", "design", "structure", "plan"] {
+            let parsed: Phase = serde_json::from_str(&format!("\"{name}\""))
+                .unwrap_or_else(|e| panic!("`{name}` must still deserialize: {e}"));
+            assert_eq!(parsed, Phase::Implement);
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), "\"implement\"");
+        }
+
+        // Widened, not permissive.
+        assert!(serde_json::from_str::<Phase>("\"speculate\"").is_err());
     }
 
     #[test]
@@ -1466,10 +1479,6 @@ mod tests {
     #[test]
     fn test_phase_display() {
         assert_eq!(Phase::Ready.to_string(), "ready");
-        assert_eq!(Phase::Research.to_string(), "research");
-        assert_eq!(Phase::Design.to_string(), "design");
-        assert_eq!(Phase::Structure.to_string(), "structure");
-        assert_eq!(Phase::Plan.to_string(), "plan");
         assert_eq!(Phase::Implement.to_string(), "implement");
         assert_eq!(Phase::Review.to_string(), "review");
         assert_eq!(Phase::Done.to_string(), "done");
@@ -1563,10 +1572,10 @@ mod tests {
     #[test]
     fn test_config_phase_timeouts_from_map() {
         let mut map = BTreeMap::new();
-        map.insert("phase_timeout_research".to_string(), "300".to_string());
+        map.insert("phase_timeout_review".to_string(), "300".to_string());
         map.insert("phase_timeout_implement".to_string(), "1800".to_string());
         let config = PluginConfig::from_config_map(&map);
-        assert_eq!(config.phase_timeouts.get(&Phase::Research), Some(&300));
+        assert_eq!(config.phase_timeouts.get(&Phase::Review), Some(&300));
         assert_eq!(config.phase_timeouts.get(&Phase::Implement), Some(&1800));
         assert_eq!(config.phase_timeouts.len(), 2);
     }
@@ -1703,7 +1712,7 @@ mod tests {
     fn test_timeout_for_phase_fallback() {
         let config = PluginConfig::new();
         // No override → falls back to session_timeout_secs (3600)
-        assert_eq!(config.timeout_for_phase(Phase::Research), 3600);
+        assert_eq!(config.timeout_for_phase(Phase::Implement), 3600);
     }
 
     #[test]
@@ -1711,10 +1720,10 @@ mod tests {
         let mut config = PluginConfig::new();
         config.session_timeout_secs = 0;
         // No override and session timeout disabled → 0
-        assert_eq!(config.timeout_for_phase(Phase::Research), 0);
+        assert_eq!(config.timeout_for_phase(Phase::Implement), 0);
         // But explicit override still works
-        config.phase_timeouts.insert(Phase::Research, 300);
-        assert_eq!(config.timeout_for_phase(Phase::Research), 300);
+        config.phase_timeouts.insert(Phase::Implement, 300);
+        assert_eq!(config.timeout_for_phase(Phase::Implement), 300);
     }
 
     #[test]
@@ -1739,10 +1748,11 @@ mod tests {
 
     #[test]
     fn test_phase_from_name() {
-        assert_eq!(Phase::from_name("research"), Some(Phase::Research));
+        assert_eq!(Phase::from_name("ready"), Some(Phase::Ready));
         assert_eq!(Phase::from_name("implement"), Some(Phase::Implement));
+        assert_eq!(Phase::from_name("review"), Some(Phase::Review));
         assert_eq!(Phase::from_name("done"), Some(Phase::Done));
         assert_eq!(Phase::from_name("invalid"), None);
-        assert_eq!(Phase::from_name("Research"), None); // case-sensitive
+        assert_eq!(Phase::from_name("Implement"), None); // case-sensitive
     }
 }

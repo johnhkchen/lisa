@@ -400,7 +400,11 @@ fn idle_legacy_name_ignores_the_body_and_reports_its_phase_effect() {
         ..State::default()
     };
     let mut thread = Thread::new("T-LEGACY", PANE_ID);
-    thread.current_phase = Phase::Research;
+    // The ticket file above still carries a retired 0.4 phase name; it loads as
+    // Implement. The thread sits at Review, the one phase that still stalls
+    // without its artifact, so this stays a test about the signal body being
+    // ignored rather than a second test of the migration.
+    thread.current_phase = Phase::Review;
     state.threads.insert("T-LEGACY".to_string(), thread);
     let path = signal_dir.join("T-LEGACY.idle");
     fs::write(&path, "arbitrary legacy body").unwrap();
@@ -408,10 +412,15 @@ fn idle_legacy_name_ignores_the_body_and_reports_its_phase_effect() {
     state.check_idle_signals();
 
     assert!(!path.exists());
-    assert_eq!(state.threads["T-LEGACY"].current_phase, Phase::Research);
+    assert_eq!(
+        state.dag.get_ticket(&"T-LEGACY".to_string()).unwrap().phase,
+        Phase::Implement,
+        "`phase: research` frontmatter must load forward as Implement"
+    );
+    assert_eq!(state.threads["T-LEGACY"].current_phase, Phase::Review);
     assert_eq!(state.idle_alerts.len(), 1);
     assert_eq!(state.idle_alerts[0].0, "T-LEGACY");
-    assert!(state.idle_alerts[0].1.contains("research.md not found"));
+    assert!(state.idle_alerts[0].1.contains("review.md not found"));
 }
 
 #[test]

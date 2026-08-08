@@ -327,24 +327,18 @@ fn parse_priority(value: &str) -> Result<Priority, TicketError> {
 }
 
 /// Parses a Phase from a string.
+///
+/// Case-insensitive, then delegated to [`Phase::from_name`] — the single
+/// phase-name table — so frontmatter parsing and the plugin's config-key
+/// parsing can never accept different vocabularies. The retired 0.4 names
+/// (`research`, `design`, `structure`, `plan`) parse to `Implement` there; they
+/// are accepted but no longer advertised, because they are no longer written.
 fn parse_phase(value: &str) -> Result<Phase, TicketError> {
-    match value.to_lowercase().as_str() {
-        "ready" => Ok(Phase::Ready),
-        "research" => Ok(Phase::Research),
-        "design" => Ok(Phase::Design),
-        "structure" => Ok(Phase::Structure),
-        "plan" => Ok(Phase::Plan),
-        "implement" => Ok(Phase::Implement),
-        "review" => Ok(Phase::Review),
-        "done" => Ok(Phase::Done),
-        _ => Err(TicketError::InvalidField {
-            field: "phase".to_string(),
-            value: value.to_string(),
-            reason:
-                "expected one of: ready, research, design, structure, plan, implement, review, done"
-                    .to_string(),
-        }),
-    }
+    Phase::from_name(&value.to_lowercase()).ok_or_else(|| TicketError::InvalidField {
+        field: "phase".to_string(),
+        value: value.to_string(),
+        reason: "expected one of: ready, implement, review, done".to_string(),
+    })
 }
 
 /// Parses a YAML array of strings like `[T-024-01, T-024-02]` into a Vec.
@@ -600,13 +594,12 @@ fn update_yaml_field(yaml: &str, field: &str, new_value: &str) -> String {
 }
 
 /// Converts a Phase to its string representation.
+///
+/// The retired 0.4 names are absent by construction: this is the writer, and a
+/// name that cannot be written here can never reappear on a board.
 fn phase_to_string(phase: Phase) -> String {
     match phase {
         Phase::Ready => "ready",
-        Phase::Research => "research",
-        Phase::Design => "design",
-        Phase::Structure => "structure",
-        Phase::Plan => "plan",
         Phase::Implement => "implement",
         Phase::Review => "review",
         Phase::Done => "done",
@@ -709,7 +702,8 @@ error handling. They need to be consolidated into a single climate service modul
         assert!(matches!(ticket.ticket_type, TicketType::Task));
         assert!(matches!(ticket.status, TicketStatus::Open));
         assert!(matches!(ticket.priority, Priority::High));
-        assert!(matches!(ticket.phase, Phase::Research));
+        // SAMPLE_TICKET still says `phase: research`; it loads as Implement.
+        assert!(matches!(ticket.phase, Phase::Implement));
         assert!(ticket.depends_on.contains(&"T-024-01".to_string()));
         assert!(ticket.depends_on.contains(&"T-024-02".to_string()));
         assert!(ticket.blocks.contains(&"T-024-06".to_string()));
@@ -733,17 +727,86 @@ error handling. They need to be consolidated into a single climate service modul
     #[test]
     fn test_parse_phases() {
         assert!(matches!(parse_phase("ready"), Ok(Phase::Ready)));
-        assert!(matches!(parse_phase("research"), Ok(Phase::Research)));
-        assert!(matches!(parse_phase("design"), Ok(Phase::Design)));
-        assert!(matches!(parse_phase("structure"), Ok(Phase::Structure)));
-        assert!(matches!(parse_phase("plan"), Ok(Phase::Plan)));
         assert!(matches!(parse_phase("implement"), Ok(Phase::Implement)));
         assert!(matches!(parse_phase("review"), Ok(Phase::Review)));
         assert!(matches!(parse_phase("done"), Ok(Phase::Done)));
 
         // Case insensitive
-        assert!(matches!(parse_phase("RESEARCH"), Ok(Phase::Research)));
-        assert!(matches!(parse_phase("Design"), Ok(Phase::Design)));
+        assert!(matches!(parse_phase("IMPLEMENT"), Ok(Phase::Implement)));
+        assert!(matches!(parse_phase("Review"), Ok(Phase::Review)));
+    }
+
+    /// The migration this change exists for. Four retired phase names must
+    /// resolve to Implement through *both* parse entry points, so a board
+    /// written against 0.4 loads whichever way Lisa reaches it.
+    #[test]
+    fn retired_phase_names_map_forward_through_both_parsers() {
+        for name in ["research", "design", "structure", "plan"] {
+            assert!(
+                matches!(parse_phase(name), Ok(Phase::Implement)),
+                "frontmatter parser rejected or misread `{name}`"
+            );
+            assert_eq!(
+                Phase::from_name(name),
+                Some(Phase::Implement),
+                "config-key parser rejected or misread `{name}`"
+            );
+            // And case-insensitively, the way frontmatter is actually written.
+            assert!(matches!(
+                parse_phase(&name.to_uppercase()),
+                Ok(Phase::Implement)
+            ));
+        }
+    }
+
+    /// The mapping widens what is accepted; it does not make parsing permissive.
+    #[test]
+    fn unknown_phase_is_still_rejected() {
+        for name in ["speculate", "", "implemented", "reviewing"] {
+            match parse_phase(name) {
+                Err(TicketError::InvalidField { field, value, .. }) => {
+                    assert_eq!(field, "phase");
+                    assert_eq!(value, name);
+                }
+                other => panic!("`{name}` should not parse, got {other:?}"),
+            }
+            assert_eq!(Phase::from_name(name), None);
+        }
+    }
+
+    /// A board self-heals: loaded at a retired phase, rewritten as `implement`.
+    #[test]
+    fn ticket_at_retired_phase_is_rewritten_as_implement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("T-900.md");
+        fs::write(
+            &path,
+            "---\nid: T-900\ntitle: legacy-board-row\ntype: task\nstatus: open\n\
+             priority: high\nphase: plan\ndepends_on: []\n---\n\n## Context\n",
+        )
+        .unwrap();
+
+        let ticket = parse_ticket(&path).unwrap();
+        assert_eq!(ticket.phase, Phase::Implement);
+
+        update_ticket_phase(&path, ticket.phase).unwrap();
+
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(
+            rewritten.contains("phase: implement"),
+            "frontmatter was not migrated:\n{rewritten}"
+        );
+        for retired in [
+            "phase: plan",
+            "phase: research",
+            "phase: design",
+            "phase: structure",
+        ] {
+            assert!(
+                !rewritten.contains(retired),
+                "`{retired}` survived the rewrite:\n{rewritten}"
+            );
+        }
     }
 
     #[test]
@@ -811,13 +874,19 @@ error handling. They need to be consolidated into a single climate service modul
     #[test]
     fn test_phase_to_string() {
         assert_eq!(phase_to_string(Phase::Ready), "ready");
-        assert_eq!(phase_to_string(Phase::Research), "research");
-        assert_eq!(phase_to_string(Phase::Design), "design");
-        assert_eq!(phase_to_string(Phase::Structure), "structure");
-        assert_eq!(phase_to_string(Phase::Plan), "plan");
         assert_eq!(phase_to_string(Phase::Implement), "implement");
         assert_eq!(phase_to_string(Phase::Review), "review");
         assert_eq!(phase_to_string(Phase::Done), "done");
+
+        // The retired names have no arm here, so they can never be written
+        // back to a board.
+        for phase in Phase::all() {
+            let written = phase_to_string(*phase);
+            assert!(
+                !["research", "design", "structure", "plan"].contains(&written.as_str()),
+                "phase_to_string emitted a retired name: {written}"
+            );
+        }
     }
 
     #[test]

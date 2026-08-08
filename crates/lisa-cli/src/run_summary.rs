@@ -403,7 +403,7 @@ mod tests {
 
         let output = render(
             dir.path(),
-            &[ticket("T-1", Phase::Done), ticket("T-2", Phase::Plan)],
+            &[ticket("T-1", Phase::Done), ticket("T-2", Phase::Implement)],
         );
 
         assert!(output.contains("Completed: 1 of 2 tickets; 1 remains."));

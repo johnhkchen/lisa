@@ -1,6 +1,6 @@
 //! Lisa - A Zellij plugin for DAG-driven concurrent task scheduling
 //!
-//! This plugin implements the RDSPI workflow (Research -> Design -> Structure -> Plan -> Implement)
+//! This plugin implements Lisa's workflow (Ready -> Implement -> Review -> Done)
 //! as a DAG-driven concurrent scheduler. It manages Claude Code sessions for each ticket,
 //! tracks phase progress, and provides a live dashboard.
 
@@ -1026,7 +1026,7 @@ pub struct State {
     /// Guards against two advance detectors observing the same transition in
     /// one tick and each announcing it. Holds only the *previous* transition
     /// rather than a set: a ticket that is reset and re-run legitimately
-    /// repeats `Research -> Design`, and that repeat is real news.
+    /// repeats `Implement -> Review`, and that repeat is real news.
     logged_transitions: HashMap<TicketId, (Phase, Phase)>,
 
     /// Whether initial loading has completed.
@@ -5812,12 +5812,12 @@ impl State {
                 thread.current_phase = ticket.phase;
 
                 // Ready is a scheduling sentinel — once spawned, advance to
-                // Research so the artifact detection pipeline can track progress.
+                // Implement so the artifact detection pipeline can track progress.
                 if ticket.phase == Phase::Ready {
-                    thread.current_phase = Phase::Research;
+                    thread.current_phase = Phase::Implement;
                     if !ticket.file_path.as_os_str().is_empty() {
                         if let Err(e) =
-                            ticket::update_ticket_phase(&ticket.file_path, Phase::Research)
+                            ticket::update_ticket_phase(&ticket.file_path, Phase::Implement)
                         {
                             self.log_activity(ActivityEvent::Error {
                                 message: format!(
@@ -6516,7 +6516,7 @@ impl State {
     /// and applies the phase advancement rules:
     ///
     /// - **Implement**: idle signal alone advances to Review (parks thread)
-    /// - **Research/Design/Structure/Plan**: idle signal + artifact advances to next phase
+    /// - **Review**: idle signal + `review.md` advances to Done
     /// - **Idle without artifact**: generates an alert for the attention banner
     ///
     /// Signal files are always deleted after processing to prevent re-triggering.
@@ -6622,12 +6622,8 @@ impl State {
                     }
                 }
 
-                Phase::Research
-                | Phase::Design
-                | Phase::Structure
-                | Phase::Plan
-                | Phase::Review => {
-                    // Need artifact + idle signal for these phases
+                Phase::Review => {
+                    // Need artifact + idle signal for this phase
                     let artifact_name = match current_phase.artifact_filename() {
                         Some(name) => name,
                         None => continue,
@@ -10138,10 +10134,6 @@ impl State {
 fn phase_to_ui_phase(phase: Phase) -> ui::Phase {
     match phase {
         Phase::Ready => ui::Phase::Ready,
-        Phase::Research => ui::Phase::Research,
-        Phase::Design => ui::Phase::Design,
-        Phase::Structure => ui::Phase::Structure,
-        Phase::Plan => ui::Phase::Plan,
         Phase::Implement => ui::Phase::Implement,
         Phase::Review => ui::Phase::Review,
         Phase::Done => ui::Phase::Done,
@@ -12404,10 +12396,6 @@ mod tests {
     #[test]
     fn test_phase_to_ui_phase() {
         assert_eq!(phase_to_ui_phase(Phase::Ready), ui::Phase::Ready);
-        assert_eq!(phase_to_ui_phase(Phase::Research), ui::Phase::Research);
-        assert_eq!(phase_to_ui_phase(Phase::Design), ui::Phase::Design);
-        assert_eq!(phase_to_ui_phase(Phase::Structure), ui::Phase::Structure);
-        assert_eq!(phase_to_ui_phase(Phase::Plan), ui::Phase::Plan);
         assert_eq!(phase_to_ui_phase(Phase::Implement), ui::Phase::Implement);
         assert_eq!(phase_to_ui_phase(Phase::Review), ui::Phase::Review);
         assert_eq!(phase_to_ui_phase(Phase::Done), ui::Phase::Done);
@@ -12426,7 +12414,7 @@ mod tests {
             ui::TicketStatus::Ready
         );
         assert_eq!(
-            ticket_status_to_ui_status(&TicketStatus::Open, Phase::Research),
+            ticket_status_to_ui_status(&TicketStatus::Open, Phase::Implement),
             ui::TicketStatus::InProgress
         );
         assert_eq!(
@@ -12715,22 +12703,22 @@ mod tests {
                 "different ticket",
                 ActivityEvent::PhaseCompleted {
                     ticket_id: "T-001".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Implement,
                 },
                 ActivityEvent::PhaseCompleted {
                     ticket_id: "T-002".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Implement,
                 },
             ),
             (
                 "different phase",
                 ActivityEvent::PhaseCompleted {
                     ticket_id: "T-001".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Implement,
                 },
                 ActivityEvent::PhaseCompleted {
                     ticket_id: "T-001".to_string(),
-                    phase: Phase::Design,
+                    phase: Phase::Review,
                 },
             ),
             (
@@ -12792,13 +12780,13 @@ mod tests {
 
         let entry = ui_entry_for(&ActivityEvent::PhaseCompleted {
             ticket_id: "T-002".to_string(),
-            phase: Phase::Design,
+            phase: Phase::Implement,
         });
         assert!(entry.is_some());
         match &entry.unwrap().activity {
             ui::ActivityType::PhaseCompleted { ticket_id, phase } => {
                 assert_eq!(ticket_id, "T-002");
-                assert_eq!(*phase, ui::Phase::Design);
+                assert_eq!(*phase, ui::Phase::Implement);
             }
             other => panic!("Expected PhaseCompleted, got {:?}", other),
         }
@@ -12999,17 +12987,17 @@ mod tests {
             .insert(lease.ticket_id.clone(), lease.clone());
         let staged_dir = artifact_state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged_dir).unwrap();
-        let staged = staged_dir.join("research.md");
+        let staged = staged_dir.join("review.md");
         fs::write(&staged, "current attempt bytes\n' $() `x`").unwrap();
         let canonical_dir = artifact_state.config.work_dir.join(&lease.ticket_id);
         fs::create_dir_all(&canonical_dir).unwrap();
-        let canonical = canonical_dir.join("research.md");
+        let canonical = canonical_dir.join("review.md");
         fs::write(&canonical, "old canonical bytes").unwrap();
-        let artifact_temporary = canonical_dir.join(".research.md.attempt-1.tmp");
+        let artifact_temporary = canonical_dir.join(".review.md.attempt-1.tmp");
         fs::write(&artifact_temporary, "old temporary collision").unwrap();
 
         assert!(artifact_state
-            .admit_artifact(&lease.ticket_id, Some(&lease), "research.md")
+            .admit_artifact(&lease.ticket_id, Some(&lease), "review.md")
             .unwrap());
         assert_eq!(
             fs::read_to_string(&canonical).unwrap(),
@@ -13156,15 +13144,15 @@ mod tests {
             .insert(lease.ticket_id.clone(), lease.clone());
         let staged_dir = artifact_state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged_dir).unwrap();
-        fs::write(staged_dir.join("research.md"), "new bytes").unwrap();
+        fs::write(staged_dir.join("review.md"), "new bytes").unwrap();
         let canonical_dir = artifact_state.config.work_dir.join(&lease.ticket_id);
         fs::create_dir_all(&canonical_dir).unwrap();
-        let canonical = canonical_dir.join("research.md");
+        let canonical = canonical_dir.join("review.md");
         fs::write(&canonical, "old canonical bytes").unwrap();
-        let artifact_temporary = canonical_dir.join(".research.md.attempt-1.tmp");
+        let artifact_temporary = canonical_dir.join(".review.md.attempt-1.tmp");
         fs::create_dir(&artifact_temporary).unwrap();
         let error = artifact_state
-            .admit_artifact(&lease.ticket_id, Some(&lease), "research.md")
+            .admit_artifact(&lease.ticket_id, Some(&lease), "review.md")
             .unwrap_err();
         assert!(error.starts_with("cannot write canonical artifact temporary "));
         assert!(error.contains(&artifact_temporary.to_string_lossy().into_owned()));
@@ -13424,7 +13412,7 @@ mod tests {
         std::fs::create_dir_all(&ticket_dir).unwrap();
         std::fs::write(
             ticket_dir.join("T-024-03-descriptive-title.md"),
-            "---\nid: T-024-03\ntitle: descriptive-title\ntype: task\nstatus: open\npriority: medium\nphase: research\n---\n",
+            "---\nid: T-024-03\ntitle: descriptive-title\ntype: task\nstatus: open\npriority: medium\nphase: implement\n---\n",
         )
         .unwrap();
 
@@ -13483,7 +13471,7 @@ mod tests {
     }
 
     #[test]
-    fn test_check_artifact_advances_research_to_design() {
+    fn test_check_artifact_advances_implement_to_review() {
         use lisa_core::types::{Thread, ThreadStatus};
         use std::fs;
 
@@ -13494,13 +13482,13 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
-        // Create work dir with research.md artifact
+        // Create work dir with review.md artifact
         let work_dir = dir.path().join("work");
         fs::create_dir_all(work_dir.join("T-001")).unwrap();
-        fs::write(work_dir.join("T-001/research.md"), "# Research done").unwrap();
+        fs::write(work_dir.join("T-001/review.md"), "# Review done").unwrap();
 
         // Build state with DAG and a running thread
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -13516,40 +13504,40 @@ mod tests {
             ..State::default()
         };
 
-        // Add a running thread for T-001 in research phase
+        // Add a running thread for T-001 in implement phase
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
 
         // Run artifact advance check
         state.check_artifact_advances();
 
-        // Verify thread phase advanced to Design
+        // Verify thread phase advanced to Review
         let thread = state.threads.get("T-001").unwrap();
-        assert_eq!(thread.current_phase, Phase::Design);
+        assert_eq!(thread.current_phase, Phase::Review);
         assert_eq!(thread.status, ThreadStatus::Running);
 
         // Verify activity log has PhaseCompleted and TicketPhaseChanged
         assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::PhaseCompleted { ticket_id, phase }
-            if ticket_id == "T-001" && *phase == Phase::Research
+            if ticket_id == "T-001" && *phase == Phase::Implement
         )));
         assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::TicketPhaseChanged { ticket_id, old_phase, new_phase }
-            if ticket_id == "T-001" && *old_phase == Phase::Research && *new_phase == Phase::Design
+            if ticket_id == "T-001" && *old_phase == Phase::Implement && *new_phase == Phase::Review
         )));
 
         // Verify ticket file was updated
         let updated = fs::read_to_string(state.config.ticket_dir.join("T-001.md")).unwrap();
-        assert!(updated.contains("phase: design"));
+        assert!(updated.contains("phase: review"));
     }
 
-    /// Build a state with T-001 at Research, research.md admitted, a running
+    /// Build a state with T-001 at Implement, review.md admitted, a running
     /// thread, and an idle signal on pane 1 — enough to drive *either* the
     /// artifact detector or the idle detector over the same transition.
-    fn research_state_reachable_by_both_detectors(dir: &std::path::Path) -> State {
+    fn implement_state_reachable_by_both_detectors(dir: &std::path::Path) -> State {
         use lisa_core::types::Thread;
         use std::fs;
 
@@ -13557,13 +13545,13 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         )
         .unwrap();
 
         let work_dir = dir.join("work");
         fs::create_dir_all(work_dir.join("T-001")).unwrap();
-        fs::write(work_dir.join("T-001/research.md"), "# Research done").unwrap();
+        fs::write(work_dir.join("T-001/review.md"), "# Review done").unwrap();
 
         let signal_dir = dir.join("signals");
         fs::create_dir_all(&signal_dir).unwrap();
@@ -13592,7 +13580,7 @@ mod tests {
             last_client: None,
         });
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
         state
     }
@@ -13631,7 +13619,7 @@ mod tests {
             .count()
     }
 
-    /// Two advance detectors observing the same Research → Design transition
+    /// Two advance detectors observing the same Implement → Review transition
     /// announce it once between them.
     ///
     /// The second detector is handed the pre-transition phase deliberately:
@@ -13642,21 +13630,21 @@ mod tests {
     #[test]
     fn two_detectors_observing_one_transition_announce_it_once() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = research_state_reachable_by_both_detectors(dir.path());
+        let mut state = implement_state_reachable_by_both_detectors(dir.path());
 
         state.check_artifact_advances();
         assert_eq!(
-            phase_completed_count(&state, "T-001", Phase::Research),
+            phase_completed_count(&state, "T-001", Phase::Implement),
             1,
             "the first detector announces the transition"
         );
 
-        // Second detector, still holding Research.
-        state.threads.get_mut("T-001").unwrap().current_phase = Phase::Research;
+        // Second detector, still holding Implement.
+        state.threads.get_mut("T-001").unwrap().current_phase = Phase::Implement;
         state.check_idle_signals();
 
         assert_eq!(
-            phase_completed_count(&state, "T-001", Phase::Research),
+            phase_completed_count(&state, "T-001", Phase::Implement),
             1,
             "the second detector must not re-announce the same transition"
         );
@@ -13666,22 +13654,22 @@ mod tests {
     #[test]
     fn artifact_advance_yields_one_feed_line() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = research_state_reachable_by_both_detectors(dir.path());
+        let mut state = implement_state_reachable_by_both_detectors(dir.path());
 
         state.check_artifact_advances();
 
-        assert_eq!(feed_phase_lines(&state), vec!["T-001 completed Research"]);
+        assert_eq!(feed_phase_lines(&state), vec!["T-001 completed Implement"]);
     }
 
     /// The idle detector: one transition, one feed line.
     #[test]
     fn idle_advance_yields_one_feed_line() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = research_state_reachable_by_both_detectors(dir.path());
+        let mut state = implement_state_reachable_by_both_detectors(dir.path());
 
         state.check_idle_signals();
 
-        assert_eq!(feed_phase_lines(&state), vec!["T-001 completed Research"]);
+        assert_eq!(feed_phase_lines(&state), vec!["T-001 completed Implement"]);
     }
 
     /// The completion detector: one transition, one feed line.
@@ -13768,8 +13756,8 @@ mod tests {
         assert!(
             activity_event_to_ui_entry(&stamped(ActivityEvent::TicketPhaseChanged {
                 ticket_id: "T-001".to_string(),
-                old_phase: Phase::Research,
-                new_phase: Phase::Design,
+                old_phase: Phase::Implement,
+                new_phase: Phase::Review,
             }))
             .is_none()
         );
@@ -13785,7 +13773,7 @@ mod tests {
         assert!(
             activity_event_to_ui_entry(&stamped(ActivityEvent::PhaseCompleted {
                 ticket_id: "T-001".to_string(),
-                phase: Phase::Research,
+                phase: Phase::Implement,
             }))
             .is_some(),
             "the surviving half must still reach the feed"
@@ -13799,12 +13787,12 @@ mod tests {
     fn two_tickets_completing_a_phase_yield_two_distinct_lines() {
         let mut state = State::default();
 
-        state.log_phase_transition("T-001", Phase::Design, Phase::Structure);
-        state.log_phase_transition("T-002", Phase::Design, Phase::Structure);
+        state.log_phase_transition("T-001", Phase::Implement, Phase::Review);
+        state.log_phase_transition("T-002", Phase::Implement, Phase::Review);
 
         assert_eq!(
             feed_phase_lines(&state),
-            vec!["T-001 completed Design", "T-002 completed Design"]
+            vec!["T-001 completed Implement", "T-002 completed Implement"]
         );
     }
 
@@ -13821,7 +13809,7 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         )
         .unwrap();
 
@@ -13876,7 +13864,7 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         )
         .unwrap();
 
@@ -13935,17 +13923,17 @@ mod tests {
     #[test]
     fn a_repeated_transition_after_other_transitions_is_announced_again() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = research_state_reachable_by_both_detectors(dir.path());
+        let mut state = implement_state_reachable_by_both_detectors(dir.path());
 
-        state.log_phase_transition("T-001", Phase::Research, Phase::Design);
-        state.log_phase_transition("T-001", Phase::Research, Phase::Design);
-        assert_eq!(phase_completed_count(&state, "T-001", Phase::Research), 1);
+        state.log_phase_transition("T-001", Phase::Implement, Phase::Review);
+        state.log_phase_transition("T-001", Phase::Implement, Phase::Review);
+        assert_eq!(phase_completed_count(&state, "T-001", Phase::Implement), 1);
 
         // An intervening transition, then the same edge again — a real repeat.
-        state.log_phase_transition("T-001", Phase::Design, Phase::Structure);
-        state.log_phase_transition("T-001", Phase::Research, Phase::Design);
+        state.log_phase_transition("T-001", Phase::Review, Phase::Done);
+        state.log_phase_transition("T-001", Phase::Implement, Phase::Review);
         assert_eq!(
-            phase_completed_count(&state, "T-001", Phase::Research),
+            phase_completed_count(&state, "T-001", Phase::Implement),
             2,
             "a genuine repeat is news, not an echo"
         );
@@ -14174,7 +14162,7 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-005.md"),
-            "---\nid: T-005\ntitle: full-run\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-005\ntitle: full-run\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
         let work_dir = dir.path().join("work");
@@ -14193,15 +14181,11 @@ mod tests {
         };
 
         let mut thread = Thread::new("T-005", 5);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-005".to_string(), thread);
         let lease = install_current_attempt(&mut state, "T-005");
         let staged = state.attempt_work_dir(&lease);
         fs::create_dir_all(&staged).unwrap();
-        fs::write(staged.join("research.md"), "# Research").unwrap();
-        fs::write(staged.join("design.md"), "# Design").unwrap();
-        fs::write(staged.join("structure.md"), "# Structure").unwrap();
-        fs::write(staged.join("plan.md"), "# Plan").unwrap();
         fs::write(staged.join("review.md"), "# Review").unwrap();
         write_passing_review_disposition(&state, &lease);
 
@@ -14229,7 +14213,7 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-003.md"),
-            "---\nid: T-003\ntitle: no-artifact\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-003\ntitle: no-artifact\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
         // Work dir exists but NO artifact
@@ -14250,14 +14234,14 @@ mod tests {
         };
 
         let mut thread = Thread::new("T-003", 3);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-003".to_string(), thread);
 
         state.check_artifact_advances();
 
         // Thread should remain unchanged
         let thread = state.threads.get("T-003").unwrap();
-        assert_eq!(thread.current_phase, Phase::Research);
+        assert_eq!(thread.current_phase, Phase::Implement);
         assert_eq!(thread.status, ThreadStatus::Running);
         assert!(state.activity_log.is_empty());
     }
@@ -15070,7 +15054,7 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: stale\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: stale\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -15098,7 +15082,7 @@ mod tests {
         // Create a thread that's been silent for 31+ minutes (past the bar)
         let mut thread = Thread::new("T-001", 1);
         thread.attempt_lease = Some(lease.clone());
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
         thread.last_activity = thread.last_phase_change;
@@ -15159,7 +15143,7 @@ mod tests {
 
         // Create a thread that started recently (5 minutes ago)
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 60);
         thread.last_activity = thread.last_phase_change;
@@ -15325,7 +15309,7 @@ mod tests {
 
         // Create a thread that's been silent past the 600s threshold
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(700);
         thread.last_activity = thread.last_phase_change;
@@ -15355,7 +15339,7 @@ mod tests {
 
         // Create a fresh thread (well within threshold)
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
 
         state.evaluate_health();
@@ -15417,7 +15401,7 @@ mod tests {
 
         // Create a thread silent past the stuck threshold
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(700);
         thread.last_activity = thread.last_phase_change;
@@ -15572,7 +15556,7 @@ mod tests {
 
         // Create a thread stuck for 5 minutes (300s) — past hard timeout of 240s
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(300);
         thread.last_activity = thread.last_phase_change;
@@ -15599,7 +15583,7 @@ mod tests {
 
         // Create a thread stuck for 180s — past warning (120s) but NOT past hard timeout (240s)
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(180);
         thread.last_activity = thread.last_phase_change;
@@ -15794,7 +15778,7 @@ mod tests {
         // Last poll saw T-001 at Research
         state
             .last_phases
-            .insert("T-001".to_string(), Phase::Research);
+            .insert("T-001".to_string(), Phase::Implement);
 
         let thread = Thread::new("T-001", 1);
         state.threads.insert("T-001".to_string(), thread);
@@ -16088,7 +16072,7 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: active\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nActive\n",
+            "---\nid: T-001\ntitle: active\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nActive\n",
         ).unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -16105,7 +16089,7 @@ mod tests {
 
         // Running thread for an active ticket — should NOT be removed
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
 
         state.audit_threads();
@@ -17802,7 +17786,7 @@ mod tests {
         ).unwrap();
         fs::write(
             tickets_dir.join("T-002.md"),
-            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: research\ndepends_on: [T-001]\n---\n\nActive.\n",
+            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: implement\ndepends_on: [T-001]\n---\n\nActive.\n",
         ).unwrap();
         fs::write(
             tickets_dir.join("T-003.md"),
@@ -17826,7 +17810,7 @@ mod tests {
 
         // Add threads
         let mut thread = Thread::new("T-002", 5);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-002".to_string(), thread);
 
         // Add agent slots
@@ -17923,7 +17907,7 @@ mod tests {
         ).unwrap();
         fs::write(
             tickets_dir.join("T-002.md"),
-            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: research\ndepends_on: [T-001]\n---\n\nActive.\n",
+            "---\nid: T-002\ntitle: second\ntype: task\nstatus: open\npriority: medium\nphase: implement\ndepends_on: [T-001]\n---\n\nActive.\n",
         ).unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -17944,7 +17928,7 @@ mod tests {
         assert!(snapshot.contains("T-001"), "Missing T-001");
         assert!(snapshot.contains("T-002"), "Missing T-002");
         assert!(snapshot.contains("done"), "Missing done phase");
-        assert!(snapshot.contains("research"), "Missing research phase");
+        assert!(snapshot.contains("implement"), "Missing implement phase");
 
         // DAG edge
         assert!(
@@ -17974,7 +17958,7 @@ mod tests {
 
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nActive.\n",
+            "---\nid: T-001\ntitle: first\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nActive.\n",
         ).unwrap();
 
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -17991,7 +17975,7 @@ mod tests {
 
         // Thread
         let mut thread = Thread::new("T-001", 42);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-001".to_string(), thread);
 
         // Slots
@@ -18107,10 +18091,10 @@ mod tests {
             (
                 ActivityEvent::TicketPhaseChanged {
                     ticket_id: "T-002".to_string(),
-                    old_phase: Phase::Research,
-                    new_phase: Phase::Design,
+                    old_phase: Phase::Implement,
+                    new_phase: Phase::Review,
                 },
-                "TicketPhaseChanged: T-002 research -> design",
+                "TicketPhaseChanged: T-002 implement -> review",
             ),
             (
                 ActivityEvent::CompletionRejected {
@@ -18307,82 +18291,6 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_signal_research_with_artifact_advances() {
-        use lisa_core::types::{Thread, ThreadStatus};
-        use std::fs;
-
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create ticket file in research phase
-        let tickets_dir = dir.path().join("tickets");
-        fs::create_dir_all(&tickets_dir).unwrap();
-        fs::write(
-            tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
-        ).unwrap();
-
-        // Create work dir with research.md artifact
-        let work_dir = dir.path().join("work");
-        fs::create_dir_all(work_dir.join("T-001")).unwrap();
-        fs::write(work_dir.join("T-001/research.md"), "# Research done").unwrap();
-
-        // Create signal directory with idle signal (pane-based)
-        let signal_dir = dir.path().join("signals");
-        fs::create_dir_all(&signal_dir).unwrap();
-        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
-
-        // Build state
-        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
-        let dag = Dag::from_tickets(tickets).unwrap();
-
-        let mut state = State {
-            dag,
-            config: PluginConfig {
-                ticket_dir: tickets_dir.clone(),
-                work_dir,
-                ..PluginConfig::new()
-            },
-            signal_dir,
-            ..State::default()
-        };
-
-        // Agent slot maps pane 1 → T-001
-        state.agent_slots.push(AgentSlot {
-            pane_id: 1,
-            ticket_id: Some("T-001".to_string()),
-            attempt_lease: None,
-            has_session: true,
-            transition_state: TransitionState::Idle,
-            transition_started_at: None,
-            cooldown_until: None,
-            last_activity_at: None,
-            last_client: None,
-        });
-
-        // Add running thread in research phase
-        let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
-        state.threads.insert("T-001".to_string(), thread);
-
-        state.check_idle_signals();
-
-        // Verify: advanced to Design, still running
-        let thread = state.threads.get("T-001").unwrap();
-        assert_eq!(thread.current_phase, Phase::Design);
-        assert_eq!(thread.status, ThreadStatus::Running);
-
-        // Verify: signal deleted
-        assert!(!state.signal_dir.join("pane-1.idle").exists());
-
-        // Verify: ticket file updated
-        let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(updated.contains("phase: design"));
-
-        // Verify: no idle alerts
-        assert!(state.idle_alerts.is_empty());
-    }
-
-    #[test]
     fn test_codex_ack_signal_promotes_matching_pending_seat() {
         let dir = tempfile::tempdir().unwrap();
         let signal_dir = dir.path().join("signals");
@@ -18484,7 +18392,7 @@ mod tests {
             ("LISA_TICKET_ID", "T-042".to_string()),
             ("LISA_REASON", "idle-without-artifact".to_string()),
         ];
-        let detail = "T-042 idle in research without research.md";
+        let detail = "T-042 idle in review without review.md";
         let (argv, env) = State::build_notify_command(root, "attention", detail, &extra);
 
         assert_eq!(argv[4], "attention");
@@ -18750,18 +18658,18 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_signal_research_without_artifact_alerts() {
+    fn test_idle_signal_review_without_artifact_alerts() {
         use lisa_core::types::Thread;
         use std::fs;
 
         let dir = tempfile::tempdir().unwrap();
 
-        // Create ticket file in research phase
+        // Create ticket file in review phase
         let tickets_dir = dir.path().join("tickets");
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: review\n---\n\nBody\n",
         ).unwrap();
 
         // No artifact — work dir empty
@@ -18801,32 +18709,32 @@ mod tests {
         });
 
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Review;
         state.threads.insert("T-001".to_string(), thread);
 
         state.check_idle_signals();
 
-        // Verify: phase NOT advanced (still research)
+        // Verify: phase NOT advanced (still review)
         let thread = state.threads.get("T-001").unwrap();
-        assert_eq!(thread.current_phase, Phase::Research);
+        assert_eq!(thread.current_phase, Phase::Review);
 
         // Verify: signal deleted
         assert!(!state.signal_dir.join("pane-1.idle").exists());
 
         // Verify: ticket file NOT updated
         let updated = fs::read_to_string(tickets_dir.join("T-001.md")).unwrap();
-        assert!(updated.contains("phase: research"));
+        assert!(updated.contains("phase: review"));
 
         // Verify: idle alert generated
         assert_eq!(state.idle_alerts.len(), 1);
         assert_eq!(state.idle_alerts[0].0, "T-001");
-        assert!(state.idle_alerts[0].1.contains("research.md not found"));
+        assert!(state.idle_alerts[0].1.contains("review.md not found"));
 
         // Verify: warning in activity log
         assert!(state.activity_events().any(|e| matches!(
             e,
             ActivityEvent::Warning { message }
-            if message.contains("T-001") && message.contains("research.md")
+            if message.contains("T-001") && message.contains("review.md")
         )));
     }
 
@@ -18922,7 +18830,7 @@ mod tests {
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
         // Create signal for a pane whose ticket has NO thread
@@ -19046,7 +18954,7 @@ mod tests {
         let mut state = State::default();
         state.idle_alerts.push((
             "T-001".to_string(),
-            "Agent idle in research phase but research.md not found".to_string(),
+            "Agent idle in review phase but review.md not found".to_string(),
         ));
 
         let ui_state = state.to_ui_state();
@@ -19054,7 +18962,7 @@ mod tests {
         assert!(ui_state.alerts.iter().any(|a| {
             a.ticket_id == "T-001"
                 && a.alert_type == ui::AlertType::IdleWithoutArtifact
-                && a.detail.contains("research.md")
+                && a.detail.contains("review.md")
         }));
     }
 
@@ -20660,7 +20568,7 @@ mod tests {
         state.check_heartbeat_signals();
         assert_eq!(state.agent_slots[0].last_activity_at, replacement_activity);
         assert!(state
-            .admit_artifact("T-NAME", Some(&predecessor), "research.md")
+            .admit_artifact("T-NAME", Some(&predecessor), "review.md")
             .is_err());
         assert!(!state.acknowledge_shell_ready(10, &predecessor, first_deadline));
         assert!(matches!(
@@ -21113,11 +21021,11 @@ mod tests {
         assert_eq!(
             snapshot,
             "starting\n\
-[1]    T-NAME       RES        codex          starting             <elapsed>\n\
+[1]    T-NAME       IMP        codex          starting             <elapsed>\n\
 delivering\n\
-[1]    T-NAME       RES        codex          delivering           <elapsed>\n\
+[1]    T-NAME       IMP        codex          delivering           <elapsed>\n\
 owned\n\
-[1]    T-NAME       RES        codex          owned                <elapsed>"
+[1]    T-NAME       IMP        codex          owned                <elapsed>"
         );
     }
 
@@ -21251,7 +21159,7 @@ owned\n\
         let replacement = state.current_leases["T-NAME"].clone();
         assert_eq!(replacement.attempt_id, predecessor.attempt_id + 1);
         exit_then_deliver_fresh_codex(&mut state, 10, &replacement);
-        state.threads.get_mut("T-NAME").unwrap().current_phase = Phase::Research;
+        state.threads.get_mut("T-NAME").unwrap().current_phase = Phase::Implement;
         let old_activity = std::time::SystemTime::UNIX_EPOCH;
         state.threads.get_mut("T-NAME").unwrap().last_activity = old_activity;
         state.agent_slots[0].last_activity_at = Some(old_activity);
@@ -21271,7 +21179,7 @@ owned\n\
         let predecessor_stage = state.attempt_work_dir(&predecessor);
         std::fs::create_dir_all(&predecessor_stage).unwrap();
         std::fs::write(
-            predecessor_stage.join("research.md"),
+            predecessor_stage.join("review.md"),
             "predecessor output must remain private\n",
         )
         .unwrap();
@@ -21287,41 +21195,41 @@ owned\n\
         ));
         assert_eq!(state.threads["T-NAME"].last_activity, old_activity);
         assert_eq!(state.agent_slots[0].last_activity_at, Some(old_activity));
-        assert_eq!(state.threads["T-NAME"].current_phase, Phase::Research);
-        assert!(!state.config.work_dir.join("T-NAME/research.md").exists());
+        assert_eq!(state.threads["T-NAME"].current_phase, Phase::Implement);
+        assert!(!state.config.work_dir.join("T-NAME/review.md").exists());
         assert!(
             state
-                .admit_artifact("T-NAME", Some(&predecessor), "research.md")
+                .admit_artifact("T-NAME", Some(&predecessor), "review.md")
                 .is_err(),
             "a predecessor artifact cannot cross the current lease boundary"
         );
         assert_eq!(
-            std::fs::read_to_string(predecessor_stage.join("research.md")).unwrap(),
+            std::fs::read_to_string(predecessor_stage.join("review.md")).unwrap(),
             "predecessor output must remain private\n"
         );
 
         let replacement_stage = state.attempt_work_dir(&replacement);
         std::fs::create_dir_all(&replacement_stage).unwrap();
         std::fs::write(
-            replacement_stage.join("research.md"),
+            replacement_stage.join("review.md"),
             "replacement output is current\n",
         )
         .unwrap();
         state.check_artifact_advances();
 
         assert_eq!(state.seat_assignment(10), Some(SeatAssignmentState::Owned));
-        assert_eq!(state.threads["T-NAME"].current_phase, Phase::Design);
+        assert_eq!(state.threads["T-NAME"].current_phase, Phase::Review);
         assert!(state.threads["T-NAME"].last_activity > old_activity);
         assert!(state.agent_slots[0].last_activity_at.unwrap() > old_activity);
         assert_eq!(
-            std::fs::read_to_string(state.config.work_dir.join("T-NAME/research.md")).unwrap(),
+            std::fs::read_to_string(state.config.work_dir.join("T-NAME/review.md")).unwrap(),
             "replacement output is current\n"
         );
         assert!(state.activity_events().any(|event| matches!(
             event,
             ActivityEvent::Info { message }
                 if message.contains("Pane 10 established ownership of T-NAME attempt 2")
-                    && message.contains("current-attempt research.md")
+                    && message.contains("current-attempt review.md")
         )));
     }
 
@@ -24359,7 +24267,7 @@ owned\n\
         fs::create_dir_all(&signal_dir).unwrap();
         fs::write(
             tickets_dir.join("T-LEASE.md"),
-            "---\nid: T-LEASE\ntitle: lease boundary\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n",
+            "---\nid: T-LEASE\ntitle: lease boundary\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n",
         )
         .unwrap();
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
@@ -24387,7 +24295,7 @@ owned\n\
         });
         let stale_clock = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
         let mut thread = Thread::new("T-LEASE", 2);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_activity = stale_clock;
         state.threads.insert("T-LEASE".to_string(), thread);
 
@@ -24398,7 +24306,7 @@ owned\n\
 
         let stale_stage = state.attempt_work_dir(&predecessor);
         fs::create_dir_all(&stale_stage).unwrap();
-        fs::write(stale_stage.join("research.md"), "stale predecessor bytes").unwrap();
+        fs::write(stale_stage.join("review.md"), "stale predecessor bytes").unwrap();
         state.awaiting_human.insert(2);
         state.notified_attention.insert(2);
         fs::write(
@@ -24420,13 +24328,13 @@ owned\n\
         assert!(state.notified_attention.contains(&2));
         assert_eq!(
             state.threads.get("T-LEASE").unwrap().current_phase,
-            Phase::Research
+            Phase::Implement
         );
-        assert!(!work_dir.join("T-LEASE/research.md").exists());
+        assert!(!work_dir.join("T-LEASE/review.md").exists());
 
         let current_stage = state.attempt_work_dir(&current);
         fs::create_dir_all(&current_stage).unwrap();
-        fs::write(current_stage.join("research.md"), "current lease bytes").unwrap();
+        fs::write(current_stage.join("review.md"), "current lease bytes").unwrap();
         fs::write(
             signal_dir.join("pane-2.heartbeat"),
             serde_json::to_string(&current).unwrap(),
@@ -24442,14 +24350,14 @@ owned\n\
         assert!(!state.notified_attention.contains(&2));
         assert_eq!(
             state.threads.get("T-LEASE").unwrap().current_phase,
-            Phase::Design
+            Phase::Review
         );
         assert_eq!(
-            fs::read_to_string(work_dir.join("T-LEASE/research.md")).unwrap(),
+            fs::read_to_string(work_dir.join("T-LEASE/review.md")).unwrap(),
             "current lease bytes"
         );
         assert_eq!(
-            fs::read_to_string(stale_stage.join("research.md")).unwrap(),
+            fs::read_to_string(stale_stage.join("review.md")).unwrap(),
             "stale predecessor bytes"
         );
     }
@@ -24852,7 +24760,7 @@ owned\n\
 
         // Create a thread that started 5 minutes ago (well within 1800s timeout)
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 60);
         state.threads.insert("T-001".to_string(), thread);
 
@@ -24882,7 +24790,7 @@ owned\n\
 
         // Create a thread that started 2 hours ago
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.started_at =
             std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
         state.threads.insert("T-001".to_string(), thread);
@@ -24924,11 +24832,11 @@ owned\n\
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
             tickets_dir.join("T-001.md"),
-            "---\nid: T-001\ntitle: phase-timeout\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-001\ntitle: phase-timeout\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
 
         let mut phase_timeouts = HashMap::new();
-        phase_timeouts.insert(Phase::Research, 300); // 5 minutes
+        phase_timeouts.insert(Phase::Implement, 300); // 5 minutes
 
         let mut state = State {
             config: PluginConfig {
@@ -24945,7 +24853,7 @@ owned\n\
         // 300s phase timeout) and silent since (exceeds the 300s hard-silence
         // bar), so it is reclaimable
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60);
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 60);
@@ -24969,7 +24877,7 @@ owned\n\
         // Should be timed out by per-phase timeout (not global — only 10 min < 30 min)
         assert!(state.threads.is_empty());
         assert_eq!(state.timeout_alerts.len(), 1);
-        assert_eq!(state.timeout_alerts[0].2, Phase::Research);
+        assert_eq!(state.timeout_alerts[0].2, Phase::Implement);
     }
 
     #[test]
@@ -24978,7 +24886,7 @@ owned\n\
         use std::collections::HashMap;
 
         let mut phase_timeouts = HashMap::new();
-        phase_timeouts.insert(Phase::Research, 300);
+        phase_timeouts.insert(Phase::Implement, 300);
 
         let mut state = State {
             config: PluginConfig {
@@ -24991,7 +24899,7 @@ owned\n\
 
         // Thread in research phase for 4 minutes (within 300s limit)
         let mut thread = Thread::new("T-001", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         thread.last_phase_change =
             std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 60);
         thread.last_activity = thread.last_phase_change;
@@ -25014,7 +24922,7 @@ owned\n\
 
         // Only set per-phase timeout for research, not implement
         let mut phase_timeouts = HashMap::new();
-        phase_timeouts.insert(Phase::Research, 300);
+        phase_timeouts.insert(Phase::Implement, 300);
 
         let mut state = State {
             config: PluginConfig {
@@ -25255,11 +25163,11 @@ owned\n\
         fs::create_dir_all(&signal_dir).unwrap();
         fs::write(
             tickets_dir.join("T-CDX-01.md"),
-            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: open\npriority: high\nphase: research\n---\n\nBody\n",
+            "---\nid: T-CDX-01\ntitle: codex-a\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
         ).unwrap();
         fs::write(
             tickets_dir.join("T-CDX-02.md"),
-            "---\nid: T-CDX-02\ntitle: codex-b\ntype: task\nstatus: open\npriority: high\nphase: research\ndepends_on: [T-CDX-01]\n---\n\nBody\n",
+            "---\nid: T-CDX-02\ntitle: codex-b\ntype: task\nstatus: open\npriority: high\nphase: implement\ndepends_on: [T-CDX-01]\n---\n\nBody\n",
         ).unwrap();
         let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
         let dag = Dag::from_tickets(tickets).unwrap();
@@ -25294,7 +25202,7 @@ owned\n\
         });
     }
 
-    /// AC: phases advance on artifacts through all RDSPI phases — purely on
+    /// AC: phases advance on artifacts through every phase — purely on
     /// artifact presence, with *no* `.idle`/`.stopped` signal involved. This is
     /// the parity load-bearer for Codex (which emits no `.idle`): advancement
     /// rides `check_artifact_advances`.
@@ -25305,30 +25213,21 @@ owned\n\
 
         let (mut state, _dir) = codex_state_with_dag();
         let mut thread = Thread::new("T-CDX-01", 1);
-        thread.current_phase = Phase::Research;
+        thread.current_phase = Phase::Implement;
         state.threads.insert("T-CDX-01".to_string(), thread);
         let lease = install_current_attempt(&mut state, "T-CDX-01");
         let ticket_work = state.attempt_work_dir(&lease);
         fs::create_dir_all(&ticket_work).unwrap();
 
-        // Each artifact advances exactly one phase boundary. Implement→Review
-        // and Review→Done both ride review.md, so writing it cascades to Done in
-        // a single fixpoint pass — the full RDSPI walk.
-        let steps: &[(&str, Phase)] = &[
-            ("research.md", Phase::Design),
-            ("design.md", Phase::Structure),
-            ("structure.md", Phase::Plan),
-            ("plan.md", Phase::Implement),
-        ];
-        for (artifact, expected) in steps {
-            fs::write(ticket_work.join(artifact), "x").unwrap();
-            state.check_artifact_advances();
-            assert_eq!(
-                state.threads.get("T-CDX-01").unwrap().current_phase,
-                *expected,
-                "writing {artifact} should advance to {expected:?}"
-            );
-        }
+        // review.md is the only phase edge left: it carries Implement→Review
+        // and then Review→Done in a single fixpoint pass — the whole walk.
+        // Until it lands, nothing moves.
+        state.check_artifact_advances();
+        assert_eq!(
+            state.threads.get("T-CDX-01").unwrap().current_phase,
+            Phase::Implement,
+            "no artifact yet, so nothing should advance"
+        );
 
         // review.md reaches Review and starts commit-gated completion.
         fs::write(ticket_work.join("review.md"), "x").unwrap();

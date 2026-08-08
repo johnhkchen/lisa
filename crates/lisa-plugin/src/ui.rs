@@ -25,7 +25,6 @@ mod colors {
     pub const GREEN: &str = "\x1b[32m";
     pub const YELLOW: &str = "\x1b[33m";
     pub const BLUE: &str = "\x1b[34m";
-    pub const MAGENTA: &str = "\x1b[35m";
     pub const CYAN: &str = "\x1b[36m";
     pub const WHITE: &str = "\x1b[37m";
     pub const BRIGHT_GREEN: &str = "\x1b[92m";
@@ -82,14 +81,10 @@ impl TicketStatus {
     }
 }
 
-/// Phase in the RDSPI workflow (UI representation)
+/// Phase in the Lisa workflow (UI representation)
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Phase {
     Ready,
-    Research,
-    Design,
-    Structure,
-    Plan,
     Implement,
     Review,
     Done,
@@ -100,10 +95,6 @@ impl Phase {
     pub fn short_name(&self) -> &'static str {
         match self {
             Phase::Ready => "RDY",
-            Phase::Research => "RES",
-            Phase::Design => "DES",
-            Phase::Structure => "STR",
-            Phase::Plan => "PLN",
             Phase::Implement => "IMP",
             Phase::Review => "REV",
             Phase::Done => "DON",
@@ -114,10 +105,6 @@ impl Phase {
     pub fn full_name(&self) -> &'static str {
         match self {
             Phase::Ready => "Ready",
-            Phase::Research => "Research",
-            Phase::Design => "Design",
-            Phase::Structure => "Structure",
-            Phase::Plan => "Plan",
             Phase::Implement => "Implement",
             Phase::Review => "Review",
             Phase::Done => "Done",
@@ -128,10 +115,6 @@ impl Phase {
     pub fn color_code(&self) -> &'static str {
         match self {
             Phase::Ready => DIM,
-            Phase::Research => CYAN,
-            Phase::Design => MAGENTA,
-            Phase::Structure => YELLOW,
-            Phase::Plan => BLUE,
             Phase::Implement => GREEN,
             Phase::Review => BRIGHT_YELLOW,
             Phase::Done => BRIGHT_GREEN,
@@ -142,10 +125,6 @@ impl Phase {
     pub fn indicator(&self) -> &'static str {
         match self {
             Phase::Ready => "○",
-            Phase::Research => "◐",
-            Phase::Design => "◑",
-            Phase::Structure => "◒",
-            Phase::Plan => "◓",
             Phase::Implement => "●",
             Phase::Review => "◎",
             Phase::Done => "✓",
@@ -1308,13 +1287,9 @@ fn render_dag(state: &PluginState, pane_cols: usize, pan: &mut DagPan, output: &
     // document a code the board has stopped speaking.
     output.push(match style {
         LabelStyle::Full => format!(
-            "{}Phases: {} Rdy {} Res {} Des {} Str {} Pln {} Imp {} Rev {} Don{}",
+            "{}Phases: {} Rdy {} Imp {} Rev {} Don{}",
             DIM,
             Phase::Ready.indicator(),
-            Phase::Research.indicator(),
-            Phase::Design.indicator(),
-            Phase::Structure.indicator(),
-            Phase::Plan.indicator(),
             Phase::Implement.indicator(),
             Phase::Review.indicator(),
             Phase::Done.indicator(),
@@ -2373,7 +2348,7 @@ mod tests {
                 TicketNode {
                     id: "T-002".to_string(),
                     title: "Second ticket".to_string(),
-                    phase: Phase::Design,
+                    phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec!["T-001".to_string()],
                 },
@@ -2387,7 +2362,7 @@ mod tests {
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-002".to_string(),
-                phase: Phase::Design,
+                phase: Phase::Implement,
                 started_at: Duration::from_secs(60),
                 slot_number: 1,
                 awaiting: false,
@@ -2409,7 +2384,7 @@ mod tests {
                     count: 1,
                     activity: ActivityType::ThreadStarted {
                         ticket_id: "T-002".to_string(),
-                        phase: Phase::Design,
+                        phase: Phase::Implement,
                     },
                 },
             ],
@@ -2632,14 +2607,18 @@ mod tests {
 
     #[test]
     fn test_phase_short_names() {
-        assert_eq!(Phase::Research.short_name(), "RES");
+        assert_eq!(Phase::Ready.short_name(), "RDY");
         assert_eq!(Phase::Implement.short_name(), "IMP");
+        assert_eq!(Phase::Review.short_name(), "REV");
+        assert_eq!(Phase::Done.short_name(), "DON");
     }
 
     #[test]
     fn test_phase_full_names() {
-        assert_eq!(Phase::Research.full_name(), "Research");
+        assert_eq!(Phase::Ready.full_name(), "Ready");
         assert_eq!(Phase::Implement.full_name(), "Implement");
+        assert_eq!(Phase::Review.full_name(), "Review");
+        assert_eq!(Phase::Done.full_name(), "Done");
     }
 
     #[test]
@@ -3050,7 +3029,7 @@ mod tests {
             }],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-002".to_string(),
-                phase: Phase::Design,
+                phase: Phase::Implement,
                 started_at: Duration::from_secs(60),
                 slot_number: 1,
                 awaiting: true,
@@ -3089,7 +3068,7 @@ mod tests {
             active_threads: vec![
                 ActiveThread {
                     ticket_id: "T-001".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Implement,
                     started_at: Duration::from_secs(30),
                     slot_number: 1,
                     awaiting: false,
@@ -3097,7 +3076,7 @@ mod tests {
                 },
                 ActiveThread {
                     ticket_id: "T-002".to_string(),
-                    phase: Phase::Design,
+                    phase: Phase::Implement,
                     started_at: Duration::from_secs(30),
                     slot_number: 2,
                     awaiting: false,
@@ -3235,21 +3214,21 @@ mod tests {
                 TicketNode {
                     id: "T-902".to_string(),
                     title: "working".to_string(),
-                    phase: Phase::Design, // MAGENTA vs status GREEN
+                    phase: Phase::Review, // BRIGHT_YELLOW vs status GREEN
                     status: TicketStatus::InProgress,
                     depends_on: vec!["T-901".to_string()],
                 },
                 TicketNode {
                     id: "T-903".to_string(),
                     title: "in review".to_string(),
-                    phase: Phase::Structure, // YELLOW vs status BRIGHT_YELLOW
+                    phase: Phase::Implement, // GREEN vs status BRIGHT_YELLOW
                     status: TicketStatus::WaitingReview,
                     depends_on: vec!["T-901".to_string()],
                 },
                 TicketNode {
                     id: "T-904".to_string(),
                     title: "blocked".to_string(),
-                    phase: Phase::Plan, // BLUE vs status RED
+                    phase: Phase::Ready, // DIM vs status RED
                     status: TicketStatus::Blocked,
                     depends_on: vec!["T-902".to_string()],
                 },
@@ -3297,9 +3276,9 @@ mod tests {
 
         for (id, phase) in [
             ("T-901", Phase::Ready),
-            ("T-902", Phase::Design),
-            ("T-903", Phase::Structure),
-            ("T-904", Phase::Plan),
+            ("T-902", Phase::Review),
+            ("T-903", Phase::Implement),
+            ("T-904", Phase::Ready),
         ] {
             let inked = format!("{}{}{}", phase.color_code(), id, RESET);
             assert!(
@@ -3319,7 +3298,7 @@ mod tests {
                 TicketNode {
                     id: "T-911".to_string(),
                     title: "one".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Ready,
                     status: TicketStatus::Blocked,
                     depends_on: vec![],
                 },
@@ -3342,7 +3321,7 @@ mod tests {
             2,
             "both Blocked tokens should be red regardless of phase, got:\n{full}"
         );
-        assert!(full.contains(&format!("{}T-911{}", CYAN, RESET)));
+        assert!(full.contains(&format!("{}T-911{}", DIM, RESET)));
         assert!(full.contains(&format!("{}T-912{}", GREEN, RESET)));
     }
 
@@ -3394,7 +3373,7 @@ mod tests {
             .map(|i| TicketNode {
                 id: format!("T-054-01-{:02}", i),
                 title: format!("child {}", i),
-                phase: Phase::Research,
+                phase: Phase::Implement,
                 status: TicketStatus::Ready,
                 depends_on: if i == 1 {
                     vec![]
@@ -3441,10 +3420,10 @@ mod tests {
             TicketStatus::Blocked,
         ];
         let phases = [
-            Phase::Research,
-            Phase::Design,
+            Phase::Ready,
             Phase::Implement,
             Phase::Review,
+            Phase::Implement,
         ];
 
         let tickets = (1..=n)
@@ -3839,7 +3818,7 @@ mod tests {
         let plain = "[T-054-01-02 WRK] → [T-054-01-03 BLK]";
         let colored = format!(
             "[{}T-054-01-02{} {}WRK{}] → [{}T-054-01-03{} {}BLK{}]",
-            MAGENTA, RESET, GREEN, RESET, BLUE, RESET, RED, RESET
+            CYAN, RESET, GREEN, RESET, BLUE, RESET, RED, RESET
         );
 
         assert_ne!(plain, colored.as_str(), "the twin must actually be colored");
@@ -4130,7 +4109,7 @@ mod tests {
             .map(|(i, status)| TicketNode {
                 id: format!("T-054-01-{:02}", i + 1),
                 title: format!("node {}", i),
-                phase: Phase::Research, // one phase throughout: color can only be status
+                phase: Phase::Implement, // one phase throughout: color can only be status
                 status: status.clone(),
                 depends_on: if i == 0 {
                     vec![]
@@ -4172,7 +4151,7 @@ mod tests {
                 TicketNode {
                     id: "T-054-01-01".to_string(),
                     title: "blocked, researching".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Implement,
                     status: TicketStatus::Blocked,
                     depends_on: vec![],
                 },
@@ -4510,14 +4489,14 @@ mod tests {
                 TicketNode {
                     id: "T-B".to_string(),
                     title: "b".to_string(),
-                    phase: Phase::Design,
+                    phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec![],
                 },
                 TicketNode {
                     id: "T-C".to_string(),
                     title: "c".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec![],
                 },
@@ -4580,7 +4559,7 @@ mod tests {
                 TicketNode {
                     id: "T-003".to_string(),
                     title: "chain2-root".to_string(),
-                    phase: Phase::Design,
+                    phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec![],
                 },
@@ -4630,7 +4609,7 @@ mod tests {
                 TicketNode {
                     id: "T-002".to_string(),
                     title: "active-mid".to_string(),
-                    phase: Phase::Design,
+                    phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec!["T-001".to_string()],
                 },
@@ -4807,7 +4786,7 @@ mod tests {
                 TicketNode {
                     id: "T-002".to_string(),
                     title: "left".to_string(),
-                    phase: Phase::Design,
+                    phase: Phase::Implement,
                     status: TicketStatus::InProgress,
                     depends_on: vec!["T-001".to_string()],
                 },
@@ -4828,7 +4807,7 @@ mod tests {
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-002".to_string(),
-                phase: Phase::Design,
+                phase: Phase::Implement,
                 started_at: Duration::from_secs(100),
                 slot_number: 1,
                 awaiting: false,
@@ -4836,7 +4815,7 @@ mod tests {
             }],
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-003".to_string(),
-                phase: Phase::Research,
+                phase: Phase::Implement,
                 artifact_path: "docs/active/work/T-003/research.md".to_string(),
                 parked_at: Duration::from_secs(80),
                 slot_number: 2,
@@ -4856,7 +4835,7 @@ mod tests {
                     count: 1,
                     activity: ActivityType::ThreadStarted {
                         ticket_id: "T-002".to_string(),
-                        phase: Phase::Design,
+                        phase: Phase::Implement,
                     },
                 },
                 ActivityEntry {
@@ -5196,7 +5175,7 @@ mod tests {
                 },
                 ActiveThread {
                     ticket_id: "T-003-02".to_string(),
-                    phase: Phase::Research,
+                    phase: Phase::Review,
                     started_at: Duration::from_secs(100),
                     slot_number: 2,
                     awaiting: false,
@@ -5214,7 +5193,7 @@ mod tests {
         assert!(full.contains("T-003-02"), "Second ticket missing");
         assert!(full.contains("Running"), "Running status missing");
         assert!(full.contains("IMP"), "Phase shortname missing");
-        assert!(full.contains("RES"), "Phase shortname missing");
+        assert!(full.contains("REV"), "Phase shortname missing");
     }
 
     #[test]
@@ -5239,7 +5218,7 @@ mod tests {
             ],
             active_threads: vec![ActiveThread {
                 ticket_id: "T-001".to_string(),
-                phase: Phase::Design,
+                phase: Phase::Implement,
                 started_at: Duration::from_secs(50),
                 slot_number: 1,
                 awaiting: false,
@@ -5256,7 +5235,7 @@ mod tests {
         assert!(full.contains("Running"), "Running status missing");
         assert!(full.contains("Idle"), "Idle status missing");
         assert!(full.contains("Winding Down"), "Winding Down status missing");
-        assert!(full.contains("DES"), "Phase shortname missing");
+        assert!(full.contains("IMP"), "Phase shortname missing");
     }
 
     #[test]
