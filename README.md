@@ -362,6 +362,8 @@ Scaffold a project for Lisa: creates ticket directories, `docs/knowledge/lisa-wo
 
 On a project an older Lisa set up, it also clears out what that Lisa left behind: the workflow document under its old name, the `CLAUDE.md` and `AGENTS.md` Lisa used to write for you, and a `.lisa.toml` setting Lisa stopped reading. It removes a file only when the bytes are still exactly as Lisa wrote them. Change one line and the file is yours — kept as it is, and named in the list so you can see Lisa looked and left it. Your board is never rewritten. Run `lisa init --dry-run` first to read the whole list before anything happens.
 
+What init leaves behind on purpose is [`lisa clean`](#lisa-clean)'s to offer, and yours to say yes to.
+
 ```bash
 lisa init                 # Initialize with the strongest history mode available
 lisa init --with-history  # Require project history (undoable finished work)
@@ -435,6 +437,42 @@ Codex is selected, this also prepares directory trust for unattended
 ```bash
 lisa doctor
 ```
+
+`lisa doctor` also says how this project differs from the Lisa you have
+installed, and names the exact command that settles each difference:
+`lisa init` for what Lisa can bring forward on its own, `lisa clean` for what
+only removal will fix, and the one-line edit for anything in a file that is
+yours.
+
+### `lisa clean`
+
+Remove what an older Lisa left behind. `lisa doctor` reports, `lisa init` brings
+forward what it can prove is safe, and `lisa clean` is where you say *yes, remove
+it* to the rest.
+
+**A bare run removes nothing.** It prints the list — every file, and why Lisa
+believes it can go — and stops. Read it, then run it again with `--remove`.
+
+```bash
+lisa clean            # print the list, change nothing
+lisa clean --remove   # carry the list out
+```
+
+Three kinds of thing are on the list:
+
+- Documents an older Lisa left behind that `lisa init` looked at and declined —
+  a workflow document you edited, a `CLAUDE.md` Lisa generated that something
+  still points at.
+- The old workflow's notes — `research.md`, `design.md`, `structure.md`,
+  `plan.md`, `progress.md` — in the work folder of a ticket your board records as
+  **done**. Nothing else in that folder is touched: your own notes stay, and so
+  does `review.md`.
+- Lisa's own working folders under `.lisa/attempts/`, for tickets that are done.
+
+And what is never on it, under any flag: your board (`docs/active/tickets/`,
+`docs/active/stories/`), your `.lisa.toml`, anything Lisa did not write, the work
+of any ticket that is not done, and anything a symlink points to outside your
+project. Lisa removes files; it never rewrites what is inside one.
 
 ### `lisa unblock`
 
