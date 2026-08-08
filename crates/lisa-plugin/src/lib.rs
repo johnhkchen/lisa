@@ -2270,7 +2270,6 @@ impl State {
             OverriddenAsk::Block { .. } => [
                 self.review_disposition_path(ticket_id),
                 work_dir.join("review.md"),
-                work_dir.join("progress.md"),
             ]
             .into_iter()
             .filter(|path| path.exists())
@@ -5958,11 +5957,12 @@ impl State {
     /// completes multiple phases in a single session catches up in one tick
     /// rather than advancing one phase per poll cycle.
     ///
-    /// For the Implement phase, `review.md` (not `progress.md`) is the
-    /// completion artifact. `progress.md` is a living tracking document
-    /// created early in the implement phase, so it cannot serve as a
-    /// completion signal. The presence of `review.md` means the agent has
-    /// moved past implement into review.
+    /// A phase advances when its completion artifact appears — see
+    /// [`Phase::completion_artifact`], which is the one place that mapping
+    /// lives. Implement and Review share `review.md`, which is why the edge is
+    /// read from that method and never from `artifact_filename()`: Implement
+    /// writes no artifact of its own, so the plain lookup would strand every
+    /// ticket there.
     fn check_artifact_advances(&mut self) {
         loop {
             // Snapshot running threads each iteration — phases change as we advance
@@ -5976,35 +5976,9 @@ impl State {
             let mut advanced_any = false;
 
             for (ticket_id, current_phase, source_lease) in running {
-                // progress.md is a living Implement artifact: publish current
-                // bytes for durability/review, but never use it as a phase edge.
-                if current_phase == Phase::Implement {
-                    match self.admit_artifact(&ticket_id, source_lease.as_ref(), "progress.md") {
-                        Ok(true) => self.record_artifact_ownership(
-                            &ticket_id,
-                            source_lease.as_ref(),
-                            "progress.md",
-                        ),
-                        Ok(false) => {}
-                        Err(error) => {
-                            self.log_activity(ActivityEvent::Error {
-                                message: format!(
-                                    "Rejected progress publication for {}: {}",
-                                    ticket_id, error
-                                ),
-                            });
-                        }
-                    }
-                }
-                // Determine which artifact signals completion of this phase.
-                // Implement uses review.md instead of progress.md (living doc).
-                let artifact_name = if current_phase == Phase::Implement {
-                    "review.md"
-                } else {
-                    match current_phase.artifact_filename() {
-                        Some(name) => name,
-                        None => continue,
-                    }
+                let artifact_name = match current_phase.completion_artifact() {
+                    Some(name) => name,
+                    None => continue,
                 };
 
                 match self.admit_artifact(&ticket_id, source_lease.as_ref(), artifact_name) {
@@ -6565,16 +6539,6 @@ impl State {
 
             match current_phase {
                 Phase::Implement => {
-                    if let Err(error) =
-                        self.admit_artifact(&ticket_id, source_lease.as_ref(), "progress.md")
-                    {
-                        self.log_activity(ActivityEvent::Error {
-                            message: format!(
-                                "Rejected idle progress publication for {}: {}",
-                                ticket_id, error
-                            ),
-                        });
-                    }
                     // Idle signal alone is the completion signal for Implement
                     let file_path = self.dag.get_ticket(&ticket_id).map(|t| t.file_path.clone());
                     let file_path = match file_path {
@@ -9852,12 +9816,21 @@ impl State {
                 ui::ParkedThread {
                     ticket_id: t.ticket_id.clone(),
                     phase: phase_to_ui_phase(t.current_phase),
-                    artifact_path: format!(
-                        "{}/{}/{}",
-                        self.config.work_dir.display(),
-                        t.ticket_id,
-                        t.current_phase.artifact_filename().unwrap_or("artifact.md")
-                    ),
+                    artifact_path: match t.current_phase.artifact_filename() {
+                        Some(name) => format!(
+                            "{}/{}/{}",
+                            self.config.work_dir.display(),
+                            t.ticket_id,
+                            name
+                        ),
+                        // The phase wrote no artifact of its own — name the
+                        // directory the operator would open, which is the same
+                        // answer `inspected_paths` gives when review.md is not
+                        // on file.
+                        None => {
+                            format!("{}/{}", self.config.work_dir.display(), t.ticket_id)
+                        }
+                    },
                     parked_at: Duration::from_secs(
                         t.started_at
                             .duration_since(std::time::UNIX_EPOCH)
@@ -13940,9 +13913,10 @@ mod tests {
     }
 
     #[test]
-    fn test_check_artifact_advances_implement_ignores_progress_md() {
-        // progress.md is a living tracking document, not a completion signal.
-        // Only review.md advances implement → review.
+    fn implement_does_not_publish_progress_md() {
+        // progress.md is retired. An attempt is free to write one into its own
+        // private directory, but nothing publishes it: the canonical work
+        // directory never gains the file, and the phase does not move.
         use lisa_core::types::{Thread, ThreadStatus};
         use std::fs;
 
@@ -13983,8 +13957,20 @@ mod tests {
         let thread = state.threads.get("T-002").unwrap();
         assert_eq!(thread.current_phase, Phase::Implement);
         assert_eq!(thread.status, ThreadStatus::Running);
+
+        // The absence is the assertion: not "it did not advance" — which would
+        // still hold if publication came back — but "the file is not there".
+        let published = state.config.work_dir.join("T-002").join("progress.md");
+        assert!(
+            !published.exists(),
+            "progress.md must not be published to {}",
+            published.display()
+        );
+        // And nothing else was published in its place.
+        assert!(!state.config.work_dir.join("T-002").exists());
+        // It is still in the attempt's own directory, untouched.
         assert_eq!(
-            fs::read_to_string(state.config.work_dir.join("T-002/progress.md")).unwrap(),
+            fs::read_to_string(staged.join("progress.md")).unwrap(),
             "# Progress"
         );
     }
@@ -14020,6 +14006,17 @@ mod tests {
             ..State::default()
         };
 
+        // The regression this test exists for. Implement produces no artifact
+        // of its own, so a detector that re-derives the name from
+        // `artifact_filename()` alone gets `None`, skips the ticket, and
+        // strands it at Implement forever. The advance asserted below is what
+        // fails when that happens.
+        assert_eq!(
+            Phase::Implement.artifact_filename(),
+            None,
+            "if this ever returns a name, re-read why this test looks like this"
+        );
+
         let mut thread = Thread::new("T-002", 2);
         thread.current_phase = Phase::Implement;
         state.threads.insert("T-002".to_string(), thread);
@@ -14041,6 +14038,119 @@ mod tests {
         // Ticket remains Review until the native transaction prepares Done.
         let updated = fs::read_to_string(tickets_dir.join("T-002.md")).unwrap();
         assert!(updated.contains("phase: review"));
+    }
+
+    #[test]
+    fn phase_transitions_logged_are_exactly_the_new_chain() {
+        // Three of the four `log_phase_transition` call sites derive their edge
+        // from `Phase::next()`, so the chain is their specification. The fourth
+        // (the idle handler's Implement arm) writes the pair as a literal, and
+        // this is where that literal is checked against the chain.
+        assert_eq!(Phase::Implement.next(), Some(Phase::Review));
+
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-003.md"),
+            "---\nid: T-003\ntitle: chain\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        let mut thread = Thread::new("T-003", 3);
+        thread.current_phase = Phase::Implement;
+        state.threads.insert("T-003".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-003");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("review.md"), "# Review").unwrap();
+
+        state.check_artifact_advances();
+
+        let edges: Vec<(Phase, Phase)> = state
+            .activity_events()
+            .filter_map(|event| match event {
+                ActivityEvent::TicketPhaseChanged {
+                    old_phase,
+                    new_phase,
+                    ..
+                } => Some((*old_phase, *new_phase)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            edges,
+            vec![(Phase::Implement, Phase::Review)],
+            "the detector reports the one edge it walked, and no other"
+        );
+        for (from, to) in &edges {
+            assert_eq!(
+                from.next(),
+                Some(*to),
+                "{from} → {to} is not an edge of the phase chain"
+            );
+        }
+    }
+
+    #[test]
+    fn parked_thread_at_implement_cites_its_work_directory() {
+        // Implement writes no artifact of its own, so there is no filename to
+        // name. The operator gets the directory — never a placeholder for a
+        // file that has never existed.
+        use lisa_core::types::Thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State {
+            config: PluginConfig {
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+
+        for (ticket_id, phase) in [("T-IMP", Phase::Implement), ("T-REV", Phase::Review)] {
+            let mut thread = Thread::new(ticket_id, 1);
+            thread.current_phase = phase;
+            thread.park();
+            state.threads.insert(ticket_id.to_string(), thread);
+        }
+
+        let parked = state.to_ui_state().parked_threads;
+        let cited = |ticket_id: &str| -> String {
+            parked
+                .iter()
+                .find(|t| t.ticket_id == ticket_id)
+                .expect("parked thread missing")
+                .artifact_path
+                .clone()
+        };
+
+        assert!(cited("T-IMP").ends_with("/T-IMP"), "{}", cited("T-IMP"));
+        assert!(
+            cited("T-REV").ends_with("/T-REV/review.md"),
+            "{}",
+            cited("T-REV")
+        );
+        for path in parked.iter().map(|t| &t.artifact_path) {
+            assert!(
+                !path.contains("artifact.md"),
+                "no operator surface may name a file Lisa never writes: {path}"
+            );
+        }
     }
 
     #[test]
@@ -16340,7 +16450,26 @@ mod tests {
 
     /// Criterion 2's "nothing fabricated": a citation names only what is there.
     #[test]
-    fn operator_override_cites_review_and_progress_only_when_they_exist() {
+    fn operator_override_cites_only_the_evidence_that_exists() {
+        // A block written before review.md lands is a real state, and it is the
+        // one that proves the property: the citation must shrink to what is on
+        // disk rather than reciting the artifacts the workflow could produce.
+        let (_dir, mut state) = parked_fixture(Some(XCODE_BLOCK));
+        assert!(
+            state.dispatch_completion(CompletionInput::OperatorRequested {
+                ticket_id: "T-001".to_string(),
+                source: OperatorRequestSource::MarkDoneKey,
+                override_reason: Some(OverrideReason::EvidenceSatisfies),
+            })
+        );
+        let citation = admitted_note(&state).evidence_citation().to_string();
+        assert!(citation.contains("review-disposition.json"), "{citation}");
+        assert!(
+            !citation.contains("review.md"),
+            "a citation must not name a file that is not there: {citation}"
+        );
+
+        // Write it, and the citation grows by exactly that file.
         let (_dir, mut state) = parked_fixture(Some(XCODE_BLOCK));
         std::fs::write(
             state.config.work_dir.join("T-001").join("review.md"),
@@ -16359,10 +16488,8 @@ mod tests {
         let citation = admitted_note(&state).evidence_citation().to_string();
         assert!(citation.contains("review-disposition.json"), "{citation}");
         assert!(citation.contains("review.md"), "{citation}");
-        assert!(
-            !citation.contains("progress.md"),
-            "a citation must not name a file that is not there: {citation}"
-        );
+        // progress.md is retired: nothing publishes it, so nothing cites it.
+        assert!(!citation.contains("progress.md"), "{citation}");
     }
 
     #[test]
@@ -18195,6 +18322,74 @@ mod tests {
 
         // Verify: no idle alerts
         assert!(state.idle_alerts.is_empty());
+    }
+
+    #[test]
+    fn idle_signal_at_implement_does_not_publish_progress_md() {
+        // The second publication site, closed with the first: an idle signal
+        // advances Implement on its own and publishes nothing on the way.
+        use lisa_core::types::Thread;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-001.md"),
+            "---\nid: T-001\ntitle: test\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nBody\n",
+        ).unwrap();
+
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        fs::write(signal_dir.join("pane-1.idle"), "2025-01-01T00:00:00Z").unwrap();
+
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                ..PluginConfig::new()
+            },
+            signal_dir,
+            ..State::default()
+        };
+
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some("T-001".to_string()),
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+
+        let mut thread = Thread::new("T-001", 1);
+        thread.current_phase = Phase::Implement;
+        state.threads.insert("T-001".to_string(), thread);
+        let lease = install_current_attempt(&mut state, "T-001");
+        let staged = state.attempt_work_dir(&lease);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("progress.md"), "# Progress").unwrap();
+
+        state.check_idle_signals();
+
+        // The idle signal still does its job.
+        assert_eq!(
+            state.threads.get("T-001").unwrap().current_phase,
+            Phase::Review
+        );
+        // And carried nothing across.
+        let published = state.config.work_dir.join("T-001").join("progress.md");
+        assert!(
+            !published.exists(),
+            "progress.md must not be published to {}",
+            published.display()
+        );
     }
 
     #[test]
