@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use crate::detect::{detect_project, DetectedProject, ProjectType};
-use crate::templates;
+use crate::detect::{detect_project, ProjectType};
 
 struct GuideSection {
     title: String,
@@ -23,16 +22,16 @@ fn render_guide(header: &str, sections: Vec<GuideSection>) -> String {
 }
 
 fn section_init(root: &Path) -> GuideSection {
-    let already_initialized = root.join("CLAUDE.md").exists()
-        && root.join(".lisa.toml").exists()
-        && root.join("docs/active/tickets").exists();
+    let already_initialized =
+        root.join(".lisa.toml").exists() && root.join("docs/active/tickets").exists();
 
     let body = if already_initialized {
         "Project is already initialized. Run `lisa init` again to update any stale files:\n\n\
          ```bash\n\
          lisa init\n\
          ```\n\n\
-         This is safe to re-run — it never overwrites CLAUDE.md and only updates files that are out of date."
+         This is safe to re-run — it only touches the files it created itself, and only \
+         when they are out of date. Anything you wrote by hand it leaves alone."
             .to_string()
     } else {
         "Run `lisa init` from the project root to scaffold everything:\n\n\
@@ -42,8 +41,6 @@ fn section_init(root: &Path) -> GuideSection {
          This creates:\n\n\
          | Path | Purpose |\n\
          |------|--------|\n\
-         | `CLAUDE.md` | Project context for Claude Code |\n\
-         | `AGENTS.md` | Codex's native context file (a pointer to CLAUDE.md — single source of truth) |\n\
          | `.lisa.toml` | Lisa configuration (`max_threads`, etc.) |\n\
          | `docs/knowledge/rdspi-workflow.md` | RDSPI workflow definition (injected into agent sessions) |\n\
          | `docs/active/tickets/` | Ticket files (YAML frontmatter markdown) |\n\
@@ -53,7 +50,8 @@ fn section_init(root: &Path) -> GuideSection {
          | `.lisa/hooks/` | Signal hooks (`on-idle.sh`, `on-stop.sh`, `on-clear.sh`, `on-heartbeat.sh`) |\n\
          | `.lisa/signals/` | Ephemeral signal files (gitignored) |\n\
          | `.claude/settings.local.json` | Claude Code hook integration |\n\n\
-         After running, edit `CLAUDE.md` to add your project description, build commands, and source layout."
+         `.lisa.toml` is the only file `lisa init` puts in the project root. Your agent \
+         context file is not on this list, and Step 3 explains why."
             .to_string()
     };
 
@@ -92,27 +90,28 @@ fn section_config() -> GuideSection {
     }
 }
 
-fn section_claude_md(_root: &Path, project: &DetectedProject) -> GuideSection {
-    let template = templates::generate_claude_md(project);
-
-    let body = format!(
-        "`lisa init` generates a CLAUDE.md template for your project type. \
-         Edit it to include:\n\n\
-         - Project description (one line)\n\
-         - Build, test, and lint commands\n\
-         - Source layout overview\n\
-         - Any project-specific conventions or architecture decisions\n\n\
-         Codex agents read the same content via the generated `AGENTS.md` pointer, \
-         so CLAUDE.md stays the single file to maintain.\n\n\
-         Generated template:\n\n\
-         ```markdown\n\
-         {}\n\
-         ```",
-        template.trim()
-    );
+fn section_agent_context() -> GuideSection {
+    let body = "Lisa does not write this file. If you used Lisa 0.4, `lisa init` used to \
+        generate a `CLAUDE.md` for you and no longer does — that is deliberate, not a \
+        missing step.\n\n\
+        An agent context file is where a project states its standing intentions to every \
+        model that will ever read it. Everything in it gets believed. A file Lisa guessed \
+        at from your `Cargo.toml` is a poor thing to have believed, so Lisa leaves the \
+        whole document to you.\n\n\
+        The clients read it from the project root under their own names — Claude Code \
+        reads `CLAUDE.md`, Codex reads `AGENTS.md`. Write one, both, or neither; agents \
+        run fine without one.\n\n\
+        If you do write one, the things worth putting in it:\n\n\
+        - What the project is, in one line\n\
+        - How to build, test, and lint it — the exact commands\n\
+        - Where the source lives\n\
+        - Conventions and decisions an agent would otherwise have to guess at\n\n\
+        You do not need to mention Lisa or the RDSPI workflow. Lisa injects the workflow \
+        into every session itself."
+        .to_string();
 
     GuideSection {
-        title: "Edit CLAUDE.md".to_string(),
+        title: "Write your own agent context file".to_string(),
         body,
     }
 }
@@ -216,7 +215,7 @@ fn section_validate() -> GuideSection {
         lisa validate\n\
         ```\n\n\
         This checks:\n\
-        - CLAUDE.md and RDSPI workflow file exist\n\
+        - .lisa.toml and the RDSPI workflow file exist\n\
         - .lisa.toml is valid (if present)\n\
         - Hook scripts and settings.local.json are configured correctly\n\
         - Ticket frontmatter parses correctly\n\
@@ -286,7 +285,7 @@ fn build_guide(root: &Path) -> Result<String, String> {
     let sections = vec![
         section_init(root),
         section_config(),
-        section_claude_md(root, &project),
+        section_agent_context(),
         section_ticket_format(),
         section_story_format(),
         section_dependencies(),
@@ -320,8 +319,6 @@ mod tests {
         let guide = build_guide(dir.path()).unwrap();
         assert!(guide.contains("my-rust-app"));
         assert!(guide.contains("Rust"));
-        assert!(guide.contains("cargo build"));
-        assert!(guide.contains("cargo test"));
         assert!(guide.contains("lisa init"));
         // The guide addresses the setup agent and ends with the operator
         // handoff — never instructing the agent to run the loop itself.
@@ -342,8 +339,32 @@ mod tests {
         let guide = build_guide(dir.path()).unwrap();
         assert!(guide.contains("my-node-app"));
         assert!(guide.contains("Node.js"));
-        assert!(guide.contains("npm run build"));
-        assert!(guide.contains("npm test"));
+    }
+
+    /// The guide names every file `lisa init` creates and no file it does not.
+    /// The project's own agent context file is the operator's to write, and the
+    /// guide says so rather than leaving a 0.4 operator to wonder.
+    #[test]
+    fn test_guide_leaves_the_context_file_to_the_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"context-owner\"\n",
+        )
+        .unwrap();
+
+        let guide = build_guide(dir.path()).unwrap();
+
+        // No table row claiming Lisa creates a context file.
+        assert!(!guide.contains("| `CLAUDE.md` |"));
+        assert!(!guide.contains("| `AGENTS.md` |"));
+        // The one root file init writes is still named.
+        assert!(guide.contains("| `.lisa.toml` |"));
+        // And the guide says the second part on purpose.
+        assert!(guide.contains("Write your own agent context file"));
+        assert!(guide.contains("Lisa does not write this file."));
+        // A removed config key must not survive in operator-facing copy.
+        assert!(!guide.contains("auto_advance"));
     }
 
     #[test]
@@ -367,7 +388,6 @@ mod tests {
 
         // Simulate `lisa init` having run
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# existing").unwrap();
         fs::write(
             dir.path().join(".lisa.toml"),
             "[scheduling]\nmax_threads = 2\n",
