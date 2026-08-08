@@ -4419,6 +4419,18 @@ my_own_setting = "keep me"
                 recorded: config::LISA_VERSION.to_string()
             }
         );
+
+        // The board row is the one thing left, and the ticket is explicit that
+        // it is not init's to fix: a retired phase still loads as `implement`,
+        // and Lisa rewrites the row itself the next time it moves the ticket.
+        // Settle it the way its owner would and the project is current outright
+        // — one `lisa init`, no hand edits to anything Lisa wrote.
+        fs::write(
+            dir.path().join("docs/active/tickets/T-024-01.md"),
+            TICKET_AT_RETIRED_PHASE.replace("phase: structure", "phase: implement"),
+        )
+        .unwrap();
+        assert!(crate::currency::inventory(dir.path()).is_current());
     }
 
     /// No retirement fires twice.
