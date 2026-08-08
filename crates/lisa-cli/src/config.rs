@@ -1790,6 +1790,34 @@ foo = 1
         assert!(version_is_stale("not-semver", "0.4.0-rc.8"));
     }
 
+    /// The comparison the 0.5.0 upgrade path hangs off.
+    ///
+    /// A project written by 0.4.4 has to read as stale against `0.5.0-rc.1`,
+    /// because that is the signal `lisa doctor`, `lisa init`, and `lisa loop`
+    /// all key their upgrade behaviour on. A prerelease suffix is exactly the
+    /// kind of string a naive compare gets backwards — `0.5.0-rc.1` sorts
+    /// *before* `0.5.0` and *after* every `0.4.x` — so both directions are
+    /// asserted with literals rather than reasoned about.
+    #[test]
+    fn a_0_4_4_project_is_stale_against_the_0_5_0_release_candidate() {
+        assert!(version_is_stale("0.4.4", "0.5.0-rc.1"));
+        assert!(!version_is_stale("0.5.0-rc.1", "0.5.0-rc.1"));
+
+        // The comparison must not invert: an rc.1 project read by an older
+        // 0.4.4 binary is ahead, not behind.
+        assert!(!version_is_stale("0.5.0-rc.1", "0.4.4"));
+
+        // And the rc still yields to the stable it precedes, and to its own
+        // later generations.
+        assert!(version_is_stale("0.5.0-rc.1", "0.5.0"));
+        assert!(version_is_stale("0.5.0-rc.1", "0.5.0-rc.2"));
+
+        // Tied to the binary actually shipping, so the assertion keeps meaning
+        // something after the next bump.
+        assert!(version_is_stale("0.4.4", LISA_VERSION));
+        assert!(!version_is_stale(LISA_VERSION, LISA_VERSION));
+    }
+
     #[test]
     fn test_parse_phase_timeouts() {
         let toml_str = r#"

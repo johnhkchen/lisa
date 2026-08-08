@@ -1022,6 +1022,50 @@ mod tests {
         );
     }
 
+    /// The same comparison as
+    /// `config::tests::a_0_4_4_project_is_stale_against_the_0_5_0_release_candidate`,
+    /// read the way an operator's project actually presents it: a recorded
+    /// version in `.lisa.toml`. This is the reading every upgrade command
+    /// branches on, so it is asserted through `inventory` and not only through
+    /// the pure function underneath it.
+    #[test]
+    fn a_lisa_toml_written_by_0_4_4_reads_as_behind_this_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "version = \"0.4.4\"\n").unwrap();
+
+        let currency = inventory(dir.path());
+        assert_eq!(
+            currency.recorded_version,
+            RecordedVersion::Behind {
+                recorded: "0.4.4".to_string()
+            },
+            "0.4.4 must read as behind {}",
+            config::LISA_VERSION
+        );
+
+        let finding = find(&currency, ".lisa.toml").expect("a behind version is reported");
+        assert_eq!(finding.kind, CurrencyKind::Behind);
+        assert_eq!(finding.remedy, Remedy::Init);
+    }
+
+    #[test]
+    fn a_lisa_toml_written_by_this_binary_reads_as_current() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".lisa.toml"), config::default_config_toml()).unwrap();
+
+        let currency = inventory(dir.path());
+        assert_eq!(
+            currency.recorded_version,
+            RecordedVersion::Current {
+                recorded: config::LISA_VERSION.to_string()
+            }
+        );
+        assert!(
+            find(&currency, ".lisa.toml").is_none(),
+            "the config this binary writes cannot already be behind it"
+        );
+    }
+
     #[test]
     fn a_directory_with_no_lisa_toml_has_nothing_to_be_current_with() {
         let dir = tempfile::tempdir().unwrap();
