@@ -726,3 +726,605 @@ fn run_clean_with_writer(root: &Path, remove: bool, out: &mut impl Write) -> Res
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::currency::{inventory, Remedy};
+
+    /// A ticket file, at whatever status the caller needs.
+    fn ticket(id: &str, status: &str) -> String {
+        format!(
+            "---\nid: {id}\nstory: S-024\ntitle: migrate-climate-calls\ntype: task\nstatus: {status}\npriority: high\nphase: done\ndepends_on: []\n---\n\n## Context\n\nWork.\n"
+        )
+    }
+
+    fn write(path: PathBuf, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    /// The five retired notes, plus whatever else the caller asked for.
+    fn retired_notes(root: &Path, ticket_id: &str) {
+        for name in RETIRED_WORKFLOW_NOTES {
+            write(
+                root.join(format!("docs/active/work/{ticket_id}/{name}")),
+                &format!("# {name} for {ticket_id}\n"),
+            );
+        }
+    }
+
+    fn attempt(root: &Path, ticket_id: &str) {
+        write(
+            root.join(format!(".lisa/attempts/{ticket_id}/1/work/assignment.md")),
+            "Do the work.\n",
+        );
+    }
+
+    /// A project carrying every class this command reasons about at once.
+    ///
+    /// `T-024-01` is done and has notes, the current workflow's `review.md`, an
+    /// operator's own note and a whole `harness/` subdirectory beside them.
+    /// `T-024-02` is open, `T-024-03` is in review, `T-024-04` is done and has
+    /// nothing but notes, and `T-024-99` has notes but no ticket anywhere.
+    fn litter_fixture(root: &Path) {
+        write(
+            root.join(".lisa.toml"),
+            &format!("version = \"{}\"\n", config::LISA_VERSION),
+        );
+
+        write(
+            root.join("docs/active/tickets/T-024-01.md"),
+            &ticket("T-024-01", "done"),
+        );
+        write(
+            root.join("docs/active/tickets/T-024-02.md"),
+            &ticket("T-024-02", "open"),
+        );
+        write(
+            root.join("docs/active/tickets/T-024-03.md"),
+            &ticket("T-024-03", "review"),
+        );
+        write(
+            root.join("docs/archive/tickets/T-024-04.md"),
+            &ticket("T-024-04", "done"),
+        );
+        write(
+            root.join("docs/active/stories/S-024.md"),
+            "---\nid: S-024\ntitle: climate\nstatus: done\n---\n\nThe story.\n",
+        );
+
+        for id in ["T-024-01", "T-024-02", "T-024-03", "T-024-04", "T-024-99"] {
+            retired_notes(root, id);
+        }
+        write(
+            root.join("docs/active/work/T-024-01/review.md"),
+            "# Review\n\nWhat changed.\n",
+        );
+        write(
+            root.join("docs/active/work/T-024-01/review-disposition.json"),
+            "{\"disposition\":\"pass\",\"reason\":null}\n",
+        );
+        write(
+            root.join("docs/active/work/T-024-01/operator-note.md"),
+            "Ask Priya about the cache before touching this again.\n",
+        );
+        write(
+            root.join("docs/active/work/T-024-01/harness/probe.sh"),
+            "#!/bin/sh\necho probe\n",
+        );
+
+        attempt(root, "T-024-01");
+        attempt(root, "T-024-02");
+
+        write(
+            root.join("README.md"),
+            "# my-app\n\nRuns the climate suite.\n",
+        );
+        write(
+            root.join("CLAUDE.md"),
+            "# CLAUDE.md\n\nRun the suite first.\n",
+        );
+        write(
+            root.join("docs/knowledge/our-notes.md"),
+            "Our own notes, nothing to do with Lisa.\n",
+        );
+        write(root.join(".lisa/completion-journal.jsonl"), "{}\n");
+        write(root.join(".lisa/provenance.jsonl"), "{}\n");
+        write(root.join(".lisa/hooks/on-stop.sh"), "#!/bin/sh\n");
+        write(root.join(".lisa/signals/pane-0.lease"), "0\n");
+    }
+
+    /// Every path under `root`: files with their exact bytes, directories and
+    /// symlinks by name. Directories are in the snapshot so that removing an
+    /// empty one cannot hide inside a file-only comparison.
+    fn tree_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Option<Vec<u8>>)>) {
+            for path in sorted_dir_entries(dir) {
+                let relative = display_relative(root, &path);
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.file_type().is_symlink() {
+                    out.push((format!("{relative} (symlink)"), None));
+                } else if metadata.is_dir() {
+                    out.push((format!("{relative}/"), None));
+                    walk(&path, root, out);
+                } else {
+                    out.push((relative, Some(fs::read(&path).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn clean_output(root: &Path, remove: bool) -> String {
+        let mut output = Vec::new();
+        run_clean_with_writer(root, remove, &mut output).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    fn removals(plan: &[CleanAction]) -> Vec<&CleanAction> {
+        plan.iter()
+            .filter(|action| action.verb.is_removal())
+            .collect()
+    }
+
+    fn relative_removals(root: &Path, plan: &[CleanAction]) -> Vec<String> {
+        removals(plan)
+            .iter()
+            .map(|action| display_relative(root, &action.path))
+            .collect()
+    }
+
+    /// A `CLAUDE.md` byte-exact to what a 0.4.4 `generate_claude_md` wrote.
+    fn generated_claude_md() -> String {
+        format!(
+            "{}my-app (Rust) — TODO: add a one-line project description here.\n\n### Build and Test\n\n```bash\n# Build\ncargo build\n\n# Run tests\ncargo test\n\n# Lint\ncargo clippy\n```\n\n### Source Layout\n\n```\nsrc:\n  main.rs\n```\n\n{}",
+            include_str!("../data/legacy/claude-md-header-v0.4.4.md"),
+            include_str!("../data/legacy/claude-md-tail.md"),
+        )
+    }
+
+    /// **The default this ticket turns on.** A bare run is a preview, and a
+    /// preview that changed one byte would be a lie about a deletion.
+    #[test]
+    fn a_bare_run_prints_the_plan_and_changes_not_one_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+        let before = tree_snapshot(dir.path());
+
+        let output = clean_output(dir.path(), false);
+
+        assert!(output.contains("Planned actions:"), "{output}");
+        assert!(
+            output.contains("  remove  docs/active/work/T-024-01/research.md"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Dry run complete. No changes made."),
+            "{output}"
+        );
+        assert_eq!(
+            tree_snapshot(dir.path()),
+            before,
+            "a bare `lisa clean` must leave the tree byte-identical"
+        );
+    }
+
+    /// Removal happens only under `--remove`, and nothing vanishes that the plan
+    /// did not name first.
+    #[test]
+    fn every_removed_path_was_named_in_the_plan_first() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+
+        let plan = plan_clean_actions(dir.path());
+        let planned = relative_removals(dir.path(), &plan);
+        let before = tree_snapshot(dir.path());
+
+        let output = clean_output(dir.path(), true);
+        assert!(output.contains("Removed "), "{output}");
+
+        let after = tree_snapshot(dir.path());
+        let survived: Vec<&String> = after.iter().map(|(path, _)| path).collect();
+        for (path, _) in &before {
+            if survived.contains(&path) {
+                continue;
+            }
+            let bare = path.trim_end_matches('/');
+            assert!(
+                planned.iter().any(|named| named == bare)
+                    || planned
+                        .iter()
+                        .any(|named| bare.starts_with(&format!("{named}/"))),
+                "{path} vanished without a plan line naming it; plan was {planned:?}"
+            );
+        }
+        for named in &planned {
+            assert!(
+                !survived
+                    .iter()
+                    .any(|path| path.trim_end_matches('/') == named),
+                "{named} was planned for removal and is still there"
+            );
+        }
+    }
+
+    /// The board is the operator's, even the parts of it Lisa scheduled.
+    #[test]
+    fn the_board_is_never_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+        let ticket_before = fs::read(dir.path().join("docs/active/tickets/T-024-01.md")).unwrap();
+        let story_before = fs::read(dir.path().join("docs/active/stories/S-024.md")).unwrap();
+
+        let plan = plan_clean_actions(dir.path());
+        for action in &plan {
+            let relative = display_relative(dir.path(), &action.path);
+            assert!(
+                !relative.starts_with("docs/active/tickets/")
+                    && !relative.starts_with("docs/active/stories/")
+                    && !relative.starts_with("docs/archive/tickets/"),
+                "{relative} is on the board and must not appear in clean's plan at all"
+            );
+        }
+
+        clean_output(dir.path(), true);
+        assert_eq!(
+            fs::read(dir.path().join("docs/active/tickets/T-024-01.md")).unwrap(),
+            ticket_before
+        );
+        assert_eq!(
+            fs::read(dir.path().join("docs/active/stories/S-024.md")).unwrap(),
+            story_before
+        );
+    }
+
+    /// Nothing outside the two per-ticket directories Lisa creates, and nothing
+    /// inside them that Lisa did not write.
+    #[test]
+    fn nothing_outside_lisas_own_directories_is_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+
+        let untouchable = [
+            "README.md",
+            "CLAUDE.md",
+            ".lisa.toml",
+            "docs/knowledge/our-notes.md",
+            ".lisa/completion-journal.jsonl",
+            ".lisa/provenance.jsonl",
+            ".lisa/hooks/on-stop.sh",
+            ".lisa/signals/pane-0.lease",
+            // Inside a done ticket's own work directory, beside the notes.
+            "docs/active/work/T-024-01/review.md",
+            "docs/active/work/T-024-01/review-disposition.json",
+            "docs/active/work/T-024-01/operator-note.md",
+            "docs/active/work/T-024-01/harness/probe.sh",
+        ];
+        let before: Vec<Vec<u8>> = untouchable
+            .iter()
+            .map(|path| fs::read(dir.path().join(path)).unwrap())
+            .collect();
+
+        let plan = plan_clean_actions(dir.path());
+        let named = relative_removals(dir.path(), &plan);
+        for path in untouchable {
+            assert!(
+                !named.iter().any(|removal| removal == path),
+                "{path} must never be a candidate; plan named {named:?}"
+            );
+        }
+
+        clean_output(dir.path(), true);
+        for (path, expected) in untouchable.iter().zip(&before) {
+            assert_eq!(
+                &fs::read(dir.path().join(path)).unwrap(),
+                expected,
+                "{path} must survive byte-identical"
+            );
+        }
+    }
+
+    /// An in-flight ticket's notes are live state. So are the notes of a ticket
+    /// the board says nothing about at all.
+    #[test]
+    fn an_unfinished_tickets_notes_are_never_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+
+        let plan = plan_clean_actions(dir.path());
+        let named = relative_removals(dir.path(), &plan);
+        let keeps: Vec<String> = plan
+            .iter()
+            .filter(|action| !action.verb.is_removal())
+            .map(|action| action.line(dir.path()))
+            .collect();
+
+        for unfinished in ["T-024-02", "T-024-03", "T-024-99"] {
+            for name in RETIRED_WORKFLOW_NOTES {
+                let path = format!("docs/active/work/{unfinished}/{name}");
+                assert!(
+                    !named.iter().any(|removal| removal == &path),
+                    "{path} belongs to a ticket that is not done"
+                );
+                assert!(dir.path().join(&path).exists());
+            }
+            assert!(
+                keeps.iter().any(|line| line.contains(unfinished)),
+                "clean must say why it left {unfinished} alone; it said {keeps:?}"
+            );
+        }
+
+        // Each refusal names what the board actually records, so the operator can
+        // act on it rather than guess.
+        let joined = keeps.join("\n");
+        assert!(joined.contains("records T-024-02 as open"), "{joined}");
+        assert!(joined.contains("records T-024-03 as review"), "{joined}");
+        assert!(
+            joined.contains("nothing on your board records T-024-99 finished"),
+            "{joined}"
+        );
+
+        // And the unfinished ticket's attempt folder is live too.
+        assert!(dir
+            .path()
+            .join(".lisa/attempts/T-024-02/1/work/assignment.md")
+            .exists());
+    }
+
+    /// A done ticket whose work directory holds nothing but retired notes loses
+    /// the directory too — predicted at plan time, never discovered afterwards.
+    #[test]
+    fn a_work_directory_with_nothing_left_in_it_goes_as_well() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+
+        let plan = plan_clean_actions(dir.path());
+        assert!(
+            plan.iter()
+                .any(|action| action.verb == CleanVerb::RemoveEmptyDir
+                    && display_relative(dir.path(), &action.path) == "docs/active/work/T-024-04"),
+            "T-024-04 has nothing but notes, so its directory is empty afterwards"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|action| action.verb == CleanVerb::RemoveEmptyDir
+                    && display_relative(dir.path(), &action.path) == "docs/active/work/T-024-01"),
+            "T-024-01 keeps its review, its note and its harness, so the directory stays"
+        );
+
+        clean_output(dir.path(), true);
+        assert!(!dir.path().join("docs/active/work/T-024-04").exists());
+        assert!(dir.path().join("docs/active/work/T-024-01").is_dir());
+    }
+
+    /// Lisa does not follow a link out of the project to delete anything — not at
+    /// a leaf, and not from inside a tree it was about to remove whole.
+    #[test]
+    fn a_symlink_out_of_the_project_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path().join("secret.md"), "Not Lisa's.\n");
+        write(outside.path().join("vault/keep.md"), "Also not Lisa's.\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+        fs::remove_file(dir.path().join("docs/active/work/T-024-01/plan.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.md"),
+            dir.path().join("docs/active/work/T-024-01/plan.md"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("vault"),
+            dir.path().join(".lisa/attempts/T-024-01/vault"),
+        )
+        .unwrap();
+
+        let plan = plan_clean_actions(dir.path());
+        let named = relative_removals(dir.path(), &plan);
+        assert!(
+            !named
+                .iter()
+                .any(|path| path == "docs/active/work/T-024-01/plan.md"),
+            "a symlinked note is refused; plan named {named:?}"
+        );
+        assert!(
+            !named.iter().any(|path| path == ".lisa/attempts/T-024-01"),
+            "a tree with a symlink in it is refused whole; plan named {named:?}"
+        );
+        let refusals: String = plan
+            .iter()
+            .filter(|action| !action.verb.is_removal())
+            .map(|action| action.line(dir.path()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            refusals.matches("is a symlink").count(),
+            2,
+            "both refusals must say why, in the preview:\n{refusals}"
+        );
+
+        clean_output(dir.path(), true);
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret.md")).unwrap(),
+            "Not Lisa's.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("vault/keep.md")).unwrap(),
+            "Also not Lisa's.\n"
+        );
+        assert!(dir.path().join(".lisa/attempts/T-024-01/vault").exists());
+    }
+
+    /// What `lisa init` just wrote cannot already be litter.
+    #[test]
+    fn a_fresh_init_project_has_nothing_to_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init::run_init(dir.path(), false, crate::init::HistoryPreference::NoHistory)
+            .expect("init must succeed in an empty directory");
+        let before = tree_snapshot(dir.path());
+
+        assert_eq!(plan_clean_actions(dir.path()), Vec::new());
+        assert_eq!(clean_output(dir.path(), false), "Nothing to remove.\n");
+        assert_eq!(clean_output(dir.path(), true), "Nothing to remove.\n");
+        assert_eq!(tree_snapshot(dir.path()), before);
+    }
+
+    /// The promise `lisa doctor` has been making since T-057-02-01: every finding
+    /// that names `lisa clean` is something `lisa clean` actually removes — and
+    /// nothing clean removes as currency is unreported.
+    #[test]
+    fn every_finding_that_names_clean_is_a_removal_in_cleans_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+        // An edited retired workflow document, and a byte-exact generated
+        // CLAUDE.md with a hand-written AGENTS.md pointing at it: the two cases
+        // init reports and preserves.
+        write(
+            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            &format!(
+                "{}\n\nOur team's note.\n",
+                crate::templates::LEGACY_WORKFLOWS[2]
+            ),
+        );
+        write(dir.path().join("CLAUDE.md"), &generated_claude_md());
+        write(
+            dir.path().join("AGENTS.md"),
+            "# AGENTS.md\n\nRead CLAUDE.md first.\n",
+        );
+
+        let currency = inventory(dir.path());
+        let named_clean: Vec<&str> = currency
+            .findings
+            .iter()
+            .filter(|finding| finding.remedy == Remedy::Clean)
+            .map(|finding| finding.subject.as_str())
+            .collect();
+        assert_eq!(
+            named_clean,
+            vec!["CLAUDE.md", "docs/knowledge/rdspi-workflow.md"],
+            "the fixture must actually produce the findings under test"
+        );
+
+        let plan = plan_clean_actions(dir.path());
+        let currency_removals: Vec<String> = plan
+            .iter()
+            .filter(|action| action.class == Some(CleanClass::Currency))
+            .map(|action| display_relative(dir.path(), &action.path))
+            .collect();
+
+        for subject in &named_clean {
+            assert!(
+                currency_removals.iter().any(|path| path == subject),
+                "doctor tells the operator to run `lisa clean` for {subject}, and clean must \
+                 remove it; it planned {currency_removals:?}"
+            );
+        }
+        for removal in &currency_removals {
+            assert!(
+                named_clean.contains(&removal.as_str()),
+                "clean removes {removal} as currency, so doctor must have reported it"
+            );
+        }
+
+        clean_output(dir.path(), true);
+        assert!(!dir.path().join("docs/knowledge/rdspi-workflow.md").exists());
+        assert!(!dir.path().join("CLAUDE.md").exists());
+        // The operator's own AGENTS.md stays — pointing at nothing, which the
+        // plan line said out loud before it happened.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            "# AGENTS.md\n\nRead CLAUDE.md first.\n"
+        );
+    }
+
+    /// Clean removes files; it does not rewrite the contents of one. A dead
+    /// setting Lisa cannot lift out surgically is therefore the operator's edit,
+    /// and doctor must say so rather than naming a command that would decline.
+    #[test]
+    fn a_config_key_lisa_cannot_lift_out_is_the_operators_edit_not_cleans() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path().join(".lisa.toml"),
+            &format!(
+                "version = \"{}\"\nscheduling = {{ auto_advance = true, max_threads = 2 }}\n",
+                config::LISA_VERSION
+            ),
+        );
+
+        let currency = inventory(dir.path());
+        let finding = currency
+            .findings
+            .iter()
+            .find(|finding| finding.subject.contains("auto_advance"))
+            .expect("an inline dead key is still reported");
+        match &finding.remedy {
+            Remedy::Operator(edit) => {
+                assert!(edit.contains("auto_advance"), "{edit}");
+                assert!(
+                    edit.contains("yourself") || edit.contains("Delete"),
+                    "the remedy has to name the edit: {edit}"
+                );
+            }
+            other => panic!("a key clean cannot remove must not name clean: {other:?}"),
+        }
+
+        // And clean has nothing to say about it at all.
+        assert_eq!(plan_clean_actions(dir.path()), Vec::new());
+        let before = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
+        clean_output(dir.path(), true);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".lisa.toml")).unwrap(),
+            before,
+            "clean never edits a file's contents"
+        );
+    }
+
+    /// Voice: every line says why, and the summary alone is enough to decide on.
+    #[test]
+    fn every_removal_line_says_why_and_the_summary_stands_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        litter_fixture(dir.path());
+
+        let plan = plan_clean_actions(dir.path());
+        for action in &plan {
+            assert!(
+                !action.reason.trim().is_empty(),
+                "{} has no reason",
+                action.path.display()
+            );
+            let line = action.line(dir.path());
+            assert!(line.contains(&action.reason), "{line}");
+            if !action.verb.is_removal() {
+                assert!(
+                    action.reason.starts_with("preserved: "),
+                    "a refusal keeps init's prefix: {line}"
+                );
+            }
+        }
+
+        let summary = summary_line(&plan);
+        assert!(summary.contains("files"), "{summary}");
+        assert!(summary.contains("folders"), "{summary}");
+        assert!(summary.contains("retired workflow notes"), "{summary}");
+        assert!(summary.contains("finished attempt folders"), "{summary}");
+        assert!(summary.contains("left alone"), "{summary}");
+        assert!(
+            !summary.contains('\n'),
+            "the summary is one line: {summary}"
+        );
+
+        // The standing statement about what is never a candidate.
+        let output = clean_output(dir.path(), false);
+        assert!(
+            output.contains(
+                "Never a candidate: your board (docs/active/tickets/, docs/active/stories/)"
+            ),
+            "{output}"
+        );
+    }
+}
