@@ -17,7 +17,6 @@ fn project() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project with spaces");
     fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
-    fs::write(root.join("CLAUDE.md"), "# Fixture\n").unwrap();
     fs::write(
         root.join("docs/active/tickets/T-046-06-03.md"),
         "---\nid: T-046-06-03\ntitle: measurement fixture\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\nFixture\n",

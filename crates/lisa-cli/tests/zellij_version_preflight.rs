@@ -49,7 +49,6 @@ fn run_with_zellij_version_and_path_and_home(
         .unwrap();
     }
 
-    fs::write(root.join("CLAUDE.md"), "# Stubbed Zellij preflight\n").unwrap();
     fs::write(
         root.join(".lisa.toml"),
         format!(
@@ -121,7 +120,6 @@ fn doctor_explicit_commit_without_git_fails_with_apt_remedy() {
     fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&home).unwrap();
-    fs::write(root.join("CLAUDE.md"), "# Stubbed Zellij preflight\n").unwrap();
     fs::write(
         root.join(".lisa.toml"),
         format!(

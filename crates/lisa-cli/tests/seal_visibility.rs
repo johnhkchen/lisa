@@ -46,7 +46,6 @@ fn run_fixture(command: &str, completion: &str, repository: RepositoryFixture) -
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&home).unwrap();
 
-    fs::write(root.join("CLAUDE.md"), "# Seal visibility fixture\n").unwrap();
     fs::write(
         root.join("docs/active/tickets/T-FIXTURE.md"),
         "---\nid: T-FIXTURE\ntitle: seal fixture\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nFixture\n",
@@ -129,7 +128,6 @@ fn cure_fixture(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&home).unwrap();
-    fs::write(root.join("CLAUDE.md"), "# Remedy cure fixture\n").unwrap();
     fs::write(
         root.join("docs/active/tickets/T-FIXTURE.md"),
         "---\nid: T-FIXTURE\ntitle: remedy cure fixture\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nFixture\n",
@@ -305,7 +303,6 @@ fn doctor_without_git_binary_passes_journal_sealed_with_plain_note() {
     fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&home).unwrap();
-    fs::write(root.join("CLAUDE.md"), "# Seal visibility fixture\n").unwrap();
     fs::write(
         root.join("docs/active/tickets/T-FIXTURE.md"),
         "---\nid: T-FIXTURE\ntitle: seal fixture\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\n\nFixture\n",

@@ -18,7 +18,6 @@ fn project() -> (tempfile::TempDir, PathBuf) {
     fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
     fs::create_dir_all(root.join("docs/active/work")).unwrap();
     fs::create_dir_all(root.join(".lisa")).unwrap();
-    fs::write(root.join("CLAUDE.md"), "# Fixture\n").unwrap();
     git(&root, &["init", "--initial-branch=main"]);
     git(&root, &["config", "user.name", "Fixture"]);
     git(&root, &["config", "user.email", "fixture@example.test"]);

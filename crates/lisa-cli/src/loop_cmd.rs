@@ -56,8 +56,8 @@ fn embedded_wasm_error() -> String {
 /// without writing files or launching zellij.
 pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(), String> {
     // Validate project structure first (cheap, no external deps)
-    if !root.join("CLAUDE.md").exists() {
-        return Err("No CLAUDE.md found. Run `lisa init` first.".to_string());
+    if !root.join(".lisa.toml").exists() {
+        return Err("No .lisa.toml found. Run `lisa init` first.".to_string());
     }
     if !root.join(&config.ticket_dir).exists() {
         return Err(format!(
@@ -438,7 +438,6 @@ fn generate_layout(
                 story_dir  "{story_dir}"
                 work_dir   "{work_dir}"
                 max_threads "{max_threads}"
-                auto_advance "{auto_advance}"
                 review_timeout_secs "{review_timeout_secs}"
                 session_timeout_secs "{session_timeout_secs}"
                 wind_down_secs "{wind_down_secs}"
@@ -461,7 +460,6 @@ fn generate_layout(
         story_dir = config.story_dir,
         work_dir = config.work_dir,
         max_threads = config.max_threads,
-        auto_advance = config.auto_advance,
         review_timeout_secs = config.review_timeout_secs,
         session_timeout_secs = config.session_timeout_secs,
         wind_down_secs = config.wind_down_secs,
@@ -521,7 +519,8 @@ mod tests {
         assert!(layout.contains("story_dir  \"docs/active/stories\""));
         assert!(layout.contains("work_dir   \"docs/active/work\""));
         assert!(layout.contains("max_threads \"3\""));
-        assert!(layout.contains("auto_advance \"false\""));
+        // Retired in 0.5.0: the layout must stop carrying it, not merely stop reading it.
+        assert!(!layout.contains("auto_advance"));
         assert!(layout.contains("review_timeout_secs \"600\""));
         assert!(layout.contains("session_timeout_secs \"3600\""));
         assert!(layout.contains("assignment_ack_timeout_secs \"30\""));
@@ -757,18 +756,20 @@ mod tests {
     }
 
     #[test]
-    fn test_run_loop_missing_claude_md() {
+    fn test_run_loop_refuses_uninitialised_project() {
         let dir = tempfile::tempdir().unwrap();
         let config = default_config();
         let result = run_loop(dir.path(), &config, false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("CLAUDE.md"));
+        let error = result.unwrap_err();
+        assert!(error.contains(".lisa.toml"), "error was: {error}");
+        assert!(!error.contains("CLAUDE.md"), "error was: {error}");
     }
 
     #[test]
     fn test_run_loop_missing_tickets_dir() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "# test").unwrap();
+        std::fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         let config = default_config();
         let result = run_loop(dir.path(), &config, false);
         assert!(result.is_err());
@@ -776,18 +777,34 @@ mod tests {
     }
 
     #[test]
-    fn test_dry_run_missing_claude_md() {
+    fn test_dry_run_refuses_uninitialised_project() {
         let dir = tempfile::tempdir().unwrap();
         let config = default_config();
         let result = run_loop(dir.path(), &config, true);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("CLAUDE.md"));
+        let error = result.unwrap_err();
+        assert!(error.contains(".lisa.toml"), "error was: {error}");
+        assert!(!error.contains("CLAUDE.md"), "error was: {error}");
+    }
+
+    /// The regression this ticket is named for: `lisa init` no longer writes a
+    /// context file, so a correctly initialised project has none. The loop must
+    /// start anyway.
+    #[test]
+    fn test_loop_starts_without_a_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".lisa.toml"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
+        assert!(!dir.path().join("CLAUDE.md").exists());
+
+        let config = default_config();
+        assert!(run_loop(dir.path(), &config, true).is_ok());
     }
 
     #[test]
     fn test_dry_run_empty_tickets() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "# test").unwrap();
+        std::fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         let config = default_config();
         let result = run_loop(dir.path(), &config, true);
@@ -797,7 +814,7 @@ mod tests {
     #[test]
     fn test_loop_rejects_stale_release_candidate_protocol() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "# test").unwrap();
+        std::fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         let config = ResolvedConfig {
             project_version: "0.4.0-rc.5".to_string(),
@@ -813,7 +830,7 @@ mod tests {
     #[test]
     fn test_dry_run_with_tickets() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "# test").unwrap();
+        std::fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         let tickets_dir = dir.path().join("docs/active/tickets");
         std::fs::create_dir_all(&tickets_dir).unwrap();
 

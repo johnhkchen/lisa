@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::config;
-use crate::detect::{detect_project, DetectedProject};
+use crate::detect::detect_project;
 use crate::templates;
 
 const HISTORY_OFFER: &str = "Bring project history along? Finished work can be undone, and you'll have a record of what the agents did. [Y/n] ";
@@ -328,7 +328,7 @@ fn plan_append_only_gitignore(path: PathBuf, required: &str) -> InitAction {
 }
 
 /// Plan what init should do without executing anything
-pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitAction> {
+pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
     let mut actions = Vec::new();
 
     // Directories to create
@@ -353,36 +353,11 @@ pub fn plan_init_actions(root: &Path, project: &DetectedProject) -> Vec<InitActi
         }
     }
 
-    // CLAUDE.md
-    let claude_md_path = root.join("CLAUDE.md");
-    if claude_md_path.exists() {
-        actions.push(InitAction::NoOp {
-            path: claude_md_path,
-            reason: "already exists".to_string(),
-        });
-    } else {
-        actions.push(InitAction::CreateFile {
-            path: claude_md_path,
-            content: templates::generate_claude_md(project),
-        });
-    }
-
-    // AGENTS.md — Codex's native context file. A pointer to CLAUDE.md (single
-    // source of truth), scaffolded like CLAUDE.md: skip if present, never
-    // overwrite. Emitted unconditionally so switching to the Codex client is a
-    // one-line .lisa.toml edit with no re-scaffold; inert for Claude-only projects.
-    let agents_md_path = root.join("AGENTS.md");
-    if agents_md_path.exists() {
-        actions.push(InitAction::NoOp {
-            path: agents_md_path,
-            reason: "already exists".to_string(),
-        });
-    } else {
-        actions.push(InitAction::CreateFile {
-            path: agents_md_path,
-            content: templates::generate_agents_md(),
-        });
-    }
+    // A project's agent context file — CLAUDE.md, AGENTS.md, or whatever the
+    // next client reads — is where the project states its standing intentions
+    // to every model that will ever read it. Lisa does not write one, does not
+    // report on one, and does not name those paths at all. The only file init
+    // creates in the repository root is .lisa.toml.
 
     // docs/knowledge/rdspi-workflow.md
     let workflow_path = root.join("docs/knowledge/rdspi-workflow.md");
@@ -933,7 +908,7 @@ fn run_init_with_history_state(
     write_init_line(out, format_args!(""))?;
 
     // Step 2: Plan actions
-    let actions = plan_init_actions(root, &project);
+    let actions = plan_init_actions(root);
 
     // Step 3: Print the plan
     write_init_line(out, format_args!("Planned actions:"))?;
@@ -1169,10 +1144,13 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         }
     }
 
-    // 2. CLAUDE.md exists
-    if !root.join("CLAUDE.md").exists() {
+    // 2. .lisa.toml exists — the file `lisa init` actually creates, and the
+    //    honest answer to "has this project been initialised?". The project's
+    //    own agent context file is the operator's to write, so its absence is
+    //    not Lisa's to report.
+    if !root.join(".lisa.toml").exists() {
         diagnostics.push(ValidationDiagnostic {
-            path: "CLAUDE.md".to_string(),
+            path: ".lisa.toml".to_string(),
             category: "structure",
             message: "not found. Run `lisa init` to create it.".to_string(),
             severity: Severity::Error,
@@ -1634,7 +1612,7 @@ mod tests {
         )
         .unwrap();
         assert!(dir.path().join(".git").exists());
-        assert!(dir.path().join("CLAUDE.md").exists());
+        assert!(dir.path().join(".lisa.toml").exists());
         assert!(String::from_utf8(output).unwrap().contains(HISTORY_KEPT));
     }
 
@@ -1731,7 +1709,7 @@ mod tests {
         assert!(output.contains(HISTORY_DECLINED));
         assert!(output.contains("Initialization complete."));
         assert!(!dir.path().join(".git").exists());
-        assert!(dir.path().join("CLAUDE.md").exists());
+        assert!(dir.path().join(".lisa.toml").exists());
     }
 
     #[test]
@@ -1775,25 +1753,44 @@ mod tests {
     #[test]
     fn test_plan_init_actions_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   14 files (the project/context/config files, seven shared hook files,
+        //   12 files (the RDSPI workflow, .lisa.toml, seven shared hook files,
         //   .lisa/.gitignore, Claude settings, and Codex hooks.json)
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, InitAction::CreateDir(_) | InitAction::CreateFile { .. }))
             .collect();
-        assert_eq!(creates.len(), 22);
+        assert_eq!(creates.len(), 20);
+    }
+
+    /// `.lisa.toml` is the only file init writes to the repository root.
+    #[test]
+    fn test_plan_init_writes_nothing_else_to_the_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let actions = plan_init_actions(dir.path());
+
+        let root_files: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                InitAction::CreateFile { path, .. } | InitAction::UpdateFile { path, .. } => {
+                    Some(path)
+                }
+                _ => None,
+            })
+            .filter(|path| path.parent() == Some(dir.path()))
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(root_files, vec![".lisa.toml".to_string()]);
     }
 
     #[test]
     fn test_plan_init_creates_on_notify_sample() {
         let dir = tempfile::tempdir().unwrap();
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         let created: Vec<_> = actions
             .iter()
@@ -1802,20 +1799,26 @@ mod tests {
         assert_eq!(created.len(), 1, "on-notify.sample should be scaffolded");
     }
 
+    /// A hand-written context file is not Lisa's to touch, and not Lisa's to
+    /// comment on either — init plans no action of any kind against it.
     #[test]
-    fn test_plan_init_actions_existing_claude_md() {
+    fn test_plan_init_ignores_existing_context_files() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("CLAUDE.md"), "existing").unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "existing").unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
-        // CLAUDE.md should be skipped
-        let skipped: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with("CLAUDE.md")))
-            .collect();
-        assert_eq!(skipped.len(), 1);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let mentions: Vec<_> = actions
+                .iter()
+                .filter(|a| a.to_string().contains(name))
+                .collect();
+            assert!(
+                mentions.is_empty(),
+                "init planned an action naming {name}: {mentions:?}"
+            );
+        }
     }
 
     #[test]
@@ -1827,8 +1830,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         // .lisa.toml without version should be updated
         let updated: Vec<_> = actions
@@ -1858,7 +1860,6 @@ mod tests {
         assert!(result.is_ok());
 
         // Dry run should not create any files
-        assert!(!dir.path().join("CLAUDE.md").exists());
         assert!(!dir.path().join("docs/active/tickets").exists());
         assert!(!dir.path().join(".lisa.toml").exists());
     }
@@ -1876,7 +1877,6 @@ mod tests {
         assert!(result.is_ok());
 
         // Should create all directories and files
-        assert!(dir.path().join("CLAUDE.md").exists());
         assert!(dir.path().join("docs/knowledge/rdspi-workflow.md").exists());
         assert!(dir.path().join(".lisa.toml").exists());
         assert!(dir.path().join("docs/active/tickets").exists());
@@ -1886,16 +1886,10 @@ mod tests {
         assert!(dir.path().join("docs/archive/stories").exists());
         assert!(dir.path().join("docs/archive/work").exists());
 
-        // Check CLAUDE.md content
-        let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(claude_md.contains("test-project"));
-        assert!(claude_md.contains("cargo build"));
-
-        // AGENTS.md is scaffolded as a pointer to CLAUDE.md.
-        assert!(dir.path().join("AGENTS.md").exists());
-        let agents_md = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
-        assert!(agents_md.contains("CLAUDE.md"));
-        assert!(agents_md.contains("docs/knowledge/rdspi-workflow.md"));
+        // The project's agent context file is the operator's to write. Init
+        // creates neither one, in a fresh project or any other.
+        assert!(!dir.path().join("CLAUDE.md").exists());
+        assert!(!dir.path().join("AGENTS.md").exists());
 
         // Check .lisa.toml content
         let lisa_toml = fs::read_to_string(dir.path().join(".lisa.toml")).unwrap();
@@ -2008,7 +2002,7 @@ mod tests {
         )
         .unwrap();
 
-        // A user-authored AGENTS.md must be preserved (skip-if-exists, like CLAUDE.md).
+        // A user-authored AGENTS.md must be preserved.
         fs::write(dir.path().join("AGENTS.md"), "my custom agents content").unwrap();
 
         let result = run_init(dir.path(), false, HistoryPreference::NoHistory);
@@ -2016,6 +2010,52 @@ mod tests {
 
         let agents_md = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         assert_eq!(agents_md, "my custom agents content");
+    }
+
+    /// The common upgrade path: a project that already has a hand-written
+    /// context file. Init leaves it byte-identical and never mentions it —
+    /// not as a creation, not as a skip.
+    #[test]
+    fn test_run_init_reports_no_action_for_hand_written_context_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test-project\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "hand written").unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "hand written too").unwrap();
+
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_init_with_io(
+            dir.path(),
+            false,
+            HistoryPreference::NoHistory,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        let reported = String::from_utf8(output).unwrap();
+        assert!(
+            !reported.contains("CLAUDE.md"),
+            "init reported on CLAUDE.md:\n{reported}"
+        );
+        assert!(
+            !reported.contains("AGENTS.md"),
+            "init reported on AGENTS.md:\n{reported}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
+            "hand written"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            "hand written too"
+        );
     }
 
     #[test]
@@ -2044,10 +2084,22 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_missing_claude_md() {
+    fn test_validate_missing_lisa_toml() {
         let dir = tempfile::tempdir().unwrap();
         let result = run_validate(dir.path(), false);
         assert!(result.is_err());
+
+        let diagnostics = validate(dir.path(), false).diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.path == ".lisa.toml" && matches!(d.severity, Severity::Error)),
+            "expected a .lisa.toml error, got: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics.iter().any(|d| d.path == "CLAUDE.md"),
+            "validate must not report on the operator's context file"
+        );
     }
 
     /// Helper to create hook infrastructure required by validate.
@@ -2097,7 +2149,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Create minimal valid setup
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
@@ -2116,16 +2168,13 @@ mod tests {
 
     #[test]
     fn test_validate_accepts_both_context_files() {
-        // A project carrying both CLAUDE.md and AGENTS.md (as `lisa init` now
-        // scaffolds) validates clean — AGENTS.md is neither required nor rejected.
+        // Hand-written context files validate clean: neither is required, and
+        // neither is rejected. Validate has no opinion about them at all.
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
-        fs::write(
-            dir.path().join("AGENTS.md"),
-            templates::generate_agents_md(),
-        )
-        .unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# hand written\n").unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "# hand written\n").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
@@ -2146,7 +2195,7 @@ mod tests {
     fn test_validate_valid_lisa_toml() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
@@ -2172,7 +2221,7 @@ mod tests {
     fn test_validate_invalid_lisa_toml() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
@@ -2192,7 +2241,7 @@ mod tests {
     fn test_validate_with_tickets() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
@@ -2235,7 +2284,7 @@ Test ticket.
     fn test_validate_detects_missing_dependency() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -2272,7 +2321,7 @@ depends_on: [T-999]
     fn test_validate_missing_rdspi_workflow() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         write_ready_ticket(dir.path());
         // No docs/knowledge/rdspi-workflow.md
@@ -2286,7 +2335,7 @@ depends_on: [T-999]
     fn test_validate_empty_ticket_dir() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -2305,7 +2354,7 @@ depends_on: [T-999]
     fn test_validate_no_ready_tickets() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -2329,7 +2378,7 @@ depends_on: [T-999]
     fn test_validate_ticket_parse_error() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -2353,7 +2402,7 @@ depends_on: [T-999]
     fn test_validate_acceptance_criteria_warning() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -2378,7 +2427,7 @@ depends_on: [T-999]
     fn test_validate_check_tools_false() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -2398,7 +2447,7 @@ depends_on: [T-999]
     fn test_validate_no_ticket_dir() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -2457,8 +2506,7 @@ depends_on: [T-999]
         // settings.local.json without idle_prompt → should plan UpdateFile
         fs::write(dir.path().join(".claude/settings.local.json"), "{}").unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         // An arbitrary difference is not evidence that this is a Lisa template.
         let preserved_hook: Vec<_> = actions
@@ -2492,8 +2540,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         // on-idle.sh should be skipped (already up to date)
         let skipped_hook: Vec<_> = actions
@@ -2520,8 +2567,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         let skipped_settings: Vec<_> = actions
             .iter()
@@ -2546,8 +2592,7 @@ depends_on: [T-999]
 }"#;
         fs::write(dir.path().join(".claude/settings.local.json"), old_settings).unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         // Should plan an UpdateFile (not Skip) to upgrade to guarded commands
         let update_settings: Vec<_> = actions
@@ -2592,8 +2637,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         let updated: Vec<_> = actions
             .iter()
@@ -2613,8 +2657,7 @@ depends_on: [T-999]
         // Include all known keys so upsert has nothing to add
         fs::write(dir.path().join(".lisa.toml"), config::default_config_toml()).unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         let skipped: Vec<_> = actions
             .iter()
@@ -2634,8 +2677,7 @@ depends_on: [T-999]
         );
         fs::write(dir.path().join(".lisa.toml"), &existing).unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         let updated: Vec<_> = actions
             .iter()
@@ -2775,8 +2817,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         let preserved: Vec<_> = actions
             .iter()
@@ -2795,8 +2836,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         let skipped: Vec<_> = actions
             .iter()
@@ -2824,8 +2864,7 @@ depends_on: [T-999]
         }
         fs::write(dir.path().join(".lisa/.gitignore"), "signals/\n").unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         for name in &[
             "rdspi-workflow.md",
@@ -2857,8 +2896,7 @@ depends_on: [T-999]
             fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
             fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), legacy).unwrap();
 
-            let project = detect_project(dir.path());
-            let actions = plan_init_actions(dir.path(), &project);
+            let actions = plan_init_actions(dir.path());
 
             assert!(
                 actions.iter().any(
@@ -2897,8 +2935,7 @@ depends_on: [T-999]
         )
         .unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         for name in &[
             "rdspi-workflow.md",
@@ -2973,11 +3010,11 @@ depends_on: [T-999]
         let mut initial_output = Vec::new();
         run_init_with_writer(dir.path(), false, &mut initial_output).unwrap();
 
-        let agents_path = dir.path().join("AGENTS.md");
+        let recreated_path = dir.path().join(".lisa/hooks/on-stop.sh");
         let gitignore_path = dir.path().join(".lisa/.gitignore");
         let workflow_path = dir.path().join("docs/knowledge/rdspi-workflow.md");
         let skipped_hook_path = dir.path().join(".lisa/hooks/on-idle.sh");
-        fs::remove_file(&agents_path).unwrap();
+        fs::remove_file(&recreated_path).unwrap();
         fs::write(&gitignore_path, "signals/\nhooks/ntfy-topic\n").unwrap();
         fs::write(&skipped_hook_path, "#!/bin/sh\n# project-owned\n").unwrap();
         #[cfg(unix)]
@@ -2986,8 +3023,7 @@ depends_on: [T-999]
             fs::set_permissions(&skipped_hook_path, fs::Permissions::from_mode(0o640)).unwrap();
         }
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
         let file_paths: Vec<PathBuf> = actions
             .iter()
             .filter_map(|action| match action {
@@ -3015,7 +3051,7 @@ depends_on: [T-999]
         assert!(dry_output.contains("  no-op   "));
         assert!(dry_output.contains("  skip    "));
         assert!(dry_output.contains("Dry run complete. No changes made."));
-        assert!(!agents_path.exists());
+        assert!(!recreated_path.exists());
         assert_eq!(
             fs::read_to_string(&gitignore_path).unwrap(),
             "signals/\nhooks/ntfy-topic\n"
@@ -3031,7 +3067,7 @@ depends_on: [T-999]
             .collect();
         assert_eq!(
             actual_changed,
-            vec![agents_path.clone(), gitignore_path.clone()]
+            vec![recreated_path.clone(), gitignore_path.clone()]
         );
 
         let report = real_output
@@ -3045,7 +3081,7 @@ depends_on: [T-999]
             report,
             format!(
                 "  created  {}\n  updated  {}\n",
-                agents_path.display(),
+                recreated_path.display(),
                 gitignore_path.display()
             )
         );
@@ -3112,8 +3148,7 @@ depends_on: [T-999]
             .unwrap();
         assert!(git_init.success());
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
         for path in preserved_fixtures.map(|(path, _)| path) {
             assert!(actions.iter().any(|a| matches!(a, InitAction::SafetySkip { path: action_path, reason } if action_path == &dir.path().join(path) && reason == "preserved: content is not a known Lisa template")));
         }
@@ -3177,8 +3212,7 @@ depends_on: [T-999]
         .unwrap();
         fs::write(dir.path().join(".lisa/hooks/on-stop.sh"), [0xff, 0xfe]).unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         for name in &["rdspi-workflow.md", "on-stop.sh"] {
             assert!(actions.iter().any(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with(name) && reason == "preserved: existing file is unreadable")));
@@ -3202,8 +3236,7 @@ depends_on: [T-999]
         .unwrap();
         fs::write(dir.path().join(".codex/hooks.json"), "[ not valid json").unwrap();
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         for name in &["settings.local.json", "hooks.json"] {
             assert!(actions.iter().any(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with(name) && reason.contains("JSON is malformed"))));
@@ -3261,8 +3294,7 @@ depends_on: [T-999]
             .unwrap();
         }
 
-        let project = detect_project(dir.path());
-        let actions = plan_init_actions(dir.path(), &project);
+        let actions = plan_init_actions(dir.path());
 
         for name in &[
             "on-idle.sh",
@@ -3284,7 +3316,7 @@ depends_on: [T-999]
     fn test_validate_missing_settings_json() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3314,7 +3346,7 @@ depends_on: [T-999]
     fn test_validate_settings_json_without_idle_hook() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3346,7 +3378,7 @@ depends_on: [T-999]
     fn test_validate_missing_idle_hook_script() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3371,7 +3403,7 @@ depends_on: [T-999]
     fn test_validate_missing_stop_hook() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3397,7 +3429,7 @@ depends_on: [T-999]
     fn test_validate_missing_clear_hook() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3423,7 +3455,7 @@ depends_on: [T-999]
     fn test_validate_missing_pretooluse_binding() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3472,7 +3504,7 @@ depends_on: [T-999]
     fn test_validate_idle_hook_not_executable() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3507,7 +3539,7 @@ depends_on: [T-999]
     fn test_validate_invalid_ticket_type_value() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3531,7 +3563,7 @@ depends_on: [T-999]
     fn test_validate_invalid_phase_value() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3571,11 +3603,9 @@ depends_on: [T-999]
         let validate_result = run_validate(dir.path(), false);
         assert!(validate_result.is_ok());
 
-        // Verify CLAUDE.md contains project type
-        let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(claude_md.contains("my-rust-project"));
-        assert!(claude_md.contains("(Rust)"));
-        assert!(claude_md.contains("cargo build"));
+        // Init wrote no context file for either client to read.
+        assert!(!dir.path().join("CLAUDE.md").exists());
+        assert!(!dir.path().join("AGENTS.md").exists());
     }
 
     #[test]
@@ -3652,11 +3682,9 @@ depends_on: [T-999]
         let validate_result = run_validate(dir.path(), false);
         assert!(validate_result.is_ok());
 
-        // Verify CLAUDE.md contains project type
-        let claude_md = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(claude_md.contains("my-node-project"));
-        assert!(claude_md.contains("(Node.js)"));
-        assert!(claude_md.contains("npm"));
+        // Init wrote no context file for either client to read.
+        assert!(!dir.path().join("CLAUDE.md").exists());
+        assert!(!dir.path().join("AGENTS.md").exists());
     }
 
     // --- Structured diagnostic tests (call validate() directly) ---
@@ -3664,7 +3692,7 @@ depends_on: [T-999]
     #[test]
     fn test_diagnostics_clean_project() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
@@ -3684,14 +3712,14 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_diagnostics_missing_claude_md() {
+    fn test_diagnostics_missing_lisa_toml() {
         let dir = tempfile::tempdir().unwrap();
 
         let result = validate(dir.path(), false);
         let errors: Vec<_> = result
             .diagnostics
             .iter()
-            .filter(|d| d.severity == Severity::Error && d.path == "CLAUDE.md")
+            .filter(|d| d.severity == Severity::Error && d.path == ".lisa.toml")
             .collect();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].category, "structure");
@@ -3700,7 +3728,7 @@ depends_on: [T-999]
     #[test]
     fn test_diagnostics_ticket_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3730,7 +3758,7 @@ depends_on: [T-999]
     #[test]
     fn test_diagnostics_missing_dependency() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3758,7 +3786,7 @@ depends_on: [T-999]
     #[test]
     fn test_diagnostics_no_ready_tickets() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3814,7 +3842,7 @@ depends_on: [T-999]
     #[test]
     fn test_diagnostics_hook_structure_errors() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
@@ -3845,7 +3873,7 @@ depends_on: [T-999]
     #[test]
     fn test_diagnostics_success_counts() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/stories")).unwrap();
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();

@@ -43,7 +43,6 @@ fn run_fixture(
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&home).unwrap();
 
-    fs::write(root.join("CLAUDE.md"), "# Client autodetect fixture\n").unwrap();
     fs::write(root.join(".codex/hooks.json"), "{}\n").unwrap();
 
     let zellij = bin.join("zellij");

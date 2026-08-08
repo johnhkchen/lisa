@@ -360,7 +360,7 @@ mod tests {
     use std::fs;
 
     fn setup_valid_project(dir: &Path) {
-        fs::write(dir.join("CLAUDE.md"), "# CLAUDE.md").unwrap();
+        fs::write(dir.join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.join("docs/active/tickets")).unwrap();
     }
 
