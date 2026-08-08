@@ -72,7 +72,6 @@ fn section_config() -> GuideSection {
          {}\n\
          ```\n\n\
          - `max_threads` — how many Claude Code sessions run concurrently\n\
-         - `auto_advance` — when true, skips review pauses between RDSPI phases\n\
          - `review_timeout_secs` — how long before a parked Review session gets a finish-up prompt\n\
          - `session_timeout_secs` — advisory budget for any single session (default: 3600s / 1h); \
          an over-budget session is flagged but never interrupted — reclamation requires \

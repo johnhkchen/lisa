@@ -123,7 +123,6 @@ the generated file.
 | `config:triage.enabled` | First-responder inspection | working default | Default is `true`, so Lisa inspects work that needs help before asking the operator. | `triage_config_defaults_resolves_and_validates_bounds` | — |
 | `config:triage.timeout_secs` | First-responder time limit | working default | Default is `120` seconds. | `triage_config_defaults_resolves_and_validates_bounds` | — |
 | `config:scheduling.max_threads` | Concurrent-agent limit | working default | Default is `2`. | `test_resolve_defaults` | — |
-| `config:scheduling.auto_advance` | Automatic move after review | working default | Default is `false`, so reviewed work waits unless the project opts in. | `test_resolve_defaults` | — |
 | `config:scheduling.review_timeout_secs` | Review time limit | working default | Default is `600` seconds. | `test_resolve_review_timeout_default` | — |
 | `config:scheduling.session_timeout_secs` | Agent-session time limit | working default | Default is `3600` seconds. | `test_resolve_session_timeout_default` | — |
 | `config:scheduling.wind_down_secs` | Session wrap-up time | working default | Default is `300` seconds. | `test_config_wind_down_default` | — |

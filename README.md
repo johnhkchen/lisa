@@ -198,7 +198,6 @@ max_threads = 2
 | `triage.enabled` | `true` | Lets Lisa inspect work that needs you before asking for help. |
 | `triage.timeout_secs` | `120` | Limits how long Lisa can inspect work that needs you. |
 | `scheduling.max_threads` | `2` | Limits how many coding agents can work at once. |
-| `scheduling.auto_advance` | `false` | Lets Lisa move reviewed work forward without waiting for approval. |
 | `scheduling.review_timeout_secs` | `600` | Limits how long Lisa waits for review to finish. |
 | `scheduling.session_timeout_secs` | `3600` | Limits how long one coding-agent session can run. |
 | `scheduling.wind_down_secs` | `300` | Sets aside time for an agent to wrap up before its session ends. |

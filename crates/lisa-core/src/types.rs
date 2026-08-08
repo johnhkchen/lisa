@@ -640,9 +640,6 @@ pub struct PluginConfig {
     /// Maximum number of concurrent threads (default: 4)
     pub max_threads: usize,
 
-    /// Whether to auto-advance certain phases without review (default: false)
-    pub auto_advance: bool,
-
     /// Seconds of total inactivity (no heartbeats, signals, or phase changes)
     /// before a thread is flagged Stuck (default: 1200 = 20 minutes). The hard
     /// reclaim bar is 2x this value, so the default tolerates a single silent
@@ -761,7 +758,6 @@ impl PluginConfig {
             story_dir: PathBuf::from(Self::DEFAULT_STORY_DIR),
             work_dir: PathBuf::from(Self::DEFAULT_WORK_DIR),
             max_threads: Self::DEFAULT_MAX_THREADS,
-            auto_advance: false,
             stuck_threshold_secs: Self::DEFAULT_STUCK_THRESHOLD_SECS,
             review_timeout_secs: Self::DEFAULT_REVIEW_TIMEOUT_SECS,
             session_timeout_secs: Self::DEFAULT_SESSION_TIMEOUT_SECS,
@@ -806,10 +802,6 @@ impl PluginConfig {
             if let Ok(n) = max_threads.parse() {
                 result.max_threads = n;
             }
-        }
-
-        if let Some(auto_advance) = config.get("auto_advance") {
-            result.auto_advance = auto_advance == "true" || auto_advance == "1";
         }
 
         if let Some(stuck_threshold) = config.get("stuck_threshold_secs") {

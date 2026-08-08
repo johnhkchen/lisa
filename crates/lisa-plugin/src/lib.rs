@@ -8458,7 +8458,6 @@ impl State {
         )
         .unwrap();
         writeln!(out, "max_threads:         {}", self.config.max_threads).unwrap();
-        writeln!(out, "auto_advance:        {}", self.config.auto_advance).unwrap();
         writeln!(
             out,
             "stuck_threshold_secs: {}",

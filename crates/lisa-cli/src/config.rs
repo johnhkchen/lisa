@@ -109,13 +109,6 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         description: "Limits how many coding agents can work at once.",
     },
     ConfigKey {
-        path: "scheduling.auto_advance",
-        section: "scheduling",
-        key: "auto_advance",
-        default: "false",
-        description: "Lets Lisa move reviewed work forward without waiting for approval.",
-    },
-    ConfigKey {
         path: "scheduling.review_timeout_secs",
         section: "scheduling",
         key: "review_timeout_secs",
@@ -237,7 +230,6 @@ pub struct DirsConfig {
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SchedulingConfig {
     pub max_threads: Option<usize>,
-    pub auto_advance: Option<bool>,
     pub review_timeout_secs: Option<u64>,
     pub session_timeout_secs: Option<u64>,
     pub wind_down_secs: Option<u64>,
@@ -268,7 +260,6 @@ pub struct ResolvedConfig {
     pub story_dir: String,
     pub work_dir: String,
     pub max_threads: usize,
-    pub auto_advance: bool,
     pub review_timeout_secs: u64,
     pub session_timeout_secs: u64,
     pub wind_down_secs: u64,
@@ -295,7 +286,6 @@ impl Default for ResolvedConfig {
             story_dir: PluginConfig::DEFAULT_STORY_DIR.to_string(),
             work_dir: PluginConfig::DEFAULT_WORK_DIR.to_string(),
             max_threads: PluginConfig::DEFAULT_MAX_THREADS,
-            auto_advance: false,
             review_timeout_secs: PluginConfig::DEFAULT_REVIEW_TIMEOUT_SECS,
             session_timeout_secs: PluginConfig::DEFAULT_SESSION_TIMEOUT_SECS,
             wind_down_secs: PluginConfig::DEFAULT_WIND_DOWN_SECS,
@@ -432,10 +422,6 @@ fn resolve_config_with_availability(
         max_threads: cli_max_threads
             .or(config.scheduling.max_threads)
             .unwrap_or(defaults.max_threads),
-        auto_advance: config
-            .scheduling
-            .auto_advance
-            .unwrap_or(defaults.auto_advance),
         review_timeout_secs: config
             .scheduling
             .review_timeout_secs
@@ -718,7 +704,6 @@ max_threads = {}
 {}
 {}
 {}
-{}
 "#,
         key("version").description,
         key("version").default,
@@ -735,7 +720,6 @@ max_threads = {}
         key("triage.timeout_secs").commented_stub(),
         key("scheduling.max_threads").description,
         key("scheduling.max_threads").default,
-        key("scheduling.auto_advance").commented_stub(),
         key("scheduling.review_timeout_secs").commented_stub(),
         key("scheduling.session_timeout_secs").commented_stub(),
         key("scheduling.wind_down_secs").commented_stub(),
@@ -774,7 +758,6 @@ timeout_secs = 9
 
 [scheduling]
 max_threads = 3
-auto_advance = true
 review_timeout_secs = 10
 session_timeout_secs = 20
 wind_down_secs = 5
@@ -1079,14 +1062,12 @@ work = "my/work"
 
 [scheduling]
 max_threads = 4
-auto_advance = true
 "#;
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.dirs.tickets, Some("my/tickets".to_string()));
         assert_eq!(config.dirs.stories, Some("my/stories".to_string()));
         assert_eq!(config.dirs.work, Some("my/work".to_string()));
         assert_eq!(config.scheduling.max_threads, Some(4));
-        assert_eq!(config.scheduling.auto_advance, Some(true));
     }
 
     #[test]
@@ -1105,7 +1086,6 @@ max_threads = 8
         let config: LisaConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.dirs.tickets, None);
         assert_eq!(config.scheduling.max_threads, Some(8));
-        assert_eq!(config.scheduling.auto_advance, None);
     }
 
     #[test]
@@ -1146,7 +1126,6 @@ max_threads = 8
         assert_eq!(resolved.story_dir, "docs/active/stories");
         assert_eq!(resolved.work_dir, "docs/active/work");
         assert_eq!(resolved.max_threads, 2);
-        assert!(!resolved.auto_advance);
     }
 
     #[test]
@@ -1328,11 +1307,41 @@ tickets = "my/tickets"
 
 [scheduling]
 max_threads = 4
-auto_advance = true
 "#;
         let result = validate_config(toml_str).unwrap();
         assert!(result.warnings.is_empty());
         assert_eq!(result.config.scheduling.max_threads, Some(4));
+    }
+
+    #[test]
+    fn retired_auto_advance_key_loads_and_is_ignored() {
+        // A board written against 0.4 still sets `auto_advance`. Removing the
+        // key is not a reason to refuse the project: the file loads, the value
+        // does nothing, and the operator is told once that it does nothing.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".lisa.toml"),
+            "[scheduling]\nmax_threads = 4\nauto_advance = true\n",
+        )
+        .unwrap();
+
+        let validation = load_config(dir.path()).expect("a retired key must not fail the load");
+        assert_eq!(validation.config.scheduling.max_threads, Some(4));
+        assert_eq!(validation.warnings.len(), 1);
+        assert!(validation.warnings[0].contains("auto_advance"));
+        assert!(validation.warnings[0].contains("[scheduling]"));
+
+        // Every other scheduling value still resolves to its default.
+        let resolved = resolve_config(&validation.config, None, None);
+        assert_eq!(resolved.max_threads, 4);
+        assert_eq!(
+            resolved.review_timeout_secs,
+            PluginConfig::DEFAULT_REVIEW_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolved.session_timeout_secs,
+            PluginConfig::DEFAULT_SESSION_TIMEOUT_SECS
+        );
     }
 
     #[test]
