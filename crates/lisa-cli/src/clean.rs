@@ -1327,4 +1327,139 @@ mod tests {
             "{output}"
         );
     }
+
+    /// **End to end, closing the story.** A project 0.4.4 left behind becomes
+    /// fully current through one `lisa init` and one `lisa clean --remove`, and
+    /// every file a person wrote in it is still there byte-identical.
+    #[test]
+    fn the_0_4_4_fixture_ends_current_and_every_human_file_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // --- what an older Lisa wrote ---
+        write(
+            root.join(".lisa.toml"),
+            "# Two agents is all this laptop can take.\nversion = \"0.4.0\"\n\n[scheduling]\nmax_threads = 2\n# Left over from 0.4 — nobody remembers turning it on.\nauto_advance = true\n",
+        );
+        // Edited since Lisa wrote it, so init preserves it and clean removes it.
+        write(
+            root.join("docs/knowledge/rdspi-workflow.md"),
+            &format!(
+                "{}\n\nOur team's note about phase four.\n",
+                crate::templates::LEGACY_WORKFLOWS[2]
+            ),
+        );
+        write(
+            root.join(".lisa/hooks/on-stop.sh"),
+            crate::templates::LEGACY_ON_STOP_HOOKS[0],
+        );
+        // A byte-exact generation, with the operator's own AGENTS.md pointing at
+        // it: init preserves it for that reason, and clean is what removes it.
+        write(root.join("CLAUDE.md"), &generated_claude_md());
+        for id in ["T-024-01", "T-024-02"] {
+            retired_notes(root, id);
+            attempt(root, id);
+        }
+
+        // --- what a person wrote ---
+        let human: Vec<(&str, String)> = vec![
+            (
+                "README.md",
+                "# my-app\n\nRuns the climate suite.\n".to_string(),
+            ),
+            (
+                "AGENTS.md",
+                "# AGENTS.md\n\nRead CLAUDE.md first, then the README.\n".to_string(),
+            ),
+            (
+                "docs/knowledge/our-notes.md",
+                "Our own notes. Nothing to do with Lisa.\n".to_string(),
+            ),
+            (
+                "docs/active/tickets/T-024-01.md",
+                ticket("T-024-01", "done"),
+            ),
+            (
+                "docs/active/tickets/T-024-02.md",
+                ticket("T-024-02", "open"),
+            ),
+            (
+                "docs/active/stories/S-024.md",
+                "---\nid: S-024\ntitle: climate\nstatus: done\n---\n\nThe story.\n".to_string(),
+            ),
+            (
+                "docs/active/work/T-024-01/review.md",
+                "# Review\n\nWhat changed, for a human.\n".to_string(),
+            ),
+            (
+                "docs/active/work/T-024-01/operator-note.md",
+                "Ask Priya about the cache before touching this again.\n".to_string(),
+            ),
+            (
+                "docs/active/work/T-024-01/harness/probe.sh",
+                "#!/bin/sh\necho probe\n".to_string(),
+            ),
+        ];
+        for (path, content) in &human {
+            write(root.join(path), content);
+        }
+
+        // --- the upgrade, exactly as an operator would run it ---
+        crate::init::run_init(root, false, crate::init::HistoryPreference::NoHistory).unwrap();
+        let preview = clean_output(root, false);
+        assert!(
+            preview.contains("docs/knowledge/rdspi-workflow.md")
+                && preview.contains("CLAUDE.md")
+                && preview.contains("docs/active/work/T-024-01/research.md")
+                && preview.contains(".lisa/attempts/T-024-01/"),
+            "the preview must name everything about to go:\n{preview}"
+        );
+        let removed = clean_output(root, true);
+        assert!(removed.contains("Removed "), "{removed}");
+
+        // --- `lisa doctor` reports the project fully current ---
+        let currency = inventory(root);
+        assert!(
+            currency.is_current(),
+            "one init and one clean must leave nothing behind: {:#?}",
+            currency.findings
+        );
+
+        // --- and every file a person wrote is byte-identical ---
+        for (path, content) in &human {
+            assert_eq!(
+                fs::read_to_string(root.join(path)).unwrap(),
+                *content,
+                "{path} must survive the whole upgrade byte-identical"
+            );
+        }
+        // Including the open ticket's notes, and its attempt folder.
+        for name in RETIRED_WORKFLOW_NOTES {
+            assert!(root
+                .join(format!("docs/active/work/T-024-02/{name}"))
+                .exists());
+        }
+        assert!(root
+            .join(".lisa/attempts/T-024-02/1/work/assignment.md")
+            .exists());
+
+        // What did go: the retired document, the generated context file, the done
+        // ticket's notes, and its attempt folder.
+        assert!(!root.join("docs/knowledge/rdspi-workflow.md").exists());
+        assert!(!root.join("CLAUDE.md").exists());
+        assert!(!root.join(".lisa/attempts/T-024-01").exists());
+        for name in RETIRED_WORKFLOW_NOTES {
+            assert!(!root
+                .join(format!("docs/active/work/T-024-01/{name}"))
+                .exists());
+        }
+
+        // A second clean has nothing left to remove. It still says what it left
+        // alone — the open ticket's work — because that is the question an
+        // operator running it twice is asking.
+        let again = clean_output(root, false);
+        assert!(again.starts_with("Nothing to remove.\n"), "{again}");
+        assert!(!again.contains("  remove  "), "{again}");
+        assert!(again.contains("records T-024-02 as open"), "{again}");
+    }
 }
