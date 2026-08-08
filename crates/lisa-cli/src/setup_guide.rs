@@ -42,7 +42,7 @@ fn section_init(root: &Path) -> GuideSection {
          | Path | Purpose |\n\
          |------|--------|\n\
          | `.lisa.toml` | Lisa configuration (`max_threads`, etc.) |\n\
-         | `docs/knowledge/rdspi-workflow.md` | RDSPI workflow definition (injected into agent sessions) |\n\
+         | `docs/knowledge/lisa-workflow.md` | How a ticket moves (injected into agent sessions) |\n\
          | `docs/active/tickets/` | Ticket files (YAML frontmatter markdown) |\n\
          | `docs/active/stories/` | Story files (groups of related tickets) |\n\
          | `docs/active/work/` | Work artifacts, one subdirectory per ticket |\n\
@@ -81,7 +81,7 @@ fn section_config() -> GuideSection {
          - `assignment_ack_timeout_secs` — positive deadline after submitting a tagged \
          recycled/recovery Codex prompt (default: 30s); timeout triggers one fresh-session \
          fallback, then an actionable terminal error if that fallback is not acknowledged\n\
-         - `[scheduling.phase_timeouts]` — per-phase timeout overrides (e.g. `research = 300`)",
+         - `[scheduling.phase_timeouts]` — per-phase timeout overrides (e.g. `implement = 1800`)",
         default_content.trim()
     );
 
@@ -107,7 +107,7 @@ fn section_agent_context() -> GuideSection {
         - How to build, test, and lint it — the exact commands\n\
         - Where the source lives\n\
         - Conventions and decisions an agent would otherwise have to guess at\n\n\
-        You do not need to mention Lisa or the RDSPI workflow. Lisa injects the workflow \
+        You do not need to mention Lisa or how its tickets move. Lisa injects that \
         into every session itself."
         .to_string();
 
@@ -128,7 +128,7 @@ fn section_ticket_format() -> GuideSection {
         type: task             # task | bug | feature | spike | chore\n\
         status: open           # open | in_progress | blocked | review | done | cancelled\n\
         priority: high         # critical | high | medium | low\n\
-        phase: ready           # ready | research | design | structure | plan | implement | review | done\n\
+        phase: ready           # ready | implement | review | done\n\
         depends_on: []         # List of ticket IDs that must complete first\n\
         ---\n\
         ```\n\n\
@@ -216,7 +216,7 @@ fn section_validate() -> GuideSection {
         lisa validate\n\
         ```\n\n\
         This checks:\n\
-        - .lisa.toml and the RDSPI workflow file exist\n\
+        - .lisa.toml and Lisa's workflow document exist\n\
         - .lisa.toml is valid (if present)\n\
         - Hook scripts and settings.local.json are configured correctly\n\
         - Ticket frontmatter parses correctly\n\
@@ -375,7 +375,6 @@ mod tests {
         let guide = build_guide(dir.path()).unwrap();
         assert!(guide.contains("unknown"));
         assert!(guide.contains("depends_on"));
-        assert!(guide.contains("RDSPI"));
     }
 
     #[test]
@@ -402,16 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn test_guide_references_rdspi() {
+    fn test_guide_references_the_workflow_document() {
         let dir = tempfile::tempdir().unwrap();
 
         let guide = build_guide(dir.path()).unwrap();
-        // Guide should reference the RDSPI workflow file and phases
-        assert!(guide.contains("rdspi-workflow.md"));
-        assert!(guide.contains("research"));
-        assert!(guide.contains("design"));
-        assert!(guide.contains("implement"));
-        assert!(guide.contains("review"));
+        // Guide should reference Lisa's workflow document and the live phases
+        assert!(guide.contains("lisa-workflow.md"));
+        assert!(guide.contains("phase: ready           # ready | implement | review | done"));
+        // The retired four are gone. "structure" is not on this list: the guide
+        // has a "### Body structure" heading, which is the English word.
+        for retired in ["research", "design"] {
+            assert!(!guide.contains(retired), "guide still names {retired}");
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub const DEFAULT_CHECK_BUDGET_SECS: u64 = 5;
 /// Sized from the field case: a ~20-minute verification sweep is real work and
 /// must fit with headroom, while a check still cannot hold a child process open
 /// indefinitely against a scheduler that rechecks every few seconds. Stated in
-/// `docs/knowledge/rdspi-workflow.md`, and pinned against that document by test.
+/// `docs/knowledge/lisa-workflow.md`, and pinned against that document by test.
 pub const MAX_CHECK_BUDGET_SECS: u64 = 1800;
 
 /// Resolve a declared budget to the seconds a check actually gets.

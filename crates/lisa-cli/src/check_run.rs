@@ -4,7 +4,7 @@
 //! the reviewer-side `lisa check-disposition`. They share this module precisely
 //! so they cannot drift into disagreeing about what a check can see, how long it
 //! gets, or what its exit code means — a reviewer authoring a check reads one
-//! contract, in `docs/knowledge/rdspi-workflow.md`, and it describes this file.
+//! contract, in `docs/knowledge/lisa-workflow.md`, and it describes this file.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};

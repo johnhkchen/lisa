@@ -336,7 +336,7 @@ pub struct Ticket {
     #[serde(default)]
     pub priority: Priority,
 
-    /// Current phase in the RDSPI workflow
+    /// Current phase in Lisa's workflow
     #[serde(default)]
     pub phase: Phase,
 
@@ -438,7 +438,7 @@ pub enum HealthStatus {
 
 /// A thread representing an active Claude Code session working on a ticket.
 ///
-/// Each thread runs a single ticket through the RDSPI workflow phases.
+/// Each thread runs a single ticket through its phases.
 /// Threads are managed by Lisa and can be paused at review points.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thread {

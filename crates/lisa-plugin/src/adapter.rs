@@ -351,7 +351,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
 /// `--dangerously-bypass-hook-trust` is scoped to this invocation because lisa
 /// generated the hook definitions. Agent command execution uses Codex's
 /// full-access/no-approval mode, matching the existing Claude
-/// `--dangerously-skip-permissions` contract and allowing the RDSPI workflow to
+/// `--dangerously-skip-permissions` contract and allowing ticket work to
 /// commit through `.git`.
 pub(crate) struct CodexAdapter {
     lisa_bin: String,

@@ -521,14 +521,20 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
                 }
             }
 
-            // Validate phase names in [scheduling.phase_timeouts]
+            // Validate phase names in [scheduling.phase_timeouts].
+            //
+            // The board has two working phases. The four retired in 0.5.0 stay
+            // accepted here for the same reason `Phase` still deserializes
+            // them: a 0.4 project's config must not start warning about keys
+            // that were correct when it wrote them. They resolve to
+            // `Phase::Implement`, exactly as the frontmatter values do.
             let known_phases = &[
+                "implement",
+                "review",
                 "research",
                 "design",
                 "structure",
                 "plan",
-                "implement",
-                "review",
             ];
             if let Some(toml::Value::Table(pt)) = sched.get("phase_timeouts") {
                 for key in pt.keys() {
