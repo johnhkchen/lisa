@@ -673,7 +673,10 @@ mod tests {
 
         // Four states, named in order, and the retired four gone entirely.
         let phase_line = "`phase`: `ready` | `implement` | `review` | `done`";
-        assert!(document.contains(phase_line), "phase list must be the four live states");
+        assert!(
+            document.contains(phase_line),
+            "phase list must be the four live states"
+        );
         for retired in ["research.md", "design.md", "structure.md", "plan.md"] {
             assert!(
                 !document.contains(retired),
@@ -693,7 +696,9 @@ mod tests {
         // What replaced the artifacts-are-insurance promise, stated where the
         // person it affects reads it.
         assert!(document.contains("Nothing in your work directory\nis a resume point."));
-        assert!(document.contains("every\n  `lisa commit-ticket` you ran is already on the branch."));
+        assert!(
+            document.contains("every\n  `lisa commit-ticket` you ran is already on the branch.")
+        );
         assert!(document.contains("The ticket restarts from the beginning."));
 
         assert!(
@@ -719,8 +724,9 @@ mod tests {
         assert!(LISA_WORKFLOW.contains(
             "`agent` when another coding attempt can perform the remedy, `operator` when a person must act, and `world` when external reality must change"
         ));
-        assert!(LISA_WORKFLOW
-            .contains("Supply a `check` whenever the remedy is externally observable"));
+        assert!(
+            LISA_WORKFLOW.contains("Supply a `check` whenever the remedy is externally observable")
+        );
         assert!(LISA_WORKFLOW.contains(
             "Write the `ask` as one sentence addressed to a person who didn't do the work, naming the action rather than the subsystem."
         ));

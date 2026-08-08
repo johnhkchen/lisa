@@ -229,10 +229,32 @@ fn upsert_missing_config_keys(existing: &str) -> String {
 #[derive(Debug, Clone)]
 pub enum InitAction {
     CreateDir(PathBuf),
-    CreateFile { path: PathBuf, content: String },
-    UpdateFile { path: PathBuf, content: String },
-    NoOp { path: PathBuf, reason: String },
-    SafetySkip { path: PathBuf, reason: String },
+    CreateFile {
+        path: PathBuf,
+        content: String,
+    },
+    UpdateFile {
+        path: PathBuf,
+        content: String,
+    },
+    NoOp {
+        path: PathBuf,
+        reason: String,
+    },
+    SafetySkip {
+        path: PathBuf,
+        reason: String,
+    },
+    /// Delete a file Lisa installed at a path it no longer installs to.
+    ///
+    /// The only action that destroys anything, and it is reachable only through
+    /// [`plan_retired_template`], which requires exact bytes from a bundled
+    /// generation. It is an action rather than a side effect so `--dry-run`
+    /// shows it before it happens.
+    RemoveFile {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl fmt::Display for InitAction {
@@ -246,6 +268,9 @@ impl fmt::Display for InitAction {
             }
             InitAction::SafetySkip { path, reason } => {
                 write!(f, "  skip    {} ({})", path.display(), reason)
+            }
+            InitAction::RemoveFile { path, reason } => {
+                write!(f, "  remove  {} ({})", path.display(), reason)
             }
         }
     }
@@ -280,6 +305,45 @@ fn plan_owned_template(path: PathBuf, current: &str, known_prior: &[&str]) -> In
             reason: "preserved: existing file is unreadable".to_string(),
         },
     }
+}
+
+/// Plan the removal of a template Lisa used to install at this path.
+///
+/// A rename is only half a migration. The other half is the file left behind:
+/// it contradicts the live document, and it is still what old prompts and an
+/// operator's muscle memory point at. So it goes — but under exactly the rule
+/// that governs every other template Lisa owns. Only bytes from a bundled
+/// generation are Lisa's to delete. Anything else is the operator's file, and
+/// it stays where they put it, reported with a reason that names what replaced
+/// it so the skip is a signpost rather than a shrug.
+///
+/// Returns `None` when there is nothing at the path, so a project that never
+/// had the old file sees no line about it at all.
+fn plan_retired_template(
+    path: PathBuf,
+    known_generations: &[&str],
+    replacement: &str,
+) -> Option<InitAction> {
+    if !path.exists() {
+        return None;
+    }
+
+    Some(match fs::read_to_string(&path) {
+        Ok(existing) if known_generations.contains(&existing.as_str()) => InitAction::RemoveFile {
+            path,
+            reason: format!("superseded by {replacement}"),
+        },
+        Ok(_) => InitAction::SafetySkip {
+            path,
+            reason: format!(
+                "preserved: content is not a known Lisa template; superseded by {replacement}"
+            ),
+        },
+        Err(_) => InitAction::SafetySkip {
+            path,
+            reason: format!("preserved: existing file is unreadable; superseded by {replacement}"),
+        },
+    })
 }
 
 /// Plan an append-only update to Lisa's nested gitignore. Existing bytes are
@@ -359,12 +423,21 @@ pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
     // report on one, and does not name those paths at all. The only file init
     // creates in the repository root is .lisa.toml.
 
-    // docs/knowledge/rdspi-workflow.md
-    let workflow_path = root.join("docs/knowledge/rdspi-workflow.md");
+    // docs/knowledge/lisa-workflow.md
+    const WORKFLOW_DOCUMENT: &str = "docs/knowledge/lisa-workflow.md";
     actions.push(plan_owned_template(
-        workflow_path,
+        root.join(WORKFLOW_DOCUMENT),
         templates::LISA_WORKFLOW.as_str(),
         templates::LEGACY_WORKFLOWS,
+    ));
+
+    // The same document under the name it carried through 0.4. A project
+    // upgrading from there has one on disk that init would otherwise stop
+    // looking at, leaving two contract documents that disagree.
+    actions.extend(plan_retired_template(
+        root.join("docs/knowledge/rdspi-workflow.md"),
+        templates::LEGACY_WORKFLOWS,
+        WORKFLOW_DOCUMENT,
     ));
 
     // .lisa.toml
@@ -569,6 +642,7 @@ pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
 enum FileMutationKind {
     Created,
     Updated,
+    Removed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,6 +1056,14 @@ fn run_init_with_history_state(
                     path: path.clone(),
                 });
             }
+            InitAction::RemoveFile { path, .. } => {
+                fs::remove_file(path)
+                    .map_err(|e| format!("Failed to remove {}: {}", path.display(), e))?;
+                mutations.push(FileMutation {
+                    kind: FileMutationKind::Removed,
+                    path: path.clone(),
+                });
+            }
             InitAction::NoOp { .. } | InitAction::SafetySkip { .. } => {}
         }
     }
@@ -1023,6 +1105,7 @@ fn run_init_with_history_state(
             let label = match mutation.kind {
                 FileMutationKind::Created => "created",
                 FileMutationKind::Updated => "updated",
+                FileMutationKind::Removed => "removed",
             };
             write_init_line(
                 out,
@@ -1157,10 +1240,10 @@ fn validate(root: &Path, check_tools: bool) -> ValidationResult {
         });
     }
 
-    // 3. docs/knowledge/rdspi-workflow.md exists (error, not warning)
-    if !root.join("docs/knowledge/rdspi-workflow.md").exists() {
+    // 3. docs/knowledge/lisa-workflow.md exists (error, not warning)
+    if !root.join("docs/knowledge/lisa-workflow.md").exists() {
         diagnostics.push(ValidationDiagnostic {
-            path: "docs/knowledge/rdspi-workflow.md".to_string(),
+            path: "docs/knowledge/lisa-workflow.md".to_string(),
             category: "structure",
             message: "not found. Run `lisa init` to create it.".to_string(),
             severity: Severity::Error,
@@ -1757,7 +1840,7 @@ mod tests {
 
         // Should plan to create:
         //   8 directories (6 docs + .lisa/hooks + .lisa/signals)
-        //   12 files (the RDSPI workflow, .lisa.toml, seven shared hook files,
+        //   12 files (the workflow document, .lisa.toml, seven shared hook files,
         //   .lisa/.gitignore, Claude settings, and Codex hooks.json)
         let creates: Vec<_> = actions
             .iter()
@@ -1877,7 +1960,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Should create all directories and files
-        assert!(dir.path().join("docs/knowledge/rdspi-workflow.md").exists());
+        assert!(dir.path().join("docs/knowledge/lisa-workflow.md").exists());
         assert!(dir.path().join(".lisa.toml").exists());
         assert!(dir.path().join("docs/active/tickets").exists());
         assert!(dir.path().join("docs/active/stories").exists());
@@ -2155,8 +2238,8 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -2180,8 +2263,8 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -2201,8 +2284,8 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         fs::write(
@@ -2227,8 +2310,8 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         fs::write(dir.path().join(".lisa.toml"), "not valid toml {{{").unwrap();
@@ -2247,8 +2330,8 @@ mod tests {
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -2288,8 +2371,8 @@ Test ticket.
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
 
@@ -2318,13 +2401,13 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_validate_missing_rdspi_workflow() {
+    fn test_validate_missing_workflow_document() {
         let dir = tempfile::tempdir().unwrap();
 
         fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         write_ready_ticket(dir.path());
-        // No docs/knowledge/rdspi-workflow.md
+        // No docs/knowledge/lisa-workflow.md
 
         let result = run_validate(dir.path(), false);
         assert!(result.is_err());
@@ -2339,8 +2422,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // No ticket files
@@ -2358,8 +2441,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
 
@@ -2382,8 +2465,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
 
@@ -2406,8 +2489,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -2431,8 +2514,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -2451,8 +2534,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // No docs/active/tickets directory
@@ -2808,12 +2891,12 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_plan_init_preserves_unknown_rdspi() {
+    fn test_plan_init_preserves_unknown_workflow() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# Old RDSPI content",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Old workflow content",
         )
         .unwrap();
 
@@ -2821,17 +2904,17 @@ depends_on: [T-999]
 
         let preserved: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with("rdspi-workflow.md") && reason == "preserved: content is not a known Lisa template"))
+            .filter(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with("lisa-workflow.md") && reason == "preserved: content is not a known Lisa template"))
             .collect();
         assert_eq!(preserved.len(), 1);
     }
 
     #[test]
-    fn test_plan_init_skips_current_rdspi() {
+    fn test_plan_init_skips_current_workflow() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
             templates::LISA_WORKFLOW.as_str(),
         )
         .unwrap();
@@ -2840,9 +2923,147 @@ depends_on: [T-999]
 
         let skipped: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with("rdspi-workflow.md")))
+            .filter(|a| matches!(a, InitAction::NoOp { path, .. } if path.ends_with("lisa-workflow.md")))
             .collect();
         assert_eq!(skipped.len(), 1);
+    }
+
+    /// A project holding a byte-exact 0.4.4 `rdspi-workflow.md` is migrated:
+    /// the document appears under its new name and the old file is removed.
+    ///
+    /// The removal is the whole point of the rename being a migration rather
+    /// than an addition. Without it the project keeps two contract documents
+    /// that disagree, and the stale one is the one every 0.4-era prompt points
+    /// at.
+    #[test]
+    fn an_unmodified_prior_workflow_is_migrated_to_the_new_name() {
+        for generation in templates::LEGACY_WORKFLOWS {
+            let dir = tempfile::tempdir().unwrap();
+            let retired = dir.path().join("docs/knowledge/rdspi-workflow.md");
+            let current = dir.path().join("docs/knowledge/lisa-workflow.md");
+            fs::create_dir_all(retired.parent().unwrap()).unwrap();
+            fs::write(&retired, generation).unwrap();
+
+            let actions = plan_init_actions(dir.path());
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, InitAction::CreateFile { path, content }
+                        if path == &current && content == templates::LISA_WORKFLOW.as_str()))
+                    .count(),
+                1,
+                "the document must be created under its new name"
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, InitAction::RemoveFile { path, reason }
+                        if path == &retired && reason == "superseded by docs/knowledge/lisa-workflow.md"))
+                    .count(),
+                1,
+                "an unmodified prior generation must be removed"
+            );
+
+            let mut input = io::Cursor::new(Vec::<u8>::new());
+            let mut output = Vec::new();
+            run_init_with_io(
+                dir.path(),
+                false,
+                HistoryPreference::NoHistory,
+                false,
+                &mut input,
+                &mut output,
+            )
+            .unwrap();
+
+            assert!(!retired.exists(), "the old file must be gone from disk");
+            assert_eq!(
+                fs::read_to_string(&current).unwrap(),
+                templates::LISA_WORKFLOW.as_str()
+            );
+            let reported = String::from_utf8(output).unwrap();
+            assert!(
+                reported.contains("removed  ") && reported.contains("rdspi-workflow.md"),
+                "the run must say what it deleted:\n{reported}"
+            );
+
+            // Idempotent: a second pass has nothing left to migrate.
+            assert!(plan_init_actions(dir.path())
+                .iter()
+                .all(|a| !matches!(a, InitAction::RemoveFile { .. })));
+        }
+    }
+
+    /// A project whose `rdspi-workflow.md` has been edited keeps it.
+    ///
+    /// Deleting it would be the first thing Lisa ever destroyed that a person
+    /// wrote. The skip names the rename, so an operator finding two documents
+    /// knows which one is live and why theirs survived.
+    #[test]
+    fn a_modified_workflow_is_left_where_the_operator_put_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let retired = dir.path().join("docs/knowledge/rdspi-workflow.md");
+        let current = dir.path().join("docs/knowledge/lisa-workflow.md");
+        fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        let edited = format!(
+            "{}\n\nOur team's amendment.\n",
+            templates::LEGACY_WORKFLOWS[1]
+        );
+        fs::write(&retired, &edited).unwrap();
+
+        let actions = plan_init_actions(dir.path());
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, InitAction::CreateFile { path, .. } if path == &current))
+                .count(),
+            1,
+            "the document must still be created under its new name"
+        );
+        let skips: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                InitAction::SafetySkip { path, reason } if path == &retired => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skips.len(), 1, "the edited file must be reported as a skip");
+        assert_eq!(
+            skips[0],
+            "preserved: content is not a known Lisa template; superseded by docs/knowledge/lisa-workflow.md",
+            "the skip reason must name the rename"
+        );
+
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_init_with_io(
+            dir.path(),
+            false,
+            HistoryPreference::NoHistory,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&retired).unwrap(),
+            edited,
+            "the operator's file must survive byte-for-byte"
+        );
+        assert_eq!(
+            fs::read_to_string(&current).unwrap(),
+            templates::LISA_WORKFLOW.as_str()
+        );
+    }
+
+    /// A project that never had the old file hears nothing about it.
+    #[test]
+    fn a_project_without_the_retired_document_gets_no_line_about_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(plan_init_actions(dir.path())
+            .iter()
+            .all(|a| !format!("{a}").contains("rdspi-workflow.md")));
     }
 
     #[test]
@@ -2851,7 +3072,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
             templates::LEGACY_WORKFLOWS[0],
         )
         .unwrap();
@@ -2867,7 +3088,7 @@ depends_on: [T-999]
         let actions = plan_init_actions(dir.path());
 
         for name in &[
-            "rdspi-workflow.md",
+            "lisa-workflow.md",
             "on-stop.sh",
             "on-clear.sh",
             "on-heartbeat.sh",
@@ -2883,7 +3104,7 @@ depends_on: [T-999]
     }
 
     #[test]
-    fn test_plan_init_updates_every_known_rdspi_template() {
+    fn test_plan_init_updates_every_known_workflow_template() {
         assert!(
             templates::LEGACY_WORKFLOWS
                 .iter()
@@ -2894,14 +3115,14 @@ depends_on: [T-999]
         for legacy in templates::LEGACY_WORKFLOWS {
             let dir = tempfile::tempdir().unwrap();
             fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
-            fs::write(dir.path().join("docs/knowledge/rdspi-workflow.md"), legacy).unwrap();
+            fs::write(dir.path().join("docs/knowledge/lisa-workflow.md"), legacy).unwrap();
 
             let actions = plan_init_actions(dir.path());
 
             assert!(
                 actions.iter().any(
                     |action| matches!(action, InitAction::UpdateFile { path, content }
-                        if path.ends_with("rdspi-workflow.md")
+                        if path.ends_with("lisa-workflow.md")
                             && content == templates::LISA_WORKFLOW.as_str())
                 ),
                 "every exact prior Lisa workflow must upgrade to the current template"
@@ -2915,7 +3136,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
             templates::LISA_WORKFLOW.as_str(),
         )
         .unwrap();
@@ -2938,7 +3159,7 @@ depends_on: [T-999]
         let actions = plan_init_actions(dir.path());
 
         for name in &[
-            "rdspi-workflow.md",
+            "lisa-workflow.md",
             "on-idle.sh",
             "on-stop.sh",
             "on-clear.sh",
@@ -3012,7 +3233,7 @@ depends_on: [T-999]
 
         let recreated_path = dir.path().join(".lisa/hooks/on-stop.sh");
         let gitignore_path = dir.path().join(".lisa/.gitignore");
-        let workflow_path = dir.path().join("docs/knowledge/rdspi-workflow.md");
+        let workflow_path = dir.path().join("docs/knowledge/lisa-workflow.md");
         let skipped_hook_path = dir.path().join(".lisa/hooks/on-idle.sh");
         fs::remove_file(&recreated_path).unwrap();
         fs::write(&gitignore_path, "signals/\nhooks/ntfy-topic\n").unwrap();
@@ -3131,7 +3352,7 @@ depends_on: [T-999]
         );
         let gitignore = "signals/\nhooks/ntfy-topic\n";
         let preserved_fixtures = [
-            ("docs/knowledge/rdspi-workflow.md", workflow.as_bytes()),
+            ("docs/knowledge/lisa-workflow.md", workflow.as_bytes()),
             (".lisa/hooks/on-stop.sh", stop_hook.as_bytes()),
             (".lisa/hooks/on-notify.sample", notify_sample.as_bytes()),
         ];
@@ -3165,7 +3386,7 @@ depends_on: [T-999]
             Some("signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\n")
         );
         assert_eq!(
-            fs::read(dir.path().join("docs/knowledge/rdspi-workflow.md")).unwrap(),
+            fs::read(dir.path().join("docs/knowledge/lisa-workflow.md")).unwrap(),
             workflow.as_bytes()
         );
 
@@ -3206,7 +3427,7 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
             [0xff, 0xfe],
         )
         .unwrap();
@@ -3214,7 +3435,7 @@ depends_on: [T-999]
 
         let actions = plan_init_actions(dir.path());
 
-        for name in &["rdspi-workflow.md", "on-stop.sh"] {
+        for name in &["lisa-workflow.md", "on-stop.sh"] {
             assert!(actions.iter().any(|a| matches!(a, InitAction::SafetySkip { path, reason } if path.ends_with(name) && reason == "preserved: existing file is unreadable")));
             assert!(!actions
                 .iter()
@@ -3320,8 +3541,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // Create on-idle.sh but NOT settings.local.json
@@ -3350,8 +3571,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // settings.local.json exists but without idle_prompt
@@ -3382,8 +3603,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // settings.local.json exists with idle_prompt, but NO on-idle.sh
@@ -3407,8 +3628,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // Full hook infra except on-stop.sh
@@ -3433,8 +3654,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // Full hook infra except on-clear.sh
@@ -3459,8 +3680,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // Full hook infra, then overwrite settings with the five legacy bindings
@@ -3508,8 +3729,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
@@ -3543,8 +3764,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -3567,8 +3788,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -3698,8 +3919,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -3732,8 +3953,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -3762,8 +3983,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -3790,8 +4011,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
@@ -3846,8 +4067,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         // No hook infrastructure at all
@@ -3879,8 +4100,8 @@ depends_on: [T-999]
         fs::create_dir_all(dir.path().join("docs/active/work")).unwrap();
         fs::create_dir_all(dir.path().join("docs/knowledge")).unwrap();
         fs::write(
-            dir.path().join("docs/knowledge/rdspi-workflow.md"),
-            "# RDSPI",
+            dir.path().join("docs/knowledge/lisa-workflow.md"),
+            "# Workflow",
         )
         .unwrap();
         write_hook_infrastructure(dir.path());
