@@ -107,7 +107,9 @@ cd your-project
 lisa init
 ```
 
-This creates the ticket directories and a `CLAUDE.md` tailored to your project.
+This creates the ticket directories, the workflow document Lisa hands your
+agents, the hooks, and `.lisa.toml`. Your own agent context file is yours to
+write.
 
 In a folder that isn't already a repository, `lisa init` keeps **project
 history** when the machine supports it — undo for finished work, plus a record
@@ -268,10 +270,10 @@ In mixed-provider loops, Lisa prefers a pane already running the requested
 client, and the same exit-then-fresh boundary safely hands a pane from one
 provider to the other. Running or human-blocked panes are never evicted.
 
-Codex reads `AGENTS.md` for project context (Claude reads `CLAUDE.md`). `lisa
-init` scaffolds both files plus both clients' hook configuration; `AGENTS.md`
-points at `CLAUDE.md` as the single source of truth. Re-run `lisa init` in an
-existing project before its first native Codex loop.
+Codex reads `AGENTS.md` for project context and Claude reads `CLAUDE.md`. Both
+files are yours to write: `lisa init` scaffolds both clients' hook configuration
+and leaves your context files alone. Re-run `lisa init` in an existing project
+before its first native Codex loop.
 
 The lower-level `lisa agent-exec` / `codex exec --json` path remains available
 for diagnostics and explicitly headless automation, but `lisa loop` no longer
@@ -356,13 +358,15 @@ docs/
 
 ### `lisa init`
 
-Scaffold a project for Lisa: creates ticket directories, `docs/knowledge/lisa-workflow.md`, hooks, and `.lisa.toml`. Your agent context file — `CLAUDE.md`, `AGENTS.md`, whatever your client reads — is yours to write; Lisa does not touch it.
+Scaffold a project for Lisa: creates ticket directories, `docs/knowledge/lisa-workflow.md`, hooks, and `.lisa.toml`.
+
+On a project an older Lisa set up, it also clears out what that Lisa left behind: the workflow document under its old name, the `CLAUDE.md` and `AGENTS.md` Lisa used to write for you, and a `.lisa.toml` setting Lisa stopped reading. It removes a file only when the bytes are still exactly as Lisa wrote them. Change one line and the file is yours — kept as it is, and named in the list so you can see Lisa looked and left it. Your board is never rewritten. Run `lisa init --dry-run` first to read the whole list before anything happens.
 
 ```bash
 lisa init                 # Initialize with the strongest history mode available
 lisa init --with-history  # Require project history (undoable finished work)
 lisa init --no-history    # Override with a journal record only
-lisa init --dry-run       # Preview what would be created
+lisa init --dry-run       # Preview what would be created and what would be removed
 lisa init --path ../other-project
 ```
 
