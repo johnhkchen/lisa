@@ -1033,8 +1033,14 @@ mod tests {
     #[test]
     fn test_no_context_file_generator_survives() {
         let source = include_str!("templates.rs");
-        assert!(!source.contains("fn generate_claude_md"));
-        assert!(!source.contains("fn generate_agents_md"));
+        // Built at runtime so this assertion is not its own counter-example.
+        for stem in ["claude", "agents"] {
+            let definition = format!("fn generate_{stem}_md");
+            assert!(
+                !source.contains(&definition),
+                "{definition} came back — Lisa does not author a project's context file"
+            );
+        }
     }
 
     #[test]

@@ -317,5 +317,4 @@ mod tests {
         let project = detect_project(dir.path());
         assert_eq!(project.project_type, ProjectType::Rust);
     }
-
 }
