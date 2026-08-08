@@ -236,7 +236,9 @@ fn bare_folder_without_git_uses_journal_and_explains_the_consequence() {
         .unwrap()
         .contains(HISTORY_DECLINED));
     assert!(!fixture.root.join(".git").exists());
-    assert!(fixture.root.join("CLAUDE.md").exists());
+    assert!(fixture.root.join(".lisa.toml").exists());
+    // Init writes no agent context file — that document is the operator's.
+    assert!(!fixture.root.join("CLAUDE.md").exists());
 
     write_status_ticket(&fixture.root);
     let status = fixture.lisa_without_git(&["status", "--path", fixture.root.to_str().unwrap()]);
@@ -262,7 +264,8 @@ fn explicit_with_history_without_git_names_the_remedy() {
     assert!(stderr.contains("--with-history"));
     assert!(stderr.contains("--no-history"));
     assert!(!fixture.root.join(".git").exists());
-    assert!(!fixture.root.join("CLAUDE.md").exists());
+    // The refusal aborted before init wrote anything at all.
+    assert!(!fixture.root.join(".lisa.toml").exists());
 }
 
 #[test]
