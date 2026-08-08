@@ -176,6 +176,22 @@ impl Phase {
         }
     }
 
+    /// The artifact whose appearance completes this phase.
+    ///
+    /// Not the same question as [`Phase::artifact_filename`], which answers
+    /// "what does this phase produce?". The two diverge at exactly one phase,
+    /// and the divergence is a scheduling rule rather than a detail:
+    /// `Implement` produces nothing of its own, and the file that moves a
+    /// ticket off it is `review.md` — Review's artifact, written by the agent
+    /// before it enters Review. Fold this back into `artifact_filename()` and
+    /// every ticket strands at Implement forever.
+    pub fn completion_artifact(&self) -> Option<&'static str> {
+        match self {
+            Phase::Implement | Phase::Review => Some("review.md"),
+            Phase::Ready | Phase::Done => None,
+        }
+    }
+
     /// Returns all phases in workflow order.
     pub fn all() -> &'static [Phase] {
         &[Phase::Ready, Phase::Implement, Phase::Review, Phase::Done]
@@ -1168,6 +1184,39 @@ mod tests {
         assert_eq!(Phase::Ready.artifact_filename(), None);
         assert_eq!(Phase::Implement.artifact_filename(), None);
         assert_eq!(Phase::Done.artifact_filename(), None);
+    }
+
+    #[test]
+    fn phase_completion_artifact_diverges_from_what_the_phase_produces() {
+        // The whole reason `completion_artifact` exists. Implement writes no
+        // artifact of its own, and `review.md` — the *next* phase's artifact —
+        // is what moves a ticket off it. Anyone folding this method back into
+        // `artifact_filename()` breaks the first assertion here, and every
+        // ticket on the board strands at Implement.
+        assert_eq!(
+            Phase::Implement.completion_artifact(),
+            Some("review.md"),
+            "review.md appearing is what moves a ticket off Implement"
+        );
+        assert_eq!(
+            Phase::Implement.artifact_filename(),
+            None,
+            "Implement still produces nothing of its own — that is the divergence"
+        );
+
+        assert_eq!(Phase::Review.completion_artifact(), Some("review.md"));
+        assert_eq!(Phase::Ready.completion_artifact(), None);
+        assert_eq!(Phase::Done.completion_artifact(), None);
+
+        // A phase that can complete must have somewhere to complete into.
+        for phase in Phase::all() {
+            if phase.completion_artifact().is_some() {
+                assert!(
+                    phase.next().is_some(),
+                    "{phase} completes on an artifact but has no next phase"
+                );
+            }
+        }
     }
 
     #[test]
