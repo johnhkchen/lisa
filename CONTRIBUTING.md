@@ -83,11 +83,11 @@ Keep PRs focused — one logical change per PR. Include a clear description of w
 
 ## Lisa's Ticket System
 
-Lisa uses its own RDSPI ticket system to manage development. You'll notice two directories in `docs/`:
+Lisa uses its own ticket system to manage development. You'll notice two directories in `docs/`:
 
-- **`docs/active/`** — Current tickets, stories, and work-in-progress phase artifacts
-- **`docs/archive/`** — Completed tickets and their RDSPI artifacts from past sprints
+- **`docs/active/`** — Current tickets, stories, and their work artifacts
+- **`docs/archive/`** — Completed tickets and their work artifacts from past sprints
 
-Every ticket goes through five phases: Research, Design, Structure, Plan, Implement. Each phase produces a ~200-line artifact. See the [RDSPI workflow](docs/knowledge/rdspi-workflow.md) for details.
+Every ticket goes `ready → implement → review → done`. The agent does the work, commits it through `lisa commit-ticket`, and writes one review document at the end. See [how a ticket moves](docs/knowledge/lisa-workflow.md) for details.
 
-This means Lisa's own development history is visible in the repo — the archive contains 50+ completed tickets with full phase artifacts, all produced by Lisa orchestrating Claude Code sessions.
+This means Lisa's own development history is visible in the repo — the archive contains 50+ completed tickets with their work artifacts, all produced by Lisa running Claude Code sessions.

@@ -6,5 +6,5 @@
   "model": "gpt-5.4",
   "permission_mode": "bypassPermissions",
   "turn_id": "turn-current-assignment",
-  "prompt": "Read the ticket at docs/active/tickets/T-033-01-02.md and complete the RDSPI workflow.\nLISA_ASSIGNMENT {\"ticket_id\":\"T-033-01-02\",\"generation\":42}"
+  "prompt": "Read the ticket at docs/active/tickets/T-033-01-02.md and complete the ticket.\nLISA_ASSIGNMENT {\"ticket_id\":\"T-033-01-02\",\"generation\":42}"
 }

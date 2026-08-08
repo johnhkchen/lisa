@@ -12,7 +12,7 @@
 
 ### Sprint 1: Foundation
 - Fixed lib.rs <-> ui.rs signature bridge
-- Created CLAUDE.md with RDSPI workflow definition
+- Created CLAUDE.md with the workflow definition
 - Set up example ticket directory structure with sample tickets
 - Verified wasm32-wasip1 compilation, 63 tests passing
 
@@ -35,9 +35,9 @@ Applied feedback from first manual setup on an external Rust project:
 - Added optional `tickets` field to story format for human convenience
 
 ### Sprint 5: Workflow Separation
-- Extract RDSPI workflow from CLAUDE.md into standalone docs/rdspi-workflow.md
+- Extract the workflow from CLAUDE.md into a standalone document under docs/
 - CLAUDE.md now project-specific only (description, build, layout)
-- Scheduler references both CLAUDE.md and rdspi-workflow.md
+- Scheduler references both CLAUDE.md and the workflow document
 - Setup guide template cut in half — no more workflow boilerplate to copy
 
 ### Sprint 6: `lisa init` CLI
@@ -166,8 +166,8 @@ Handle real-world failure modes.
 
 ## Open Questions
 
-1. **Context limits**: Does a full RDSPI cycle fit in 1M tokens for real tickets?
+1. **Context limits**: Does a full ticket fit in 1M tokens for real work?
 2. **Parallelism limits**: Is 2 concurrent threads safe? When to go higher?
-3. **Agent teams ROI**: Do Research/Design swarms improve quality or just burn tokens?
+3. **Agent teams ROI**: Do planning swarms improve quality or just burn tokens?
 4. **Worktree integration**: Should lisa manage worktrees for cross-story parallelism?
 5. **Ticket ID scheme**: Global sequential IDs (T-001, T-002) vs story-prefixed (T-001-01)? Feedback suggests decoupling from stories.

@@ -12,7 +12,7 @@ Use the repository notes below when you are changing Lisa itself.
 
 ## Project
 
-Lisa is a Zellij WASM plugin (Rust) that implements DAG-driven concurrent task scheduling for the RDSPI workflow. It manages Claude Code sessions -- spawning, tracking, and scheduling them based on ticket dependencies. It carries between projects as a single `.wasm` file with zero project-specific dependencies.
+Lisa is a Zellij WASM plugin (Rust) that implements DAG-driven concurrent task scheduling for its ticket workflow. It manages Claude Code sessions -- spawning, tracking, and scheduling them based on ticket dependencies. It carries between projects as a single `.wasm` file with zero project-specific dependencies.
 
 ### Build and Test
 
@@ -51,7 +51,7 @@ crates/
       detect.rs       Project type detection
       init.rs         Init and validate commands
       loop_cmd.rs     Loop command: embeds WASM, generates layout, execs zellij
-      templates.rs    CLAUDE.md generation, embedded RDSPI workflow + WASM
+      templates.rs    Embedded workflow document, hook scripts + WASM
     build.rs          Copies WASM plugin to OUT_DIR for embedding
 ```
 
@@ -65,4 +65,4 @@ docs/active/work/       # Work artifacts, one subdirectory per ticket ID
 
 ---
 
-The RDSPI workflow definition is in docs/knowledge/rdspi-workflow.md and is injected into agent context by lisa automatically.
+Lisa's workflow definition is in docs/knowledge/lisa-workflow.md and is injected into agent context by lisa automatically.

@@ -101,7 +101,7 @@ depends_on: []
 ## Context
 
 Exercise Lisa's phase and completion protocol without project history.
-This is an evidence-only task: create the required RDSPI phase artifacts, but do
+This is an evidence-only task: create the required review artifacts, but do
 not create or modify project source files.
 
 ## Acceptance Criteria

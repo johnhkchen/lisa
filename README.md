@@ -73,7 +73,7 @@ When you have a set of interdependent tasks — a feature broken into tickets, a
 
 Lisa runs as a [Zellij](https://zellij.dev/) plugin. It reads your tickets, computes a dependency graph, and spawns Claude Code sessions for every ticket whose dependencies are satisfied. A dashboard shows what's running, what's queued, and what's done. When a ticket finishes, Lisa checks what it unblocked and schedules the next wave.
 
-Each ticket goes through six phases: Research, Design, Structure, Plan, Implement, Review. Every phase produces a short artifact (~200 lines) that serves as both a review checkpoint and crash recovery. If a session dies mid-work, the latest artifact plus the ticket is enough to seed a new session at the right phase.
+Each ticket goes `ready → implement → review → done`. The agent does the work and commits it as it goes, then writes one review document and a machine-readable verdict at the end. If a session dies mid-work, what it already committed is on the branch and the next session carries on from there.
 
 Lisa keeps the trail reviewable: an append-only attempt ledger records each run,
 the completion journal seals every finished ticket — to a commit where the
@@ -255,7 +255,7 @@ verify the binary, version, and trust seeding.
 
 ### What runs in the pane
 
-A Codex ticket launches the official interactive Codex TUI with its initial RDSPI
+A Codex ticket launches the official interactive Codex TUI with its initial ticket
 prompt, just as the Claude path launches Claude Code. Lisa-generated hooks in
 `.codex/hooks.json` translate `Stop`, `SessionStart[clear]`, and `PostToolUse`
 into the same `.lisa/signals/` files the scheduler consumes. Every ticket gets a
@@ -281,16 +281,12 @@ uses its JSON renderer for Codex panes.
 
 ### Workflow
 
-Every ticket passes through six phases in order:
+A ticket has four states, and an agent works two of them:
 
-1. **Research** — Map the relevant codebase. What exists, where, how it connects.
-2. **Design** — Explore options, evaluate tradeoffs, choose an approach with rationale.
-3. **Structure** — Define file-level changes, module boundaries, public interfaces.
-4. **Plan** — Sequence implementation steps with testing strategy.
-5. **Implement** — Execute the plan, commit meaningful ticket-owned units through Lisa's isolated transaction, track progress.
-6. **Review** — Summarize changes, test coverage, and open concerns, then wait for Lisa to confirm completion.
+1. **Implement** — Do the work. Commit meaningful ticket-owned units through Lisa's isolated transaction as they finish.
+2. **Review** — Summarize what changed, what it covers, and what is still open, then wait for Lisa to confirm completion.
 
-Each phase produces a ~200-line artifact in `docs/active/work/{ticket-id}/`. These are review checkpoints — catching a bad design at 200 lines is cheaper than catching it at 2,000 lines of wrong code.
+That produces two files in `docs/active/work/{ticket-id}/`: `review.md` for a human, and `review-disposition.json` — pass or block, with a reason and an optional read-only check — for Lisa. Nothing is written before the work exists; the diff and the commits are the record of what happened.
 
 ### Atomic completion
 
@@ -353,14 +349,14 @@ docs/
     stories/       Story files (grouping related tickets)
     work/          Phase artifacts, one subdirectory per ticket
   knowledge/
-    rdspi-workflow.md   Workflow definition (injected into agent context)
+    lisa-workflow.md    How a ticket moves (injected into agent context)
 ```
 
 ## CLI Reference
 
 ### `lisa init`
 
-Scaffold a project for Lisa: creates ticket directories, `CLAUDE.md`, `AGENTS.md` (a pointer to `CLAUDE.md` for the Codex client), RDSPI workflow, hooks, and `.lisa.toml`.
+Scaffold a project for Lisa: creates ticket directories, `docs/knowledge/lisa-workflow.md`, hooks, and `.lisa.toml`. Your agent context file — `CLAUDE.md`, `AGENTS.md`, whatever your client reads — is yours to write; Lisa does not touch it.
 
 ```bash
 lisa init                 # Initialize with the strongest history mode available

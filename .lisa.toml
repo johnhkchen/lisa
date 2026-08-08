@@ -19,9 +19,8 @@ max_threads = 2
 # provider_caps = {}
 
 # [scheduling.phase_timeouts]
-# research = 300
-# design = 300
 # implement = 1800
+# review = 600
 
 # [agent]
 # Chooses which coding agent Lisa drives. Omit it to detect agents on PATH; claude is the default when both are installed.

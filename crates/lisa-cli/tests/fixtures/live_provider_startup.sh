@@ -265,7 +265,7 @@ depends_on: []
 
 ## Context
 
-This is an isolated live harness ticket. Produce concise RDSPI phase artifacts only.
+This is an isolated live harness ticket. Produce concise review artifacts only.
 Do not modify product source. Continue through Review without asking questions, then stop
 and let Lisa publish completion.
 

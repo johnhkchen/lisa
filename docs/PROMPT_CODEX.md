@@ -15,7 +15,7 @@ UNDERSTAND it deeply and critically — not to write implementation code yet.
 
 ## What lisa is
 lisa is a Zellij WASM plugin (Rust) that does DAG-driven concurrent task
-scheduling for the RDSPI workflow: it manages Claude Code sessions — spawning,
+scheduling for its ticket workflow: it manages Claude Code sessions — spawning,
 tracking, and scheduling them based on ticket dependencies — and carries between
 projects as a single .wasm with zero project-specific deps.
 
@@ -53,7 +53,7 @@ especially: crates/lisa-plugin/src/lib.rs (build_claude_command ~L53, the /clear
 reuse handshake ~L555-620, ENTER_DELAY_SECS ~L83, the signal-file consumption),
 the .lisa/hooks/ scripts + how .claude/settings.local.json wires them,
 crates/lisa-core/src/types.rs PluginConfig, crates/lisa-cli/src/doctor.rs, and
-crates/lisa-cli/src/templates.rs. The RDSPI workflow is docs/knowledge/rdspi-workflow.md.
+crates/lisa-cli/src/templates.rs. The workflow document is docs/knowledge/lisa-workflow.md.
 
 ## Locked decisions — understand them; do NOT re-open unless you find them broken
 - North star = per-pane (provider, model) routing + execution provenance (S-026/S-027).
