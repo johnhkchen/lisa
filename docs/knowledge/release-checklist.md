@@ -2,7 +2,7 @@
 
 This is the maintainer runbook for cutting a stable Lisa release. It is
 version-parameterized: set the block below once and every command derives from
-it. Current cut: **v0.4.4** (prepared 2026-07-17; prior stable v0.4.3).
+it. Current cut: **v0.5.0-rc.1** (prepared 2026-08-07; prior stable v0.4.4).
 
 Only John authorizes publication. Preparing or reviewing this checklist is not
 authorization to tag, dispatch, publish, or update the Homebrew tap or apt
@@ -22,26 +22,56 @@ directory.
 ```bash
 set -euo pipefail
 REPO=johnhkchen/lisa
-VERSION=0.4.4
+VERSION=0.5.0-rc.1
 TAG="v$VERSION"
-PRIOR_STABLE=v0.4.3
+PRIOR_STABLE=v0.4.4
 # Ancestry gates: each must be an ancestor of the release commit.
 E045_GATE=c08e755   # completion boundary of the last E-045 ticket
 MUSL_GATE=fcdd293   # static-musl linkage + Bullseye execution checks in release.yml
 SEAL_GATE=6fcb2f2   # completion boundary of S-049-08 (stable-0.4.4 hotfix: E-049 + E-050 line)
+WORKFLOW_GATE=e67491b # completion boundary of S-057-02 (0.5.0 line: one working phase, and the upgrade path to it)
 ```
 
 For a future cut: update `VERSION`, `PRIOR_STABLE`, and append the new cut's
 gate commit; do not delete old gates — they are cumulative lineage proof.
 
+Every `for gate in ...` loop below takes the whole list. Add the new name there
+when you add it above; a gate that is declared and never iterated proves
+nothing.
+
+## Prerelease cuts
+
+`VERSION` may name a release candidate, as this cut does. The runbook is the
+same walk with three deliberate differences, all of them consequences of
+`dist-workspace.toml` (`publish-prereleases = true`, apt publishing stable-only):
+
+- **`releases/latest` stays at `$PRIOR_STABLE`.** GitHub does not resolve latest
+  to a prerelease. Section 6 reads `repos/$REPO/releases/tags/$TAG` instead, and
+  asserts `.prerelease == true`.
+- **`publish-apt-repository` is skipped, and a skip is correct.** For a stable
+  cut a skip is a failed release; for a prerelease it is the design. Section 10
+  does not apply, and the apt repository legitimately keeps serving the prior
+  stable.
+- **Section 8's README installer path does not carry the prerelease** — it
+  downloads through `releases/latest`, which is `$PRIOR_STABLE`. Install through
+  the tagged asset instead:
+  `https://github.com/johnhkchen/lisa/releases/download/$TAG/lisa-cli-installer.sh`.
+
+`channel_skew: eliminated` is therefore unreachable for a prerelease. Record
+`channel_skew: deliberate` with the exact per-channel versions, the reason, and
+the resolution date — the stable cut that supersedes it.
+
 ## Channel baseline
 
-Expected skew before this stable cut:
+Expected skew before this cut:
 
 - `releases/latest`: `$PRIOR_STABLE` (stable);
-- newest prerelease: `v0.4.4-rc.1`;
-- Homebrew tap: `0.4.4-rc.1` (deliberate: `publish-prereleases = true`);
-- apt repository: `$PRIOR_STABLE` versions only (apt publishing skips prereleases).
+- newest release of any kind: `$PRIOR_STABLE` — the 0.4.4 line was cut stable
+  and no prerelease has been published since;
+- Homebrew tap: `$PRIOR_STABLE` without its `v` (deliberate:
+  `publish-prereleases = true` means the tap tracks whichever came last);
+- apt repository: `$PRIOR_STABLE` and older stables (apt publishing skips
+  prereleases).
 
 Capture the live values instead of assuming that baseline is still current:
 
@@ -56,8 +86,12 @@ gh api repos/johnhkchen/homebrew-lisa/contents/Formula/lisa.rb \
   --jq .content | tr -d '\n' | base64 --decode | sed -n '1,45p'
 
 curl -fsSL https://johnhkchen.github.io/lisa/dists/stable/main/binary-amd64/Packages \
-  | awk '/^Package: lisa$/{p=1} p&&/^Version:/{print; exit}'
+  | awk '/^Package: lisa$/{p=1; next} /^Package: /{p=0} p&&/^Version:/{print}'
 ```
+
+The apt index carries every published stable, in publication order, so print all
+of them. The earlier single-stanza form stopped at the first `Version:` and
+reported the *oldest* version in the repository as the baseline.
 
 Stop if a stable `$TAG` already exists. Switch to the post-cut audit rather than
 creating or moving the tag.
@@ -81,7 +115,7 @@ worktrees are not a suitable place to perform the version bump.
 Prove the chosen line contains every gate:
 
 ```bash
-for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE"; do
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE"; do
   git merge-base --is-ancestor "$gate" "$RELEASE_BASE"
 done
 ```
@@ -363,7 +397,7 @@ Fetch and peel the public stable tag, then repeat the ancestry gates:
 ```bash
 git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
 PUBLIC_TAG_COMMIT=$(git rev-parse "$TAG^{commit}")
-for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE"; do
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE"; do
   git merge-base --is-ancestor "$gate" "$PUBLIC_TAG_COMMIT"
 done
 printf 'public_tag_commit=%s\n' "$PUBLIC_TAG_COMMIT" \
