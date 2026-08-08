@@ -3114,7 +3114,7 @@ mod tests {
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-003".to_string(),
                 phase: Phase::Review,
-                artifact_path: "docs/active/work/T-003/design.md".to_string(),
+                artifact_path: "docs/active/work/T-003/review.md".to_string(),
                 parked_at: Duration::from_secs(100),
                 slot_number: 1,
             }],
@@ -3128,6 +3128,89 @@ mod tests {
         let full = output.join("\n");
         assert!(full.contains("T-003"), "Parked ticket missing");
         assert!(full.contains("Parked"), "Parked status missing");
+    }
+
+    /// The board a person supervising several panes reads at a glance. Four
+    /// phases is the whole vocabulary now, so the board draws four cells and
+    /// carries no trace of the phases the scheduler can no longer be in.
+    #[test]
+    fn render_threads_draws_a_four_phase_board() {
+        let slots: Vec<SlotInfo> = (1..=4)
+            .map(|slot_number| SlotInfo {
+                ticket_id: Some(format!("T-00{slot_number}")),
+                slot_number,
+                transitioning: false,
+            })
+            .collect();
+
+        let state = PluginState {
+            slots,
+            active_threads: vec![
+                ActiveThread {
+                    ticket_id: "T-001".to_string(),
+                    phase: Phase::Ready,
+                    started_at: Duration::from_secs(10),
+                    slot_number: 1,
+                    awaiting: false,
+                    route: None,
+                },
+                ActiveThread {
+                    ticket_id: "T-002".to_string(),
+                    phase: Phase::Implement,
+                    started_at: Duration::from_secs(20),
+                    slot_number: 2,
+                    awaiting: false,
+                    route: None,
+                },
+                ActiveThread {
+                    ticket_id: "T-004".to_string(),
+                    phase: Phase::Done,
+                    started_at: Duration::from_secs(40),
+                    slot_number: 4,
+                    awaiting: false,
+                    route: None,
+                },
+            ],
+            parked_threads: vec![ParkedThread {
+                ticket_id: "T-003".to_string(),
+                phase: Phase::Review,
+                artifact_path: "docs/active/work/T-003/review.md".to_string(),
+                parked_at: Duration::from_secs(30),
+                slot_number: 3,
+            }],
+            current_time: Duration::from_secs(100),
+            ..PluginState::default()
+        };
+
+        let mut output = Vec::new();
+        render_threads(&state, &mut output);
+        let full = output.join("\n");
+
+        for short_name in ["RDY", "IMP", "REV", "DON"] {
+            assert_eq!(
+                full.matches(short_name).count(),
+                1,
+                "{short_name} must appear exactly once on a one-ticket-per-phase board:\n{full}"
+            );
+        }
+
+        // The half that makes this a four-phase test rather than four
+        // one-phase assertions: nothing survives from the retired vocabulary.
+        for retired in [
+            "RES",
+            "DES",
+            "STR",
+            "PLN",
+            "Research",
+            "Design",
+            "Structure",
+            "Plan",
+        ] {
+            assert!(
+                !full.contains(retired),
+                "the board still speaks a phase the scheduler cannot be in: {retired}\n{full}"
+            );
+        }
     }
 
     #[test]
@@ -4816,7 +4899,7 @@ mod tests {
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-003".to_string(),
                 phase: Phase::Implement,
-                artifact_path: "docs/active/work/T-003/research.md".to_string(),
+                artifact_path: "docs/active/work/T-003".to_string(),
                 parked_at: Duration::from_secs(80),
                 slot_number: 2,
             }],
@@ -4897,7 +4980,7 @@ mod tests {
             parked_threads: vec![ParkedThread {
                 ticket_id: "T-005".to_string(),
                 phase: Phase::Review,
-                artifact_path: "docs/active/work/T-005/design.md".to_string(),
+                artifact_path: "docs/active/work/T-005/review.md".to_string(),
                 parked_at: Duration::from_secs(50),
                 slot_number: 1,
             }],
