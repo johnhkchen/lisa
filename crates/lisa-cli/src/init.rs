@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::config;
+use crate::currency;
 use crate::detect::detect_project;
 use crate::templates;
 
@@ -247,12 +248,25 @@ pub enum InitAction {
     },
     /// Delete a file Lisa installed at a path it no longer installs to.
     ///
-    /// The only action that destroys anything, and it is reachable only through
-    /// [`plan_retired_template`], which requires exact bytes from a bundled
-    /// generation. It is an action rather than a side effect so `--dry-run`
-    /// shows it before it happens.
+    /// The only action that destroys a file, and it is reachable only through a
+    /// [`crate::currency::Disposition::RemoveFile`], which requires exact bytes
+    /// from a bundled generation. It is an action rather than a side effect so
+    /// `--dry-run` shows it before it happens.
     RemoveFile {
         path: PathBuf,
+        reason: String,
+    },
+    /// A `.lisa.toml` key Lisa no longer reads, named so `--dry-run` shows it.
+    ///
+    /// Reporting only. The bytes ride in the `.lisa.toml` [`InitAction::UpdateFile`]
+    /// planned above — one file, one write — so the execute loop does nothing
+    /// for this action. It exists because `update  .lisa.toml` does not tell an
+    /// operator which key is about to disappear, and the preview is what they
+    /// read before letting init touch a repository they have work in.
+    RetireConfigKey {
+        path: PathBuf,
+        section: &'static str,
+        key: &'static str,
         reason: String,
     },
 }
@@ -272,6 +286,16 @@ impl fmt::Display for InitAction {
             InitAction::RemoveFile { path, reason } => {
                 write!(f, "  remove  {} ({})", path.display(), reason)
             }
+            InitAction::RetireConfigKey {
+                path,
+                section,
+                key,
+                reason,
+            } => write!(
+                f,
+                "  remove  {} [{section}] {key} ({reason})",
+                path.display()
+            ),
         }
     }
 }
@@ -307,43 +331,95 @@ fn plan_owned_template(path: PathBuf, current: &str, known_prior: &[&str]) -> In
     }
 }
 
-/// Plan the removal of a template Lisa used to install at this path.
+/// Turn the shared retirement detection into plan lines.
 ///
-/// A rename is only half a migration. The other half is the file left behind:
-/// it contradicts the live document, and it is still what old prompts and an
-/// operator's muscle memory point at. So it goes — but under exactly the rule
-/// that governs every other template Lisa owns. Only bytes from a bundled
-/// generation are Lisa's to delete. Anything else is the operator's file, and
-/// it stays where they put it, reported with a reason that names what replaced
-/// it so the skip is a signpost rather than a shrug.
+/// One verb — `remove` — for the destructive class, and the existing `skip`
+/// for everything Lisa recognises and will not touch. Every preserved reason
+/// arrives carrying the `preserved:` prefix the rest of the plan uses, so a
+/// preserved ticket cannot be misread as a ticket Lisa declined to schedule.
 ///
-/// Returns `None` when there is nothing at the path, so a project that never
-/// had the old file sees no line about it at all.
-fn plan_retired_template(
-    path: PathBuf,
-    known_generations: &[&str],
-    replacement: &str,
-) -> Option<InitAction> {
-    if !path.exists() {
-        return None;
+/// `config_key_dropped` says whether the `.lisa.toml` content this plan will
+/// actually write came back without the key. Init never removes the key on its
+/// own judgment and never reports a removal it did not make: the two answers
+/// are the same answer.
+///
+/// Retired-phase tickets are the one unbounded group, and a board with two
+/// hundred of them would push the removals off the top of the preview. Five are
+/// listed, then one aggregate line. The cap lives here rather than in the
+/// detector because the inventory has to stay complete for `lisa doctor`; this
+/// is a decision about a preview, and it belongs to the thing rendering one.
+fn plan_retirements(retired: &[currency::Retirement], config_key_dropped: bool) -> Vec<InitAction> {
+    const TICKET_PREVIEW_LIMIT: usize = 5;
+
+    let mut actions = Vec::new();
+    let mut tickets_seen = 0usize;
+    let mut tickets_hidden = 0usize;
+    let mut ticket_dir = None;
+
+    for retirement in retired {
+        if matches!(
+            retirement.kind,
+            currency::RetirementKind::TicketPhase { .. }
+        ) {
+            tickets_seen += 1;
+            ticket_dir = retirement
+                .disposition
+                .path()
+                .parent()
+                .map(Path::to_path_buf)
+                .or(ticket_dir);
+            if tickets_seen > TICKET_PREVIEW_LIMIT {
+                tickets_hidden += 1;
+                continue;
+            }
+        }
+
+        actions.push(match &retirement.disposition {
+            currency::Disposition::RemoveFile { path, reason } => InitAction::RemoveFile {
+                path: path.clone(),
+                reason: reason.clone(),
+            },
+            currency::Disposition::DropConfigKey {
+                path,
+                section,
+                key,
+                reason,
+            } if config_key_dropped => InitAction::RetireConfigKey {
+                path: path.clone(),
+                section,
+                key,
+                reason: reason.clone(),
+            },
+            // The removal was authorized from the file on disk but the content
+            // this run would write kept the key — a `.lisa.toml` that changed
+            // under us, and not a removal to announce.
+            currency::Disposition::DropConfigKey {
+                path, section, key, ..
+            } => InitAction::SafetySkip {
+                path: path.clone(),
+                reason: format!(
+                    "preserved: [{section}] {key} is inert since 0.5.0, but this run could not \
+                         rewrite the file"
+                ),
+            },
+            currency::Disposition::Preserve { path, reason } => InitAction::SafetySkip {
+                path: path.clone(),
+                reason: reason.clone(),
+            },
+        });
     }
 
-    Some(match fs::read_to_string(&path) {
-        Ok(existing) if known_generations.contains(&existing.as_str()) => InitAction::RemoveFile {
-            path,
-            reason: format!("superseded by {replacement}"),
-        },
-        Ok(_) => InitAction::SafetySkip {
-            path,
+    if let (true, Some(dir)) = (tickets_hidden > 0, ticket_dir) {
+        actions.push(InitAction::SafetySkip {
+            path: dir,
             reason: format!(
-                "preserved: content is not a known Lisa template; superseded by {replacement}"
+                "preserved: {tickets_hidden} more tickets record a retired phase; \
+                 `lisa doctor` lists them"
             ),
-        },
-        Err(_) => InitAction::SafetySkip {
-            path,
-            reason: format!("preserved: existing file is unreadable; superseded by {replacement}"),
-        },
-    })
+        });
+    }
+
+    actions
 }
 
 /// Plan an append-only update to Lisa's nested gitignore. Existing bytes are
@@ -395,6 +471,11 @@ fn plan_append_only_gitignore(path: PathBuf, required: &str) -> InitAction {
 pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
     let mut actions = Vec::new();
 
+    // Everything Lisa used to write here and no longer does, detected once.
+    // Init consumes this; it never re-derives staleness of its own, which is
+    // what keeps `lisa doctor`'s diagnosis and init's fix the same answer.
+    let retired = currency::retirements(root);
+
     // Directories to create
     let dirs = [
         "docs/active/tickets",
@@ -431,17 +512,16 @@ pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
         templates::LEGACY_WORKFLOWS,
     ));
 
-    // The same document under the name it carried through 0.4. A project
-    // upgrading from there has one on disk that init would otherwise stop
-    // looking at, leaving two contract documents that disagree.
-    actions.extend(plan_retired_template(
-        root.join("docs/knowledge/rdspi-workflow.md"),
-        templates::LEGACY_WORKFLOWS,
-        WORKFLOW_DOCUMENT,
-    ));
-
     // .lisa.toml
     let config_path = root.join(".lisa.toml");
+    // Removing a dead key is authorized by the retirement, never by init's own
+    // reading of the file. That gate is what makes "a key disappeared with no
+    // line in the preview naming it" impossible rather than merely unlikely.
+    let config_key_authorized = retired.iter().any(|retirement| {
+        matches!(&retirement.disposition,
+            currency::Disposition::DropConfigKey { path, .. } if path == &config_path)
+    });
+    let mut config_key_dropped = false;
     if config_path.exists() {
         match fs::read_to_string(&config_path) {
             Ok(existing) => {
@@ -456,6 +536,15 @@ pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
                     update_version_in_toml(&existing, config::LISA_VERSION)
                 };
                 let updated = upsert_missing_config_keys(&with_version);
+                let updated = match config_key_authorized
+                    .then(|| config::remove_retired_scheduling_key(&updated))
+                {
+                    Some(config::RetiredKeyRemoval::Removed(without_key)) => {
+                        config_key_dropped = true;
+                        without_key
+                    }
+                    _ => updated,
+                };
 
                 if updated == existing {
                     actions.push(InitAction::NoOp {
@@ -634,6 +723,12 @@ pub fn plan_init_actions(root: &Path) -> Vec<InitAction> {
             content: templates::codex_hooks_json(),
         });
     }
+
+    // Retirements last, so the preview closes on what is about to be destroyed
+    // rather than burying it under twenty no-ops. `--dry-run` is the load-bearing
+    // flag now: it is what an operator reads before letting init touch a
+    // repository they have work in.
+    actions.extend(plan_retirements(&retired, config_key_dropped));
 
     actions
 }
@@ -1064,7 +1159,11 @@ fn run_init_with_history_state(
                     path: path.clone(),
                 });
             }
-            InitAction::NoOp { .. } | InitAction::SafetySkip { .. } => {}
+            // The retired key's bytes ride in the `.lisa.toml` UpdateFile above.
+            // One file, one write: this action exists to be read, not to run.
+            InitAction::NoOp { .. }
+            | InitAction::SafetySkip { .. }
+            | InitAction::RetireConfigKey { .. } => {}
         }
     }
 

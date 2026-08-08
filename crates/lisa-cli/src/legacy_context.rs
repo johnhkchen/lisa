@@ -58,6 +58,22 @@ const CLAUDE_TYPE_LABELS: &[&str] = &["Rust", "Node.js", "Go", "Python", "unknow
 /// The text between the interpolated type label and the optional sections.
 const CLAUDE_DESCRIPTION: &str = ") — TODO: add a one-line project description here.\n\n";
 
+/// The sentence Lisa's `CLAUDE.md` preambles opened with.
+///
+/// The 0.2 preamble carried none: it was `# CLAUDE.md`, a blank line and
+/// `## Project`, which is also exactly what somebody writing the file by hand
+/// produces. So it proves nothing, and the weak signal below ignores it — an
+/// edited 0.2 generation is silently left alone, which is the safe direction.
+const CLAUDE_PREAMBLE_SENTENCE: &str =
+    "Lisa runs coding agents like Claude Code and Codex through your ticket board";
+
+/// The sentence every generated `AGENTS.md` carried, pointing at `CLAUDE.md`.
+///
+/// Lisa's own prose, not a phrase an operator writes by accident, and the
+/// reason retiring `CLAUDE.md` while something remains at `AGENTS.md` would
+/// leave a dangling reference.
+const AGENTS_POINTER_SENTENCE: &str = "This project's agent context lives in [CLAUDE.md](CLAUDE.md) — the single source of truth for every agent client";
+
 /// Every `AGENTS.md` Lisa shipped. The file was a pointer at `CLAUDE.md` with
 /// no project-specific content, so these are exact bytes.
 pub(crate) const LEGACY_AGENTS_CONTEXTS: &[&str] = &[
@@ -183,6 +199,35 @@ pub(crate) fn is_generated_claude_md(content: &str) -> bool {
 /// Is `content` byte-for-byte an `AGENTS.md` Lisa once wrote?
 pub(crate) fn is_generated_agents_md(content: &str) -> bool {
     LEGACY_AGENTS_CONTEXTS.contains(&content)
+}
+
+/// Does `content` still carry a mark of a Lisa `CLAUDE.md` generation, even
+/// though it is no longer one byte-for-byte?
+///
+/// The weak signal, and it exists for one job: letting init say *preserved*
+/// about a file it recognises and will not touch. An edited generation and an
+/// operator's own writing are the same thing to [`is_generated_claude_md`] —
+/// falling out of that match is exactly what an edit does — so without a
+/// second, softer test an operator who changed one line hears nothing at all.
+///
+/// **This is never a warrant to remove anything.** A false positive here costs
+/// one informational line; a false positive in [`is_generated_claude_md`] costs
+/// somebody their standing instructions to every model that reads their
+/// repository. Keep the two apart, and keep this one out of any code path that
+/// deletes.
+pub(crate) fn bears_lisa_claude_marks(content: &str) -> bool {
+    CLAUDE_HEADERS
+        .iter()
+        .filter(|header| header.contains(CLAUDE_PREAMBLE_SENTENCE))
+        .any(|header| content.starts_with(*header))
+}
+
+/// Does `content` still carry the pointer sentence Lisa's `AGENTS.md`
+/// generators wrote? The `AGENTS.md` counterpart of
+/// [`bears_lisa_claude_marks`], under the same rule: reportable, never
+/// removable.
+pub(crate) fn bears_lisa_agents_marks(content: &str) -> bool {
+    content.contains(AGENTS_POINTER_SENTENCE)
 }
 
 #[cfg(test)]
@@ -313,6 +358,82 @@ mod tests {
             "{}\n",
             LEGACY_AGENTS_CONTEXTS[1]
         )));
+    }
+
+    #[test]
+    fn an_edited_generation_still_bears_its_marks() {
+        // The weak signal's whole job: an operator's one-line edit falls out of
+        // the strict match, and init still has something to say `preserved`
+        // about. What it must never do is grow into a removal warrant.
+        let generated = generated_claude_md(
+            CLAUDE_HEADERS[2],
+            "my-app",
+            "Rust",
+            Some(("cargo build", "cargo test", "cargo clippy")),
+            Some("src:\n  main.rs"),
+        );
+        let edited = generated.replace(
+            "TODO: add a one-line project description here.",
+            "A scheduler for climate model runs.",
+        );
+        assert!(!is_generated_claude_md(&edited));
+        assert!(bears_lisa_claude_marks(&edited));
+
+        // Every generation whose preamble is distinctively Lisa's bears its
+        // mark, edited or not. The 0.2 preamble is not: `# CLAUDE.md` followed
+        // by `## Project` is what a person writing the file by hand produces,
+        // so an edited 0.2 generation is deliberately invisible rather than
+        // claimed on that evidence.
+        for &header in CLAUDE_HEADERS {
+            let generated = generated_claude_md(header, "my-app", "Go", None, None);
+            let distinctive = header.contains(CLAUDE_PREAMBLE_SENTENCE);
+            assert_eq!(bears_lisa_claude_marks(&generated), distinctive);
+            assert_eq!(
+                bears_lisa_claude_marks(&format!(
+                    "{generated}\n## House rules\n\nAlways run the linter.\n"
+                )),
+                distinctive
+            );
+            // Either way the strict matcher still recognises the unedited file,
+            // which is the only signal that authorizes removing it.
+            assert!(is_generated_claude_md(&generated));
+        }
+        assert_eq!(
+            CLAUDE_HEADERS
+                .iter()
+                .filter(|header| !header.contains(CLAUDE_PREAMBLE_SENTENCE))
+                .count(),
+            1,
+            "only the 0.2 preamble is too plain to be evidence"
+        );
+
+        for &generation in LEGACY_AGENTS_CONTEXTS {
+            assert!(bears_lisa_agents_marks(generation));
+            assert!(bears_lisa_agents_marks(&format!(
+                "{generation}\nAnd read the runbook.\n"
+            )));
+        }
+    }
+
+    #[test]
+    fn hand_written_context_bears_no_marks() {
+        // The operator's own file, at the same path, saying similar things.
+        // Silence is the required outcome: Lisa has no business having an
+        // opinion about a context file it did not write.
+        for hand_written in [
+            "# CLAUDE.md\n\n## Project\n\nA garden planner.\n",
+            "# CLAUDE.md\n\nRun the climate suite before every commit.\n",
+            "",
+        ] {
+            assert!(!bears_lisa_claude_marks(hand_written));
+        }
+        for hand_written in [
+            "# AGENTS.md\n\nRead the README first.\n",
+            "# AGENTS.md\n\nSee CLAUDE.md for the house rules.\n",
+            "",
+        ] {
+            assert!(!bears_lisa_agents_marks(hand_written));
+        }
     }
 
     #[test]

@@ -448,6 +448,153 @@ fn resolve_config_with_availability(
     }
 }
 
+/// The `[scheduling]` section holding the key 0.5.0 stopped reading.
+pub(crate) const RETIRED_SCHEDULING_SECTION: &str = "scheduling";
+/// The key itself. Parsed and ignored since 0.5.0; removable since T-057-02-02.
+pub(crate) const RETIRED_SCHEDULING_KEY: &str = "auto_advance";
+
+/// What lifting `scheduling.auto_advance` out of an operator's `.lisa.toml`
+/// would cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetiredKeyRemoval {
+    /// The file does not set the key — or does not parse, in which case it is
+    /// not this function's problem.
+    Absent,
+    /// The whole file, minus one line. Every other byte is the original's.
+    Removed(String),
+    /// The key is set in a shape no line deletion can express. The string says
+    /// which, already worded for a preview line.
+    NotSurgical(&'static str),
+}
+
+/// Remove `[scheduling] auto_advance` from a `.lisa.toml`, or refuse.
+///
+/// `.lisa.toml` is a file the operator edits: it holds their concurrency, model
+/// routing and client choices, and their comments explaining why. So this is
+/// line surgery in the manner of [`crate::init::upsert_missing_config_keys`],
+/// never a `toml::Value` round trip — nothing is reserialized, so no comment,
+/// no key order and no whitespace can be lost.
+///
+/// The post-condition is what makes it safe rather than clever: **every other
+/// byte survives by construction, and every other key survives by assertion.**
+/// When either cannot be guaranteed the answer is [`RetiredKeyRemoval::NotSurgical`]
+/// and the file is left exactly as it is. A `.lisa.toml` that comes back with
+/// its comments stripped is a worse outcome than a dead key sitting inert.
+pub(crate) fn remove_retired_scheduling_key(existing: &str) -> RetiredKeyRemoval {
+    let Ok(original) = existing.parse::<toml::Value>() else {
+        return RetiredKeyRemoval::Absent;
+    };
+    if !sets_retired_scheduling_key(&original) {
+        return RetiredKeyRemoval::Absent;
+    }
+
+    // Rejoining lines would rewrite every CRLF in the file into an LF, which is
+    // a reformat of the whole thing to remove one line of it.
+    if existing.contains('\r') {
+        return RetiredKeyRemoval::NotSurgical(
+            "removing it would rewrite every line ending in the file",
+        );
+    }
+
+    let candidates = retired_key_lines(existing);
+    let [line_to_drop] = candidates[..] else {
+        return RetiredKeyRemoval::NotSurgical(if candidates.is_empty() {
+            "the setting is not written as a line of its own"
+        } else {
+            "the file assigns the setting more than once"
+        });
+    };
+
+    let kept: Vec<&str> = existing
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| *index != line_to_drop)
+        .map(|(_, line)| line)
+        .collect();
+    let mut updated = kept.join("\n");
+    if existing.ends_with('\n') {
+        updated.push('\n');
+    }
+
+    let Ok(reparsed) = updated.parse::<toml::Value>() else {
+        return RetiredKeyRemoval::NotSurgical("removing that line leaves the file unparseable");
+    };
+    if sets_retired_scheduling_key(&reparsed) {
+        return RetiredKeyRemoval::NotSurgical("the setting survives its own line being removed");
+    }
+    if without_retired_scheduling_key(original) != without_retired_scheduling_key(reparsed) {
+        return RetiredKeyRemoval::NotSurgical("removing that line would change another setting");
+    }
+
+    RetiredKeyRemoval::Removed(updated)
+}
+
+/// Does this parsed `.lisa.toml` actively set the retired scheduling key?
+fn sets_retired_scheduling_key(table: &toml::Value) -> bool {
+    table
+        .get(RETIRED_SCHEDULING_SECTION)
+        .and_then(|scheduling| scheduling.get(RETIRED_SCHEDULING_KEY))
+        .is_some()
+}
+
+/// The same parsed file with the retired key gone, for comparing what a line
+/// deletion actually did against what it was supposed to do.
+///
+/// A `[scheduling]` section left empty is dropped, so a file that set the key
+/// through a top-level `scheduling.auto_advance` — where deleting the line
+/// takes the whole table with it — compares equal to one that kept an empty
+/// header behind.
+fn without_retired_scheduling_key(mut value: toml::Value) -> toml::Value {
+    let Some(toml::Value::Table(scheduling)) = value.get_mut(RETIRED_SCHEDULING_SECTION) else {
+        return value;
+    };
+    scheduling.remove(RETIRED_SCHEDULING_KEY);
+    if scheduling.is_empty() {
+        if let Some(table) = value.as_table_mut() {
+            table.remove(RETIRED_SCHEDULING_SECTION);
+        }
+    }
+    value
+}
+
+/// Every line that could be the live assignment of the retired key.
+///
+/// Commented lines are not candidates: the caller has already established from
+/// the parsed file that the key is live, so a commented one is somebody's note.
+/// A dotted `scheduling.auto_advance` counts only above the first section
+/// header, where it means the same table.
+fn retired_key_lines(existing: &str) -> Vec<usize> {
+    let dotted = format!("{RETIRED_SCHEDULING_SECTION}.{RETIRED_SCHEDULING_KEY}");
+    let mut section: Option<String> = None;
+    let mut candidates = Vec::new();
+
+    for (index, line) in existing.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(header) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            section = Some(header.trim().to_string());
+            continue;
+        }
+        let assigns = |name: &str| {
+            trimmed
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        };
+        let is_candidate = match section.as_deref() {
+            Some(RETIRED_SCHEDULING_SECTION) => assigns(RETIRED_SCHEDULING_KEY),
+            None => assigns(&dotted),
+            Some(_) => false,
+        };
+        if is_candidate {
+            candidates.push(index);
+        }
+    }
+
+    candidates
+}
+
 /// Result of config validation, containing the parsed config and any warnings.
 #[derive(Debug)]
 pub struct ConfigValidation {
@@ -1317,6 +1464,149 @@ max_threads = 4
         let result = validate_config(toml_str).unwrap();
         assert!(result.warnings.is_empty());
         assert_eq!(result.config.scheduling.max_threads, Some(4));
+    }
+
+    /// The fixture the ticket asks for: comments interleaved with keys, a
+    /// custom value, an unrelated section, and a key Lisa has never heard of.
+    const INTERLEAVED_CONFIG: &str = r#"# Set up by hand in 2025. Do not reformat.
+version = "0.4.4"
+
+[dirs]
+tickets = "planning/tickets"   # we keep the board out of docs/
+
+# Two agents is all this laptop can take.
+[scheduling]
+max_threads = 2
+# Left over from 0.4 — nobody remembers turning it on.
+auto_advance = true
+review_timeout_secs = 900
+
+[experimental]
+# Not a key Lisa knows. It is still the operator's file.
+my_own_setting = "keep me"
+"#;
+
+    #[test]
+    fn removing_the_retired_key_keeps_every_other_byte() {
+        let RetiredKeyRemoval::Removed(updated) = remove_retired_scheduling_key(INTERLEAVED_CONFIG)
+        else {
+            panic!("a plain assignment must lift out cleanly");
+        };
+
+        // The one line is gone and nothing else moved: comments, custom values,
+        // key order, the unknown section, and the trailing newline.
+        assert_eq!(
+            updated,
+            INTERLEAVED_CONFIG.replace("auto_advance = true\n", "")
+        );
+        assert!(!updated.contains("auto_advance"));
+        assert!(updated.contains("# Left over from 0.4 — nobody remembers turning it on."));
+        assert!(updated.contains("# Set up by hand in 2025. Do not reformat."));
+        assert!(
+            updated.contains("tickets = \"planning/tickets\"   # we keep the board out of docs/")
+        );
+        assert!(updated.contains("my_own_setting = \"keep me\""));
+
+        // And every surviving key still parses to exactly what it did before.
+        let before: toml::Value = INTERLEAVED_CONFIG.parse().unwrap();
+        let after: toml::Value = updated.parse().unwrap();
+        assert_eq!(
+            after["scheduling"]["max_threads"],
+            before["scheduling"]["max_threads"]
+        );
+        assert_eq!(
+            after["scheduling"]["review_timeout_secs"],
+            before["scheduling"]["review_timeout_secs"]
+        );
+        assert_eq!(after["dirs"], before["dirs"]);
+        assert_eq!(after["experimental"], before["experimental"]);
+        assert_eq!(after["version"], before["version"]);
+
+        // Idempotent: a second pass finds nothing to do.
+        assert_eq!(
+            remove_retired_scheduling_key(&updated),
+            RetiredKeyRemoval::Absent
+        );
+    }
+
+    #[test]
+    fn a_file_that_does_not_set_the_key_is_left_alone() {
+        for untouched in [
+            "",
+            "[scheduling]\nmax_threads = 2\n",
+            // A commented assignment is somebody's note, not a live setting.
+            "[scheduling]\n# auto_advance = true\nmax_threads = 2\n",
+            // A key of the same name in another section is another key.
+            "[triage]\nauto_advance = true\n",
+            // Not parseable at all: doctor's config check owns that, not this.
+            "[scheduling\nmax_threads =\n",
+        ] {
+            assert_eq!(
+                remove_retired_scheduling_key(untouched),
+                RetiredKeyRemoval::Absent,
+                "must be Absent: {untouched:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shape_no_line_deletion_can_express_is_refused() {
+        // An inline table: the key has no line of its own, so deleting a line
+        // cannot express the removal and rewriting one would reformat the
+        // operator's file.
+        let inline = "version = \"0.4.4\"\nscheduling = { auto_advance = true, max_threads = 2 }\n";
+        assert_eq!(
+            remove_retired_scheduling_key(inline),
+            RetiredKeyRemoval::NotSurgical("the setting is not written as a line of its own")
+        );
+
+        // A quoted key is a shape the line scanner deliberately does not claim.
+        let quoted = "[scheduling]\n\"auto_advance\" = true\nmax_threads = 2\n";
+        assert_eq!(
+            remove_retired_scheduling_key(quoted),
+            RetiredKeyRemoval::NotSurgical("the setting is not written as a line of its own")
+        );
+
+        // CRLF: removing one line must not rewrite every other line's ending.
+        let crlf = "[scheduling]\r\nauto_advance = true\r\nmax_threads = 2\r\n";
+        assert!(matches!(
+            remove_retired_scheduling_key(crlf),
+            RetiredKeyRemoval::NotSurgical(_)
+        ));
+    }
+
+    #[test]
+    fn a_dotted_assignment_takes_its_empty_table_with_it() {
+        // The only assignment in the file. Deleting the line removes the whole
+        // `scheduling` table, which the parse-equivalence check must accept
+        // rather than read as "another setting changed".
+        let dotted = "version = \"0.4.4\"\nscheduling.auto_advance = true\n";
+        let RetiredKeyRemoval::Removed(updated) = remove_retired_scheduling_key(dotted) else {
+            panic!("a dotted assignment on its own line lifts out too");
+        };
+        assert_eq!(updated, "version = \"0.4.4\"\n");
+    }
+
+    #[test]
+    fn a_reopened_scheduling_section_still_finds_its_key() {
+        // `[scheduling.phase_timeouts]` is a different table; the key after it
+        // belongs to whatever header follows, not to `[scheduling]`.
+        let nested =
+            "[scheduling]\nmax_threads = 2\n\n[scheduling.phase_timeouts]\nimplement = 60\n";
+        assert_eq!(
+            remove_retired_scheduling_key(nested),
+            RetiredKeyRemoval::Absent
+        );
+
+        let nested_then_key = "[scheduling.phase_timeouts]\nimplement = 60\n\n[scheduling]\nauto_advance = true\nmax_threads = 2\n";
+        let RetiredKeyRemoval::Removed(updated) = remove_retired_scheduling_key(nested_then_key)
+        else {
+            panic!("the key under the real [scheduling] header lifts out");
+        };
+        assert_eq!(
+            updated,
+            "[scheduling.phase_timeouts]\nimplement = 60\n\n[scheduling]\nmax_threads = 2\n"
+        );
     }
 
     #[test]
