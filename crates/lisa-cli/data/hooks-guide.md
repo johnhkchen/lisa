@@ -38,7 +38,8 @@ and Codex bind their supported subsets through `.claude/settings.local.json` and
 | `on-idle.sh`       | `Notification[idle_prompt]` | `.lisa/signals/pane-<id>.idle`      | session finished work   |
 | `on-stop.sh`       | `Stop`                      | `.lisa/signals/pane-<id>.stopped`   | session ready for input |
 | `on-clear.sh`      | `SessionStart[clear]`       | `.lisa/signals/pane-<id>.cleared`   | context was cleared     |
-| `on-heartbeat.sh`  | `PostToolUse`               | `.lisa/signals/pane-<id>.heartbeat` | session actively working|
+| `on-heartbeat.sh`  | `PostToolUse`               | `.lisa/signals/pane-<id>.alive`     | a process is in the pane|
+| `on-heartbeat.sh`  | `PostToolUse`               | `.lisa/signals/pane-<id>.heartbeat` | this attempt is working |
 | `on-ack.sh`        | `UserPromptSubmit`          | `.lisa/signals/pane-<id>.ack`       | assigned prompt accepted|
 | *(launch guard)*   | Codex TUI exits non-zero     | `.lisa/signals/pane-<id>.error`     | session failed          |
 
@@ -48,6 +49,17 @@ preserves its raw JSON payload; the other lifecycle scripts write UTC timestamps
 **heartbeat** is the liveness primitive: the plugin reuses a pane only after a stretch
 of heartbeat *silence* — not on a stop/idle signal, which can fire before an agent is
 truly finished.
+
+The heartbeat hook writes **two** files because it has two separable things to say.
+`.alive` says only *a process ran a tool call here*; it names nobody, so it costs
+nothing to write and there is nothing in it to forge. `.heartbeat` says *this attempt
+is making progress*, which moves activity clocks and lifts the question guard, so the
+hook publishes it only when the session's own `$LISA_TICKET_ID`/`$LISA_ATTEMPT_ID`
+byte-match the pane's lease marker — the same test `on-start.sh` applies. During a
+pane recycle a lingering predecessor keeps producing `.alive` (which is how Lisa knows
+not to type a launch line into a live TUI) and stops producing `.heartbeat`. Projects
+scaffolded by 0.5.0-rc.2 or earlier have the older single-file hook; `lisa doctor`
+reports it as behind and `lisa init` replaces it in place.
 
 The **`.error`** signal is part of the normalized core contract
 (`.heartbeat`/`.stopped`/`.error`) but is written by non-Claude adapters — native

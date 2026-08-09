@@ -188,7 +188,43 @@ fi
 /// client's SessionStart[startup] event. It publishes the scheduler-owned
 /// attempt lease only when the immutable launch identity still matches the
 /// pane marker, so a stale predecessor cannot borrow a successor's identity.
+///
+/// It compares the bytes it is about to publish, not the file it read them
+/// from. Reading the marker, then copying it, leaves a window in which the
+/// scheduler publishes a successor between the two — and the process would then
+/// publish a `.started` naming a generation it does not hold, on the strength of
+/// a comparison against different bytes. Copy first, compare the copy, rename
+/// the thing compared.
 pub const ON_START_HOOK: &str = r#"#!/bin/sh
+# Lisa process-start signal hook — called when a native agent process starts.
+# Publishes only an exact pane/ticket/attempt-scoped scheduler lease.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ] && [ -n "$LISA_TICKET_ID" ] && [ -n "$LISA_ATTEMPT_ID" ]; then
+    case "$LISA_ATTEMPT_ID" in
+        *[!0-9]*) exit 0 ;;
+    esac
+    marker="$SIGNAL_DIR/pane-$LISA_PANE_ID.lease"
+    expected=$(printf '{"ticket_id":"%s","attempt_id":%s}' "$LISA_TICKET_ID" "$LISA_ATTEMPT_ID")
+
+    # Publish only bytes that were compared: take the copy first, then judge it.
+    tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.started.tmp.$$"
+    cp "$marker" "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 0; }
+    if [ "$(cat "$tmp")" = "$expected" ]; then
+        mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.started"
+    else
+        rm -f "$tmp"
+    fi
+fi
+"#;
+
+pub(crate) const LEGACY_ON_START_HOOKS: &[&str] = &[
+    // 0.5.0-rc.2. Same identity test, but it compared the marker file and then
+    // copied it again, so a successor published between the two reads could be
+    // announced by a process that does not hold it.
+    r#"#!/bin/sh
 # Lisa process-start signal hook — called when a native agent process starts.
 # Publishes only an exact pane/ticket/attempt-scoped scheduler lease.
 
@@ -211,15 +247,65 @@ if [ -n "$LISA_PANE_ID" ] && [ -n "$LISA_TICKET_ID" ] && [ -n "$LISA_ATTEMPT_ID"
         rm -f "$tmp"
     fi
 fi
-"#;
-
-pub(crate) const LEGACY_ON_START_HOOKS: &[&str] = &[];
+"#,
+];
 
 /// The heartbeat hook script, called by the native client's PostToolUse event.
-/// Fires after every tool call, proving the session is actively working.
-/// The plugin uses the absence of recent heartbeats — not stop/idle signals,
-/// which fire before agents truly finish — to decide a pane is safe to reuse.
+/// Fires after every tool call, and writes two files because it has two
+/// separable things to say.
+///
+/// `pane-<id>.alive` says *a process ran a tool call in this pane*. It names
+/// nobody, so there is nothing in it to forge, and it is written before any
+/// identity check — the exit policy holds a pane open while a provider is still
+/// emitting hooks, and during a recycle a still-resident predecessor stops
+/// matching the marker the moment the successor's lease is published.
+///
+/// `pane-<id>.heartbeat` says *this attempt is making progress*, and the
+/// scheduler acts on it: it moves activity clocks and clears the
+/// `AskUserQuestion` guard. That claim needs proof, so it is published only when
+/// the caller's own immutable launch identity byte-matches the pane marker,
+/// exactly as `ON_START_HOOK` does. A process that cannot name itself as the
+/// current attempt gets residency and nothing more.
 pub const ON_HEARTBEAT_HOOK: &str = r#"#!/bin/sh
+# Lisa heartbeat signal hook — called after each tool call.
+# Residency is unconditional; authority must name itself.
+
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+[ -n "$LISA_PANE_ID" ] || exit 0
+
+# "A process is in this pane." Asserts nothing about who, so it needs no
+# identity and survives a recycle that has already published the successor's
+# lease into the marker this hook used to copy blindly.
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.alive"
+
+# "This attempt is making progress." Published only against the immutable launch
+# identity, so a resident predecessor cannot borrow a successor's lease.
+[ -n "$LISA_TICKET_ID" ] && [ -n "$LISA_ATTEMPT_ID" ] || exit 0
+case "$LISA_ATTEMPT_ID" in
+    *[!0-9]*) exit 0 ;;
+esac
+
+marker="$SIGNAL_DIR/pane-$LISA_PANE_ID.lease"
+expected=$(printf '{"ticket_id":"%s","attempt_id":%s}' "$LISA_TICKET_ID" "$LISA_ATTEMPT_ID")
+
+# Publish only bytes that were compared: take the copy first, then judge it.
+tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat.tmp.$$"
+cp "$marker" "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 0; }
+if [ "$(cat "$tmp")" = "$expected" ]; then
+    mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
+else
+    rm -f "$tmp"
+fi
+"#;
+
+pub(crate) const LEGACY_ON_HEARTBEAT_HOOKS: &[&str] = &[
+    // 0.5.0-rc.2. Copies the marker on the strength of `$LISA_PANE_ID` alone, so
+    // any process that can run a tool call in the pane publishes a signal
+    // carrying whatever attempt the marker names. Listed here so `lisa init`
+    // upgrades every board that already has it.
+    r#"#!/bin/sh
 # Lisa heartbeat signal hook — called after each tool call.
 # Copies the scheduler-owned attempt lease into an atomic liveness signal.
 
@@ -235,9 +321,7 @@ if [ -n "$LISA_PANE_ID" ]; then
         rm -f "$tmp"
     fi
 fi
-"#;
-
-pub(crate) const LEGACY_ON_HEARTBEAT_HOOKS: &[&str] = &[
+"#,
     r#"#!/bin/sh
 # Lisa heartbeat signal hook — called after each tool call.
 # Writes a signal file so the plugin knows this session is actively working.
@@ -943,10 +1027,101 @@ mod tests {
     fn test_on_heartbeat_hook_content() {
         assert!(ON_HEARTBEAT_HOOK.starts_with("#!/bin/sh"));
         assert!(ON_HEARTBEAT_HOOK.contains("LISA_PANE_ID"));
+        assert!(ON_HEARTBEAT_HOOK.contains("LISA_TICKET_ID"));
+        assert!(ON_HEARTBEAT_HOOK.contains("LISA_ATTEMPT_ID"));
         assert!(ON_HEARTBEAT_HOOK.contains(".lisa/signals"));
+        assert!(ON_HEARTBEAT_HOOK.contains(".alive"));
         assert!(ON_HEARTBEAT_HOOK.contains(".heartbeat"));
         assert!(ON_HEARTBEAT_HOOK.contains(".lease"));
         assert!(ON_HEARTBEAT_HOOK.contains("mv \"$tmp\""));
+        // Residency is written before the first thing that can exit early, or a
+        // caller who cannot name itself would produce no evidence at all.
+        assert!(
+            ON_HEARTBEAT_HOOK.find(".alive").unwrap()
+                < ON_HEARTBEAT_HOOK.find("LISA_TICKET_ID").unwrap(),
+            "the presence-only write must precede every identity check"
+        );
+    }
+
+    /// Drive the real script. Returns `(alive, heartbeat)` — what a process with
+    /// this launch identity actually published into a pane whose marker names
+    /// `marker`.
+    fn run_heartbeat_hook(
+        marker: Option<&str>,
+        ticket_id: &str,
+        attempt_id: &str,
+    ) -> (bool, Option<String>) {
+        let root = tempfile::tempdir().unwrap();
+        let signals = root.path().join(".lisa/signals");
+        fs::create_dir_all(&signals).unwrap();
+        let script = root.path().join("on-heartbeat.sh");
+        fs::write(&script, ON_HEARTBEAT_HOOK).unwrap();
+        if let Some(body) = marker {
+            fs::write(signals.join("pane-7.lease"), body).unwrap();
+        }
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg(&script)
+            .current_dir(root.path())
+            .env("LISA_PANE_ID", "7");
+        if !ticket_id.is_empty() {
+            command.env("LISA_TICKET_ID", ticket_id);
+        }
+        if !attempt_id.is_empty() {
+            command.env("LISA_ATTEMPT_ID", attempt_id);
+        }
+        let status = command.status().unwrap();
+        assert!(status.success());
+        assert!(
+            fs::read_dir(&signals).unwrap().flatten().all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .contains("heartbeat.tmp")),
+            "no temporary file may survive the hook"
+        );
+        (
+            signals.join("pane-7.alive").exists(),
+            fs::read_to_string(signals.join("pane-7.heartbeat")).ok(),
+        )
+    }
+
+    /// The forgery this hook used to permit, driven against the script itself.
+    /// Only the process that can name the attempt in the marker publishes a
+    /// heartbeat; everyone else in the pane publishes residency and stops there.
+    #[test]
+    fn test_heartbeat_hook_publishes_progress_only_for_the_attempt_it_names() {
+        let marker = r#"{"ticket_id":"T-058-01-01","attempt_id":4}"#;
+
+        // The attempt the marker names.
+        assert_eq!(
+            run_heartbeat_hook(Some(marker), "T-058-01-01", "4"),
+            (true, Some(marker.to_string()))
+        );
+
+        // A resident predecessor, after the successor's marker was published.
+        assert_eq!(
+            run_heartbeat_hook(Some(marker), "T-058-01-01", "3"),
+            (true, None)
+        );
+        // A process working on another ticket entirely.
+        assert_eq!(
+            run_heartbeat_hook(Some(marker), "T-OTHER", "4"),
+            (true, None)
+        );
+        // A process with no launch identity at all — an operator's own session
+        // inside a Lisa pane, or any process that inherited only the pane id.
+        assert_eq!(run_heartbeat_hook(Some(marker), "", ""), (true, None));
+        assert_eq!(
+            run_heartbeat_hook(Some(marker), "T-058-01-01", ""),
+            (true, None)
+        );
+        // A non-numeric attempt id cannot be spliced into the expected JSON.
+        assert_eq!(
+            run_heartbeat_hook(Some(marker), "T-058-01-01", "4 or bust"),
+            (true, None)
+        );
+        // No marker: nothing to prove identity against, residency still true.
+        assert_eq!(run_heartbeat_hook(None, "T-058-01-01", "4"), (true, None));
     }
 
     #[test]

@@ -821,6 +821,33 @@ mod tests {
         assert_eq!(key.kind, CurrencyKind::Retired);
     }
 
+    /// What `lisa doctor` says to a board still running the forgeable heartbeat
+    /// hook (T-058-01-01). Nothing here is special-cased for it: the finding
+    /// exists because init would replace those bytes, which is the whole reason
+    /// the remedy cannot drift from the fix.
+    #[test]
+    fn a_pre_hardening_heartbeat_hook_reads_as_behind_with_init_as_the_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lisa/hooks")).unwrap();
+        fs::write(
+            dir.path().join(".lisa.toml"),
+            format!("version = \"{}\"\n", config::LISA_VERSION),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".lisa/hooks/on-heartbeat.sh"),
+            crate::templates::LEGACY_ON_HEARTBEAT_HOOKS[0],
+        )
+        .unwrap();
+
+        let currency = inventory(dir.path());
+
+        let finding = find(&currency, ".lisa/hooks/on-heartbeat.sh")
+            .expect("a shipped prior heartbeat generation is behind");
+        assert_eq!(finding.kind, CurrencyKind::Behind);
+        assert_eq!(finding.remedy, Remedy::Init);
+    }
+
     #[test]
     fn every_finding_names_a_remedy() {
         let dir = tempfile::tempdir().unwrap();
