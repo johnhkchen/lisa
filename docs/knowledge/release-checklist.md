@@ -2,7 +2,7 @@
 
 This is the maintainer runbook for cutting a stable Lisa release. It is
 version-parameterized: set the block below once and every command derives from
-it. Current cut: **v0.5.0-rc.1** (prepared 2026-08-07; prior stable v0.4.4).
+it. Current cut: **v0.5.0-rc.2** (published 2026-08-09; prior stable v0.4.4).
 
 Only John authorizes publication. Preparing or reviewing this checklist is not
 authorization to tag, dispatch, publish, or update the Homebrew tap or apt
@@ -22,7 +22,7 @@ directory.
 ```bash
 set -euo pipefail
 REPO=johnhkchen/lisa
-VERSION=0.5.0-rc.1
+VERSION=0.5.0-rc.2
 TAG="v$VERSION"
 PRIOR_STABLE=v0.4.4
 # Ancestry gates: each must be an ancestor of the release commit.
@@ -30,7 +30,13 @@ E045_GATE=c08e755   # completion boundary of the last E-045 ticket
 MUSL_GATE=fcdd293   # static-musl linkage + Bullseye execution checks in release.yml
 SEAL_GATE=6fcb2f2   # completion boundary of S-049-08 (stable-0.4.4 hotfix: E-049 + E-050 line)
 WORKFLOW_GATE=e67491b # completion boundary of S-057-02 (0.5.0 line: one working phase, and the upgrade path to it)
+DELIVERY_GATE=f508031 # the pane-delivery fix (0.5.0-rc.2: wait for the provider to leave before typing into its pane)
 ```
+
+`v0.5.0-rc.1` was prepared under this checklist and never published — it was
+superseded by rc.2 before anyone tagged it. See
+[its cut record](release-0.5.0-rc.1-cut-record.md) for why, and
+[the rc.2 record](release-0.5.0-rc.2-cut-record.md) for the cut that shipped.
 
 For a future cut: update `VERSION`, `PRIOR_STABLE`, and append the new cut's
 gate commit; do not delete old gates — they are cumulative lineage proof.
@@ -115,7 +121,7 @@ worktrees are not a suitable place to perform the version bump.
 Prove the chosen line contains every gate:
 
 ```bash
-for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE"; do
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE" "$DELIVERY_GATE"; do
   git merge-base --is-ancestor "$gate" "$RELEASE_BASE"
 done
 ```
@@ -397,7 +403,7 @@ Fetch and peel the public stable tag, then repeat the ancestry gates:
 ```bash
 git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
 PUBLIC_TAG_COMMIT=$(git rev-parse "$TAG^{commit}")
-for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE"; do
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE" "$DELIVERY_GATE"; do
   git merge-base --is-ancestor "$gate" "$PUBLIC_TAG_COMMIT"
 done
 printf 'public_tag_commit=%s\n' "$PUBLIC_TAG_COMMIT" \

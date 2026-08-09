@@ -1,5 +1,16 @@
 # Release-candidate cut record — v0.5.0-rc.1
 
+> **Superseded, and never published.** `v0.5.0-rc.1` was prepared on 2026-08-07
+> and then overtaken: a 0.4.4 field run on `tabular-recipes` found that Lisa
+> never delivered a ticket's prompt to a recycled pane, and that fix went out as
+> [`v0.5.0-rc.2`](release-0.5.0-rc.2-cut-record.md) on 2026-08-09 instead. No
+> `v0.5.0-rc.1` tag or release exists anywhere and none will be made.
+>
+> The `PENDING` values below are therefore **closed, not owed** — they were
+> waiting on a publication that will never happen. Everything above them is
+> still a true record of the preparation pass, and rc.2 is rc.1 plus the pane
+> fix, so the preparation evidence carried forward rather than being redone.
+
 Field report for the checklist in [release-checklist.md](release-checklist.md).
 The preparation values below are from live evidence gathered during the cut;
 none are assumed. The publication values are `PENDING` because **this release
