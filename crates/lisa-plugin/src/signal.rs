@@ -15,6 +15,7 @@ use lisa_core::{
 /// The logical signal family one consumer requests from the shared directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalRequest {
+    Alive,
     Heartbeats,
     ProcessStarts,
     ShellReady,
@@ -39,6 +40,12 @@ pub(crate) enum IdleTarget {
 /// consumers cannot accidentally treat provider-specific evidence uniformly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SignalRecord {
+    /// A process ran a tool call in this pane. Presence-only by construction:
+    /// the hook writes it before it knows whether it can name itself, so it is
+    /// the one liveness record a resident predecessor can still produce.
+    Alive {
+        pane_id: u32,
+    },
     Heartbeat {
         pane_id: u32,
         lease: AttemptLease,
@@ -95,6 +102,11 @@ pub(crate) fn ingest(dir: &Path, request: SignalRequest) -> Vec<SignalRecord> {
 
 fn ingest_path(path: PathBuf, request: SignalRequest) -> Option<SignalRecord> {
     match request {
+        SignalRequest::Alive => {
+            let pane_id = pane_id_from_signal_filename(path.file_name()?, ".alive")?;
+            let _ = std::fs::remove_file(path);
+            Some(SignalRecord::Alive { pane_id })
+        }
         SignalRequest::Heartbeats => {
             let pane_id = pane_id_from_signal_filename(path.file_name()?, ".heartbeat")?;
             ingest_lease(path, pane_id, |pane_id, lease| SignalRecord::Heartbeat {
@@ -236,6 +248,32 @@ mod tests {
         );
         assert!(!valid.exists());
         assert!(!malformed.exists());
+    }
+
+    #[test]
+    fn alive_is_presence_only_and_never_ingested_as_a_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let alive = dir.path().join("pane-7.alive");
+        let heartbeat = dir.path().join("pane-8.heartbeat");
+        fs::write(&alive, "2026-01-01T00:00:00Z\n").unwrap();
+        fs::write(&heartbeat, serde_json::to_string(&lease()).unwrap()).unwrap();
+
+        // The two families are separate scans: an `.alive` body is never parsed
+        // as a lease, and a heartbeat scan leaves it alone.
+        assert_eq!(
+            ingest(dir.path(), SignalRequest::Heartbeats),
+            vec![SignalRecord::Heartbeat {
+                pane_id: 8,
+                lease: lease(),
+            }]
+        );
+        assert!(alive.exists());
+
+        assert_eq!(
+            ingest(dir.path(), SignalRequest::Alive),
+            vec![SignalRecord::Alive { pane_id: 7 }]
+        );
+        assert!(!alive.exists());
     }
 
     #[test]

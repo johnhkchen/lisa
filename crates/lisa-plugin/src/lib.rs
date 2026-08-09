@@ -1469,6 +1469,7 @@ impl State {
     fn clear_pane_reset_signals(&self, pane_id: u32) {
         for suffix in [
             "ack",
+            "alive",
             "heartbeat",
             "idle",
             "stopped",
@@ -4619,11 +4620,12 @@ impl State {
     /// `fail_startup_recovery` rather than looping. The `WaitingForExit` leg it
     /// re-enters is itself bounded by `AGENT_EXIT_CEILING_SECS`.
     ///
-    /// Residency evidence is what routes a pane here, and `.ack`/`.stopped` are
-    /// the legs that carry it: both are written unconditionally by hooks that
-    /// hold no identity, so they survive any future tightening of the
-    /// lease-copying heartbeat hook. Heartbeat residency is a bonus in this
-    /// window, never a precondition.
+    /// Residency evidence is what routes a pane here, and `.alive`/`.ack`/
+    /// `.stopped` are the legs that carry it: all three are written
+    /// unconditionally by hooks that hold no identity, which is why tightening
+    /// the heartbeat's authority leg (T-058-01-01) left this branch intact.
+    /// Admitted-heartbeat residency is a bonus in this window, never a
+    /// precondition.
     fn begin_resident_exit_retry(
         &mut self,
         pane_id: u32,
@@ -6695,7 +6697,8 @@ impl State {
     ///
     /// Called from the signal consumers *before* they admit anything, because
     /// the question this answers is "is a process in there", not "may it act".
-    /// A rejected heartbeat, a `.started` from the wrong generation, a `.stopped`
+    /// An `.alive` — which names nobody by design — a rejected heartbeat, a
+    /// `.started` from the wrong generation, a `.stopped`
     /// from a turn that ended after the `/exit`, an `.ack` from a launch line
     /// that landed in a chat box — each is worthless as authority and conclusive
     /// as residency. Shell-boundary and adapter-exit evidence are deliberately
@@ -6753,12 +6756,33 @@ impl State {
         })
     }
 
+    /// Scan for `pane-<id>.alive` — the presence-only leg of the PostToolUse
+    /// hook.
+    ///
+    /// The hook writes this file before it checks anything about the caller, so
+    /// it asserts only *a process ran a tool call in this pane*. That is exactly
+    /// the claim the exit policy needs and the one an identity check would have
+    /// darkened: during a recycle the marker already names the successor, so a
+    /// still-resident predecessor can no longer prove who it is — but "the old
+    /// TUI is still sitting there" is precisely what the exit hold exists to
+    /// notice. Nothing else reads it; residency confers no authority anywhere.
+    fn check_alive_signals(&mut self) {
+        for record in signal::ingest(&self.signal_dir, SignalRequest::Alive) {
+            let SignalRecord::Alive { pane_id } = record else {
+                continue;
+            };
+            self.record_provider_residency(pane_id);
+        }
+    }
+
     /// Scan for `.heartbeat` signal files written by the PostToolUse hook.
     ///
-    /// Each heartbeat proves the session in that pane is actively making tool
-    /// calls. Heartbeats reset both the thread's stuck/stale clocks and the
-    /// pane's wind-down clock, so an active session is never flagged stuck,
-    /// never reclaimed by a timeout, and never has its pane reused.
+    /// A heartbeat is the hook's *authenticated* leg: it is published only when
+    /// the calling process's own launch identity byte-matches the pane's lease
+    /// marker, so admitting one means this attempt is making progress. Heartbeats
+    /// reset both the thread's stuck/stale clocks and the pane's wind-down clock,
+    /// so an active session is never flagged stuck, never reclaimed by a timeout,
+    /// and never has its pane reused.
     fn check_heartbeat_signals(&mut self) {
         for record in signal::ingest(&self.signal_dir, SignalRequest::Heartbeats) {
             let SignalRecord::Heartbeat {
@@ -6768,10 +6792,12 @@ impl State {
             else {
                 continue;
             };
-            // Residency before authority. The PostToolUse hook copies whatever
+            // Residency before authority, still. A project mid-run on the
+            // pre-T-058-01-01 hook publishes only this file — its `.alive` leg
+            // arrives with `lisa init` — and that hook copies whatever
             // `pane-<id>.lease` holds, so a departing session can carry the
-            // successor's lease here and be rejected below — but only a running
-            // process runs a hook at all.
+            // successor's lease here and be rejected below. Rejected or not,
+            // only a running process runs a hook at all.
             self.record_provider_residency(pane_id);
             let admitted = self
                 .agent_slots
@@ -6785,16 +6811,22 @@ impl State {
             if !admitted {
                 continue;
             }
-            // A reset holds `pane-<id>.lease` in place so a late-starting
-            // provider can still announce itself, and the heartbeat hook — alone
-            // among the hooks — copies that marker without comparing it to the
-            // calling process's own identity. So inside the reset window the
-            // lease a heartbeat carries proves only that *some* process is
-            // resident, which is what the recorder above already took from it.
-            // Admitting it as progress on top of that would let a process that
-            // is not this attempt reset the silence clock and, worse, clear the
-            // AskUserQuestion guard so Lisa types over a live question. Residency
-            // is what this window widened; clocks and attention are not.
+            // Kept after T-058-01-01, on a different reason than it was written
+            // with. The original one is gone: the hook no longer copies the
+            // marker without comparing it to the caller, so a heartbeat here is
+            // no longer forgeable by a resident predecessor.
+            //
+            // What remains is the ordering. `begin_startup_recovery` deliberately
+            // does not mint, so this window's whole question is *which* process
+            // is in the pane, and it has a first-class channel for the answer:
+            // `.started` is admitted from the reset generation and moves the seat
+            // to ReadyForAssignment, after which heartbeats flow normally. Until
+            // that arrives, admitting one as progress would extend the seat's
+            // clocks to a process the seat has not acknowledged — and would clear
+            // an `awaiting_human` flag set by `.awaiting`, which carries no
+            // identity at all and can have come from whatever else is in the
+            // pane. The honest late provider loses nothing: it announces itself
+            // one tick earlier through the channel built for it.
             if matches!(
                 self.seat_assignment(pane_id),
                 Some(SeatAssignmentState::ResettingStartup { .. })
@@ -8533,7 +8565,12 @@ impl State {
     /// Rescans tickets, detects phase changes, marks completed threads,
     /// frees agent slots, and schedules new work.
     fn poll_tick(&mut self) {
-        // Consume heartbeat signals first so activity clocks are current
+        // Presence first: the exit policy asks only whether a process is in the
+        // pane, and the answer must be current before any timeout decision —
+        // including for a process that cannot name itself.
+        self.check_alive_signals();
+
+        // Consume heartbeat signals next so activity clocks are current
         // before any health or timeout decisions this tick.
         self.check_heartbeat_signals();
 
@@ -25532,10 +25569,13 @@ owned\n\
 
     /// The field failure at the state layer. `/exit` goes into a Claude that has
     /// not finished, the grace expires on the clock alone, and the launch line
-    /// is typed into a live TUI where it lands as a chat message. The departing
-    /// session's heartbeat carries the predecessor lease and is rejected as
-    /// authority — but it proves a process is in the pane, and that must hold
-    /// the launch back until the ceiling.
+    /// is typed into a live TUI where it lands as a chat message.
+    ///
+    /// This is the leg T-058-01-01 had to keep lit. The successor's marker is
+    /// already published, so the resident predecessor can no longer name itself
+    /// and its hook publishes nothing but `pane-1.alive` — the one file that
+    /// asserts residency without asserting identity. If hardening ever darkens
+    /// it, this test fails and the launch goes back into a live TUI.
     #[test]
     fn test_resident_provider_evidence_holds_the_post_exit_launch_to_the_ceiling() {
         use std::fs;
@@ -25563,18 +25603,14 @@ owned\n\
             last_client: Some(AgentClient::Claude),
         });
 
-        let departing = AttemptLease::mint("T-DEPARTING".to_string(), None).unwrap();
-        fs::write(
-            signal_dir.join("pane-1.heartbeat"),
-            serde_json::to_string(&departing).unwrap(),
-        )
-        .unwrap();
+        fs::write(signal_dir.join("pane-1.alive"), "2026-01-01T00:00:00Z\n").unwrap();
 
+        state.check_alive_signals();
         state.check_heartbeat_signals();
 
-        // Ownership is untouched: the heartbeat was never admitted.
+        // Ownership is untouched: the pane said someone is here, nothing more.
         assert!(state.agent_slots[0].last_activity_at.is_none());
-        assert!(!signal_dir.join("pane-1.heartbeat").exists());
+        assert!(!signal_dir.join("pane-1.alive").exists());
         assert!(state.provider_is_resident(1));
 
         state.check_transition_timeouts();
@@ -25677,7 +25713,8 @@ owned\n\
         )));
     }
 
-    /// Every recorder leg in one table. `.stopped` is the trap: Claude's Stop
+    /// Every recorder leg in one table. `.alive` is the presence-only leg of the
+    /// heartbeat hook and records on its own. `.stopped` is the trap: Claude's Stop
     /// hook fires at the end of every assistant turn, not at teardown, so it is
     /// residency and never departure. `.shell-ready` and `.error` assert the
     /// opposite claim and must never record — the field transcript shows a live
@@ -25696,7 +25733,8 @@ owned\n\
         .unwrap();
         let stamp = "2026-01-01T00:00:00Z";
 
-        let cases: [(&str, &str, bool); 10] = [
+        let cases: [(&str, &str, bool); 12] = [
+            ("pane-1.alive", stamp, true),
             ("pane-1.heartbeat", lease_body.as_str(), true),
             ("pane-1.started", lease_body.as_str(), true),
             ("pane-1.stopped", stamp, true),
@@ -25709,6 +25747,7 @@ owned\n\
             // Signal filenames are untrusted input. An id no seat owns must not
             // create an entry, or the map would not be bounded by the pane count.
             ("pane-99.heartbeat", lease_body.as_str(), false),
+            ("pane-99.alive", stamp, false),
         ];
 
         for (filename, payload, expected) in cases {
@@ -25733,6 +25772,7 @@ owned\n\
                 last_client: Some(AgentClient::Claude),
             });
 
+            state.check_alive_signals();
             state.check_heartbeat_signals();
             state.check_awaiting_signals();
             state.check_process_start_signals();
@@ -25756,9 +25796,9 @@ owned\n\
 
     /// Residency widens readiness, never authority. Drive the two records a
     /// still-live predecessor can actually produce against a seat that is
-    /// Starting on the successor's lease — a heartbeat copied verbatim from the
-    /// successor's `pane-1.lease` marker (`on-heartbeat.sh` does no identity
-    /// check), and a `.started` for the predecessor's own generation
+    /// Starting on the successor's lease — an `.alive` (`on-heartbeat.sh` writes
+    /// it before any identity check, and it is now all a predecessor gets from
+    /// that hook), and a `.started` for the predecessor's own generation
     /// (`on-start.sh` byte-matches its launch env, so this is the only
     /// `.started` a predecessor can emit). Both must record residency and move
     /// nothing else.
@@ -25782,17 +25822,13 @@ owned\n\
             state.agent_slots[0].attempt_lease.clone(),
         );
 
-        fs::write(
-            signal_dir.join("pane-1.heartbeat"),
-            serde_json::to_string(&successor).unwrap(),
-        )
-        .unwrap();
+        fs::write(signal_dir.join("pane-1.alive"), "2026-01-01T00:00:00Z\n").unwrap();
         fs::write(
             signal_dir.join("pane-1.started"),
             serde_json::to_string(&predecessor).unwrap(),
         )
         .unwrap();
-        state.check_heartbeat_signals();
+        state.check_alive_signals();
         state.check_process_start_signals();
 
         assert!(state.provider_is_resident(1));
@@ -25807,6 +25843,57 @@ owned\n\
             before,
             "residency must not touch any lease, seat, or admission state"
         );
+    }
+
+    /// The sharpest edge, at the state layer. A pane blocked on an
+    /// `AskUserQuestion` keeps its guard against every signal that cannot name
+    /// the current attempt — and `.alive` cannot, by construction. Only an
+    /// admitted heartbeat means the question was answered and real work resumed.
+    #[test]
+    fn an_unproven_signal_moves_no_clock_and_lifts_no_question_guard() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, lease) = resident_pane_fixture(&signal_dir, "T-UNPROVEN");
+        let mut thread = Thread::new("T-UNPROVEN", 1);
+        let stale_clock = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        thread.last_activity = stale_clock;
+        state.threads.insert("T-UNPROVEN".to_string(), thread);
+        state.awaiting_human.insert(1);
+        state.notified_attention.insert(1);
+
+        fs::write(signal_dir.join("pane-1.alive"), "2026-01-01T00:00:00Z\n").unwrap();
+        state.check_alive_signals();
+
+        assert!(
+            state.provider_is_resident(1),
+            "someone is in the pane, and that much is admitted"
+        );
+        assert!(
+            state.awaiting_human.contains(&1),
+            "a signal that names nobody must never lift the question guard"
+        );
+        assert!(state.notified_attention.contains(&1));
+        assert!(state.agent_slots[0].last_activity_at.is_none());
+        assert_eq!(
+            state.threads.get("T-UNPROVEN").unwrap().last_activity,
+            stale_clock
+        );
+
+        // The same pane, once the writer proves it holds the current attempt.
+        fs::write(
+            signal_dir.join("pane-1.heartbeat"),
+            serde_json::to_string(&lease).unwrap(),
+        )
+        .unwrap();
+        state.check_heartbeat_signals();
+
+        assert!(!state.awaiting_human.contains(&1));
+        assert!(!state.notified_attention.contains(&1));
+        assert!(state.agent_slots[0].last_activity_at.is_some());
+        assert!(state.threads.get("T-UNPROVEN").unwrap().last_activity > stale_clock);
     }
 
     /// Leg (ii). Startup was not observed and the pane proves a provider is
@@ -26093,13 +26180,13 @@ owned\n\
 
     /// Inside the reset window a heartbeat proves residency and nothing else.
     ///
-    /// The reset now retains `pane-<id>.lease` so a late provider can announce
-    /// itself, and the heartbeat hook — alone among the hooks — copies that
-    /// marker without comparing it to the calling process's own identity. So in
-    /// this window a heartbeat can carry the reset generation without having come
-    /// from the attempt that owns it. It may reset no clock and, above all, may
-    /// not clear the AskUserQuestion guard: doing so would let Lisa type over a
-    /// live question.
+    /// Kept through T-058-01-01 on a narrower reason than it was written with.
+    /// The hook now authenticates, so this is no longer about forgery; it is
+    /// about ordering. The reset deliberately does not mint, and the seat's own
+    /// question — which process is in this pane — is answered by `.started`,
+    /// which is admitted from the reset generation and ends this window. Until
+    /// then a heartbeat may reset no clock and, above all, may not clear the
+    /// AskUserQuestion guard, which `.awaiting` sets without any identity at all.
     #[test]
     fn a_heartbeat_inside_the_reset_window_moves_no_clock_and_lifts_no_guard() {
         use std::fs;
