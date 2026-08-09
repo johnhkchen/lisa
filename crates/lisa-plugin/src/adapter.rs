@@ -49,10 +49,17 @@ use crate::{build_claude_command, finish_up_prompt, shell_quote, ticket_prompt};
 
 /// Inputs needed to construct a launch command or a reuse prompt for a ticket.
 ///
-/// Paths are already host-relative (the caller applies `strip_host_prefix`);
-/// adapters must not re-strip them.
+/// Pane-facing paths are already host-relative (the caller applies
+/// `strip_host_prefix`); adapters must not re-strip them. `ticket_scan_dir` is
+/// the single exception, and nothing may put it into pane text as it stands.
 pub(crate) struct SpawnContext<'a> {
-    pub ticket_dir: &'a Path,
+    /// Ticket directory as the WASM sandbox reads it (`/host`-prefixed), so a
+    /// prompt can resolve the ticket's real, descriptive filename by scanning
+    /// it. Whoever names a path out of it to an agent strips the mount at that
+    /// moment. Handing this field the already-stripped form is the reversed
+    /// contract that made every assignment name a file that does not exist:
+    /// the scan fails silently, so the rename is the compile-time guard.
+    pub ticket_scan_dir: &'a Path,
     pub ticket_id: &'a str,
     pub pane_id: u32,
     /// Immutable attempt identity inherited by native lifecycle hooks.
@@ -64,8 +71,12 @@ pub(crate) struct SpawnContext<'a> {
 }
 
 /// Inputs needed to construct a follow-up nudge for a parked Review session.
+///
+/// No ticket directory: the follow-up names attempt artifacts only. The field
+/// that used to sit here was built by stripping the `/host` mount, so it was
+/// unreadable by the plugin and was never opened by anything — a live-looking
+/// parameter position holding a value no caller could have used correctly.
 pub(crate) struct FollowUpContext<'a> {
-    pub ticket_dir: &'a Path,
     pub work_dir: &'a Path,
     pub ticket_id: &'a str,
     // Retained for non-interactive/future bridge adapters that spawn a follow-up
@@ -239,11 +250,7 @@ pub(crate) trait AgentAdapter {
     /// clients type the shared prompt into their live TUI; integrations with a
     /// different delivery mechanism override this default.
     fn follow_up(&self, ctx: &FollowUpContext) -> FollowUp {
-        FollowUp::TypeIntoPane(finish_up_prompt(
-            ctx.ticket_dir,
-            ctx.work_dir,
-            ctx.ticket_id,
-        ))
+        FollowUp::TypeIntoPane(finish_up_prompt(ctx.work_dir, ctx.ticket_id))
     }
 
     /// Which optional signals this adapter emits (see [`SignalCapabilities`]).
@@ -296,7 +303,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 
     fn assignment_text(&self, ctx: &SpawnContext) -> String {
-        ticket_prompt(ctx.ticket_dir, ctx.ticket_id, ctx.artifact_dir)
+        ticket_prompt(ctx.ticket_scan_dir, ctx.ticket_id, ctx.artifact_dir)
     }
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
@@ -427,7 +434,7 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn assignment_text(&self, ctx: &SpawnContext) -> String {
-        ticket_prompt(ctx.ticket_dir, ctx.ticket_id, ctx.artifact_dir)
+        ticket_prompt(ctx.ticket_scan_dir, ctx.ticket_id, ctx.artifact_dir)
     }
 
     fn reuse_prompt(&self, ctx: &SpawnContext) -> String {
@@ -531,7 +538,7 @@ mod tests {
 
     fn spawn_ctx<'a>(dir: &'a Path, id: &'a str, pane: u32) -> SpawnContext<'a> {
         SpawnContext {
-            ticket_dir: dir,
+            ticket_scan_dir: dir,
             ticket_id: id,
             pane_id: pane,
             attempt_id: 1,
@@ -593,17 +600,15 @@ mod tests {
 
     #[test]
     fn native_follow_up_is_type_into_pane() {
-        let ticket_dir = Path::new("docs/active/tickets");
         let work_dir = Path::new("docs/active/work");
         let ctx = FollowUpContext {
-            ticket_dir,
             work_dir,
             ticket_id: "T-042-01",
             pane_id: 7,
         };
         assert_eq!(
             ClaudeCodeAdapter::default().follow_up(&ctx),
-            FollowUp::TypeIntoPane(finish_up_prompt(ticket_dir, work_dir, "T-042-01"))
+            FollowUp::TypeIntoPane(finish_up_prompt(work_dir, "T-042-01"))
         );
     }
 
@@ -861,17 +866,15 @@ mod tests {
 
     #[test]
     fn codex_follow_up_is_typed_into_live_tui() {
-        let ticket_dir = Path::new("docs/active/tickets");
         let work_dir = Path::new("docs/active/work");
         let ctx = FollowUpContext {
-            ticket_dir,
             work_dir,
             ticket_id: "T-042-01",
             pane_id: 9,
         };
         assert_eq!(
             CodexAdapter::new(Some("/abs/lisa"), None).follow_up(&ctx),
-            FollowUp::TypeIntoPane(finish_up_prompt(ticket_dir, work_dir, "T-042-01"))
+            FollowUp::TypeIntoPane(finish_up_prompt(work_dir, "T-042-01"))
         );
     }
 

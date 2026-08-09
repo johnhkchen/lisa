@@ -64,6 +64,26 @@ impl DeadlineEvaluator {
                 let elapsed_secs = elapsed(now, started).as_secs();
                 match candidate.state {
                     TransitionState::WaitingForExit if elapsed_secs > policy.exit_grace_secs => {
+                        // Quiet is the only departure evidence Lisa has, so the
+                        // grace elapsing normally releases the pane. What it may
+                        // not do is overrule the opposite evidence: a provider
+                        // hook that fired since the `/exit` went in proves a
+                        // process is still sitting there, and the launch command
+                        // would land in its chat box instead of a shell.
+                        //
+                        // The evidence decays. A pane holds only while it is
+                        // still noisy — one hook within the last grace window —
+                        // so a provider that emitted once and then genuinely
+                        // died releases its seat a grace later, not a ceiling
+                        // later. And the total hold is capped regardless,
+                        // because a provider that dies while still emitting must
+                        // never strand its seat.
+                        let noisy = candidate.last_provider_signal.is_some_and(|last| {
+                            elapsed(now, last).as_secs() <= policy.exit_grace_secs
+                        });
+                        if noisy && elapsed_secs <= policy.exit_ceiling_secs {
+                            return None;
+                        }
                         Some(TransitionAction::ExitReady {
                             pane_id: candidate.pane_id,
                             ticket_id: candidate.ticket_id,
@@ -212,13 +232,32 @@ pub(crate) struct TransitionInput {
     pub(crate) ticket_id: Option<TicketId>,
     pub(crate) state: TransitionState,
     pub(crate) started: Option<SystemTime>,
+    /// When a provider hook last fired in this pane, counting only hooks seen
+    /// since Lisa typed a command meant to change who occupies it. `None` is
+    /// the absence of evidence, never proof of departure, and a timestamp older
+    /// than one grace window is evidence that has expired rather than evidence
+    /// against.
+    pub(crate) last_provider_signal: Option<SystemTime>,
 }
 
-/// The exit grace is the whole transition policy: a session that has been told
-/// to `/exit` is given a bounded window to tear down, and nothing exempts it —
-/// not pane activity, not a pending question. The pane is already leaving.
+/// The exit policy is two clocks and one input. `exit_grace_secs` is the
+/// ordinary window: no hook Lisa installs reports a provider exit — Claude's
+/// Stop hook fires at the end of every assistant turn, not at teardown — so a
+/// pane going quiet is the only departure evidence there is, and a quiet pane
+/// is relaunched exactly as before. `last_provider_signal` is the one thing that
+/// holds a pane past the grace: a hook only a running process can fire, seen
+/// after the `/exit`, which proves the TUI is still there and would read the
+/// launch line as chat. That hold decays after one grace window of renewed
+/// silence, and `exit_ceiling_secs` bounds it absolutely, because a provider
+/// that dies while still emitting must never strand its seat.
+///
+/// Pane activity and pending questions remain non-exemptions. `last_activity_at`
+/// is bumped by Lisa's own writes and only for lease-admitted work; this input
+/// is narrower, is reset every time Lisa retypes into the pane, and is evidence
+/// of residency alone — never of ownership.
 pub(crate) struct TransitionPolicy {
     pub(crate) exit_grace_secs: u64,
+    pub(crate) exit_ceiling_secs: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -320,6 +359,89 @@ mod tests {
     }
 
     #[test]
+    fn resident_provider_defers_exit_until_the_ceiling() {
+        let evaluator = evaluator(100);
+        let policy = || TransitionPolicy {
+            exit_grace_secs: 8,
+            exit_ceiling_secs: 90,
+        };
+
+        // Four panes past the grace, differing only in what the pane has been
+        // emitting since Lisa typed the `/exit`.
+        let transitions = evaluator.transitions(
+            [
+                // A provider hook fired a moment ago: a process is still there.
+                TransitionInput {
+                    pane_id: 1,
+                    ticket_id: Some("T-RESIDENT".into()),
+                    state: TransitionState::WaitingForExit,
+                    started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(90)),
+                    last_provider_signal: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(94)),
+                },
+                // Silence remains the ordinary departure evidence.
+                TransitionInput {
+                    pane_id: 2,
+                    ticket_id: Some("T-QUIET".into()),
+                    state: TransitionState::WaitingForExit,
+                    started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(90)),
+                    last_provider_signal: None,
+                },
+                // Resident and past the ceiling: the escape hatch fires so a
+                // noisy dying provider cannot hold the seat forever.
+                TransitionInput {
+                    pane_id: 3,
+                    ticket_id: Some("T-CEILING".into()),
+                    state: TransitionState::WaitingForExit,
+                    started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(9)),
+                    last_provider_signal: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(99)),
+                },
+                // Emitted once and then went quiet again. The evidence has
+                // expired, so this pane must not be pinned to the ceiling by a
+                // single trailing hook — it leaves one grace after its last
+                // gasp, like any other quiet pane.
+                TransitionInput {
+                    pane_id: 4,
+                    ticket_id: Some("T-STALE".into()),
+                    state: TransitionState::WaitingForExit,
+                    started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60)),
+                    last_provider_signal: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(61)),
+                },
+            ],
+            policy(),
+        );
+        assert_eq!(
+            transitions,
+            vec![
+                TransitionAction::ExitReady {
+                    pane_id: 2,
+                    ticket_id: Some("T-QUIET".into()),
+                },
+                TransitionAction::ExitReady {
+                    pane_id: 3,
+                    ticket_id: Some("T-CEILING".into()),
+                },
+                TransitionAction::ExitReady {
+                    pane_id: 4,
+                    ticket_id: Some("T-STALE".into()),
+                },
+            ]
+        );
+
+        // Inside the grace, residency changes nothing: the pane waits either way.
+        let inside = evaluator.transitions(
+            [TransitionInput {
+                pane_id: 5,
+                ticket_id: Some("T-INSIDE".into()),
+                state: TransitionState::WaitingForExit,
+                started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(95)),
+                last_provider_signal: None,
+            }],
+            policy(),
+        );
+        assert!(inside.is_empty());
+    }
+
+    #[test]
     fn fixed_clock_drives_all_six_policies_at_their_boundaries() {
         let evaluator = evaluator(100);
 
@@ -344,8 +466,12 @@ mod tests {
                 ticket_id: None,
                 state: TransitionState::WaitingForExit,
                 started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(91)),
+                last_provider_signal: None,
             }],
-            TransitionPolicy { exit_grace_secs: 8 },
+            TransitionPolicy {
+                exit_grace_secs: 8,
+                exit_ceiling_secs: 90,
+            },
         );
         assert_eq!(
             transitions,
@@ -417,10 +543,11 @@ mod tests {
     #[test]
     fn policy_specific_exemptions_are_preserved() {
         let evaluator = evaluator(100);
-        // The transition policy is deliberately absent here: it has no
-        // exemptions to preserve. A pane told to `/exit` leaves on the grace
-        // clock alone — pending questions and pane activity do not hold it
-        // back, unlike the review/session/stale policies below.
+        // The transition policy is deliberately absent here: its one hold is
+        // post-`/exit` provider residency, covered by
+        // `resident_provider_defers_exit_until_the_ceiling`. Pending questions
+        // and pane activity still do not hold an exiting pane back, unlike the
+        // review/session/stale policies below.
         let review = ReviewInput {
             ticket_id: "T-R".into(),
             pane_id: 2,
@@ -495,21 +622,27 @@ mod tests {
                     ticket_id: Some("T-EXIT".into()),
                     state: TransitionState::WaitingForExit,
                     started: Some(SystemTime::UNIX_EPOCH),
+                    last_provider_signal: None,
                 },
                 TransitionInput {
                     pane_id: 22,
                     ticket_id: Some("T-IDLE".into()),
                     state: TransitionState::Idle,
                     started: Some(SystemTime::UNIX_EPOCH),
+                    last_provider_signal: None,
                 },
                 TransitionInput {
                     pane_id: 23,
                     ticket_id: Some("T-FENCED".into()),
                     state: TransitionState::Fenced,
                     started: Some(SystemTime::UNIX_EPOCH),
+                    last_provider_signal: None,
                 },
             ],
-            TransitionPolicy { exit_grace_secs: 8 },
+            TransitionPolicy {
+                exit_grace_secs: 8,
+                exit_ceiling_secs: 90,
+            },
         );
         assert_eq!(
             transitions,
@@ -625,10 +758,11 @@ mod tests {
             }]
         ));
 
-        // Transition evaluation, like acknowledgement above, now carries no
-        // activity or awaiting-human exemption input at all: a pane told to
-        // `/exit` leaves on the grace clock. The exemptions below belong to the
-        // review, session, and stale policies and must stay distinct from it.
+        // Transition evaluation, like acknowledgement above, carries no activity
+        // or awaiting-human exemption input. Its only hold is post-`/exit`
+        // provider residency, which is not an activity clock and has its own
+        // test. The exemptions below belong to the review, session, and stale
+        // policies and must stay distinct from it.
 
         let reviews = evaluator.reviews(
             [

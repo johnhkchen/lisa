@@ -105,11 +105,30 @@ use lisa_core::completion_journal::MAX_ACTION_REQUIRED_GENERATIONS;
 /// The command that finishes a ticket whose work is already in history.
 const ALREADY_DONE_COMMAND: &str = "lisa already-done";
 
-/// Grace period after submitting `/exit` before typing a fresh provider launch
+/// Quiet window after submitting `/exit` before typing a fresh provider launch
 /// command into the returned shell. Enter itself is deferred by
-/// `ENTER_DELAY_SECS`; using a longer grace ensures the old TUI has fully torn
-/// down before the scheduler treats the pane as a shell again.
+/// `ENTER_DELAY_SECS`, so this is most of what a departing TUI actually gets.
+///
+/// Elapsing it is not proof the provider left. No hook Lisa installs reports a
+/// provider exit — Claude's Stop hook fires at the end of every assistant turn,
+/// not at teardown — so this clock only ever meant "the pane went quiet", which
+/// is the best departure evidence available and a fine default. Raising it just
+/// moves the same coin flip and taxes every healthy recycle, so it stays where
+/// it was; what changes is that it no longer overrules evidence to the
+/// contrary. See `AGENT_EXIT_CEILING_SECS`.
 const AGENT_EXIT_GRACE_SECS: u64 = 8;
+
+/// Ceiling on that same wait when the pane *proves* a provider is still resident
+/// after its `/exit` — a hook only a running process can fire, seen since the
+/// command went in. While that evidence keeps arriving Lisa waits rather than
+/// typing a launch command into a live TUI, where it lands as a chat message:
+/// no process starts, no `.started` is ever written, and the ticket is never
+/// delivered. At the ceiling the pane is launched regardless, because a provider
+/// that dies while still emitting must not strand its seat — and if that launch
+/// does land in a TUI, `begin_resident_exit_retry` is the second line of
+/// defence. Sized for a cold provider start in a large project (~35s observed)
+/// plus the turn the old session may be in the middle of.
+const AGENT_EXIT_CEILING_SECS: u64 = 90;
 
 /// The prompt text sent to an agent for a ticket.
 ///
@@ -121,15 +140,27 @@ const AGENT_EXIT_GRACE_SECS: u64 = 8;
 /// What survives is Lisa's contract, which an agent cannot infer: where its
 /// attempt directory is and that `docs/active/work/` is Lisa's to publish, how
 /// to commit, the two Review artifacts and their check, and where to stop.
+///
+/// `ticket_dir` is the directory as the *plugin* reads it — `/host`-prefixed
+/// inside the WASI sandbox — because the ticket's real, descriptive filename is
+/// recovered by scanning it. Handing this function the pane-facing stripped
+/// form makes that scan fail silently every time: the ticket resolves to
+/// `None`, the prompt names the naive `<id>.md` fallback (a file that does not
+/// exist under descriptive naming), and the Review recovery clause below can
+/// never fire. The mount is stripped back off here, at the one moment a path is
+/// named to an agent, because the pane's shell is rooted at the project rather
+/// than at the mount.
 pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, artifact_dir: &Path) -> String {
     let ticket = lisa_core::ticket::scan_tickets(ticket_dir)
         .ok()
         .and_then(|tickets| tickets.into_iter().find(|ticket| ticket.id == ticket_id));
-    let ticket_path = ticket
-        .as_ref()
-        .map(|ticket| ticket.file_path.clone())
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| ticket_dir.join(format!("{}.md", ticket_id)));
+    let ticket_path = strip_host_prefix(
+        &ticket
+            .as_ref()
+            .map(|ticket| ticket.file_path.clone())
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| ticket_dir.join(format!("{}.md", ticket_id))),
+    );
     let review_recovery = if ticket.as_ref().map(|ticket| ticket.phase) == Some(Phase::Review) {
         format!(
             " Recovery case: this ticket already starts in Review. Inspect any existing \
@@ -203,11 +234,11 @@ pub(crate) fn build_claude_command(
 }
 
 /// The prompt text sent to a stuck Review session after the review timeout.
-pub(crate) fn finish_up_prompt(
-    _ticket_dir: &Path,
-    artifact_dir: &Path,
-    _ticket_id: &str,
-) -> String {
+///
+/// Takes no ticket directory: the nudge names attempt artifacts only, and the
+/// parameter that used to be here was handed the host-stripped, unopenable form
+/// of it — dead weight that read as a live path contract.
+pub(crate) fn finish_up_prompt(artifact_dir: &Path, _ticket_id: &str) -> String {
     let review_path = artifact_dir.join("review.md");
     let disposition_path = artifact_dir.join("review-disposition.json");
     format!(
@@ -1003,6 +1034,37 @@ pub struct State {
     /// the `SeatAssignmentState` machine.
     seat_readiness: HashMap<u32, ReadinessMode>,
 
+    /// When a provider hook was last seen in each physical pane, counting only
+    /// hooks ingested since Lisa typed a command meant to change who occupies
+    /// the pane (`/exit`, a fresh launch line). An entry is the only positive
+    /// evidence Lisa has that a process outlived the command it was sent;
+    /// absence is the absence of evidence and never proof of departure.
+    ///
+    /// Deliberately separate from `last_activity_at`, which Lisa also bumps for
+    /// its own writes and only for lease-admitted work: a recycled seat rebinds
+    /// to the successor's lease the moment `/exit` is typed, so every signal the
+    /// departing provider still emits is rejected as unowned and its residency
+    /// is lost with it. Entries are inserted only for panes that exist in
+    /// `agent_slots`, so the map is bounded by the seat count even though signal
+    /// filenames are attacker-shaped.
+    ///
+    /// The timestamp is what keeps the exit hold honest. Membership alone would
+    /// mean "emitted at least once since then, however long ago", so one
+    /// trailing hook would pin a departed pane for the whole ceiling; the exit
+    /// policy therefore holds only while the pane is still *noisy* — see
+    /// `TransitionPolicy`. The startup-recovery reader wants the other question
+    /// ("did anything survive the launch line at all") and reads it whole.
+    ///
+    /// Readiness evidence, never ownership evidence. It is read by exactly two
+    /// decision points — `check_transition_timeouts`, which will not type a
+    /// launch command into a pane that proved a provider is resident, and the
+    /// startup-recovery arm of `check_assignment_ack_timeouts_at`, which
+    /// re-exits such a pane instead of interrupting it. No lease, seat, or
+    /// admission predicate reads it, so forging residency can only make Lisa
+    /// more cautious: wait longer, capped at `AGENT_EXIT_CEILING_SECS`, or
+    /// re-exit instead of probing, capped at the one same-pane relaunch.
+    resident_providers: HashMap<u32, std::time::SystemTime>,
+
     /// Last pane name applied by Lisa, keyed by physical terminal pane ID.
     /// Used to suppress redundant Zellij rename operations across scheduler polls.
     last_pane_names: HashMap<u32, String>,
@@ -1237,6 +1299,17 @@ impl State {
     /// Characters are written immediately via `write_chars_to_pane_id`.
     /// The Enter key (0x0D) is queued and sent after `ENTER_DELAY_SECS` so the
     /// TUI has time to process the characters before receiving the submit action.
+    ///
+    /// Typing into a pane also retires whatever residency evidence that pane had
+    /// accumulated. `resident_providers` answers one question — has a provider
+    /// hook fired *since the last thing Lisa typed here* — so the answer expires
+    /// the moment Lisa types again. Clearing it here rather than at each caller
+    /// is what makes that definition true: every command that can change who
+    /// occupies a pane reaches the pane through this method, and a future one
+    /// cannot forget to invalidate evidence it has just made stale. Writes that
+    /// do not change occupancy (an assignment, a follow-up nudge) clear it too,
+    /// which costs nothing — residency is only ever read for a seat waiting on
+    /// an exit or on a startup, and both of those are preceded by a write.
     fn send_line_to_pane(&mut self, text: &str, pane_id: PaneId) {
         // Belt-and-suspenders safety net: never inject into a pane that is blocked
         // on an AskUserQuestion. The per-caller guards keep state machines coherent;
@@ -1249,6 +1322,11 @@ impl State {
                 });
                 return;
             }
+        }
+        // Only after the suppression guard: a dropped line typed nothing, so it
+        // invalidates nothing.
+        if let PaneId::Terminal(id) = pane_id {
+            self.forget_provider_residency(id);
         }
         write_chars_to_pane_id(text, pane_id);
         self.pending_enters.push_back(PendingEnter {
@@ -1358,6 +1436,38 @@ impl State {
         for suffix in [
             "lease",
             "started",
+            "ack",
+            "heartbeat",
+            "idle",
+            "stopped",
+            "cleared",
+            "error",
+            "awaiting",
+            "shell-ready",
+            "claim",
+        ] {
+            let _ = std::fs::remove_file(self.signal_dir.join(format!("pane-{pane_id}.{suffix}")));
+        }
+    }
+
+    /// Clear pane-scoped lifecycle state for the one permitted same-pane reset,
+    /// deliberately retaining `lease` and `started`.
+    ///
+    /// The reset keeps its attempt generation, so the marker still names the
+    /// identity the launched process carries in its own immutable environment,
+    /// and `started` is still that exact attempt's proof. The native start hook
+    /// byte-matches the marker against that environment and exits silently when
+    /// it is absent, so deleting the marker withdraws the only evidence the
+    /// intended provider can ever publish and leaves the reset with nothing but
+    /// a shell probe a resident TUI can answer on its behalf. A `started` from
+    /// an older attempt is not a hazard: exact attempt validation remains the
+    /// authority boundary.
+    ///
+    /// Deliberately a sibling rather than a parameter on
+    /// `clear_pane_lifecycle_signals`: the terminal fence paths must keep
+    /// revoking everything, including the marker.
+    fn clear_pane_reset_signals(&self, pane_id: u32) {
+        for suffix in [
             "ack",
             "heartbeat",
             "idle",
@@ -3891,9 +4001,17 @@ impl State {
     /// attempt lease installed for this pane. Assignment delivery and ownership
     /// are separate later transitions.
     fn acknowledge_process_start(&mut self, pane_id: u32, candidate: &AttemptLease) -> bool {
-        let Some(SeatAssignmentState::Starting { generation, .. }) = self.seat_assignment(pane_id)
-        else {
-            return false;
+        let (generation, from_reset) = match self.seat_assignment(pane_id) {
+            // Readiness widens to the reset window; ownership does not. The
+            // reset keeps this attempt's generation, so a real process start
+            // for it is exactly the proof it would have been one tick earlier,
+            // and it is better evidence than the shell probe: `poll_tick`
+            // consumes process starts before shell readiness, so a provider
+            // that was merely slow pre-empts a relaunch into a pane that never
+            // left its old TUI.
+            Some(SeatAssignmentState::Starting { generation, .. }) => (generation, false),
+            Some(SeatAssignmentState::ResettingStartup { generation, .. }) => (generation, true),
+            _ => return false,
         };
         if generation != candidate.attempt_id {
             return false;
@@ -3913,6 +4031,24 @@ impl State {
             return false;
         }
 
+        if from_reset {
+            // The reset typed a readiness probe into this pane and queued its
+            // Enter. Nobody ran that probe — the provider announced itself
+            // instead — so the probe text is sitting unsubmitted in the new
+            // TUI's composer and its deferred Enter is still due. Left alone,
+            // the assignment would be typed on top of it and the queued Enter
+            // would submit the concatenation as one mangled prompt.
+            //
+            // Drop the Enter only. `interrupt_shell_input` would be the obvious
+            // call, but it also writes Ctrl-C, and the reset already sent one on
+            // its way in: a second Ctrl-C arriving a poll later can land inside
+            // the provider's double-press exit window and tear down the very
+            // process this call is admitting as ready. The composer residue is
+            // harmless once the Enter is gone — the delivery that follows types
+            // its own line and submits that.
+            self.pending_enters
+                .retain(|pending| pending.pane_id != PaneId::Terminal(pane_id));
+        }
         self.seat_assignments.insert(
             pane_id,
             SeatAssignmentState::ReadyForAssignment { generation },
@@ -3981,7 +4117,9 @@ impl State {
             ));
         }
 
-        let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
+        // Scanned, not typed: the prompt recovers the ticket's real filename
+        // from this directory, so it must be the readable `/host` form.
+        let ticket_scan_dir = self.config.ticket_dir.clone();
         let artifact_dir = strip_host_prefix(&self.attempt_work_dir(&lease));
         let chat_assignment_path = strip_host_prefix(&assignment_path);
         let (adapter, _) = resolve_adapter_or_native(
@@ -3990,7 +4128,7 @@ impl State {
             self.config.lisa_bin.as_deref(),
         );
         let ctx = SpawnContext {
-            ticket_dir: &host_ticket_dir,
+            ticket_scan_dir: &ticket_scan_dir,
             ticket_id: &ticket_id,
             pane_id,
             attempt_id: generation,
@@ -4454,9 +4592,153 @@ impl State {
         })
     }
 
-    /// Revoke an unproven original launch and begin the one permitted reset in
-    /// the same physical pane. The successor marker is deliberately withheld
-    /// until the shell probe proves a command boundary.
+    /// Startup was not observed *and* the pane proved a provider is still in it:
+    /// the launch line was typed into a live TUI and read as chat. Type the
+    /// resident client's exit again and put the pane back in `WaitingForExit`,
+    /// where the residency-aware exit policy now waits for it to actually leave.
+    ///
+    /// This is deliberately not `begin_startup_recovery`. That path interrupts
+    /// the pane and probes it for a shell, which is a dead end against a live
+    /// TUI: a `--dangerously-skip-permissions` session executes the probe
+    /// command on the scheduler's behalf and forges the readiness proof. Asking
+    /// the pane to exit again is the one question actually outstanding.
+    ///
+    /// The attempt generation still advances here, exactly as in the ordinary
+    /// reset, and for a reason independent of the marker: once the exit grace
+    /// elapses, `launch_after_exit` types a *second* launch line. If the first
+    /// one ever did reach a shell, two processes must not be able to carry
+    /// byte-identical `LISA_TICKET_ID`/`LISA_ATTEMPT_ID` — both would byte-match
+    /// the marker in `on-start.sh`, both could publish `.started`, and both
+    /// could satisfy the same assignment claim. Minting keeps launch identity
+    /// unique per typed launch line. It costs nothing here, because
+    /// `launch_after_exit` publishes the successor marker only after the grace,
+    /// which is the handoff discipline `publish_prompt_lease_marker` documents.
+    ///
+    /// Bounded: the retry consumes the seat's single same-pane relaunch budget,
+    /// so a second unobserved startup fences the pane through
+    /// `fail_startup_recovery` rather than looping. The `WaitingForExit` leg it
+    /// re-enters is itself bounded by `AGENT_EXIT_CEILING_SECS`.
+    ///
+    /// Residency evidence is what routes a pane here, and `.ack`/`.stopped` are
+    /// the legs that carry it: both are written unconditionally by hooks that
+    /// hold no identity, so they survive any future tightening of the
+    /// lease-copying heartbeat hook. Heartbeat residency is a bonus in this
+    /// window, never a precondition.
+    fn begin_resident_exit_retry(
+        &mut self,
+        pane_id: u32,
+        now: std::time::SystemTime,
+    ) -> Option<FailureTransitionOutcome> {
+        let Some(SeatAssignmentState::Starting {
+            generation: prior_generation,
+            relaunches: 0,
+            ..
+        }) = self.seat_assignment(pane_id)
+        else {
+            return None;
+        };
+        let Some(slot_idx) = self
+            .agent_slots
+            .iter()
+            .position(|slot| slot.pane_id == pane_id && slot.ticket_id.is_some())
+        else {
+            return self.fail_startup(pane_id, "same-pane exit retry reservation is missing");
+        };
+        let ticket_id = self.agent_slots[slot_idx]
+            .ticket_id
+            .clone()
+            .expect("exit retry slot has a ticket");
+        let Some(predecessor) = self.agent_slots[slot_idx].attempt_lease.clone() else {
+            return self.fail_startup(pane_id, "same-pane exit retry attempt lease is missing");
+        };
+        let valid_predecessor = predecessor.ticket_id == ticket_id
+            && predecessor.attempt_id == prior_generation
+            && predecessor.is_current(self.current_leases.get(&ticket_id))
+            && self.lease_high_water.get(&ticket_id) == Some(&predecessor);
+        if !valid_predecessor {
+            return self.fail_startup(pane_id, "same-pane exit retry attempt lease is stale");
+        }
+        // Without a recorded resident client there is no exit spelling to send;
+        // the ordinary reset remains the honest fallback.
+        let Some(resident_client) = self.agent_slots[slot_idx].last_client else {
+            return self.begin_startup_recovery(pane_id, now);
+        };
+        let (resident_adapter, _) =
+            resolve_adapter_or_native(None, resident_client, self.config.lisa_bin.as_deref());
+        let exit_command = resident_adapter.exit_command();
+
+        self.revoke_current_lease(&ticket_id);
+        let successor = match AttemptLease::mint(ticket_id.clone(), Some(&predecessor)) {
+            Ok(successor) => successor,
+            Err(error) => {
+                return self.fail_startup(
+                    pane_id,
+                    &format!("cannot mint same-pane exit retry lease: {error}"),
+                );
+            }
+        };
+        self.lease_high_water
+            .insert(ticket_id.clone(), successor.clone());
+        self.current_leases
+            .insert(ticket_id.clone(), successor.clone());
+        self.agent_slots[slot_idx].attempt_lease = Some(successor.clone());
+        if let Some(thread) = self.threads.get_mut(&ticket_id) {
+            thread.attempt_lease = Some(successor.clone());
+        }
+
+        // Before the send, not after: `send_line_to_pane` silently drops writes
+        // into a pane flagged `awaiting_human`, and a session blocked on
+        // AskUserQuestion is one of the shapes that gets us here — `.awaiting`
+        // is a residency leg. A dropped exit would leave the pane waiting for a
+        // teardown nobody asked for.
+        self.awaiting_human.remove(&pane_id);
+        self.notified_attention.remove(&pane_id);
+        self.send_line_to_pane(exit_command, PaneId::Terminal(pane_id));
+        self.agent_slots[slot_idx].has_session = false;
+        self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForExit;
+        self.agent_slots[slot_idx].transition_started_at = Some(now);
+        self.agent_slots[slot_idx].last_activity_at = Some(now);
+        // Consume the one same-pane relaunch so the next unobserved startup
+        // fences instead of retrying. `start_assignment_ack_wait` re-arms the
+        // deadline after the replacement launch and preserves this budget.
+        self.seat_assignments.insert(
+            pane_id,
+            SeatAssignmentState::Starting {
+                generation: successor.attempt_id,
+                start_deadline: None,
+                relaunches: MAX_SAME_PANE_STARTUP_RELAUNCHES,
+            },
+        );
+        self.log_activity(ActivityEvent::Warning {
+            message: format!(
+                "{} startup was not observed on pane {} and a provider is still resident; re-sending {} rather than interrupting a live session, as attempt {}",
+                ticket_id, pane_id, exit_command, successor.attempt_id
+            ),
+        });
+        None
+    }
+
+    /// Begin the one permitted reset in the same physical pane without
+    /// advancing the attempt generation.
+    ///
+    /// The launch this reset recovers was never observed to start, so its
+    /// generation was never spent. Keeping it keeps the marker published for
+    /// that launch valid, and that marker is the only thing a merely-slow
+    /// provider can match to announce itself: `on-start.sh` byte-matches
+    /// `pane-<id>.lease` against the launching process's own immutable
+    /// `LISA_TICKET_ID`/`LISA_ATTEMPT_ID` and exits silently when it cannot, so
+    /// deleting the marker made this window announceable by nobody and left the
+    /// shell probe — which a resident TUI can run on the scheduler's behalf — as
+    /// its only exit. The successor is minted in
+    /// [`Self::acknowledge_shell_ready`] instead: the exact moment a second
+    /// process is about to exist and needs an identity of its own.
+    ///
+    /// Retaining the generation is safe against the predecessor because nothing
+    /// it can write is new authority. Its `LISA_ATTEMPT_ID` was fixed at exec by
+    /// the launch line's `VAR=` prefix, `AttemptLease::mint` is strictly
+    /// monotonic, and `SessionStart[startup]` never re-fires for an already
+    /// running process — so a `.started` for this generation names either the
+    /// process this launch was meant to start or nothing at all.
     fn begin_startup_recovery(
         &mut self,
         pane_id: u32,
@@ -4492,43 +4774,32 @@ impl State {
             return self.fail_startup(pane_id, "same-pane recovery attempt lease is stale");
         }
 
-        self.revoke_current_lease(&ticket_id);
-        let successor = match AttemptLease::mint(ticket_id.clone(), Some(&predecessor)) {
-            Ok(successor) => successor,
-            Err(error) => {
-                self.seat_assignments.insert(
-                    pane_id,
-                    SeatAssignmentState::ResettingStartup {
-                        generation: prior_generation,
-                        reset_deadline: now,
-                    },
-                );
-                return self.fail_startup_recovery(
-                    pane_id,
-                    &format!("cannot mint same-pane recovery lease: {error}"),
-                );
-            }
-        };
-        self.lease_high_water
-            .insert(ticket_id.clone(), successor.clone());
-        self.current_leases
-            .insert(ticket_id.clone(), successor.clone());
-        self.agent_slots[slot_idx].attempt_lease = Some(successor.clone());
-        if let Some(thread) = self.threads.get_mut(&ticket_id) {
-            thread.attempt_lease = Some(successor.clone());
-        }
+        // Deliberately no revoke and no mint. `pane-<id>.lease` keeps naming
+        // this exact attempt, so the process this launch was supposed to start
+        // can still byte-match its own `LISA_TICKET_ID`/`LISA_ATTEMPT_ID` and
+        // publish `.started`. Minting here retired that identity while the
+        // intended process was still booting — a large repository can take
+        // longer to reach an interactive prompt than the whole acknowledgment
+        // budget — which left the window with no admissible evidence but a
+        // shell probe a resident TUI can answer on the process's behalf.
         self.seat_assignments.insert(
             pane_id,
             SeatAssignmentState::ResettingStartup {
-                generation: successor.attempt_id,
+                generation: predecessor.attempt_id,
                 reset_deadline: self.assignment_ack_deadline(now),
             },
         );
         self.awaiting_human.remove(&pane_id);
         self.notified_attention.remove(&pane_id);
-        self.clear_pane_lifecycle_signals(pane_id);
+        self.clear_pane_reset_signals(pane_id);
+        // Republish rather than assume. The retained marker is load-bearing for
+        // the whole window now, so one that cannot be written must fence the
+        // seat here instead of silently reproducing the dead end it closes.
+        if let Err(error) = self.write_pane_lease_marker(pane_id, &predecessor) {
+            return self.fail_startup_recovery(pane_id, &error);
+        }
 
-        let probe = match Self::shell_readiness_probe(&self.signal_dir, pane_id, &successor) {
+        let probe = match Self::shell_readiness_probe(&self.signal_dir, pane_id, &predecessor) {
             Ok(probe) => probe,
             Err(error) => {
                 return self.fail_startup_recovery(pane_id, &error);
@@ -4546,14 +4817,22 @@ impl State {
         self.log_activity(ActivityEvent::Warning {
             message: format!(
                 "{} startup was not observed on pane {}; interrupted incomplete shell input and awaiting exact readiness for attempt {}",
-                ticket_id, pane_id, successor.attempt_id
+                ticket_id, pane_id, predecessor.attempt_id
             ),
         });
         None
     }
 
-    /// Admit exact successor shell proof and submit the already-established
-    /// bare-provider launch contract back into the same physical pane.
+    /// Admit exact shell proof for the reset generation, mint the successor, and
+    /// submit the already-established bare-provider launch contract back into
+    /// the same physical pane.
+    ///
+    /// The mint lives here and only here. This is the first moment a second
+    /// provider process for this ticket is about to exist, and it must not be
+    /// able to shelter behind the identity the first launch was given: revoking
+    /// fences anything the unobserved original may yet publish under the old
+    /// generation, and the fresh generation gives the relaunch its own attempt
+    /// directory, assignment nonce, and marker.
     fn acknowledge_shell_ready(
         &mut self,
         pane_id: u32,
@@ -4583,8 +4862,54 @@ impl State {
             return false;
         }
 
-        let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
-        let attempt_artifact_dir = self.attempt_work_dir(candidate);
+        // The successor is minted here, after the candidate has been fully
+        // validated and before anything touches an attempt directory or the
+        // marker, so the whole relaunch is built on it.
+        //
+        // Mint from the high-water mark, never from the candidate. The reset
+        // deliberately holds this seat across a window in which other authority
+        // can move — `revoke_current_lease` preserves the high water precisely
+        // so a revoked generation is never handed out twice, and the journal can
+        // raise it on its own — so minting from the seat's own idea of its
+        // predecessor could return an attempt id that already exists. Every
+        // other mint in this file is anchored the same way.
+        let predecessor = self.lease_high_water.get(&ticket_id).cloned();
+        if predecessor.as_ref() != Some(candidate) {
+            self.fail_startup_recovery(
+                pane_id,
+                "same-pane recovery candidate is not the attempt high-water mark",
+            );
+            return false;
+        }
+        self.revoke_current_lease(&ticket_id);
+        let successor = match AttemptLease::mint(ticket_id.clone(), predecessor.as_ref()) {
+            Ok(successor) => successor,
+            Err(error) => {
+                self.fail_startup_recovery(
+                    pane_id,
+                    &format!("cannot mint same-pane recovery lease: {error}"),
+                );
+                return false;
+            }
+        };
+        self.lease_high_water
+            .insert(ticket_id.clone(), successor.clone());
+        self.current_leases
+            .insert(ticket_id.clone(), successor.clone());
+        if let Some(slot) = self
+            .agent_slots
+            .iter_mut()
+            .find(|slot| slot.pane_id == pane_id)
+        {
+            slot.attempt_lease = Some(successor.clone());
+        }
+        if let Some(thread) = self.threads.get_mut(&ticket_id) {
+            thread.attempt_lease = Some(successor.clone());
+        }
+
+        // Scanned, not typed: see `ticket_prompt`.
+        let ticket_scan_dir = self.config.ticket_dir.clone();
+        let attempt_artifact_dir = self.attempt_work_dir(&successor);
         let artifact_dir = strip_host_prefix(&attempt_artifact_dir);
         let (adapter, route) = resolve_adapter_or_native(
             self.dag.get_ticket(&ticket_id),
@@ -4592,16 +4917,16 @@ impl State {
             self.config.lisa_bin.as_deref(),
         );
         let ctx = SpawnContext {
-            ticket_dir: &host_ticket_dir,
+            ticket_scan_dir: &ticket_scan_dir,
             ticket_id: &ticket_id,
             pane_id,
-            attempt_id: candidate.attempt_id,
+            attempt_id: successor.attempt_id,
             artifact_dir: &artifact_dir,
             assignment_generation: None,
         };
         let assignment = adapter.assignment_text(&ctx);
         let assignment_ref =
-            match self.prepare_assignment(&attempt_artifact_dir, candidate, &assignment) {
+            match self.prepare_assignment(&attempt_artifact_dir, &successor, &assignment) {
                 Ok(assignment_ref) => assignment_ref,
                 Err(error) => {
                     self.fail_startup_recovery(pane_id, &error);
@@ -4617,7 +4942,9 @@ impl State {
                 return false;
             }
         };
-        if let Err(error) = self.write_pane_lease_marker(pane_id, candidate) {
+        // Replaces the retained predecessor marker, so the original attempt can
+        // no longer announce itself once the relaunch line goes in.
+        if let Err(error) = self.write_pane_lease_marker(pane_id, &successor) {
             self.fail_startup_recovery(pane_id, &error);
             return false;
         }
@@ -4625,7 +4952,7 @@ impl State {
         self.seat_assignments.insert(
             pane_id,
             SeatAssignmentState::Starting {
-                generation,
+                generation: successor.attempt_id,
                 start_deadline: Some(self.assignment_ack_deadline(now)),
                 relaunches: MAX_SAME_PANE_STARTUP_RELAUNCHES,
             },
@@ -4654,7 +4981,7 @@ impl State {
         self.log_activity(ActivityEvent::Info {
             message: format!(
                 "Pane {} proved shell readiness; relaunched {} for {} as attempt {}",
-                pane_id, route.agent, ticket_id, generation
+                pane_id, route.agent, ticket_id, successor.attempt_id
             ),
         });
         true
@@ -4698,6 +5025,10 @@ impl State {
         }
         self.revoke_current_lease(&ticket_id);
         self.clear_pane_lifecycle_signals(pane_id);
+        // The other place that must retire residency itself: fencing ends this
+        // occupancy without typing, and a fenced pane must not bequeath evidence
+        // to whatever the operator does with it next.
+        self.forget_provider_residency(pane_id);
         self.awaiting_human.remove(&pane_id);
         self.notified_attention.remove(&pane_id);
         self.pending_enters
@@ -4959,6 +5290,15 @@ impl State {
                                 outcomes.push(outcome);
                             }
                         }
+                    } else if self.provider_is_resident(pane_id) {
+                        // The launch was never executed: a provider is still in
+                        // this pane, so the launch line landed in its chat box.
+                        // Interrupting and probing here is the dead end — a live
+                        // TUI runs the probe itself and forges the shell proof.
+                        // Send the exit again instead.
+                        if let Some(outcome) = self.begin_resident_exit_retry(pane_id, now) {
+                            outcomes.push(outcome);
+                        }
                     } else {
                         if let Some(outcome) = self.begin_startup_recovery(pane_id, now) {
                             outcomes.push(outcome);
@@ -4966,10 +5306,12 @@ impl State {
                     }
                 }
                 SeatAssignmentState::Starting { .. } => {
-                    if let Some(outcome) = self.fail_startup_recovery(
-                        pane_id,
-                        "replacement provider process start was not observed before the deadline",
-                    ) {
+                    let reason = if self.provider_is_resident(pane_id) {
+                        "the resident provider did not leave the pane after a second exit"
+                    } else {
+                        "replacement provider process start was not observed before the deadline"
+                    };
+                    if let Some(outcome) = self.fail_startup_recovery(pane_id, reason) {
                         outcomes.push(outcome);
                     }
                 }
@@ -5466,8 +5808,10 @@ impl State {
             let recycle = cross_provider_recycle
                 || (reused_seat && adapter.reset_strategy() == ResetStrategy::ExitThenFresh);
 
-            // Build the host-relative ticket dir (strip /host/ prefix)
-            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
+            // Scanned, not typed: the prompt recovers the ticket's real
+            // filename from this directory and strips the mount itself when it
+            // names the path, so this stays the readable `/host` form.
+            let ticket_scan_dir = self.config.ticket_dir.clone();
 
             let pane_id = self.agent_slots[slot_idx].pane_id;
 
@@ -5554,7 +5898,7 @@ impl State {
             let artifact_dir = strip_host_prefix(&attempt_artifact_dir);
 
             let ctx = SpawnContext {
-                ticket_dir: &host_ticket_dir,
+                ticket_scan_dir: &ticket_scan_dir,
                 ticket_id: &ticket_id,
                 pane_id,
                 attempt_id: attempt_lease.attempt_id,
@@ -5648,6 +5992,9 @@ impl State {
                             continue;
                         }
                     };
+                // Everything the pane emits from the send on is evidence about
+                // whether the resident provider actually left; `send_line_to_pane`
+                // retires the older evidence as it types.
                 self.send_line_to_pane(exit_command, PaneId::Terminal(pane_id));
                 self.agent_slots[slot_idx].has_session = false;
                 self.agent_slots[slot_idx].transition_state = TransitionState::WaitingForExit;
@@ -6343,6 +6690,69 @@ impl State {
         }
     }
 
+    /// Record that a provider hook fired in this pane, i.e. that a process is
+    /// still in there right now.
+    ///
+    /// Called from the signal consumers *before* they admit anything, because
+    /// the question this answers is "is a process in there", not "may it act".
+    /// A rejected heartbeat, a `.started` from the wrong generation, a `.stopped`
+    /// from a turn that ended after the `/exit`, an `.ack` from a launch line
+    /// that landed in a chat box — each is worthless as authority and conclusive
+    /// as residency. Shell-boundary and adapter-exit evidence are deliberately
+    /// excluded: `.shell-ready` and `.error` assert the provider is *gone*, the
+    /// opposite claim, and the field transcript shows a live TUI can execute the
+    /// readiness probe itself.
+    ///
+    /// Unknown pane ids are dropped. Signal filenames are untrusted input, so
+    /// the map is admitted against `agent_slots` and stays bounded by the seat
+    /// count. This widens readiness only; no ownership decision reads it.
+    fn record_provider_residency(&mut self, pane_id: u32) {
+        if self.agent_slots.iter().any(|slot| slot.pane_id == pane_id) {
+            self.resident_providers
+                .insert(pane_id, std::time::SystemTime::now());
+        }
+    }
+
+    /// Forget this pane's residency evidence because Lisa just typed a command
+    /// meant to change who occupies it. Every later hook is then evidence about
+    /// the occupant that survived the command, which is the only question the
+    /// map exists to answer.
+    fn forget_provider_residency(&mut self, pane_id: u32) {
+        self.resident_providers.remove(&pane_id);
+    }
+
+    /// When this pane last proved a provider was in it, or `None` if nothing has
+    /// been heard since Lisa last tried to change its occupancy.
+    fn last_provider_signal(&self, pane_id: u32) -> Option<std::time::SystemTime> {
+        self.resident_providers.get(&pane_id).copied()
+    }
+
+    /// Whether a provider proved it still holds this pane at any point since
+    /// Lisa last tried to change its occupancy.
+    ///
+    /// No decay: this is the startup-recovery question, and its window is the
+    /// whole acknowledgment budget. A live TUI answers a misdirected launch line
+    /// the instant it arrives and can then sit silent for the rest of the wait,
+    /// so a freshness test here would throw away the very evidence the branch
+    /// exists to act on. The exit policy asks the narrower, decaying question.
+    fn provider_is_resident(&self, pane_id: u32) -> bool {
+        self.resident_providers.contains_key(&pane_id)
+    }
+
+    /// Whether this pane emitted a provider hook within the last `window_secs`.
+    /// This is the decaying form the exit policy holds on, restated here so the
+    /// ceiling warning fires on exactly the releases the hold was delaying.
+    fn provider_was_noisy_within(
+        &self,
+        pane_id: u32,
+        now: std::time::SystemTime,
+        window_secs: u64,
+    ) -> bool {
+        self.last_provider_signal(pane_id).is_some_and(|last| {
+            now.duration_since(last).unwrap_or_default().as_secs() <= window_secs
+        })
+    }
+
     /// Scan for `.heartbeat` signal files written by the PostToolUse hook.
     ///
     /// Each heartbeat proves the session in that pane is actively making tool
@@ -6358,6 +6768,11 @@ impl State {
             else {
                 continue;
             };
+            // Residency before authority. The PostToolUse hook copies whatever
+            // `pane-<id>.lease` holds, so a departing session can carry the
+            // successor's lease here and be rejected below — but only a running
+            // process runs a hook at all.
+            self.record_provider_residency(pane_id);
             let admitted = self
                 .agent_slots
                 .iter()
@@ -6368,6 +6783,22 @@ impl State {
                         && candidate.is_current(self.current_leases.get(&candidate.ticket_id))
                 });
             if !admitted {
+                continue;
+            }
+            // A reset holds `pane-<id>.lease` in place so a late-starting
+            // provider can still announce itself, and the heartbeat hook — alone
+            // among the hooks — copies that marker without comparing it to the
+            // calling process's own identity. So inside the reset window the
+            // lease a heartbeat carries proves only that *some* process is
+            // resident, which is what the recorder above already took from it.
+            // Admitting it as progress on top of that would let a process that
+            // is not this attempt reset the silence clock and, worse, clear the
+            // AskUserQuestion guard so Lisa types over a live question. Residency
+            // is what this window widened; clocks and attention are not.
+            if matches!(
+                self.seat_assignment(pane_id),
+                Some(SeatAssignmentState::ResettingStartup { .. })
+            ) {
                 continue;
             }
             self.bump_pane_activity(pane_id);
@@ -6391,6 +6822,10 @@ impl State {
             else {
                 continue;
             };
+            // A `.started` names a process that just booted in this pane. Even
+            // when it belongs to the wrong generation and is rejected below, it
+            // is conclusive residency.
+            self.record_provider_residency(pane_id);
             self.acknowledge_process_start(pane_id, &candidate);
         }
     }
@@ -6417,6 +6852,7 @@ impl State {
             let SignalRecord::Claim { pane_id, claim } = record else {
                 continue;
             };
+            self.record_provider_residency(pane_id);
 
             if self.admit_assignment_claim(pane_id, &claim) {
                 self.bump_pane_activity(pane_id);
@@ -6437,6 +6873,10 @@ impl State {
             let SignalRecord::CodexAcknowledgement { pane_id, payload } = record else {
                 continue;
             };
+            // The densest evidence of the exact field failure: a launch command
+            // typed into a live TUI is submitted as a chat prompt, and the
+            // provider's `UserPromptSubmit` hook reports it here.
+            self.record_provider_residency(pane_id);
 
             if self.acknowledge_codex_assignment(pane_id, &payload) {
                 self.bump_pane_activity(pane_id);
@@ -6465,6 +6905,9 @@ impl State {
             let SignalRecord::Awaiting { pane_id } = record else {
                 continue;
             };
+            // A pane blocked on AskUserQuestion is resident and will stay silent
+            // until answered — exactly the shape that reads as departure.
+            self.record_provider_residency(pane_id);
             if self.awaiting_human.insert(pane_id) {
                 self.log_activity(ActivityEvent::Info {
                     message: format!(
@@ -6704,10 +7147,15 @@ impl State {
                 SignalRecord::Stopped { pane_id } => {
                     // A stop signal is recent life — restart the wind-down
                     // clock. Agents often keep working past their stop signal.
+                    // It is emphatically not an exit: Stop fires at the end of
+                    // every assistant turn, so a `.stopped` seen after a `/exit`
+                    // proves the old session is still resident.
+                    self.record_provider_residency(pane_id);
                     self.bump_pane_activity(pane_id);
                     self.handle_stopped_signal(pane_id);
                 }
                 SignalRecord::Cleared { pane_id } => {
+                    self.record_provider_residency(pane_id);
                     self.bump_pane_activity(pane_id);
                 }
                 _ => {}
@@ -7468,9 +7916,15 @@ impl State {
     /// Check for transition deadlines and advance stalled transitions.
     ///
     /// One transition can stall: a session told to `/exit` that has not yet
-    /// returned its pane to a shell. Once the bounded exit grace expires the
-    /// pane is launched fresh regardless — the old client is leaving either
-    /// way, so no activity or pending-question exemption applies.
+    /// returned its pane to a shell. A pane that goes quiet for the exit grace
+    /// is launched fresh — quiet is the only "it left" evidence Lisa has, since
+    /// no hook Lisa installs reports a provider exit. A pane that instead keeps
+    /// firing provider hooks after the `/exit` demonstrably has not left, and
+    /// typing a launch command into it would deliver the ticket to a chat box;
+    /// that pane waits while it stays noisy, and in no case past
+    /// `AGENT_EXIT_CEILING_SECS`, after which it is launched anyway so a
+    /// dying-but-noisy provider cannot hold a seat. Activity clocks and pending
+    /// questions are still not exemptions.
     fn check_transition_timeouts(&mut self) {
         let evaluator = DeadlineEvaluator::new(SystemClock);
         let now = evaluator.now();
@@ -7480,9 +7934,11 @@ impl State {
                 ticket_id: slot.ticket_id.clone(),
                 state: slot.transition_state,
                 started: slot.transition_started_at,
+                last_provider_signal: self.last_provider_signal(slot.pane_id),
             }),
             TransitionPolicy {
                 exit_grace_secs: AGENT_EXIT_GRACE_SECS,
+                exit_ceiling_secs: AGENT_EXIT_CEILING_SECS,
             },
         );
 
@@ -7496,9 +7952,29 @@ impl State {
         }
 
         for (pane_id, ticket_id) in exit_ready {
+            if self.provider_was_noisy_within(pane_id, now, AGENT_EXIT_GRACE_SECS) {
+                // Only the ceiling released this pane. The relaunch is the
+                // escape hatch against a stranded seat, so say plainly that the
+                // next command may land in a TUI — the silent version of this
+                // exact moment is what made the field failure undiagnosable.
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!(
+                        "Pane {} still showed a live provider {}s after /exit; relaunching at the exit ceiling",
+                        pane_id, AGENT_EXIT_CEILING_SECS
+                    ),
+                });
+            }
+
             let Some(ticket_id) = ticket_id else {
                 // The pending ticket disappeared while the old client was
                 // exiting. Leave a clean shell available to either provider.
+                //
+                // This arm hands the pane back without typing anything, so it is
+                // one of the two places that must retire residency evidence
+                // itself: nothing here goes through `send_line_to_pane`, and an
+                // entry left behind would outlive this occupancy and be read as
+                // evidence about the pane's *next* tenant.
+                self.forget_provider_residency(pane_id);
                 if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
                     slot.transition_state = TransitionState::Idle;
                     slot.transition_started_at = None;
@@ -7530,7 +8006,8 @@ impl State {
                 .then(|| self.active_assignment_generation(pane_id))
                 .flatten();
 
-            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
+            // Scanned, not typed: see `ticket_prompt`.
+            let ticket_scan_dir = self.config.ticket_dir.clone();
             let (adapter, route) = resolve_adapter_or_native(
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
@@ -7572,7 +8049,7 @@ impl State {
             };
             let artifact_dir = strip_host_prefix(&launch_artifact_dir);
             let ctx = SpawnContext {
-                ticket_dir: &host_ticket_dir,
+                ticket_scan_dir: &ticket_scan_dir,
                 ticket_id: &ticket_id,
                 pane_id,
                 attempt_id: launch_lease.attempt_id,
@@ -7615,6 +8092,10 @@ impl State {
                     continue;
                 }
             };
+            // Once the launch line is typed, any hook that fires is evidence
+            // about who is in the pane *now* — which is what the startup-recovery
+            // arm needs to tell a dead pane from a live TUI. `send_line_to_pane`
+            // retires the pre-launch evidence as it types.
             self.send_line_to_pane(&command, PaneId::Terminal(pane_id));
 
             if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
@@ -7765,7 +8246,6 @@ impl State {
             if self.review_completion_suppresses_finish_up(&ticket_id) {
                 continue;
             }
-            let host_ticket_dir = strip_host_prefix(&self.config.ticket_dir);
             let host_work_dir = match self
                 .threads
                 .get(&ticket_id)
@@ -7789,7 +8269,6 @@ impl State {
                 self.config.lisa_bin.as_deref(),
             );
             let follow_up = adapter.follow_up(&FollowUpContext {
-                ticket_dir: &host_ticket_dir,
                 work_dir: &host_work_dir,
                 ticket_id: &ticket_id,
                 pane_id,
@@ -13457,6 +13936,60 @@ mod tests {
         );
     }
 
+    /// The scan reads through the `/host` mount; the agent's shell does not
+    /// know the mount exists. Whatever the scan resolves, the prompt names the
+    /// repository-relative path — including on the fallback branch, which is
+    /// the only branch a missing or unreadable directory can reach.
+    #[test]
+    fn ticket_prompt_strips_the_host_mount_from_the_path_it_names() {
+        let prompt = ticket_prompt(
+            Path::new("/host/docs/active/tickets"),
+            "T-024-03",
+            Path::new(".lisa/attempts/T-024-03/1/work"),
+        );
+
+        assert!(
+            prompt.contains("Read the ticket at docs/active/tickets/T-024-03.md and"),
+            "got: {prompt}"
+        );
+        assert!(!prompt.contains("/host/"), "got: {prompt}");
+    }
+
+    /// The plumbing half, which no native runtime test can observe: the field
+    /// failure needs a directory that is both `/host`-prefixed and readable,
+    /// and that pair exists only inside Zellij's WASI sandbox. Stripping the
+    /// mount before the scan fails silently, so this pins the four spawn sites
+    /// structurally instead — the repo's existing companion-test idiom.
+    #[test]
+    fn every_spawn_context_carries_the_readable_ticket_dir() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module marker remains available")
+            .0;
+
+        let contexts = production.matches("SpawnContext {").count();
+        assert!(contexts > 0, "the spawn contexts moved");
+        assert_eq!(
+            production
+                .matches("ticket_scan_dir: &ticket_scan_dir,")
+                .count(),
+            contexts,
+            "every SpawnContext must carry the unstripped scan directory"
+        );
+        assert_eq!(
+            production
+                .matches("let ticket_scan_dir = self.config.ticket_dir.clone();")
+                .count(),
+            contexts,
+            "the scan directory is the configured one, taken whole"
+        );
+        assert!(
+            !production.contains("ticket_scan_dir = strip_host_prefix("),
+            "stripping the /host mount before the scan silently empties it"
+        );
+    }
+
     #[test]
     fn test_ticket_prompt_uses_discovered_descriptive_ticket_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -13507,11 +14040,7 @@ mod tests {
 
     #[test]
     fn test_finish_up_prompt_preserves_atomic_completion_contract() {
-        let prompt = finish_up_prompt(
-            Path::new("docs/active/tickets"),
-            Path::new(".lisa/attempts/T-024-03/1/work"),
-            "T-024-03",
-        );
+        let prompt = finish_up_prompt(Path::new(".lisa/attempts/T-024-03/1/work"), "T-024-03");
 
         assert!(prompt.contains(".lisa/attempts/T-024-03/1/work/review.md"));
         assert!(prompt.contains(".lisa/attempts/T-024-03/1/work/review-disposition.json"));
@@ -19432,7 +19961,11 @@ mod tests {
         let tickets_dir = dir.path().join("tickets");
         fs::create_dir_all(&tickets_dir).unwrap();
         fs::write(
-            tickets_dir.join("T-NAME.md"),
+            // Deliberately NOT `T-NAME.md`. That is exactly the naive
+            // `<id>.md` fallback `ticket_prompt` reaches for when its scan
+            // fails, so a fixture named that way makes the fallback and the
+            // discovered path indistinguishable at every caller.
+            tickets_dir.join("T-NAME-some-descriptive-title.md"),
             format!(
                 "---\nid: T-NAME\ntitle: pane lifecycle\ntype: task\nstatus: open\npriority: high\nphase: ready\nagent: {requested_agent}\n---\n"
             ),
@@ -19455,6 +19988,52 @@ mod tests {
         };
         state.agent_slots.push(fresh_slot(10, resident_agent));
         (state, dir)
+    }
+
+    /// A pane-1 seat sitting in the exact state the field failure produces: a
+    /// Claude session was launched for `ticket_id`, its start was never
+    /// observed, and its acknowledgment deadline has already passed.
+    ///
+    /// Establishes one `AgentSlot` on pane 1 carrying the ticket and the minted
+    /// lease with `has_session: true`, `transition_state: Idle` and
+    /// `last_client: Some(Claude)`; `current_leases` and `lease_high_water` both
+    /// at that lease; and `seat_assignments[1] = Starting { generation,
+    /// start_deadline: <one second ago>, relaunches: 0 }` — the one shape the
+    /// startup-recovery arm acts on.
+    fn resident_pane_fixture(signal_dir: &Path, ticket_id: &str) -> (State, AttemptLease) {
+        let mut state = State {
+            signal_dir: signal_dir.to_path_buf(),
+            ..State::default()
+        };
+        let lease = AttemptLease::mint(ticket_id.to_string(), None).unwrap();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: Some(ticket_id.to_string()),
+            attempt_lease: Some(lease.clone()),
+            has_session: true,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Claude),
+        });
+        state
+            .current_leases
+            .insert(ticket_id.to_string(), lease.clone());
+        state
+            .lease_high_water
+            .insert(ticket_id.to_string(), lease.clone());
+        state.seat_assignments.insert(
+            1,
+            SeatAssignmentState::Starting {
+                generation: lease.attempt_id,
+                start_deadline: Some(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(1),
+                ),
+                relaunches: 0,
+            },
+        );
+        (state, lease)
     }
 
     fn consecutive_reuse_state(
@@ -20416,6 +20995,46 @@ mod tests {
         assert!(!codex.seat_is_owned(10));
     }
 
+    /// The caller-side half, at the site whose text actually reaches an agent.
+    /// Dispatch publishes the assignment file; the path it tells the agent to
+    /// read has to be a path that is there.
+    ///
+    /// This cannot reproduce the field failure — that needs the `/host`-mounted
+    /// readable directory only WASI has, which is why
+    /// `every_spawn_context_carries_the_readable_ticket_dir` exists. What it
+    /// does pin is the consequence the field failure produced: with the fixture
+    /// ticket named descriptively, the naive `<id>.md` fallback names a file
+    /// that is not on disk, so any future change that loses the scan or names
+    /// an unopenable path fails here rather than in somebody's pane.
+    #[test]
+    fn dispatch_publishes_an_assignment_naming_a_ticket_file_that_exists() {
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+
+        state.schedule_ready_tickets();
+
+        let assignment_ref = state
+            .assignment_refs
+            .get("T-NAME")
+            .expect("dispatch publishes an assignment for the scheduled ticket");
+        let assignment = std::fs::read_to_string(&assignment_ref.path).unwrap();
+        let named = assignment
+            .split_once("Read the ticket at ")
+            .expect("the assignment names a ticket path")
+            .1
+            .split_once(" and docs/knowledge/lisa-workflow.md")
+            .expect("the named path is bounded by the workflow document")
+            .0;
+
+        assert!(
+            named.ends_with("T-NAME-some-descriptive-title.md"),
+            "the assignment must name the ticket's real filename, got: {named}"
+        );
+        assert!(
+            Path::new(named).is_file(),
+            "the assignment names a file that does not exist: {named}"
+        );
+    }
+
     #[test]
     fn dispatch_mints_and_stamps_strictly_new_attempt_lease() {
         let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
@@ -20674,27 +21293,31 @@ mod tests {
 
         assert!(state.check_assignment_ack_timeouts_at(deadline).is_empty());
 
-        let successor = state.current_leases["T-NAME"].clone();
+        // The reset keeps the launched attempt's generation: it was never
+        // observed to start, so it was never spent, and retaining it keeps
+        // `pane-10.lease` naming the identity the launched process carries in
+        // its own environment. The successor is minted only when a shell proof
+        // actually arrives (`acknowledge_shell_ready`), which is the path this
+        // test deliberately never takes.
+        let retained = state.current_leases["T-NAME"].clone();
         let reset_deadline = match state.seat_assignment(10) {
             Some(SeatAssignmentState::ResettingStartup {
                 generation,
                 reset_deadline,
             }) => {
-                assert_eq!(generation, successor.attempt_id);
+                assert_eq!(generation, retained.attempt_id);
                 reset_deadline
             }
             other => panic!("expected shell reset wait, got {other:?}"),
         };
-        assert_eq!(successor.attempt_id, predecessor.attempt_id + 1);
-        assert!(!predecessor.is_current(state.current_leases.get("T-NAME")));
+        assert_eq!(retained, predecessor);
+        assert!(predecessor.is_current(state.current_leases.get("T-NAME")));
+        assert!(state.signal_dir.join("pane-10.lease").is_file());
         assert_eq!(state.agent_slots[0].ticket_id.as_deref(), Some("T-NAME"));
-        assert_eq!(
-            state.agent_slots[0].attempt_lease.as_ref(),
-            Some(&successor)
-        );
+        assert_eq!(state.agent_slots[0].attempt_lease.as_ref(), Some(&retained));
         assert_eq!(
             state.threads["T-NAME"].attempt_lease.as_ref(),
-            Some(&successor)
+            Some(&retained)
         );
         assert_eq!(
             state.agent_slots.len(),
@@ -20809,6 +21432,86 @@ mod tests {
         assert_eq!(state.error_alerts, vec![("T-NAME".to_string(), 10)]);
     }
 
+    /// The reset window's authority contract, pinned on its own because it is
+    /// the one thing that changed: an attempt that was never observed to start
+    /// was never proved dead either, so it keeps its lease — and therefore its
+    /// `pane-10.lease` marker — for the length of the window.
+    ///
+    /// This is what makes the window announceable. `on-start.sh` byte-matches
+    /// the marker against the launching process's own immutable
+    /// `LISA_TICKET_ID`/`LISA_ATTEMPT_ID`; withdrawing it left a merely-slow
+    /// provider unable to announce itself at all, and the only remaining way out
+    /// of the window was a shell probe a resident TUI can run on the
+    /// scheduler's behalf. Retaining costs nothing an attacker can spend: the
+    /// only process that can match this identity is the one this launch line
+    /// started, because the env is fixed at exec and `AttemptLease::mint` is
+    /// strictly monotonic.
+    ///
+    /// The complementary post-relaunch contract — the same evidence is rejected
+    /// once the successor exists — is pinned by
+    /// `same_pane_replacement_requires_start_and_chat_ack_for_claude`.
+    #[test]
+    fn an_unproved_attempt_retains_authority_through_the_reset() {
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        state.config.assignment_ack_timeout_secs = 1;
+        std::fs::create_dir_all(&state.signal_dir).unwrap();
+        state.schedule_ready_tickets();
+        let launched = state.current_leases["T-NAME"].clone();
+        let first_deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                start_deadline: Some(deadline),
+                relaunches: 0,
+                ..
+            }) => deadline,
+            other => panic!("expected initial Starting, got {other:?}"),
+        };
+        assert!(state
+            .check_assignment_ack_timeouts_at(first_deadline)
+            .is_empty());
+
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::ResettingStartup { generation, .. })
+                if generation == launched.attempt_id
+        ));
+        assert_eq!(state.current_leases["T-NAME"], launched);
+        let marker: AttemptLease = serde_json::from_str(
+            &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker, launched, "the reset must not withdraw the marker");
+
+        // The retained attempt still holds authority, because it has not been
+        // shown to be dead.
+        std::fs::write(
+            state.signal_dir.join("pane-10.heartbeat"),
+            serde_json::to_string(&launched).unwrap(),
+        )
+        .unwrap();
+        state.check_heartbeat_signals();
+        assert!(state.agent_slots[0].last_activity_at.is_some());
+        assert!(state
+            .admit_artifact("T-NAME", Some(&launched), "review.md")
+            .is_ok());
+
+        // And its own `.started`, arriving late, ends the window with real
+        // evidence rather than a probe.
+        std::fs::write(
+            state.signal_dir.join("pane-10.started"),
+            serde_json::to_string(&launched).unwrap(),
+        )
+        .unwrap();
+        state.check_process_start_signals();
+        assert_eq!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::ReadyForAssignment {
+                generation: launched.attempt_id
+            })
+        );
+        assert_eq!(state.current_leases["T-NAME"], launched);
+        assert!(!state.seat_is_owned(10));
+    }
+
     #[test]
     fn same_pane_replacement_requires_start_and_chat_ack_for_claude() {
         // SessionStart-mode (Claude) same-pane startup replacement contract: a
@@ -20819,6 +21522,12 @@ mod tests {
         // (Codex) diverges here — its Starting deadline paces the first prompt
         // directly into Delivering instead of recovering; that path is covered by
         // `codex_startup_grace_paces_first_prompt_into_delivering`.
+        //
+        // The reset itself retains the launched attempt (see
+        // `an_unproved_attempt_retains_authority_through_the_reset`); the
+        // successor is minted by the shell proof, and from that moment the
+        // predecessor's evidence is rejected everywhere — which is what the
+        // assertions below pin.
         let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
         state.config.assignment_ack_timeout_secs = 1;
         state.schedule_ready_tickets();
@@ -20835,8 +21544,36 @@ mod tests {
         assert!(state
             .check_assignment_ack_timeouts_at(first_deadline)
             .is_empty());
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::ResettingStartup { generation, .. })
+                if generation == predecessor.attempt_id
+        ));
+        // Only the reset generation may prove a shell boundary.
+        assert!(!state.acknowledge_shell_ready(
+            10,
+            &AttemptLease {
+                ticket_id: "T-NAME".to_string(),
+                attempt_id: predecessor.attempt_id + 1,
+            },
+            first_deadline
+        ));
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::ResettingStartup { .. })
+        ));
+
+        std::fs::write(
+            state.signal_dir.join("pane-10.shell-ready"),
+            serde_json::to_string(&predecessor).unwrap(),
+        )
+        .unwrap();
+        state.check_shell_ready_signals();
         let successor = state.current_leases["T-NAME"].clone();
         assert_eq!(successor.attempt_id, predecessor.attempt_id + 1);
+
+        // From here the predecessor is retired: its liveness and its artifacts
+        // are both refused.
         let replacement_activity = state.agent_slots[0].last_activity_at;
         std::fs::write(
             state.signal_dir.join("pane-10.heartbeat"),
@@ -20848,19 +21585,6 @@ mod tests {
         assert!(state
             .admit_artifact("T-NAME", Some(&predecessor), "review.md")
             .is_err());
-        assert!(!state.acknowledge_shell_ready(10, &predecessor, first_deadline));
-        assert!(matches!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::ResettingStartup { generation, .. })
-                if generation == successor.attempt_id
-        ));
-
-        std::fs::write(
-            state.signal_dir.join("pane-10.shell-ready"),
-            serde_json::to_string(&successor).unwrap(),
-        )
-        .unwrap();
-        state.check_shell_ready_signals();
         let replacement_deadline = match state.seat_assignment(10) {
             Some(SeatAssignmentState::Starting {
                 generation,
@@ -24792,8 +25516,10 @@ owned\n\
 
         state.check_transition_timeouts();
 
-        // Exit uses only transition_started_at: recent pane activity is not an
-        // exemption once the grace deadline has elapsed.
+        // Exit still weighs only transition_started_at against the clocks:
+        // recent pane activity (`last_activity_at`) is not an exemption once the
+        // grace has elapsed. Only post-`/exit` provider residency defers it, and
+        // neither pane here recorded any.
         assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
         assert!(!state.agent_slots[0].has_session);
         assert_eq!(state.agent_slots[0].last_client, None);
@@ -24801,6 +25527,644 @@ owned\n\
         assert_eq!(
             state.agent_slots[1].transition_state,
             TransitionState::WaitingForExit
+        );
+    }
+
+    /// The field failure at the state layer. `/exit` goes into a Claude that has
+    /// not finished, the grace expires on the clock alone, and the launch line
+    /// is typed into a live TUI where it lands as a chat message. The departing
+    /// session's heartbeat carries the predecessor lease and is rejected as
+    /// authority — but it proves a process is in the pane, and that must hold
+    /// the launch back until the ceiling.
+    #[test]
+    fn test_resident_provider_evidence_holds_the_post_exit_launch_to_the_ceiling() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let mut state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(
+                now - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+            ),
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Claude),
+        });
+
+        let departing = AttemptLease::mint("T-DEPARTING".to_string(), None).unwrap();
+        fs::write(
+            signal_dir.join("pane-1.heartbeat"),
+            serde_json::to_string(&departing).unwrap(),
+        )
+        .unwrap();
+
+        state.check_heartbeat_signals();
+
+        // Ownership is untouched: the heartbeat was never admitted.
+        assert!(state.agent_slots[0].last_activity_at.is_none());
+        assert!(!signal_dir.join("pane-1.heartbeat").exists());
+        assert!(state.provider_is_resident(1));
+
+        state.check_transition_timeouts();
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit,
+            "a pane that proved a provider is resident must not be relaunched"
+        );
+        assert!(!state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message } if message.contains("still showed a live provider")
+        )));
+
+        // The escape hatch: past the ceiling the pane is freed anyway, with the
+        // one warning that explains a launch line landing in a live TUI.
+        state.agent_slots[0].transition_started_at =
+            Some(now - std::time::Duration::from_secs(AGENT_EXIT_CEILING_SECS + 1));
+        state.check_transition_timeouts();
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message } if message.contains("still showed a live provider")
+        )));
+    }
+
+    /// The hold decays. One trailing hook must not pin a pane for the whole
+    /// ceiling: the pane leaves a grace after its last gasp, exactly like a pane
+    /// that never emitted at all. Membership alone would make silence
+    /// indistinguishable from noise for 90 seconds.
+    #[test]
+    fn test_stale_residency_evidence_stops_holding_the_exit_after_one_grace() {
+        let now = std::time::SystemTime::now();
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(
+                now - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+            ),
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Claude),
+        });
+
+        // A hook that fired one second ago holds the pane.
+        state
+            .resident_providers
+            .insert(1, now - std::time::Duration::from_secs(1));
+        state.check_transition_timeouts();
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+
+        // The same hook, now a grace old, does not. The evidence expired; it did
+        // not become evidence of departure, but silence is all Lisa ever had.
+        state.resident_providers.insert(
+            1,
+            now - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+        );
+        state.check_transition_timeouts();
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(!state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message } if message.contains("still showed a live provider")
+        )));
+    }
+
+    /// The no-deadlock guarantee at the state layer. A provider that truly died
+    /// emits nothing, so the residency map stays empty and the pane frees itself
+    /// on the unchanged grace with no ceiling warning.
+    #[test]
+    fn test_quiet_pane_still_relaunches_on_the_ordinary_exit_grace() {
+        let now = std::time::SystemTime::now();
+        let mut state = State::default();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 1,
+            ticket_id: None,
+            attempt_lease: None,
+            has_session: true,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(
+                now - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+            ),
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Claude),
+        });
+
+        state.check_transition_timeouts();
+
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        assert!(!state.agent_slots[0].has_session);
+        assert!(!state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message } if message.contains("still showed a live provider")
+        )));
+    }
+
+    /// Every recorder leg in one table. `.stopped` is the trap: Claude's Stop
+    /// hook fires at the end of every assistant turn, not at teardown, so it is
+    /// residency and never departure. `.shell-ready` and `.error` assert the
+    /// opposite claim and must never record — the field transcript shows a live
+    /// TUI executing the readiness probe on the scheduler's behalf.
+    #[test]
+    fn test_only_live_process_hooks_record_residency_and_only_for_known_panes() {
+        use std::fs;
+
+        let lease = AttemptLease::mint("T-RESIDENCY".to_string(), None).unwrap();
+        let lease_body = serde_json::to_string(&lease).unwrap();
+        let claim_body = serde_json::to_string(&AssignmentClaim {
+            ticket_id: "T-RESIDENCY".to_string(),
+            attempt_id: lease.attempt_id,
+            nonce: 42,
+        })
+        .unwrap();
+        let stamp = "2026-01-01T00:00:00Z";
+
+        let cases: [(&str, &str, bool); 10] = [
+            ("pane-1.heartbeat", lease_body.as_str(), true),
+            ("pane-1.started", lease_body.as_str(), true),
+            ("pane-1.stopped", stamp, true),
+            ("pane-1.cleared", stamp, true),
+            ("pane-1.awaiting", stamp, true),
+            ("pane-1.ack", "{\"prompt\":\"claude --resume\"}", true),
+            ("pane-1.claim", claim_body.as_str(), true),
+            ("pane-1.shell-ready", lease_body.as_str(), false),
+            ("pane-1.error", "", false),
+            // Signal filenames are untrusted input. An id no seat owns must not
+            // create an entry, or the map would not be bounded by the pane count.
+            ("pane-99.heartbeat", lease_body.as_str(), false),
+        ];
+
+        for (filename, payload, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let signal_dir = dir.path().join("signals");
+            fs::create_dir_all(&signal_dir).unwrap();
+            fs::write(signal_dir.join(filename), payload).unwrap();
+
+            let mut state = State {
+                signal_dir: signal_dir.clone(),
+                ..State::default()
+            };
+            state.agent_slots.push(AgentSlot {
+                pane_id: 1,
+                ticket_id: None,
+                attempt_lease: None,
+                has_session: true,
+                transition_state: TransitionState::Idle,
+                transition_started_at: None,
+                cooldown_until: None,
+                last_activity_at: None,
+                last_client: Some(AgentClient::Claude),
+            });
+
+            state.check_heartbeat_signals();
+            state.check_awaiting_signals();
+            state.check_process_start_signals();
+            state.check_shell_ready_signals();
+            state.check_claim_signals();
+            state.check_codex_ack_signals();
+            state.check_transition_signals();
+            let _ = state.check_error_signals();
+
+            assert_eq!(
+                state.provider_is_resident(1),
+                expected,
+                "{filename} residency"
+            );
+            assert!(
+                state.resident_providers.keys().all(|pane| *pane == 1),
+                "{filename} recorded an unknown pane"
+            );
+        }
+    }
+
+    /// Residency widens readiness, never authority. Drive the two records a
+    /// still-live predecessor can actually produce against a seat that is
+    /// Starting on the successor's lease — a heartbeat copied verbatim from the
+    /// successor's `pane-1.lease` marker (`on-heartbeat.sh` does no identity
+    /// check), and a `.started` for the predecessor's own generation
+    /// (`on-start.sh` byte-matches its launch env, so this is the only
+    /// `.started` a predecessor can emit). Both must record residency and move
+    /// nothing else.
+    #[test]
+    fn test_recording_residency_never_confers_ownership() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, successor) = resident_pane_fixture(&signal_dir, "T-OWNERSHIP");
+        let predecessor = AttemptLease {
+            ticket_id: "T-OWNERSHIP".to_string(),
+            attempt_id: successor.attempt_id - 1,
+        };
+
+        let before = (
+            state.seat_assignments.clone(),
+            state.current_leases.clone(),
+            state.lease_high_water.clone(),
+            state.agent_slots[0].attempt_lease.clone(),
+        );
+
+        fs::write(
+            signal_dir.join("pane-1.heartbeat"),
+            serde_json::to_string(&successor).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            signal_dir.join("pane-1.started"),
+            serde_json::to_string(&predecessor).unwrap(),
+        )
+        .unwrap();
+        state.check_heartbeat_signals();
+        state.check_process_start_signals();
+
+        assert!(state.provider_is_resident(1));
+        assert!(!state.seat_is_owned(1));
+        assert_eq!(
+            (
+                state.seat_assignments.clone(),
+                state.current_leases.clone(),
+                state.lease_high_water.clone(),
+                state.agent_slots[0].attempt_lease.clone(),
+            ),
+            before,
+            "residency must not touch any lease, seat, or admission state"
+        );
+    }
+
+    /// Leg (ii). Startup was not observed and the pane proves a provider is
+    /// still in it: the launch line landed in a chat box. The old response was
+    /// Ctrl-C plus a `.shell-ready` probe, which can only be answered by the
+    /// live TUI it was trying to detect. Re-send the exit instead, and let the
+    /// residency-aware exit policy wait for the provider to actually leave.
+    #[test]
+    fn test_unobserved_startup_on_a_resident_pane_re_exits_instead_of_probing() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, lease) = resident_pane_fixture(&signal_dir, "T-STUCK");
+        state.write_pane_lease_marker(1, &lease).unwrap();
+
+        // A launch line typed into a live Claude is submitted as a chat prompt,
+        // and its UserPromptSubmit hook reports exactly that. The session then
+        // asks the human about it, which is the other residency leg and also
+        // the flag that silently drops pane writes.
+        fs::write(
+            signal_dir.join("pane-1.ack"),
+            "{\"prompt\":\"cd /repo && claude\"}",
+        )
+        .unwrap();
+        fs::write(signal_dir.join("pane-1.awaiting"), "2026-01-01T00:00:00Z").unwrap();
+        state.check_codex_ack_signals();
+        state.check_awaiting_signals();
+        assert!(state.provider_is_resident(1));
+        assert!(state.awaiting_human.contains(&1));
+
+        let now = std::time::SystemTime::now();
+        state.check_assignment_ack_timeouts_at(now);
+
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit,
+            "a resident pane is exited again, not interrupted"
+        );
+        assert!(!state.agent_slots[0].has_session);
+        assert!(!state.provider_is_resident(1));
+        assert!(
+            !state
+                .attempt_lifecycle
+                .iter()
+                .any(|event| matches!(event, AttemptLifecycleEvent::ShellInterrupted { .. })),
+            "the dead-end reset must not be entered against a live provider"
+        );
+        // A second launch line is about to be typed, so it must carry an
+        // identity of its own: two processes with byte-identical
+        // LISA_TICKET_ID/LISA_ATTEMPT_ID would be indistinguishable to every
+        // hook. The marker is left alone — `launch_after_exit` republishes it
+        // after the grace, which is the documented handoff discipline.
+        let successor = state.current_leases["T-STUCK"].clone();
+        assert_eq!(successor.attempt_id, lease.attempt_id + 1);
+        assert_eq!(
+            state.agent_slots[0].attempt_lease.as_ref(),
+            Some(&successor)
+        );
+        assert_eq!(state.lease_high_water.get("T-STUCK"), Some(&successor));
+        assert!(signal_dir.join("pane-1.lease").exists());
+        assert!(matches!(
+            state.seat_assignment(1),
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: None,
+                relaunches: MAX_SAME_PANE_STARTUP_RELAUNCHES,
+            }) if generation == successor.attempt_id
+        ));
+        assert!(state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Warning { message }
+                if message.contains("a provider is still resident")
+        )));
+        assert!(!state.awaiting_human.contains(&1));
+        assert!(
+            !state.activity_events().any(|event| matches!(
+                event,
+                ActivityEvent::Info { message } if message.contains("Suppressed injection")
+            )),
+            "the question flag must be cleared before the exit is typed, not after"
+        );
+
+        // Bounded: the budget is spent, so a second unobserved startup fences the
+        // pane and names the real diagnosis instead of retrying forever.
+        state.seat_assignments.insert(
+            1,
+            SeatAssignmentState::Starting {
+                generation: successor.attempt_id,
+                start_deadline: Some(now - std::time::Duration::from_secs(1)),
+                relaunches: MAX_SAME_PANE_STARTUP_RELAUNCHES,
+            },
+        );
+        state.agent_slots[0].transition_state = TransitionState::Idle;
+        state.record_provider_residency(1);
+        state.check_assignment_ack_timeouts_at(now);
+
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::Fenced
+        );
+        assert!(state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message }
+                if message.contains("did not leave the pane after a second exit")
+        )));
+    }
+
+    /// The retry's second launch line must not be able to impersonate the
+    /// first. Follow the whole loop — resident pane, re-exit, grace, relaunch —
+    /// and check that the marker, the assignment, and the exported
+    /// `LISA_ATTEMPT_ID` all name the successor, so two processes started by two
+    /// typed launch lines can never present byte-identical launch identity.
+    #[test]
+    fn the_relaunch_after_a_resident_exit_retry_carries_the_successor_identity() {
+        let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+        state.config.assignment_ack_timeout_secs = 1;
+        std::fs::create_dir_all(&state.signal_dir).unwrap();
+        state.schedule_ready_tickets();
+        let launched = state.current_leases["T-NAME"].clone();
+        let deadline = match state.seat_assignment(10) {
+            Some(SeatAssignmentState::Starting {
+                start_deadline: Some(deadline),
+                ..
+            }) => deadline,
+            other => panic!("expected Starting, got {other:?}"),
+        };
+
+        // The launch line landed in a live TUI and was read as chat.
+        std::fs::write(
+            state.signal_dir.join("pane-10.ack"),
+            "{\"prompt\":\"sh /work/.lisa-launch-10.sh\"}",
+        )
+        .unwrap();
+        state.check_codex_ack_signals();
+        state.check_assignment_ack_timeouts_at(deadline);
+
+        let successor = state.current_leases["T-NAME"].clone();
+        assert_eq!(successor.attempt_id, launched.attempt_id + 1);
+        assert_eq!(
+            state.agent_slots[0].transition_state,
+            TransitionState::WaitingForExit
+        );
+
+        // The provider finally leaves; the pane goes quiet and the grace elapses.
+        state.agent_slots[0].transition_started_at = Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(AGENT_EXIT_GRACE_SECS + 1),
+        );
+        state.check_transition_timeouts();
+
+        assert_eq!(state.agent_slots[0].transition_state, TransitionState::Idle);
+        let marker: AttemptLease = serde_json::from_str(
+            &std::fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker, successor);
+        assert_eq!(state.assignment_refs["T-NAME"].lease, successor);
+        let launch = std::fs::read_to_string(
+            state
+                .attempt_work_dir(&successor)
+                .join(".lisa-launch-10.sh"),
+        )
+        .unwrap();
+        assert!(
+            launch.contains(&format!("LISA_ATTEMPT_ID={}", successor.attempt_id)),
+            "the second launch line must export its own attempt identity: {launch}"
+        );
+        assert!(!launch.contains(&format!("LISA_ATTEMPT_ID={}", launched.attempt_id)));
+        // Budget spent: this relaunch gets no reset of its own.
+        assert!(matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::Starting {
+                generation,
+                start_deadline: Some(_),
+                relaunches: MAX_SAME_PANE_STARTUP_RELAUNCHES,
+            }) if generation == successor.attempt_id
+        ));
+    }
+
+    /// The other half of the same branch: the reset path is correct for a
+    /// genuinely dead pane and must stay reachable. No residency evidence, no
+    /// re-exit — the pane is interrupted and probed exactly as before.
+    #[test]
+    fn test_unobserved_startup_on_a_quiet_pane_still_enters_the_ordinary_reset() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, _lease) = resident_pane_fixture(&signal_dir, "T-DEAD");
+
+        state.check_assignment_ack_timeouts_at(std::time::SystemTime::now());
+
+        assert!(matches!(
+            state.seat_assignment(1),
+            Some(SeatAssignmentState::ResettingStartup { .. })
+        ));
+        assert!(state
+            .attempt_lifecycle
+            .iter()
+            .any(|event| matches!(event, AttemptLifecycleEvent::ShellInterrupted { .. })));
+    }
+
+    /// Residency evidence belongs to one occupancy of a pane and must not be
+    /// inherited by the next.
+    ///
+    /// The failure this pins was real and cost the whole slow-boot fix: a pane
+    /// whose previous session emitted a last hook kept that entry after the seat
+    /// was handed back, so the *next* ticket's merely-slow launch read a resident
+    /// provider that had died minutes earlier, took the re-exit branch, revoked
+    /// and re-minted an attempt no process would ever carry, and spent the seat's
+    /// one relaunch. Typing into a pane is what retires the evidence, so a pane
+    /// that has been written to since its last hook is quiet by definition.
+    #[test]
+    fn residency_evidence_does_not_outlive_the_occupancy_that_produced_it() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, lease) = resident_pane_fixture(&signal_dir, "T-INHERIT");
+        state.write_pane_lease_marker(1, &lease).unwrap();
+
+        // The previous occupant's parting hook.
+        fs::write(signal_dir.join("pane-1.ack"), "{\"prompt\":\"anything\"}").unwrap();
+        state.check_codex_ack_signals();
+        assert!(state.provider_is_resident(1));
+
+        // Lisa now types into the pane — the launch line for its next tenant.
+        // Whatever the pane said before that keystroke describes a provider that
+        // is no longer the question.
+        state.send_line_to_pane("sh /tmp/launch.sh", PaneId::Terminal(1));
+        assert!(
+            !state.provider_is_resident(1),
+            "typing into a pane retires the residency evidence it had"
+        );
+
+        // With no hook since, the merely-slow launch must reach the ordinary
+        // reset, not the re-exit branch meant for a live TUI.
+        state.check_assignment_ack_timeouts_at(std::time::SystemTime::now());
+
+        assert!(
+            matches!(
+                state.seat_assignment(1),
+                Some(SeatAssignmentState::ResettingStartup { .. })
+            ),
+            "a quiet pane takes the reset; stale evidence must not divert it"
+        );
+        assert_eq!(
+            state.current_leases.get("T-INHERIT"),
+            Some(&lease),
+            "the reset retains the attempt so a slow provider can still announce it"
+        );
+    }
+
+    /// A suppressed write types nothing, so it invalidates nothing.
+    ///
+    /// The retirement lives inside `send_line_to_pane`, after the guard that
+    /// drops writes into a pane blocked on AskUserQuestion. If it ran before the
+    /// guard, a dropped line would erase evidence about a provider that is very
+    /// much still there — the pane is blocked precisely because it is alive.
+    #[test]
+    fn a_dropped_write_retires_no_residency_evidence() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, _lease) = resident_pane_fixture(&signal_dir, "T-BLOCKED");
+
+        fs::write(signal_dir.join("pane-1.ack"), "{\"prompt\":\"anything\"}").unwrap();
+        state.check_codex_ack_signals();
+        state.awaiting_human.insert(1);
+
+        state.send_line_to_pane("this line is dropped", PaneId::Terminal(1));
+
+        assert!(
+            state.provider_is_resident(1),
+            "a write Lisa suppressed cannot be evidence that the pane moved on"
+        );
+    }
+
+    /// Inside the reset window a heartbeat proves residency and nothing else.
+    ///
+    /// The reset now retains `pane-<id>.lease` so a late provider can announce
+    /// itself, and the heartbeat hook — alone among the hooks — copies that
+    /// marker without comparing it to the calling process's own identity. So in
+    /// this window a heartbeat can carry the reset generation without having come
+    /// from the attempt that owns it. It may reset no clock and, above all, may
+    /// not clear the AskUserQuestion guard: doing so would let Lisa type over a
+    /// live question.
+    #[test]
+    fn a_heartbeat_inside_the_reset_window_moves_no_clock_and_lifts_no_guard() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signal_dir = dir.path().join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, lease) = resident_pane_fixture(&signal_dir, "T-RESET");
+        state.seat_assignments.insert(
+            1,
+            SeatAssignmentState::ResettingStartup {
+                generation: lease.attempt_id,
+                reset_deadline: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+            },
+        );
+        state.agent_slots[0].last_activity_at = None;
+        state.awaiting_human.insert(1);
+
+        fs::write(
+            signal_dir.join("pane-1.heartbeat"),
+            serde_json::to_string(&lease).unwrap(),
+        )
+        .unwrap();
+        state.check_heartbeat_signals();
+
+        assert!(
+            state.provider_is_resident(1),
+            "the heartbeat still proves a process is in the pane"
+        );
+        assert!(
+            state.awaiting_human.contains(&1),
+            "a heartbeat in the reset window must not lift the question guard"
+        );
+        assert!(
+            state.agent_slots[0].last_activity_at.is_none(),
+            "a heartbeat in the reset window must not reset the silence clock"
+        );
+    }
+
+    /// The from-reset admission drops the probe's Enter without sending a second
+    /// Ctrl-C.
+    ///
+    /// `interrupt_shell_input` is the obvious call and the wrong one: the reset
+    /// already sent a Ctrl-C on its way in, and a second one arriving a poll later
+    /// can land inside the provider's double-press exit window and kill the very
+    /// process being admitted. Structural, because the interrupt writes straight
+    /// to the pane and leaves no state a test can read.
+    #[test]
+    fn the_from_reset_admission_never_sends_a_second_interrupt() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split_once("fn acknowledge_process_start")
+            .expect("acknowledge_process_start is still here")
+            .1
+            .split_once("\n    /// Compute the finite acceptance deadline")
+            .expect("the function is still followed by assignment_ack_deadline")
+            .0;
+
+        assert!(
+            !body.contains("self.interrupt_shell_input("),
+            "admitting a live provider must not interrupt it; drain pending_enters instead"
+        );
+        assert!(
+            body.contains("self.pending_enters"),
+            "the probe's deferred Enter must still be dropped on the from-reset admission"
         );
     }
 
@@ -25708,19 +27072,17 @@ owned\n\
         )));
 
         // (b) the delivered value is the bare finish-up prompt for the composer.
-        let ticket_dir = Path::new("docs/active/tickets");
         let work_dir = Path::new("docs/active/work");
         let (adapter, _route) =
             resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa"));
         let follow_up = adapter.follow_up(&FollowUpContext {
-            ticket_dir,
             work_dir,
             ticket_id: "T-CDX-01",
             pane_id: 1,
         });
         assert_eq!(
             follow_up,
-            FollowUp::TypeIntoPane(finish_up_prompt(ticket_dir, work_dir, "T-CDX-01"))
+            FollowUp::TypeIntoPane(finish_up_prompt(work_dir, "T-CDX-01"))
         );
     }
 

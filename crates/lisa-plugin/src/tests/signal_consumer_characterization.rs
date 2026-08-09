@@ -212,13 +212,18 @@ fn process_start_requires_the_current_starting_lease_and_only_marks_ready() {
     assert!(!state.seat_is_owned(PANE_ID));
 }
 
+/// The reset no longer advances the generation, so the lease that proves shell
+/// readiness is the *retained* one — the same attempt the launch line carried,
+/// which is also the attempt still named by `pane-10.lease`. Anything else is
+/// rejected, and admitting the right one is the moment the successor is minted,
+/// so the relaunch runs under a generation of its own.
 #[test]
-fn shell_ready_requires_the_exact_reset_successor_before_relaunch() {
+fn shell_ready_requires_the_exact_reset_generation_then_mints_the_successor() {
     let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
     state.config.assignment_ack_timeout_secs = 1;
     fs::create_dir_all(&state.signal_dir).unwrap();
     state.schedule_ready_tickets();
-    let predecessor = state.current_leases["T-NAME"].clone();
+    let launched = state.current_leases["T-NAME"].clone();
     let deadline = match state.seat_assignment(10) {
         Some(SeatAssignmentState::Starting {
             start_deadline: Some(deadline),
@@ -227,25 +232,36 @@ fn shell_ready_requires_the_exact_reset_successor_before_relaunch() {
         other => panic!("expected Starting, got {other:?}"),
     };
     state.check_assignment_ack_timeouts_at(deadline);
-    let successor = state.current_leases["T-NAME"].clone();
+    assert_eq!(state.current_leases["T-NAME"], launched);
     assert!(matches!(
         state.seat_assignment(10),
         Some(SeatAssignmentState::ResettingStartup { generation, .. })
-            if generation == successor.attempt_id
+            if generation == launched.attempt_id
     ));
 
     let path = state.signal_dir.join("pane-10.shell-ready");
-    fs::write(&path, serde_json::to_string(&predecessor).unwrap()).unwrap();
+    let not_the_reset_generation = AttemptLease {
+        ticket_id: "T-NAME".to_string(),
+        attempt_id: launched.attempt_id + 1,
+    };
+    fs::write(
+        &path,
+        serde_json::to_string(&not_the_reset_generation).unwrap(),
+    )
+    .unwrap();
     state.check_shell_ready_signals();
     assert!(!path.exists());
     assert!(matches!(
         state.seat_assignment(10),
         Some(SeatAssignmentState::ResettingStartup { .. })
     ));
+    assert_eq!(state.current_leases["T-NAME"], launched);
 
-    fs::write(&path, serde_json::to_string(&successor).unwrap()).unwrap();
+    fs::write(&path, serde_json::to_string(&launched).unwrap()).unwrap();
     state.check_shell_ready_signals();
     assert!(!path.exists());
+    let successor = state.current_leases["T-NAME"].clone();
+    assert_eq!(successor.attempt_id, launched.attempt_id + 1);
     assert!(matches!(
         state.seat_assignment(10),
         Some(SeatAssignmentState::Starting {
@@ -254,6 +270,224 @@ fn shell_ready_requires_the_exact_reset_successor_before_relaunch() {
             ..
         }) if generation == successor.attempt_id
     ));
+
+    // The mismatch must be rejected in both directions. The case above uses a
+    // generation ABOVE the reset's, which no process could ever hold; this one
+    // uses the dangerous adversary that really does appear on disk — a
+    // `.shell-ready` left over from the attempt this reset just revoked.
+    //
+    // Measured, so the comment does not claim more than it pins: this rejection
+    // is layered, and loosening the seat-generation gate alone does not surface
+    // here, because `&slot_lease != candidate` refuses the predecessor on its
+    // own. That is the point worth keeping — a stale shell proof has to get past
+    // every gate, not just the one a refactor happens to touch.
+    state.seat_assignments.insert(
+        10,
+        SeatAssignmentState::ResettingStartup {
+            generation: successor.attempt_id,
+            reset_deadline: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+        },
+    );
+    fs::write(&path, serde_json::to_string(&launched).unwrap()).unwrap();
+    state.check_shell_ready_signals();
+    assert!(!path.exists());
+    assert!(
+        matches!(
+            state.seat_assignment(10),
+            Some(SeatAssignmentState::ResettingStartup { generation, .. })
+                if generation == successor.attempt_id
+        ),
+        "a revoked predecessor's shell proof must not end the reset"
+    );
+    assert_eq!(
+        state.current_leases["T-NAME"], successor,
+        "and it must not mint anything"
+    );
+}
+
+/// The reset window must stay announceable. The pane marker is retained at the
+/// same generation, so a provider that was merely slow — a large repository can
+/// take longer to reach an interactive prompt than the whole acknowledgment
+/// budget — still byte-matches its own launch identity, publishes `.started`,
+/// and ends the reset with real evidence instead of a forgeable shell probe.
+///
+/// It also has to end cleanly. The reset typed a probe into the pane and queued
+/// its Enter; nobody ran the probe, so admitting the seat here must cancel that
+/// Enter, or the assignment would be typed onto the probe residue and submitted
+/// as one mangled prompt.
+#[test]
+fn a_slow_startup_ends_the_reset_without_a_second_launch() {
+    let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+    state.config.assignment_ack_timeout_secs = 1;
+    fs::create_dir_all(&state.signal_dir).unwrap();
+    state.schedule_ready_tickets();
+    let launched = state.current_leases["T-NAME"].clone();
+    let deadline = match state.seat_assignment(10) {
+        Some(SeatAssignmentState::Starting {
+            start_deadline: Some(deadline),
+            ..
+        }) => deadline,
+        other => panic!("expected Starting, got {other:?}"),
+    };
+    state.check_assignment_ack_timeouts_at(deadline);
+
+    let marker: AttemptLease =
+        serde_json::from_str(&fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap())
+            .unwrap();
+    assert_eq!(marker, launched, "the reset must not withdraw the marker");
+    assert!(
+        !state.pending_enters.is_empty(),
+        "the reset probe queued a deferred Enter"
+    );
+
+    // Both the late process start and an answered probe arrive in one tick.
+    // `poll_tick` consumes starts first, so the real evidence wins.
+    fs::write(
+        state.signal_dir.join("pane-10.started"),
+        serde_json::to_string(&launched).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.signal_dir.join("pane-10.shell-ready"),
+        serde_json::to_string(&launched).unwrap(),
+    )
+    .unwrap();
+    state.check_process_start_signals();
+    assert_eq!(
+        state.seat_assignment(10),
+        Some(SeatAssignmentState::ReadyForAssignment {
+            generation: launched.attempt_id
+        })
+    );
+    assert!(
+        state
+            .pending_enters
+            .iter()
+            .all(|pending| pending.pane_id != PaneId::Terminal(10)),
+        "the unrun probe's Enter must not survive to submit the assignment on top of it"
+    );
+    state.check_shell_ready_signals();
+    assert_eq!(
+        state.seat_assignment(10),
+        Some(SeatAssignmentState::ReadyForAssignment {
+            generation: launched.attempt_id
+        }),
+        "a shell probe must not relaunch over a provider that proved it started"
+    );
+    assert_eq!(state.current_leases["T-NAME"], launched);
+    assert!(!state.seat_is_owned(10));
+    let launches = state
+        .activity_log
+        .iter()
+        .filter(|entry| matches!(entry.event, ActivityEvent::SessionLaunch { .. }))
+        .count();
+    assert_eq!(launches, 1, "no second provider was launched into the pane");
+
+    // And the assignment goes out with no republication step: the ref the
+    // original dispatch published names this same retained lease, so delivery
+    // accepts it as current.
+    assert_eq!(state.assignment_refs["T-NAME"].lease, launched);
+    state.deliver_ready_assignments();
+    assert!(matches!(
+        state.seat_assignment(10),
+        Some(SeatAssignmentState::Delivering { generation, .. })
+            if generation == launched.attempt_id
+    ));
+}
+
+/// The reset clears the pane's lifecycle signals, and the two it must not clear
+/// are `lease` and `started` — the marker because the window is unannounceable
+/// without it, and `started` because of this race: `poll_tick` consumes process
+/// starts near its top and evaluates acknowledgment deadlines near its bottom,
+/// so a provider that finishes booting in between publishes real evidence that
+/// the reset would otherwise delete unread. Everything else the pane wrote
+/// belongs to the launch being abandoned and goes.
+#[test]
+fn the_reset_keeps_start_evidence_that_arrived_while_it_was_deciding() {
+    let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+    state.config.assignment_ack_timeout_secs = 1;
+    fs::create_dir_all(&state.signal_dir).unwrap();
+    state.schedule_ready_tickets();
+    let launched = state.current_leases["T-NAME"].clone();
+    let deadline = match state.seat_assignment(10) {
+        Some(SeatAssignmentState::Starting {
+            start_deadline: Some(deadline),
+            ..
+        }) => deadline,
+        other => panic!("expected Starting, got {other:?}"),
+    };
+
+    // This tick's `check_process_start_signals` has already run. The provider
+    // reaches SessionStart now, a few milliseconds before the deadline check.
+    fs::write(
+        state.signal_dir.join("pane-10.started"),
+        serde_json::to_string(&launched).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.signal_dir.join("pane-10.stopped"),
+        "2026-01-01T00:00:00Z",
+    )
+    .unwrap();
+
+    state.check_assignment_ack_timeouts_at(deadline);
+
+    assert!(
+        state.signal_dir.join("pane-10.started").is_file(),
+        "the reset must not delete unread proof that the provider started"
+    );
+    assert!(
+        !state.signal_dir.join("pane-10.stopped").exists(),
+        "everything that belongs to the abandoned launch is still cleared"
+    );
+
+    // Next tick reads it, and it is admissible because the reset kept the
+    // generation it names.
+    state.check_process_start_signals();
+    assert_eq!(
+        state.seat_assignment(10),
+        Some(SeatAssignmentState::ReadyForAssignment {
+            generation: launched.attempt_id
+        })
+    );
+}
+
+/// An unwritable marker means an unannounceable window, which is exactly the
+/// bug. The reset must fence rather than proceed into it.
+#[test]
+fn a_reset_that_cannot_publish_its_marker_fences_the_pane() {
+    let (mut state, dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
+    state.config.assignment_ack_timeout_secs = 1;
+    fs::create_dir_all(&state.signal_dir).unwrap();
+    state.schedule_ready_tickets();
+    let deadline = match state.seat_assignment(10) {
+        Some(SeatAssignmentState::Starting {
+            start_deadline: Some(deadline),
+            ..
+        }) => deadline,
+        other => panic!("expected Starting, got {other:?}"),
+    };
+
+    // A signal directory that cannot exist: its parent is a regular file.
+    let blocker = dir.path().join("blocker");
+    fs::write(&blocker, b"not a directory").unwrap();
+    state.signal_dir = blocker.join("signals");
+
+    assert_eq!(
+        state.check_assignment_ack_timeouts_at(deadline),
+        vec![FailureTransitionOutcome::StartupRecoveryFailed {
+            pane_id: 10,
+            ticket_id: "T-NAME".to_string(),
+        }]
+    );
+    assert_eq!(
+        state.seat_assignment(10),
+        Some(SeatAssignmentState::StartupFailed)
+    );
+    assert_eq!(
+        state.agent_slots[0].transition_state,
+        TransitionState::Fenced
+    );
 }
 
 #[test]
