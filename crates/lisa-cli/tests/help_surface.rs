@@ -1,11 +1,11 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 19 of Lisa's own subcommands still resolve,
+//!   (a) all 20 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
 //!   (d) the five machinery-invoked plumbing commands stay outside the
-//!       operator listing and the four internal commands stay hidden out of it,
+//!       operator listing and the five internal commands stay hidden out of it,
 //!   (e) the about-line and operator help carry none of the banned category
 //!       jargon.
 //!
@@ -39,7 +39,13 @@ const PLUMBING_COMMANDS: [&str; 5] = [
 ];
 
 /// Hidden out of the primary listing (`hide = true`) but still resolvable.
-const HIDDEN_COMMANDS: [&str; 4] = ["check-disposition", "setup-guide", "hooks-guide", "version"];
+const HIDDEN_COMMANDS: [&str; 5] = [
+    "check-disposition",
+    "setup-guide",
+    "hooks-guide",
+    "json-guide",
+    "version",
+];
 
 const PLUMBING_HEADING: &str = "Plumbing commands (called by Lisa and agent hooks):";
 
@@ -105,9 +111,12 @@ Usage: lisa validate [OPTIONS]
 Options:
       --path <PATH>  Path to the project root (defaults to current directory) [default: .]
       --check-tools  Also check that zellij and claude are on PATH
+      --json         Print one JSON document instead of prose, for another program to read
   -h, --help         Print help
 
 Example: lisa validate --path ./my-project --check-tools
+
+For another program to read: lisa validate --json. What the fields mean and which ones you can rely on: lisa json-guide
 "#,
     },
     OperatorHelpSnapshot {
@@ -120,9 +129,12 @@ Options:
       --path <PATH>      Path to the project root (defaults to current directory) [default: .]
       --ticket <TICKET>  Show retained pre-ownership failures for this ticket
       --ledger <LEDGER>  Provenance ledger to read (defaults to .lisa/provenance.jsonl)
+      --json             Print one JSON document instead of prose, for another program to read
   -h, --help             Print help
 
 Example: lisa status --path ./my-project
+
+For another program to read: lisa status --json. What the fields mean and which ones you can rely on: lisa json-guide
 "#,
     },
     OperatorHelpSnapshot {
@@ -242,7 +254,7 @@ Example: lisa loop --path ./my-project --max-threads 3
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 19] = [
+const OWN_COMMANDS: [&str; 20] = [
     "init",
     "validate",
     "status",
@@ -261,6 +273,7 @@ const OWN_COMMANDS: [&str; 19] = [
     "complete-ticket",
     "setup-guide",
     "hooks-guide",
+    "json-guide",
     "version",
 ];
 
@@ -346,14 +359,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 19 own subcommands resolves — including the hidden
-/// four, which `--help` reaches even though they are absent from the listing.
+/// (a) Every one of the 20 own subcommands resolves — including the hidden
+/// five, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_nineteen_subcommands_resolve() {
+fn all_twenty_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        19,
-        "the pinned command set must be exactly 19"
+        20,
+        "the pinned command set must be exactly 20"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);

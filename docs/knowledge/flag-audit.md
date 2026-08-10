@@ -37,7 +37,9 @@ rows with the live command tree and config catalog.
 | `flag:lisa/init:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/init:--with-history` | Require project history | working default | Default is off, so bare init can choose history or a journal fallback from what the machine supports. | `unavailable_history_falls_back_unless_explicitly_required` | — |
 | `flag:lisa/validate:--check-tools` | Also check installed tools | working default | Default is off, so ordinary validation checks the project without requiring optional tool probes. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/validate:--json` | Print one JSON document for another program | working default | Default is off, so a person still reads the same sentences; the exit status means the same either way. | `validate_json_document_agrees_with_the_prose` | — |
 | `flag:lisa/validate:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/status:--json` | Print one JSON document for another program | working default | Default is off, so a person still reads the same sentences; the board is unchanged either way. | `status_json_document_agrees_with_the_prose` | — |
 | `flag:lisa/status:--ledger` | Read a different retained-failure ledger | working default | Without the flag, ticket detail reads `.lisa/provenance.jsonl`. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/status:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/status:--ticket` | Show one ticket's retained failures | working default | Without the flag, Lisa shows the whole board status. | `operator_help_matches_snapshots` | — |

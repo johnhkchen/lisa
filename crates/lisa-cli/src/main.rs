@@ -13,6 +13,8 @@ mod detect;
 mod doctor;
 mod hooks_guide;
 mod init;
+mod json_guide;
+mod json_output;
 mod legacy_context;
 mod loop_cmd;
 mod notes;
@@ -80,7 +82,7 @@ enum Commands {
     /// Check your tickets and project setup for problems before a run.
     #[command(
         display_order = 1,
-        after_help = "Example: lisa validate --path ./my-project --check-tools"
+        after_help = "Example: lisa validate --path ./my-project --check-tools\n\nFor another program to read: lisa validate --json. What the fields mean and which ones you can rely on: lisa json-guide"
     )]
     Validate {
         /// Path to the project root (defaults to current directory)
@@ -90,11 +92,15 @@ enum Commands {
         /// Also check that zellij and claude are on PATH
         #[arg(long)]
         check_tools: bool,
+
+        /// Print one JSON document instead of prose, for another program to read
+        #[arg(long)]
+        json: bool,
     },
     /// Show which tickets are ready to run and which are waiting, and why.
     #[command(
         display_order = 2,
-        after_help = "Example: lisa status --path ./my-project"
+        after_help = "Example: lisa status --path ./my-project\n\nFor another program to read: lisa status --json. What the fields mean and which ones you can rely on: lisa json-guide"
     )]
     Status {
         /// Path to the project root (defaults to current directory)
@@ -108,6 +114,10 @@ enum Commands {
         /// Provenance ledger to read (defaults to .lisa/provenance.jsonl)
         #[arg(long, requires = "ticket")]
         ledger: Option<PathBuf>,
+
+        /// Print one JSON document instead of prose, for another program to read
+        #[arg(long)]
+        json: bool,
     },
     /// Read or acknowledge updates from work that kept moving.
     #[command(
@@ -211,6 +221,9 @@ enum Commands {
     /// Print the guide for wiring up Claude Code hooks.
     #[command(hide = true)]
     HooksGuide,
+    /// Print the guide to Lisa's `--json` documents and their stability rules.
+    #[command(hide = true)]
+    JsonGuide,
     /// Check that the tools Lisa needs are installed.
     #[command(
         display_order = 6,
@@ -607,8 +620,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Validate { path, check_tools } => {
+        Commands::Validate {
+            path,
+            check_tools,
+            json,
+        } => {
             let path = resolve_path(&path);
+            if json {
+                std::process::exit(match lisa_project_gate(&path) {
+                    Ok(()) => init::run_validate_json(&path, check_tools),
+                    Err(message) => {
+                        json_output::emit("validate", json_output::Outcome::Failure(message))
+                    }
+                });
+            }
             require_lisa_project(&path);
             if let Err(e) = init::run_validate(&path, check_tools) {
                 eprintln!("Error: {}", e);
@@ -619,8 +644,24 @@ fn main() {
             path,
             ticket,
             ledger,
+            json,
         } => {
             let path = resolve_path(&path);
+            if json {
+                // `--ticket` answers a different question with a different
+                // shape. Saying so in a document beats letting a caller parse
+                // one shape and receive another.
+                let gate = match ticket {
+                    Some(_) => Err(JSON_WITH_TICKET.to_string()),
+                    None => lisa_project_gate(&path),
+                };
+                std::process::exit(match gate {
+                    Ok(()) => status::run_status_json(&path),
+                    Err(message) => {
+                        json_output::emit("status", json_output::Outcome::Failure(message))
+                    }
+                });
+            }
             let result = if let Some(ticket_id) = ticket {
                 let ledger_path = match ledger {
                     Some(ledger) if ledger.is_absolute() => ledger,
@@ -789,6 +830,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::JsonGuide => {
+            if let Err(e) = json_guide::run_json_guide() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Loop {
             path,
             max_threads,
@@ -835,8 +882,29 @@ fn resolve_path(path: &PathBuf) -> PathBuf {
     }
 }
 
+/// What `lisa status --json --ticket <id>` says instead of guessing.
+const JSON_WITH_TICKET: &str = "--json reports the whole board and is not available with --ticket. Run `lisa status --json` for the board, or `lisa status --ticket <id>` without --json for one ticket's retained failures.";
+
+/// The gate `require_lisa_project` enforces, as a sentence a caller can read.
+///
+/// Same predicate, one message: a JSON caller must not learn a different rule
+/// from the one the prose path applies.
+fn lisa_project_gate(root: &Path) -> Result<(), String> {
+    if is_lisa_project(root) {
+        return Ok(());
+    }
+    Err(format!(
+        "{SETUP_FIRST_LINE} — Lisa couldn't find .lisa.toml or docs/active/tickets/ in {}.",
+        root.display()
+    ))
+}
+
+fn is_lisa_project(root: &Path) -> bool {
+    root.join(".lisa.toml").exists() || root.join("docs/active/tickets").is_dir()
+}
+
 fn require_lisa_project(root: &Path) {
-    if root.join(".lisa.toml").exists() || root.join("docs/active/tickets").is_dir() {
+    if is_lisa_project(root) {
         return;
     }
 

@@ -124,6 +124,67 @@ fn file_len_or_zero(path: &Path) -> Result<u64, String> {
     }
 }
 
+/// The latest run's facts, assembled once and then either printed or
+/// serialised. Two renderers over one collection is what keeps the JSON body
+/// from disagreeing with the prose beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RunSummary {
+    pub(crate) tickets_total: usize,
+    pub(crate) tickets_completed: usize,
+    pub(crate) tickets_remaining: usize,
+    /// `None` when the latest run's outcomes could not be read at all, which
+    /// is a different fact from "no failures".
+    pub(crate) failed: Option<usize>,
+    pub(crate) timed_out: Option<usize>,
+    /// `None` when the installed hooks cannot track approval gates.
+    pub(crate) manual_interventions: Option<ManualInterventions>,
+    pub(crate) evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ManualInterventions {
+    pub(crate) questions: usize,
+    pub(crate) permissions: usize,
+}
+
+/// Assemble the latest run's facts. `None` when there is no board to summarise.
+pub(crate) fn collect_run_summary(
+    root: &Path,
+    tickets: &[Ticket],
+    work_dir: &Path,
+) -> Option<RunSummary> {
+    if tickets.is_empty() {
+        return None;
+    }
+
+    let total = tickets.len();
+    let completed = tickets
+        .iter()
+        .filter(|ticket| ticket.phase == Phase::Done)
+        .count();
+    let ticket_ids: HashSet<&str> = tickets.iter().map(|ticket| ticket.id.as_str()).collect();
+    let baseline = load_baseline(root);
+    let outcomes = baseline
+        .as_ref()
+        .and_then(|baseline| load_outcomes(root, baseline, &ticket_ids));
+    let interventions = baseline
+        .as_ref()
+        .and_then(|baseline| load_interventions(root, baseline));
+
+    Some(RunSummary {
+        tickets_total: total,
+        tickets_completed: completed,
+        tickets_remaining: total.saturating_sub(completed),
+        failed: outcomes.map(|counts| counts.failed),
+        timed_out: outcomes.map(|counts| counts.timed_out),
+        manual_interventions: interventions.map(|counts| ManualInterventions {
+            questions: counts.questions,
+            permissions: counts.permissions,
+        }),
+        evidence: existing_evidence_paths(root, work_dir, tickets),
+    })
+}
+
 /// Print the same summary used by `lisa status` and post-loop reporting.
 pub(crate) fn print_run_summary(
     root: &Path,
@@ -142,24 +203,33 @@ fn write_run_summary(
     work_dir: &Path,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    if tickets.is_empty() {
+    let Some(summary) = collect_run_summary(root, tickets, work_dir) else {
         return Ok(());
-    }
+    };
+    render_run_summary(&summary, output)
+}
 
-    let total = tickets.len();
-    let completed = tickets
-        .iter()
-        .filter(|ticket| ticket.phase == Phase::Done)
-        .count();
-    let remaining = total.saturating_sub(completed);
-    let ticket_ids: HashSet<&str> = tickets.iter().map(|ticket| ticket.id.as_str()).collect();
-    let baseline = load_baseline(root);
-    let outcomes = baseline
-        .as_ref()
-        .and_then(|baseline| load_outcomes(root, baseline, &ticket_ids));
-    let interventions = baseline
-        .as_ref()
-        .and_then(|baseline| load_interventions(root, baseline));
+pub(crate) fn render_run_summary(
+    summary: &RunSummary,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let RunSummary {
+        tickets_total: total,
+        tickets_completed: completed,
+        tickets_remaining: remaining,
+        failed,
+        timed_out,
+        manual_interventions: interventions,
+        evidence,
+    } = summary;
+    let (total, completed, remaining) = (*total, *completed, *remaining);
+    let outcomes = failed
+        .zip(*timed_out)
+        .map(|(failed, timed_out)| OutcomeCounts { failed, timed_out });
+    let interventions = interventions.map(|counts| InterventionCounts {
+        questions: counts.questions,
+        permissions: counts.permissions,
+    });
     let clean_outcomes = outcomes.is_some_and(|counts| counts == OutcomeCounts::default());
     let zero_interventions =
         interventions.is_some_and(|counts| counts == InterventionCounts::default());
@@ -213,7 +283,6 @@ fn write_run_summary(
         }
     }
 
-    let evidence = existing_evidence_paths(root, work_dir, tickets);
     if !evidence.is_empty() {
         writeln!(output, "Evidence: {}", evidence.join("; "))?;
     }

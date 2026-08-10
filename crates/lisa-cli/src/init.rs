@@ -1698,6 +1698,69 @@ pub fn run_validate(root: &Path, check_tools: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Run validation and print one JSON document. Returns the exit code.
+///
+/// The exit code is exactly what the human path returns: `0` when validation
+/// passed, `1` when it found errors. That code is what a caller already treats
+/// as authoritative for "could a run start here", so the body is an addition to
+/// it and never a replacement. Finding problems is an *answer*, not a failure
+/// to answer — the problems ride in the body where a consumer can read them.
+pub fn run_validate_json(root: &Path, check_tools: bool) -> i32 {
+    let result = validate(root, check_tools);
+    let resolved = match config::load_config(root) {
+        Ok(validation) => config::resolve_config(&validation.config, None, None),
+        Err(_) => config::ResolvedConfig::default(),
+    };
+    let exit_code = i32::from(result.has_errors());
+    crate::json_output::emit(
+        "validate",
+        crate::json_output::Outcome::verdict(validate_payload(&result, &resolved), exit_code),
+    )
+}
+
+fn validate_payload(
+    result: &ValidationResult,
+    resolved: &config::ResolvedConfig,
+) -> serde_json::Value {
+    let problems: Vec<crate::json_output::ProblemView> = result
+        .diagnostics
+        .iter()
+        .map(|diagnostic| crate::json_output::ProblemView {
+            path: diagnostic.path.clone(),
+            category: diagnostic.category.to_string(),
+            severity: match diagnostic.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+            },
+            message: diagnostic.message.clone(),
+        })
+        .collect();
+    let warning_count = problems.len() - result.error_count();
+
+    let mut phase_timeouts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    phase_timeouts.extend(
+        resolved
+            .phase_timeouts
+            .iter()
+            .map(|(phase, seconds)| (phase.clone(), *seconds)),
+    );
+
+    serde_json::json!({
+        "verdict": if result.has_errors() { "failed" } else { "passed" },
+        "ticket_count": result.ticket_count,
+        "ready_count": result.ready_count,
+        "error_count": result.error_count(),
+        "warning_count": warning_count,
+        "problems": problems,
+        "config": crate::json_output::ConfigView {
+            max_threads: resolved.max_threads,
+            session_timeout_secs: resolved.session_timeout_secs,
+            phase_timeouts,
+        },
+    })
+}
+
 /// Print structured validation diagnostics and return appropriate Result.
 fn print_diagnostics(result: &ValidationResult) -> Result<(), String> {
     // Print errors first, then warnings

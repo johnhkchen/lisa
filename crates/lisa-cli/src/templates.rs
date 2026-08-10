@@ -26,6 +26,11 @@ pub(crate) const LEGACY_WORKFLOWS: &[&str] = &[
 /// The hooks setup guide, embedded at compile time. Printed by `lisa hooks-guide`.
 pub const HOOKS_GUIDE: &str = include_str!("../data/hooks-guide.md");
 
+/// The `--json` document guide, embedded at compile time. Printed by
+/// `lisa json-guide`. The same guide-level treatment `HOOKS_GUIDE` gives the
+/// signal contract, for the contract a second reader builds against.
+pub const JSON_GUIDE: &str = include_str!("../data/json-guide.md");
+
 /// The compiled WASM plugin, embedded at compile time via build.rs
 pub const PLUGIN_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lisa.wasm"));
 

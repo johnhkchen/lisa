@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use crate::config;
+use crate::json_output::{BoardCounts, ConfigView};
 use lisa_core::completion::CompletionSeal;
-use lisa_core::dag::{CycleDetectionResult, Dag, DagError};
+use lisa_core::dag::{CycleDetectionResult, Dag, DagError, DagStats};
 use lisa_core::disposition::RemedyOwner;
 use lisa_core::notes::{collect_notes, QueuedNote};
 use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
@@ -10,7 +11,9 @@ use lisa_core::provenance::{
     correct_usage, latest_world_rechecks, usage_gap, ProvenanceLedgerRecord,
     WorldRecheckObservation,
 };
-use std::collections::HashMap;
+use lisa_core::types::{AttemptLease, Ticket};
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
 
 /// How many recorded non-passes make a world remedy worth naming as stuck.
 ///
@@ -34,63 +37,102 @@ fn group_thousands(value: u64) -> String {
     out
 }
 
-/// Render the "Token usage" block from the **corrected view** — per-ticket totals
+/// Measured token usage per ticket, from the **corrected view** — totals
 /// layered from append-only usage corrections, never the raw first-write row.
 /// A completed ticket whose capture never joined stays a visible, counted gap
 /// rather than a fabricated zero (T-051-03-01).
-fn token_usage_lines(records: &[ProvenanceLedgerRecord]) -> Vec<String> {
-    let view = correct_usage(records);
-    let gap = usage_gap(records);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TokenUsageView {
+    /// One entry per ticket whose capture joined, in ticket-id order.
+    tickets: Vec<TicketUsageView>,
+    tickets_joined: usize,
+    tokens_in: u64,
+    tokens_out: u64,
+    /// Completed tickets whose usage capture is pending or never arrived.
+    not_yet_joined: Vec<String>,
+}
 
-    let mut lines = vec!["Token usage".to_string()];
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TicketUsageView {
+    ticket_id: String,
+    tokens_in: u64,
+    tokens_out: u64,
+}
 
-    let mut joined = 0usize;
-    let mut total_in = 0u64;
-    let mut total_out = 0u64;
-    for (ticket_id, usage) in &view {
-        if let (Some(tokens_in), Some(tokens_out)) = (usage.tokens_in, usage.tokens_out) {
-            joined += 1;
-            total_in = total_in.saturating_add(tokens_in);
-            total_out = total_out.saturating_add(tokens_out);
-            lines.push(format!(
-                "  {:<12}  {} in / {} out",
-                ticket_id,
-                group_thousands(tokens_in),
-                group_thousands(tokens_out),
-            ));
+fn token_usage_view(records: &[ProvenanceLedgerRecord]) -> TokenUsageView {
+    let corrected = correct_usage(records);
+    let mut tickets = Vec::new();
+    let mut tokens_in = 0u64;
+    let mut tokens_out = 0u64;
+    for (ticket_id, usage) in &corrected {
+        if let (Some(ticket_in), Some(ticket_out)) = (usage.tokens_in, usage.tokens_out) {
+            tokens_in = tokens_in.saturating_add(ticket_in);
+            tokens_out = tokens_out.saturating_add(ticket_out);
+            tickets.push(TicketUsageView {
+                ticket_id: ticket_id.clone(),
+                tokens_in: ticket_in,
+                tokens_out: ticket_out,
+            });
         }
     }
+    TokenUsageView {
+        tickets_joined: tickets.len(),
+        tickets,
+        tokens_in,
+        tokens_out,
+        not_yet_joined: usage_gap(records),
+    }
+}
 
-    if joined == 0 {
+/// Render the "Token usage" block from the same view `--json` serialises, so
+/// the two cannot say different things about the same ledger.
+fn token_usage_lines(records: &[ProvenanceLedgerRecord]) -> Vec<String> {
+    let view = token_usage_view(records);
+
+    let mut lines = vec!["Token usage".to_string()];
+    for ticket in &view.tickets {
+        lines.push(format!(
+            "  {:<12}  {} in / {} out",
+            ticket.ticket_id,
+            group_thousands(ticket.tokens_in),
+            group_thousands(ticket.tokens_out),
+        ));
+    }
+
+    if view.tickets_joined == 0 {
         lines.push("  Nothing measured yet.".to_string());
     } else {
         lines.push(format!(
             "  Joined {} ticket{}: {} in / {} out",
-            joined,
-            if joined == 1 { "" } else { "s" },
-            group_thousands(total_in),
-            group_thousands(total_out),
+            view.tickets_joined,
+            if view.tickets_joined == 1 { "" } else { "s" },
+            group_thousands(view.tokens_in),
+            group_thousands(view.tokens_out),
         ));
     }
 
-    if !gap.is_empty() {
+    let gap = view.not_yet_joined.len();
+    if gap > 0 {
         lines.push(format!(
             "  Not yet joined: {} completed ticket{} — usage capture pending or never arrived.",
-            gap.len(),
-            if gap.len() == 1 { "" } else { "s" },
+            gap,
+            if gap == 1 { "" } else { "s" },
         ));
     }
 
     lines
 }
 
-fn print_token_usage(ledger_path: &Path) {
-    let records: Vec<ProvenanceLedgerRecord> = std::fs::read_to_string(ledger_path)
+fn read_ledger(ledger_path: &Path) -> Vec<ProvenanceLedgerRecord> {
+    std::fs::read_to_string(ledger_path)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    for line in token_usage_lines(&records) {
+        .collect()
+}
+
+fn print_token_usage(records: &[ProvenanceLedgerRecord]) {
+    for line in token_usage_lines(records) {
         println!("{line}");
     }
     println!();
@@ -218,8 +260,122 @@ fn format_config_summary(resolved: &config::ResolvedConfig, seal: CompletionSeal
     output
 }
 
-/// Run the status command: scan tickets, build DAG, print scheduling state.
-pub fn run_status(root: &Path) -> Result<(), String> {
+/// One seat the scheduler placed an attempt into.
+///
+/// Read from `.lisa/signals/pane-<id>.lease`, which the plugin publishes
+/// atomically for each launch and is the scheduler's own record of the
+/// placement — not a re-derivation from the ledger. The marker is deliberately
+/// *not* revoked when a seat is released, so an entry names the attempt the
+/// scheduler most recently placed in that pane. `ticket_phase` is that ticket's
+/// phase on the board right now, which is how a consumer tells a running seat
+/// from a finished one without re-deriving residency. `lisa json-guide` states
+/// this in the same words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SeatAttempt {
+    pane_id: u32,
+    ticket_id: String,
+    attempt_id: u64,
+    /// `None` when the lease names a ticket that is no longer on the board.
+    ticket_phase: Option<String>,
+    /// Whether a later attempt for the same ticket holds another seat.
+    ///
+    /// `AttemptLease::mint` is strictly monotonic per ticket, so between two
+    /// markers naming one ticket the lower attempt is definitively the older
+    /// one. That is a fact about the markers themselves, which is why it can be
+    /// stated here without reconstructing residency from the ledgers.
+    superseded: bool,
+}
+
+/// Read every pane lease marker the scheduler has published, in pane order.
+///
+/// A marker that cannot be read or parsed is skipped rather than reported: a
+/// half-written file is the scheduler's business, and this reader must never
+/// turn one into a failure for a consumer asking what is running.
+fn read_seat_attempts(signal_dir: &Path, tickets: &[Ticket]) -> Vec<SeatAttempt> {
+    let phases: HashMap<&str, String> = tickets
+        .iter()
+        .map(|ticket| (ticket.id.as_str(), ticket.phase.to_string()))
+        .collect();
+    let Ok(entries) = std::fs::read_dir(signal_dir) else {
+        return Vec::new();
+    };
+
+    let mut attempts = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("lease") {
+            continue;
+        }
+        let Some(pane_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.strip_prefix("pane-"))
+            .and_then(|pane| pane.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(lease) = serde_json::from_str::<AttemptLease>(&body) else {
+            continue;
+        };
+        attempts.push(SeatAttempt {
+            pane_id,
+            ticket_phase: phases.get(lease.ticket_id.as_str()).cloned(),
+            ticket_id: lease.ticket_id,
+            attempt_id: lease.attempt_id,
+            superseded: false,
+        });
+    }
+
+    let newest: HashMap<String, u64> =
+        attempts.iter().fold(HashMap::new(), |mut newest, attempt| {
+            let seen = newest.entry(attempt.ticket_id.clone()).or_default();
+            *seen = (*seen).max(attempt.attempt_id);
+            newest
+        });
+    for attempt in &mut attempts {
+        attempt.superseded = newest
+            .get(&attempt.ticket_id)
+            .is_some_and(|newest| *newest > attempt.attempt_id);
+    }
+
+    attempts.sort_by_key(|attempt| attempt.pane_id);
+    attempts
+}
+
+/// Everything `lisa status` computes, assembled once.
+///
+/// The prose and the JSON document are two renderings of this one value, which
+/// is the only way to keep them from disagreeing.
+struct StatusData {
+    ticket_dir_rel: String,
+    resolved: config::ResolvedConfig,
+    completion_seal: CompletionSeal,
+    parked_remedies: Vec<ParkedRemedy>,
+    rechecks: HashMap<String, WorldRecheckObservation>,
+    notes: Vec<QueuedNote>,
+    tickets: Vec<Ticket>,
+    ledger: Vec<ProvenanceLedgerRecord>,
+    attempts: Vec<SeatAttempt>,
+    /// `None` when the ticket directory holds no tickets: there is no board to
+    /// describe, which is a fact rather than a failure.
+    board: Option<StatusBoard>,
+    run_summary: Option<crate::run_summary::RunSummary>,
+}
+
+/// The dependency structure `status` prints, computed once.
+struct StatusBoard {
+    dag: Dag,
+    stats: DagStats,
+    waves: Vec<Vec<String>>,
+    /// Sorted, exactly as the "Ready to schedule" line lists them.
+    ready: Vec<String>,
+}
+
+/// Scan tickets, build the DAG, and gather everything status reports.
+fn collect_status(root: &Path) -> Result<StatusData, String> {
     // Load config to get ticket directory and scheduling settings
     let resolved = match config::load_config(root) {
         Ok(validation) => config::resolve_config(&validation.config, None, None),
@@ -245,63 +401,108 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     let ledger_path = root.join(".lisa/provenance.jsonl");
     let parked_remedies =
         collect_parked_remedies(tickets.iter(), &root.join(&work_dir_rel), &ledger_path);
-    print_waiting_on_you(&parked_remedies, &latest_world_rechecks(&ledger_path));
+    let rechecks = latest_world_rechecks(&ledger_path);
     let notes = collect_notes(
         &root.join(".lisa/completion-journal.jsonl"),
         &root.join(".lisa/provenance.jsonl"),
     )?;
-    print_status_notes(&notes);
+    let attempts = read_seat_attempts(&root.join(".lisa/signals"), &tickets);
 
-    if tickets.is_empty() {
-        println!("No tickets found in {}", ticket_dir_rel);
+    let board = if tickets.is_empty() {
+        None
+    } else {
+        // Build DAG
+        let dag = Dag::from_tickets(tickets.clone()).map_err(|e| match e {
+            DagError::MissingDependency {
+                ticket_id,
+                missing_dep,
+            } => format!(
+                "Ticket {} depends on {} which does not exist",
+                ticket_id, missing_dep
+            ),
+            DagError::CycleDetected(nodes) => {
+                format!("Cycle detected involving: {}", nodes.join(", "))
+            }
+        })?;
+
+        // Check for cycles
+        match dag.detect_cycles() {
+            CycleDetectionResult::NoCycle => {}
+            CycleDetectionResult::Cycle(nodes) => {
+                return Err(format!("Cycle detected involving: {}", nodes.join(", ")));
+            }
+        }
+
+        let stats = dag.stats();
+        let waves = dag
+            .execution_waves()
+            .map_err(|_| "Failed to compute execution waves".to_string())?;
+        let mut ready = dag.get_ready_tickets();
+        ready.sort();
+
+        Some(StatusBoard {
+            dag,
+            stats,
+            waves,
+            ready,
+        })
+    };
+
+    let run_summary =
+        crate::run_summary::collect_run_summary(root, &tickets, Path::new(&work_dir_rel));
+
+    Ok(StatusData {
+        ticket_dir_rel,
+        resolved,
+        completion_seal,
+        parked_remedies,
+        rechecks,
+        notes,
+        tickets,
+        ledger: read_ledger(&ledger_path),
+        attempts,
+        board,
+        run_summary,
+    })
+}
+
+/// Print the board for a person. Unchanged by `--json` existing.
+fn print_status(data: &StatusData) -> Result<(), String> {
+    print_waiting_on_you(&data.parked_remedies, &data.rechecks);
+    print_status_notes(&data.notes);
+
+    let Some(board) = &data.board else {
+        println!("No tickets found in {}", data.ticket_dir_rel);
         return Ok(());
-    }
-
-    // Build DAG
-    let dag = Dag::from_tickets(tickets.clone()).map_err(|e| match e {
-        DagError::MissingDependency {
-            ticket_id,
-            missing_dep,
-        } => format!(
-            "Ticket {} depends on {} which does not exist",
-            ticket_id, missing_dep
-        ),
-        DagError::CycleDetected(nodes) => {
-            format!("Cycle detected involving: {}", nodes.join(", "))
-        }
-    })?;
-
-    // Check for cycles
-    match dag.detect_cycles() {
-        CycleDetectionResult::NoCycle => {}
-        CycleDetectionResult::Cycle(nodes) => {
-            return Err(format!("Cycle detected involving: {}", nodes.join(", ")));
-        }
-    }
+    };
 
     // Print summary header
-    let stats = dag.stats();
     println!(
         "DAG: {} tickets, {} edges, no cycles",
-        dag.len(),
-        dag.edge_count()
+        board.dag.len(),
+        board.dag.edge_count()
     );
-    println!("Critical path: {} tickets", stats.critical_path_length);
+    println!(
+        "Critical path: {} tickets",
+        board.stats.critical_path_length
+    );
     println!(
         "Status: {} done, {} in progress, {} ready, {} blocked",
-        stats.done_tickets, stats.in_progress_tickets, stats.ready_tickets, stats.blocked_tickets
+        board.stats.done_tickets,
+        board.stats.in_progress_tickets,
+        board.stats.ready_tickets,
+        board.stats.blocked_tickets
     );
-    print!("{}", format_config_summary(&resolved, completion_seal));
+    print!(
+        "{}",
+        format_config_summary(&data.resolved, data.completion_seal)
+    );
     println!();
 
-    print_token_usage(&root.join(".lisa/provenance.jsonl"));
+    print_token_usage(&data.ledger);
 
     // Print execution waves
-    let waves = dag
-        .execution_waves()
-        .map_err(|_| "Failed to compute execution waves".to_string())?;
-
-    for (i, wave) in waves.iter().enumerate() {
+    for (i, wave) in board.waves.iter().enumerate() {
         let label = if i == 0 {
             "no dependencies".to_string()
         } else {
@@ -310,24 +511,20 @@ pub fn run_status(root: &Path) -> Result<(), String> {
         println!("Wave {} ({}):", i, label);
 
         for id in wave {
-            if let Some(ticket) = dag.get_ticket(id) {
-                let deps = dag.get_dependencies(id);
-                let blocks = dag.get_blocked_by(id);
+            if let Some(ticket) = board.dag.get_ticket(id) {
+                let deps = sorted_ids(board.dag.get_dependencies(id));
+                let blocks = sorted_ids(board.dag.get_blocked_by(id));
 
                 let deps_str = if deps.is_empty() {
                     String::new()
                 } else {
-                    let mut deps_sorted: Vec<_> = deps.into_iter().collect();
-                    deps_sorted.sort();
-                    format!("  deps: {}", deps_sorted.join(", "))
+                    format!("  deps: {}", deps.join(", "))
                 };
 
                 let blocks_str = if blocks.is_empty() {
                     String::new()
                 } else {
-                    let mut blocks_sorted: Vec<_> = blocks.into_iter().collect();
-                    blocks_sorted.sort();
-                    format!("  blocks: {}", blocks_sorted.join(", "))
+                    format!("  blocks: {}", blocks.join(", "))
                 };
 
                 println!(
@@ -340,18 +537,223 @@ pub fn run_status(root: &Path) -> Result<(), String> {
     }
 
     // Print ready-to-schedule summary
-    let ready = dag.get_ready_tickets();
-    if ready.is_empty() {
+    if board.ready.is_empty() {
         println!("No tickets ready to schedule.");
     } else {
-        let mut ready_sorted = ready;
-        ready_sorted.sort();
-        println!("Ready to schedule: {}", ready_sorted.join(", "));
+        println!("Ready to schedule: {}", board.ready.join(", "));
     }
 
-    crate::run_summary::print_run_summary(root, &tickets, Path::new(&work_dir_rel))?;
+    if let Some(summary) = &data.run_summary {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        crate::run_summary::render_run_summary(summary, &mut output)
+            .map_err(|error| format!("Failed to print run summary: {error}"))?;
+    }
 
     Ok(())
+}
+
+fn sorted_ids(ids: std::collections::HashSet<String>) -> Vec<String> {
+    let mut sorted: Vec<String> = ids.into_iter().collect();
+    sorted.sort();
+    sorted
+}
+
+/// Run the status command: scan tickets, build DAG, print scheduling state.
+pub fn run_status(root: &Path) -> Result<(), String> {
+    print_status(&collect_status(root)?)
+}
+
+/// Run the status command and print one JSON document. Returns the exit code.
+pub fn run_status_json(root: &Path) -> i32 {
+    crate::json_output::emit_result(
+        "status",
+        collect_status(root).map(|data| status_payload(&data)),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The JSON body. Every field below is stated in `lisa json-guide`; adding one
+// here without adding it there leaves a shape nobody can find.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct TicketView {
+    id: String,
+    title: String,
+    /// The same spelling the prose prints, e.g. `in_progress`.
+    status: String,
+    phase: String,
+    depends_on: Vec<String>,
+    blocks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WaveView {
+    index: usize,
+    /// The wave this one waits on, or `null` for the wave with no dependencies.
+    depends_on_wave: Option<usize>,
+    ticket_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NoteView {
+    ticket_id: String,
+    attempt_id: String,
+    generation: u64,
+    summary: String,
+    criterion_quote: String,
+    evidence_citation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WaitingView {
+    ticket_id: String,
+    remedy_owner: RemedyOwner,
+    ask: String,
+    reason: String,
+    steps: Vec<String>,
+    check: Option<String>,
+    check_timeout_secs: Option<u64>,
+    origin: lisa_core::disposition::DispositionOrigin,
+    proposal: Option<ProposalView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProposalView {
+    summary: String,
+    recommendation: String,
+}
+
+fn status_payload(data: &StatusData) -> serde_json::Value {
+    let (counts, critical_path_length, edge_count) = match &data.board {
+        Some(board) => (
+            BoardCounts {
+                total: board.stats.total_tickets,
+                done: board.stats.done_tickets,
+                in_progress: board.stats.in_progress_tickets,
+                ready: board.stats.ready_tickets,
+                blocked: board.stats.blocked_tickets,
+            },
+            board.stats.critical_path_length,
+            board.dag.edge_count(),
+        ),
+        None => (
+            BoardCounts {
+                total: 0,
+                done: 0,
+                in_progress: 0,
+                ready: 0,
+                blocked: 0,
+            },
+            0,
+            0,
+        ),
+    };
+
+    let tickets: Vec<TicketView> = data
+        .tickets
+        .iter()
+        .map(|ticket| TicketView {
+            id: ticket.id.clone(),
+            title: ticket.title.clone(),
+            status: ticket.status.to_string(),
+            phase: ticket.phase.to_string(),
+            depends_on: match &data.board {
+                Some(board) => sorted_ids(board.dag.get_dependencies(&ticket.id)),
+                None => {
+                    let mut deps = ticket.depends_on.clone();
+                    deps.sort();
+                    deps
+                }
+            },
+            blocks: match &data.board {
+                Some(board) => sorted_ids(board.dag.get_blocked_by(&ticket.id)),
+                None => Vec::new(),
+            },
+        })
+        .collect();
+
+    let waves: Vec<WaveView> = data
+        .board
+        .as_ref()
+        .map(|board| {
+            board
+                .waves
+                .iter()
+                .enumerate()
+                .map(|(index, wave)| WaveView {
+                    index,
+                    depends_on_wave: index.checked_sub(1),
+                    ticket_ids: wave.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let notes: Vec<NoteView> = data
+        .notes
+        .iter()
+        .map(|note| NoteView {
+            ticket_id: note.key.ticket_id.clone(),
+            attempt_id: note.key.attempt_id.clone(),
+            generation: note.key.generation,
+            summary: note.note.summary().to_string(),
+            criterion_quote: note.note.criterion_quote().to_string(),
+            evidence_citation: note.note.evidence_citation().to_string(),
+        })
+        .collect();
+
+    let waiting_on_you: Vec<WaitingView> = data
+        .parked_remedies
+        .iter()
+        .map(|remedy| WaitingView {
+            ticket_id: remedy.ticket_id.clone(),
+            remedy_owner: remedy.remedy_owner,
+            ask: remedy.ask.clone(),
+            reason: remedy.reason.clone(),
+            steps: remedy.steps.clone(),
+            check: remedy.check.clone(),
+            check_timeout_secs: remedy.check_timeout_secs,
+            origin: remedy.origin,
+            proposal: remedy.proposal.as_ref().map(|proposal| ProposalView {
+                summary: proposal.summary.clone(),
+                recommendation: proposal.recommendation.clone(),
+            }),
+        })
+        .collect();
+
+    let mut phase_timeouts: BTreeMap<String, u64> = BTreeMap::new();
+    phase_timeouts.extend(
+        data.resolved
+            .phase_timeouts
+            .iter()
+            .map(|(phase, seconds)| (phase.clone(), *seconds)),
+    );
+
+    serde_json::json!({
+        "ticket_dir": data.ticket_dir_rel,
+        "completion_seal": match data.completion_seal {
+            CompletionSeal::Commit => "commit",
+            CompletionSeal::Journal => "journal",
+        },
+        "counts": counts,
+        "critical_path_length": critical_path_length,
+        "edge_count": edge_count,
+        "tickets": tickets,
+        "waves": waves,
+        "ready": data.board.as_ref().map(|board| board.ready.clone()).unwrap_or_default(),
+        "notes": notes,
+        "waiting_on_you": waiting_on_you,
+        "attempts": data.attempts,
+        "token_usage": token_usage_view(&data.ledger),
+        "run_summary": data.run_summary,
+        "config": ConfigView {
+            max_threads: data.resolved.max_threads,
+            session_timeout_secs: data.resolved.session_timeout_secs,
+            phase_timeouts,
+        },
+    })
 }
 
 #[cfg(test)]
