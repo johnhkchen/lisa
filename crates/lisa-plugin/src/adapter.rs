@@ -60,6 +60,13 @@ pub(crate) struct SpawnContext<'a> {
     /// contract that made every assignment name a file that does not exist:
     /// the scan fails silently, so the rename is the compile-time guard.
     pub ticket_scan_dir: &'a Path,
+    /// Absolute host path of the project this pane was leased from, exported to
+    /// the launched process as `LISA_PROJECT`. Lifecycle hooks write their
+    /// signals here rather than into their own working directory, which is a
+    /// different place the moment an agent steps into another repository
+    /// (S-061-01). Host-side, never `/host`-prefixed: the pane's shell runs
+    /// outside the WASM sandbox and cannot open the mount.
+    pub project_root: &'a Path,
     pub ticket_id: &'a str,
     pub pane_id: u32,
     /// Immutable attempt identity inherited by native lifecycle hooks.
@@ -299,6 +306,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             ctx.attempt_id,
             self.model.as_deref(),
             self.lisa_bin.as_deref(),
+            ctx.project_root,
         )
     }
 
@@ -408,17 +416,25 @@ impl CodexAdapter {
     }
 
     /// The full native launcher line for a fresh Codex TUI. The env prefix gives
-    /// lifecycle hooks pane/ticket attribution and tells `capture-usage` to
-    /// parse the Codex transcript into `.lisa/codex/`. Only the exact immutable
-    /// assignment path crosses this shell boundary; the native launcher builds
-    /// Codex argv without a shell and the assignment body never enters the pane.
+    /// lifecycle hooks pane/ticket attribution, names the leased project so they
+    /// signal into it rather than into whatever directory the agent walks to
+    /// (S-061-01), and tells `capture-usage` to parse the Codex transcript into
+    /// `.lisa/codex/`. Only the exact immutable assignment path crosses this
+    /// shell boundary; the native launcher builds Codex argv without a shell and
+    /// the assignment body never enters the pane.
+    ///
+    /// The failure branch spells the project out rather than reading
+    /// `$LISA_PROJECT`: an environment prefix applies to the command it prefixes,
+    /// so the variable is not set on the `||` side of the launch.
     fn interactive_line(&self, ctx: &SpawnContext, assignment_path: &Path) -> String {
+        let project = shell_quote(&ctx.project_root.to_string_lossy());
         format!(
-            "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} LISA_ATTEMPT_ID={attempt} \
+            "LISA_BIN={bin} LISA_AGENT_CLIENT=codex LISA_PROJECT={project} LISA_PANE_ID={pane} LISA_TICKET_ID={ticket} LISA_ATTEMPT_ID={attempt} \
              {bin} launch-codex{model} -- {assignment} || \
-             {{ mkdir -p .lisa/signals; date -u +%Y-%m-%dT%H:%M:%SZ > \
-             .lisa/signals/pane-{pane}.error; }}",
+             {{ mkdir -p {project}/.lisa/signals; date -u +%Y-%m-%dT%H:%M:%SZ > \
+             {project}/.lisa/signals/pane-{pane}.error; }}",
             bin = shell_quote(&self.lisa_bin),
+            project = project,
             pane = ctx.pane_id,
             ticket = shell_quote(ctx.ticket_id),
             attempt = ctx.attempt_id,
@@ -535,10 +551,14 @@ mod tests {
     use super::*;
 
     const ASSIGNMENT_PATH: &str = ".lisa/attempts/T-042-01/1/work/assignment-1-8675309.md";
+    /// The leased project every fixture pane belongs to. Absolute, because that
+    /// is what a pane shell can address from wherever the agent has walked to.
+    const PROJECT_ROOT: &str = "/projects/steer";
 
     fn spawn_ctx<'a>(dir: &'a Path, id: &'a str, pane: u32) -> SpawnContext<'a> {
         SpawnContext {
             ticket_scan_dir: dir,
+            project_root: Path::new(PROJECT_ROOT),
             ticket_id: id,
             pane_id: pane,
             attempt_id: 1,
@@ -553,7 +573,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
             ClaudeCodeAdapter::default().launch_command(&ctx, Path::new(ASSIGNMENT_PATH)),
-            build_claude_command("T-042-01", 7, 1, None, None)
+            build_claude_command("T-042-01", 7, 1, None, None, Path::new(PROJECT_ROOT))
         );
     }
 
@@ -566,7 +586,14 @@ mod tests {
         assert!(cmd.contains("--model 'opus'"), "got: {cmd}");
         assert_eq!(
             cmd,
-            build_claude_command("T-042-01", 7, 1, Some("opus"), None)
+            build_claude_command(
+                "T-042-01",
+                7,
+                1,
+                Some("opus"),
+                None,
+                Path::new(PROJECT_ROOT)
+            )
         );
     }
 
@@ -579,13 +606,17 @@ mod tests {
         let with_bin = ClaudeCodeAdapter::new(None, Some("/abs/lisa"))
             .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(
-            with_bin.starts_with("LISA_BIN='/abs/lisa' LISA_PANE_ID=7"),
+            with_bin
+                .starts_with("LISA_BIN='/abs/lisa' LISA_PROJECT='/projects/steer' LISA_PANE_ID=7"),
             "got: {with_bin}"
         );
         let without =
             ClaudeCodeAdapter::new(None, None).launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(!without.contains("LISA_BIN="), "got: {without}");
-        assert!(without.starts_with("LISA_PANE_ID=7"), "got: {without}");
+        assert!(
+            without.starts_with("LISA_PROJECT='/projects/steer' LISA_PANE_ID=7"),
+            "got: {without}"
+        );
     }
 
     #[test]
@@ -765,11 +796,21 @@ mod tests {
         let cmd = CodexAdapter::new(Some("/abs/lisa"), None)
             .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(cmd.starts_with(
-            "LISA_BIN='/abs/lisa' LISA_AGENT_CLIENT=codex LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 '/abs/lisa' launch-codex -- "
-        ));
+            "LISA_BIN='/abs/lisa' LISA_AGENT_CLIENT=codex LISA_PROJECT='/projects/steer' LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 '/abs/lisa' launch-codex -- "
+        ), "got: {cmd}");
         assert!(cmd.contains(&shell_quote(ASSIGNMENT_PATH)));
         assert!(!cmd.contains("codex --dangerously-bypass"));
-        assert!(cmd.contains(".lisa/signals/pane-7.error"));
+        // The launch fallback names the leased project outright: an env prefix
+        // does not reach the `||` branch, and a relative path there would put
+        // the failure signal in whatever directory the pane shell was left in.
+        assert!(
+            cmd.contains("'/projects/steer'/.lisa/signals/pane-7.error"),
+            "got: {cmd}"
+        );
+        assert!(
+            !cmd.contains(" .lisa/signals/pane-7.error"),
+            "the error signal must not be written relative to the pane's cwd: {cmd}"
+        );
         assert!(!cmd.contains("Read the ticket"));
         assert!(!cmd.contains("LISA_ASSIGNMENT"));
     }

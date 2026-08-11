@@ -199,6 +199,14 @@ pub(crate) fn ticket_prompt(ticket_dir: &Path, ticket_id: &str, artifact_dir: &P
 /// Sets LISA_PANE_ID env var so the idle signal hook can identify the pane,
 /// and ticket/attempt identity for attempt-scoped lifecycle signals.
 ///
+/// `project_root` is the absolute host path of the project this pane was leased
+/// from, exported as `LISA_PROJECT`. The lifecycle hooks resolve their signal
+/// directory against it, because the one thing they cannot use is their own
+/// working directory: an agent that reads a second repository — ordinary work —
+/// used to write this pane's liveness into that repository instead (S-061-01).
+/// The pane's identity travels with the process; where it happens to stand does
+/// not.
+///
 /// `lisa_bin` is the absolute `lisa` path (plugin config) exported as `LISA_BIN`
 /// so the `Stop` hook's `lisa capture-usage` (T-027-02) is reachable even when
 /// the pane shell lacks `lisa` on PATH — mirroring the Codex adapter's
@@ -211,6 +219,7 @@ pub(crate) fn build_claude_command(
     attempt_id: u64,
     model: Option<&str>,
     lisa_bin: Option<&str>,
+    project_root: &Path,
 ) -> String {
     // The Claude adapter owns the model→flag mapping (`--model`). When no model
     // is routed the flag is omitted, preserving the provider invocation while
@@ -224,8 +233,9 @@ pub(crate) fn build_claude_command(
         None => String::new(),
     };
     format!(
-        "{}LISA_PANE_ID={} LISA_TICKET_ID={} LISA_ATTEMPT_ID={} claude --dangerously-skip-permissions{}",
+        "{}LISA_PROJECT={} LISA_PANE_ID={} LISA_TICKET_ID={} LISA_ATTEMPT_ID={} claude --dangerously-skip-permissions{}",
         lisa_bin_env,
+        shell_quote(&project_root.to_string_lossy()),
         pane_id,
         shell_quote(ticket_id),
         attempt_id,
@@ -1681,6 +1691,43 @@ impl State {
                 "pane {pane_id} does not carry the current lease for {ticket_id}"
             )),
         }
+    }
+
+    /// Write `.lisa/scheduler.alive` with the moment this tick happened.
+    ///
+    /// The one thing on disk that a dead run cannot fake. Lease markers are
+    /// never withdrawn — a slow session needs its own to announce itself — so
+    /// nothing else distinguishes a seat this scheduler is still working from a
+    /// seat left behind by a run that died. A reader compares this stamp's age
+    /// against the project's own idea of silence; see
+    /// [`lisa_core::liveness`].
+    ///
+    /// Best-effort by design, and deliberately not a fence. A stamp that cannot
+    /// be written costs the operator a diagnosis, and the next tick tries
+    /// again; failing the scheduler over it would turn a reporting aid into an
+    /// outage. Nothing in scheduling reads it.
+    fn stamp_scheduler_alive(&self) {
+        if self.signal_dir.as_os_str().is_empty() {
+            return;
+        }
+        let Some(lisa_dir) = self.signal_dir.parent() else {
+            return;
+        };
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return;
+        };
+        let stamp = lisa_core::liveness::SchedulerAlive::new(
+            now.as_secs(),
+            POLL_INTERVAL_SECS.round() as u64,
+        );
+        let Ok(body) = serde_json::to_vec(&stamp) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(lisa_dir);
+        let _ = std::fs::write(
+            lisa_dir.join(lisa_core::liveness::SCHEDULER_ALIVE_NAME),
+            &body,
+        );
     }
 
     /// Publish the lease marker copied by native heartbeat hooks. The rename is
@@ -4121,6 +4168,7 @@ impl State {
         // Scanned, not typed: the prompt recovers the ticket's real filename
         // from this directory, so it must be the readable `/host` form.
         let ticket_scan_dir = self.config.ticket_dir.clone();
+        let project_root = self.project_root.clone();
         let artifact_dir = strip_host_prefix(&self.attempt_work_dir(&lease));
         let chat_assignment_path = strip_host_prefix(&assignment_path);
         let (adapter, _) = resolve_adapter_or_native(
@@ -4130,6 +4178,7 @@ impl State {
         );
         let ctx = SpawnContext {
             ticket_scan_dir: &ticket_scan_dir,
+            project_root: &project_root,
             ticket_id: &ticket_id,
             pane_id,
             attempt_id: generation,
@@ -4911,6 +4960,7 @@ impl State {
 
         // Scanned, not typed: see `ticket_prompt`.
         let ticket_scan_dir = self.config.ticket_dir.clone();
+        let project_root = self.project_root.clone();
         let attempt_artifact_dir = self.attempt_work_dir(&successor);
         let artifact_dir = strip_host_prefix(&attempt_artifact_dir);
         let (adapter, route) = resolve_adapter_or_native(
@@ -4920,6 +4970,7 @@ impl State {
         );
         let ctx = SpawnContext {
             ticket_scan_dir: &ticket_scan_dir,
+            project_root: &project_root,
             ticket_id: &ticket_id,
             pane_id,
             attempt_id: successor.attempt_id,
@@ -5814,6 +5865,7 @@ impl State {
             // filename from this directory and strips the mount itself when it
             // names the path, so this stays the readable `/host` form.
             let ticket_scan_dir = self.config.ticket_dir.clone();
+            let project_root = self.project_root.clone();
 
             let pane_id = self.agent_slots[slot_idx].pane_id;
 
@@ -5901,6 +5953,7 @@ impl State {
 
             let ctx = SpawnContext {
                 ticket_scan_dir: &ticket_scan_dir,
+                project_root: &project_root,
                 ticket_id: &ticket_id,
                 pane_id,
                 attempt_id: attempt_lease.attempt_id,
@@ -8040,6 +8093,7 @@ impl State {
 
             // Scanned, not typed: see `ticket_prompt`.
             let ticket_scan_dir = self.config.ticket_dir.clone();
+            let project_root = self.project_root.clone();
             let (adapter, route) = resolve_adapter_or_native(
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
@@ -8082,6 +8136,7 @@ impl State {
             let artifact_dir = strip_host_prefix(&launch_artifact_dir);
             let ctx = SpawnContext {
                 ticket_scan_dir: &ticket_scan_dir,
+                project_root: &project_root,
                 ticket_id: &ticket_id,
                 pane_id,
                 attempt_id: launch_lease.attempt_id,
@@ -8565,6 +8620,14 @@ impl State {
     /// Rescans tickets, detects phase changes, marks completed threads,
     /// frees agent slots, and schedules new work.
     fn poll_tick(&mut self) {
+        // First, and unconditionally: say that this scheduler is running. A
+        // lease marker records a placement and cannot record its own death, so
+        // this stamp is the only thing that separates a seat held by a slow
+        // session from one held by a run that no longer exists. It leads the
+        // tick because it must keep being written even if every step below
+        // decides there is nothing to do.
+        self.stamp_scheduler_alive();
+
         // Presence first: the exit policy asks only whether a process is in the
         // pane, and the answer must be current before any timeout decision —
         // including for a process that cannot name itself.
@@ -9884,6 +9947,11 @@ impl ZellijPlugin for State {
         // LISA_DURATION_SECS on completion.
         self.project_root = get_plugin_ids().initial_cwd;
         self.loop_started_at = Some(std::time::SystemTime::now());
+
+        // Stamp once at load rather than waiting for the first poll: a run that
+        // starts and immediately places seats should never be readable as one
+        // that already ended.
+        self.stamp_scheduler_alive();
 
         // Subscribe to the events we need
         subscribe(&[
@@ -13309,10 +13377,10 @@ mod tests {
 
     #[test]
     fn test_build_claude_command() {
-        let cmd = build_claude_command("T-042-01", 7, 1, None, None);
+        let cmd = build_claude_command("T-042-01", 7, 1, None, None, Path::new("/projects/steer"));
 
         assert!(cmd.starts_with(
-            "LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 claude --dangerously-skip-permissions"
+            "LISA_PROJECT='/projects/steer' LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 claude --dangerously-skip-permissions"
         ));
         assert!(!cmd.contains("Read the ticket"));
         assert!(!cmd.contains("CLAUDE.md"));
@@ -13326,7 +13394,14 @@ mod tests {
 
     #[test]
     fn test_build_claude_command_with_model() {
-        let cmd = build_claude_command("T-042-01", 7, 1, Some("opus"), None);
+        let cmd = build_claude_command(
+            "T-042-01",
+            7,
+            1,
+            Some("opus"),
+            None,
+            Path::new("/projects/steer"),
+        );
         assert!(
             cmd.ends_with("--dangerously-skip-permissions --model 'opus'"),
             "got: {cmd}"
@@ -13335,18 +13410,20 @@ mod tests {
 
     #[test]
     fn test_build_claude_command_includes_env_vars() {
-        let cmd = build_claude_command("T-042-01", 42, 9, None, None);
+        let cmd = build_claude_command("T-042-01", 42, 9, None, None, Path::new("/projects/steer"));
 
         assert!(
-            cmd.starts_with("LISA_PANE_ID=42 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=9 "),
-            "command should set pane, ticket, and attempt env vars, got: {}",
+            cmd.starts_with(
+                "LISA_PROJECT='/projects/steer' LISA_PANE_ID=42 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=9 "
+            ),
+            "command should set project, pane, ticket, and attempt env vars, got: {}",
             cmd
         );
     }
 
     #[test]
     fn test_build_claude_command_excludes_assignment_reference() {
-        let cmd = build_claude_command("T-001", 1, 1, None, None);
+        let cmd = build_claude_command("T-001", 1, 1, None, None, Path::new("/projects/steer"));
         assert!(!cmd.contains("docs/knowledge/lisa-workflow.md"));
         assert!(!cmd.contains("assignment.md"));
     }
@@ -14024,6 +14101,40 @@ mod tests {
         assert!(
             !production.contains("ticket_scan_dir = strip_host_prefix("),
             "stripping the /host mount before the scan silently empties it"
+        );
+    }
+
+    /// The same companion shape for the project a pane is leased from. The
+    /// compiler already forces every spawn site to supply the field; what it
+    /// cannot force is that the value is the plugin's own host-side project
+    /// root. A stripped or invented one would export a `LISA_PROJECT` the pane
+    /// shell cannot open, and every hook guarded on it would fall silent — the
+    /// failure this field exists to end, inverted.
+    #[test]
+    fn every_spawn_context_carries_the_host_project_root() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module marker remains available")
+            .0;
+
+        let contexts = production.matches("SpawnContext {").count();
+        assert!(contexts > 0, "the spawn contexts moved");
+        assert_eq!(
+            production.matches("project_root: &project_root,").count(),
+            contexts,
+            "every SpawnContext must name the project its pane was leased from"
+        );
+        assert_eq!(
+            production
+                .matches("let project_root = self.project_root.clone();")
+                .count(),
+            contexts,
+            "that project is the plugin's own root, taken whole"
+        );
+        assert!(
+            !production.contains("project_root = strip_host_prefix("),
+            "the pane's shell runs on the host and cannot open the /host mount"
         );
     }
 
@@ -20019,6 +20130,10 @@ mod tests {
                 ..PluginConfig::new()
             },
             signal_dir: dir.path().join("signals"),
+            // The host-side project this pane is leased from. Every launch line
+            // exports it so the session's hooks signal here and not into
+            // whatever repository the agent walks into.
+            project_root: dir.path().to_path_buf(),
             permissions_granted: true,
             slots_discovered: true,
             ..State::default()
@@ -21223,6 +21338,15 @@ mod tests {
             let launch = std::fs::read_to_string(attempt_dir.join(".lisa-launch-10.sh")).unwrap();
             assert!(!launch.contains("Read the ticket"));
             assert!(!launch.contains("LISA_ASSIGNMENT"));
+            // The pane carries its project to the hooks it will fire, so their
+            // signals come back here however far the agent wanders (S-061-01).
+            assert!(
+                launch.contains(&format!(
+                    "LISA_PROJECT={}",
+                    shell_quote(&dir.path().to_string_lossy())
+                )),
+                "launch line must export the leased project: {launch}"
+            );
 
             let started = dir.path().join("signals/pane-10.started");
             std::fs::write(&started, "not an attempt lease").unwrap();
