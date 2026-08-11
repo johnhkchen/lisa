@@ -72,7 +72,7 @@ only want to know "could a run start here", read the exit status and ignore the 
 | `ready[]` | Ticket ids that could start now, sorted. |
 | `notes[]` | `{ticket_id, attempt_id, generation, summary, criterion_quote, evidence_citation}` for each unread note. |
 | `waiting_on_you[]` | Each waiting ticket: `{ticket_id, remedy_owner, ask, reason, steps[], check, check_timeout_secs, origin, proposal}`. |
-| `attempts[]` | `{pane_id, ticket_id, attempt_id, ticket_phase, superseded}` — see below. |
+| `attempts[]` | `{pane_id, ticket_id, attempt_id, ticket_phase, superseded, abandoned, abandoned_reason}` — see below. |
 | `token_usage` | `{tickets[], tickets_joined, tokens_in, tokens_out, not_yet_joined[]}`. |
 | `run_summary` | The latest run's counts, or `null` when there is no board. |
 | `config` | `{max_threads, session_timeout_secs, phase_timeouts}`. |
@@ -93,7 +93,7 @@ an attempt into a pane. It is Lisa's own record of the placement, not a guess re
 ledgers. Read it as: **the attempt Lisa most recently put in this pane.**
 
 The marker is deliberately not withdrawn when a seat is released — a slow-starting session needs it
-to announce itself — so an entry can outlive the attempt it names. Two fields tell you which
+to announce itself — so an entry can outlive the attempt it names. Three fields tell you which
 entries have:
 
 - `ticket_phase` is that ticket's phase on the board right now. An entry whose `ticket_phase` is
@@ -101,14 +101,27 @@ entries have:
 - `superseded` is `true` when a *later* attempt for the same ticket holds another seat. Attempt
   numbers only go up within a ticket, so a superseded entry is an older attempt whatever else is
   true.
+- `abandoned` is `true` when the run that placed the seat has stopped without withdrawing it — the
+  machine swapped, the terminal was killed, the loop was quit. `abandoned_reason` is the plain
+  sentence explaining how Lisa knows, and it is `null` whenever `abandoned` is `false`.
 
-An entry that is neither `superseded` nor on a `done` ticket is Lisa's best answer to "this seat is
-working". Lisa's live seat table lives inside the plugin; `lisa status` is a separate one-shot
-command and cannot see it, so this is the closest honest answer it can give.
+An entry that is none of `superseded`, `abandoned`, or on a `done` ticket is Lisa's best answer to
+"this seat is working". Lisa's live seat table lives inside the plugin; `lisa status` is a separate
+one-shot command and cannot see it, so this is the closest honest answer it can give.
 
-Do not read `.lisa/signals/` yourself. Those files are single-consumer and the plugin deletes them
-as it reads them; a second reader loses that race by design. `attempts` exists so you do not have
-to try.
+`abandoned` errs toward `false`. Lisa sets it only when a running scheduler has not said it was
+here for longer than the project allows, *and* nothing has stirred in the signal directory for the
+same stretch. A seat Lisa is unsure about reads as working, because a seat wrongly reported free
+could put a second agent on a ticket somebody is working. If you are deciding whether to start a
+run, treat `abandoned` as "this one is not a reason to hold off".
+
+Nothing clears these on its own. `lisa release-seats` prints which seats it believes are free, and
+why, and removes them only when the operator adds `--release`.
+
+Do not read `.lisa/signals/` yourself — and do not delete anything in it either. Those files are
+single-consumer and the plugin deletes them as it reads them; a second reader loses that race by
+design, and a second writer breaks a live pane's ability to announce itself. `attempts` exists so
+you do not have to look, and `lisa release-seats` exists so you never have to reach in.
 
 ## `lisa validate --json`
 

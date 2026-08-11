@@ -422,6 +422,10 @@ for you**. **Token usage** lists what each completed ticket cost once its
 session's capture joins the ledger — never a fabricated zero for a missing
 capture. The completion-seal line says how finished work is being recorded.
 
+If a run stopped without shutting down, the seats it was working still look
+busy. **Seats held by a run that is gone** names them, says how Lisa knows, and
+points at `lisa release-seats`.
+
 ```bash
 lisa status
 ```
@@ -473,6 +477,33 @@ And what is never on it, under any flag: your board (`docs/active/tickets/`,
 `docs/active/stories/`), your `.lisa.toml`, anything Lisa did not write, the work
 of any ticket that is not done, and anything a symlink points to outside your
 project. Lisa removes files; it never rewrites what is inside one.
+
+### `lisa release-seats`
+
+Free the seats a run left behind when it stopped without shutting down.
+
+When a run dies — the machine swaps, the terminal is killed, the laptop sleeps
+and never wakes — it can't put its own seats back. The tickets it was working
+keep looking busy, `lisa status` keeps counting them as in progress, and
+anything reading that board keeps believing it. Running `lisa loop` again does
+clear it, by reassigning the tickets, which is a strange thing to have to do
+when the board is telling you a run is already going.
+
+**A bare run frees nothing.** It prints which seats it believes are free, what
+each one was working, and the evidence — then stops. Read it, then run it again
+with `--release`.
+
+```bash
+lisa release-seats            # print the list and the evidence, change nothing
+lisa release-seats --release  # free the listed seats
+```
+
+Lisa frees a seat only when two things agree: no scheduler has said it was
+running for longer than this project allows, **and** nothing has stirred in
+Lisa's signal folder for the same stretch. While a run is there — even one
+detached in the background, or sitting quietly on a question — the command says
+so and frees nothing. A seat Lisa isn't sure about stays held, because handing
+out a seat somebody is working is the mistake that costs you.
 
 ### `lisa unblock`
 

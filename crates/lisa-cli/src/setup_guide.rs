@@ -240,6 +240,13 @@ fn section_handoff() -> GuideSection {
         - **Do not run `lisa loop`.** That command belongs to the person you're working \
         with — they run it themselves in a separate terminal pane, window, or tab, where \
         they can watch the dashboard and answer anything waiting on them.\n\n\
+        One thing worth telling them before they start, because it is the only \
+        state a stopped run leaves behind: if a run dies without shutting down — the \
+        machine swaps, the terminal is killed, the laptop sleeps and never comes back — \
+        the seats it was working stay marked as busy, and `lisa status` keeps counting \
+        them as in progress. `lisa status` names them under **Seats held by a run that \
+        is gone**, and `lisa release-seats` prints which ones it believes are free and \
+        why; adding `--release` frees them. It refuses while a run is still there.\n\n\
         If you are an agent, finish by telling them: the board is ready, and running \
         `lisa loop` in another terminal starts the work."
         .to_string();
