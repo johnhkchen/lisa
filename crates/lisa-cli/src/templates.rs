@@ -34,9 +34,60 @@ pub const JSON_GUIDE: &str = include_str!("../data/json-guide.md");
 /// The compiled WASM plugin, embedded at compile time via build.rs
 pub const PLUGIN_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lisa.wasm"));
 
+/// The lease guard every signal hook opens with. Each hook is a standalone
+/// script and carries its own copy; this constant is the single text they are
+/// all checked against, so a hook cannot quietly drop it.
+///
+/// A signal belongs to the project the pane was leased from. The hook runs in
+/// the agent's working directory, which is a different fact: an agent reading a
+/// second repository — ordinary, and encouraged — used to write `pane-N.ack`
+/// into whatever tree it was standing in, and `mkdir -p` created
+/// `.lisa/signals/` there to hold it. The true project lost a heartbeat; the
+/// innocent project gained a fresh signal its own launcher then refused to run
+/// against, from a pane numbering it does not share.
+///
+/// So the hook takes its project from `$LISA_PROJECT`, exported on the pane's
+/// launch line beside `$LISA_PANE_ID`, and never from the working directory.
+/// Both facts must be present and `$LISA_PROJECT` must already be a Lisa
+/// project: a hook that cannot name its lease writes nothing at all, because the
+/// alternative — a plausible signal file in a directory Lisa does not manage —
+/// is the failure itself, not a degraded form of it. An operator's own session
+/// has neither variable and stays silent exactly as before.
+#[cfg(test)]
+pub(crate) const HOOK_LEASE_GUARD: &str = r#"# Signals belong to the project this pane was leased from, not to whatever
+# directory the agent is standing in. Both facts ride the pane's launch line;
+# without them there is no lease to write to, so write nothing rather than
+# leave a plausible signal in a repository Lisa does not manage.
+[ -n "${LISA_PANE_ID:-}" ] || exit 0
+[ -n "${LISA_PROJECT:-}" ] || exit 0
+[ -d "$LISA_PROJECT/.lisa" ] || exit 0
+SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+mkdir -p "$SIGNAL_DIR" || exit 0"#;
+
 /// The on-idle hook script, called by Claude Code's idle_prompt notification.
 /// Writes a signal file so the plugin knows which session finished its work.
 pub const ON_IDLE_HOOK: &str = r#"#!/bin/sh
+# Lisa idle signal hook — called by Claude Code on idle_prompt notification.
+# Writes a signal file so the plugin knows this session finished its work.
+
+# Signals belong to the project this pane was leased from, not to whatever
+# directory the agent is standing in. Both facts ride the pane's launch line;
+# without them there is no lease to write to, so write nothing rather than
+# leave a plausible signal in a repository Lisa does not manage.
+[ -n "${LISA_PANE_ID:-}" ] || exit 0
+[ -n "${LISA_PROJECT:-}" ] || exit 0
+[ -d "$LISA_PROJECT/.lisa" ] || exit 0
+SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+mkdir -p "$SIGNAL_DIR" || exit 0
+
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.idle"
+"#;
+
+pub(crate) const LEGACY_ON_IDLE_HOOKS: &[&str] = &[
+    // 0.5.0-rc.3 and earlier. Resolved `.lisa/signals` relative to the agent's
+    // working directory, so a session that stepped into another repository
+    // signalled there instead (S-061-01).
+    r#"#!/bin/sh
 # Lisa idle signal hook — called by Claude Code on idle_prompt notification.
 # Writes a signal file so the plugin knows this session finished its work.
 
@@ -46,9 +97,8 @@ mkdir -p "$SIGNAL_DIR"
 if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.idle"
 fi
-"#;
-
-pub(crate) const LEGACY_ON_IDLE_HOOKS: &[&str] = &[];
+"#,
+];
 
 /// The on-stop hook script, called by the native client's Stop event.
 /// Fires when Claude or Codex finishes responding (ready for input).
@@ -60,6 +110,45 @@ pub(crate) const LEGACY_ON_IDLE_HOOKS: &[&str] = &[];
 /// Stops without observable transcript usage append a no-capture marker, while
 /// malformed identity or persistence errors remain visible to the operator.
 pub const ON_STOP_HOOK: &str = r#"#!/bin/sh
+# Lisa stop signal hook — called when the native agent finishes responding.
+# Captures session token usage for the provenance ledger (T-027-02) first,
+# then writes the stop signal file. Order matters: the stop signal is what
+# lets the scheduler act on this pane (advance the ticket, end the session),
+# so the capture must already be durable when the signal appears — a session
+# ended mid-capture lost 8 of 9 usage records in the 0.4.4-rc.8 field leg.
+
+# An operator's own session has no Lisa pane and no leased project: nothing to
+# attribute, so stay silent — and drain stdin, because the caller is writing to
+# it. Inside a Lisa-managed pane, capture errors remain loud on purpose (silent
+# no-writes were the 2026-07-09 attribution incident).
+if [ -z "${LISA_PANE_ID:-}" ] || [ -z "${LISA_PROJECT:-}" ] || [ ! -d "$LISA_PROJECT/.lisa" ]; then
+    cat >/dev/null
+    exit 0
+fi
+
+# Signals belong to the project this pane was leased from, not to whatever
+# directory the agent is standing in.
+SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+mkdir -p "$SIGNAL_DIR" || exit 0
+
+# Forward the Stop payload (stdin: includes transcript_path) to the usage
+# capturer, naming the leased project so the capture ledger lands beside the
+# signals rather than in the tree the agent happens to be reading.
+# No-capture markers and capture errors remain visible to operators.
+in=$(cat)
+printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage --cwd "$LISA_PROJECT"
+
+# Signal last: the pane only reads as stopped once its usage is recorded.
+# A capture failure still signals (the scheduler must never stall on it);
+# its error above stays visible in the pane.
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
+"#;
+
+/// Exact prior Stop-hook generations eligible for safe `lisa init` upgrades.
+pub(crate) const LEGACY_ON_STOP_HOOKS: &[&str] = &[
+    // 0.5.0-rc.3 and earlier: signal directory and capture ledger both resolved
+    // against the agent's working directory (S-061-01).
+    r#"#!/bin/sh
 # Lisa stop signal hook — called when the native agent finishes responding.
 # Captures session token usage for the provenance ledger (T-027-02) first,
 # then writes the stop signal file. Order matters: the stop signal is what
@@ -87,10 +176,7 @@ printf '%s' "$in" | "${LISA_BIN:-lisa}" capture-usage
 # A capture failure still signals (the scheduler must never stall on it);
 # its error above stays visible in the pane.
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.stopped"
-"#;
-
-/// Exact prior Stop-hook generations eligible for safe `lisa init` upgrades.
-pub(crate) const LEGACY_ON_STOP_HOOKS: &[&str] = &[
+"#,
     r#"#!/bin/sh
 # Lisa stop signal hook — called when the native agent finishes responding.
 # Writes a signal file so the plugin knows the pane is ready for input, and
@@ -169,15 +255,33 @@ pub const ON_CLEAR_HOOK: &str = r#"#!/bin/sh
 # Lisa clear signal hook — called after /clear is processed.
 # Writes a signal file so the plugin knows context has been cleared.
 
+# Signals belong to the project this pane was leased from, not to whatever
+# directory the agent is standing in. Both facts ride the pane's launch line;
+# without them there is no lease to write to, so write nothing rather than
+# leave a plausible signal in a repository Lisa does not manage.
+[ -n "${LISA_PANE_ID:-}" ] || exit 0
+[ -n "${LISA_PROJECT:-}" ] || exit 0
+[ -d "$LISA_PROJECT/.lisa" ] || exit 0
+SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+mkdir -p "$SIGNAL_DIR" || exit 0
+
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.cleared"
+"#;
+
+pub(crate) const LEGACY_ON_CLEAR_HOOKS: &[&str] = &[
+    // 0.5.0-rc.3 and earlier: relative signal directory (S-061-01).
+    r#"#!/bin/sh
+# Lisa clear signal hook — called after /clear is processed.
+# Writes a signal file so the plugin knows context has been cleared.
+
 SIGNAL_DIR=".lisa/signals"
 mkdir -p "$SIGNAL_DIR"
 
 if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.cleared"
 fi
-"#;
-
-pub(crate) const LEGACY_ON_CLEAR_HOOKS: &[&str] = &[r#"#!/bin/sh
+"#,
+    r#"#!/bin/sh
 # Lisa clear signal hook — called by Claude Code after /clear is processed.
 # Writes a signal file so the plugin knows context has been cleared.
 
@@ -187,7 +291,8 @@ mkdir -p "$SIGNAL_DIR"
 if [ -n "$LISA_PANE_ID" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.cleared"
 fi
-"#];
+"#,
+];
 
 /// The provider-neutral native process-start hook, called by the native
 /// client's SessionStart[startup] event. It publishes the scheduler-owned
@@ -201,6 +306,42 @@ fi
 /// a comparison against different bytes. Copy first, compare the copy, rename
 /// the thing compared.
 pub const ON_START_HOOK: &str = r#"#!/bin/sh
+# Lisa process-start signal hook — called when a native agent process starts.
+# Publishes only an exact pane/ticket/attempt-scoped scheduler lease.
+
+# Signals belong to the project this pane was leased from, not to whatever
+# directory the agent is standing in. Both facts ride the pane's launch line;
+# without them there is no lease to write to, so write nothing rather than
+# leave a plausible signal in a repository Lisa does not manage.
+[ -n "${LISA_PANE_ID:-}" ] || exit 0
+[ -n "${LISA_PROJECT:-}" ] || exit 0
+[ -d "$LISA_PROJECT/.lisa" ] || exit 0
+SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+mkdir -p "$SIGNAL_DIR" || exit 0
+
+if [ -n "$LISA_TICKET_ID" ] && [ -n "$LISA_ATTEMPT_ID" ]; then
+    case "$LISA_ATTEMPT_ID" in
+        *[!0-9]*) exit 0 ;;
+    esac
+    marker="$SIGNAL_DIR/pane-$LISA_PANE_ID.lease"
+    expected=$(printf '{"ticket_id":"%s","attempt_id":%s}' "$LISA_TICKET_ID" "$LISA_ATTEMPT_ID")
+
+    # Publish only bytes that were compared: take the copy first, then judge it.
+    tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.started.tmp.$$"
+    cp "$marker" "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 0; }
+    if [ "$(cat "$tmp")" = "$expected" ]; then
+        mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.started"
+    else
+        rm -f "$tmp"
+    fi
+fi
+"#;
+
+pub(crate) const LEGACY_ON_START_HOOKS: &[&str] = &[
+    // 0.5.0-rc.3. Correct identity test, relative signal directory: a process
+    // that had stepped into another repository read that tree's marker and
+    // published its `.started` there (S-061-01).
+    r#"#!/bin/sh
 # Lisa process-start signal hook — called when a native agent process starts.
 # Publishes only an exact pane/ticket/attempt-scoped scheduler lease.
 
@@ -223,9 +364,7 @@ if [ -n "$LISA_PANE_ID" ] && [ -n "$LISA_TICKET_ID" ] && [ -n "$LISA_ATTEMPT_ID"
         rm -f "$tmp"
     fi
 fi
-"#;
-
-pub(crate) const LEGACY_ON_START_HOOKS: &[&str] = &[
+"#,
     // 0.5.0-rc.2. Same identity test, but it compared the marker file and then
     // copied it again, so a successor published between the two reads could be
     // announced by a process that does not hold it.
@@ -275,6 +414,49 @@ pub const ON_HEARTBEAT_HOOK: &str = r#"#!/bin/sh
 # Lisa heartbeat signal hook — called after each tool call.
 # Residency is unconditional; authority must name itself.
 
+# Signals belong to the project this pane was leased from, not to whatever
+# directory the agent is standing in. Both facts ride the pane's launch line;
+# without them there is no lease to write to, so write nothing rather than
+# leave a plausible signal in a repository Lisa does not manage.
+[ -n "${LISA_PANE_ID:-}" ] || exit 0
+[ -n "${LISA_PROJECT:-}" ] || exit 0
+[ -d "$LISA_PROJECT/.lisa" ] || exit 0
+SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+mkdir -p "$SIGNAL_DIR" || exit 0
+
+# "A process is in this pane." Asserts nothing about who, so it needs no
+# identity and survives a recycle that has already published the successor's
+# lease into the marker this hook used to copy blindly.
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.alive"
+
+# "This attempt is making progress." Published only against the immutable launch
+# identity, so a resident predecessor cannot borrow a successor's lease.
+[ -n "$LISA_TICKET_ID" ] && [ -n "$LISA_ATTEMPT_ID" ] || exit 0
+case "$LISA_ATTEMPT_ID" in
+    *[!0-9]*) exit 0 ;;
+esac
+
+marker="$SIGNAL_DIR/pane-$LISA_PANE_ID.lease"
+expected=$(printf '{"ticket_id":"%s","attempt_id":%s}' "$LISA_TICKET_ID" "$LISA_ATTEMPT_ID")
+
+# Publish only bytes that were compared: take the copy first, then judge it.
+tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat.tmp.$$"
+cp "$marker" "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 0; }
+if [ "$(cat "$tmp")" = "$expected" ]; then
+    mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.heartbeat"
+else
+    rm -f "$tmp"
+fi
+"#;
+
+pub(crate) const LEGACY_ON_HEARTBEAT_HOOKS: &[&str] = &[
+    // 0.5.0-rc.3. Both signals correct in kind, both written relative to the
+    // agent's working directory: an agent reading a second repository sent its
+    // liveness there and its own project went quiet (S-061-01).
+    r#"#!/bin/sh
+# Lisa heartbeat signal hook — called after each tool call.
+# Residency is unconditional; authority must name itself.
+
 SIGNAL_DIR=".lisa/signals"
 mkdir -p "$SIGNAL_DIR"
 
@@ -303,9 +485,7 @@ if [ "$(cat "$tmp")" = "$expected" ]; then
 else
     rm -f "$tmp"
 fi
-"#;
-
-pub(crate) const LEGACY_ON_HEARTBEAT_HOOKS: &[&str] = &[
+"#,
     // 0.5.0-rc.2. Copies the marker on the strength of `$LISA_PANE_ID` alone, so
     // any process that can run a tool call in the pane publishes a signal
     // carrying whatever attempt the marker names. Listed here so `lisa init`
@@ -358,6 +538,36 @@ pub const ON_ACK_HOOK: &str = r#"#!/bin/sh
 # Lisa assignment acknowledgment hook — called before a provider submits a user prompt.
 # Writes the raw lifecycle payload for ticket/generation matching in the plugin.
 
+# Signals belong to the project this pane was leased from, not to whatever
+# directory the agent is standing in. Both facts ride the pane's launch line;
+# without them there is no lease to write to, so drain the payload and write
+# nothing rather than leave a plausible signal in a repository Lisa does not
+# manage.
+if [ -z "${LISA_PANE_ID:-}" ] || [ -z "${LISA_PROJECT:-}" ] || [ ! -d "$LISA_PROJECT/.lisa" ]; then
+    cat >/dev/null
+    exit 0
+fi
+SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+mkdir -p "$SIGNAL_DIR" || exit 0
+
+tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.ack.tmp.$$"
+if cat > "$tmp"; then
+    mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.ack"
+else
+    rm -f "$tmp"
+fi
+"#;
+
+pub(crate) const LEGACY_ON_ACK_HOOKS: &[&str] = &[
+    // 0.4.0-rc.6, back when the hook was Codex-only and said so. Byte-identical
+    // to its successor apart from that first comment line, and listed for the
+    // same reason: a board still carrying it would otherwise keep the relative
+    // signal directory forever, and this is the hook the field report caught in
+    // the act (S-061-01).
+    r#"#!/bin/sh
+# Lisa Codex acknowledgment hook — called before Codex submits a user prompt.
+# Writes the raw lifecycle payload for ticket/generation matching in the plugin.
+
 SIGNAL_DIR=".lisa/signals"
 mkdir -p "$SIGNAL_DIR"
 
@@ -369,14 +579,37 @@ if [ -n "$LISA_PANE_ID" ]; then
         rm -f "$tmp"
     fi
 fi
-"#;
+"#,
+    // 0.5.0-rc.3 and earlier: relative signal directory. This is the hook the
+    // field report caught in the act — `pane-1.ack` in a repository whose pane
+    // numbering it did not share (S-061-01).
+    r#"#!/bin/sh
+# Lisa assignment acknowledgment hook — called before a provider submits a user prompt.
+# Writes the raw lifecycle payload for ticket/generation matching in the plugin.
 
-pub(crate) const LEGACY_ON_ACK_HOOKS: &[&str] = &[];
+SIGNAL_DIR=".lisa/signals"
+mkdir -p "$SIGNAL_DIR"
+
+if [ -n "$LISA_PANE_ID" ]; then
+    tmp="$SIGNAL_DIR/pane-$LISA_PANE_ID.ack.tmp.$$"
+    if cat > "$tmp"; then
+        mv "$tmp" "$SIGNAL_DIR/pane-$LISA_PANE_ID.ack"
+    else
+        rm -f "$tmp"
+    fi
+fi
+"#,
+];
 
 /// Gitignore content for `.lisa/` runtime state. Signal files and per-provider
 /// usage/session artifacts are machine-owned and must never enter the project DAG.
+///
+/// `scheduler.alive` is the running scheduler's own stamp (T-060-01-01). It says
+/// when a scheduler was last here, which is a fact about this machine at this
+/// moment and never about the project, so it belongs in history even less than
+/// the signal files do.
 pub const LISA_GITIGNORE: &str =
-    "signals/\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\n";
+    "signals/\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n";
 
 /// The on-notify hook SAMPLE, scaffolded as `.lisa/hooks/on-notify.sample`.
 /// User-owned attention/completion notification hook. It is deliberately a
@@ -422,7 +655,14 @@ pub(crate) const LEGACY_ON_NOTIFY_HOOKS: &[&str] = &[];
 /// `idle_prompt` payloads (already handled by on-idle.sh + the plugin), records
 /// the fact that an interactive gate fired, and then invokes the user hook when
 /// the operator opted in. Payload text is never retained in the run ledger.
-const NOTIFY_ATTENTION_COMMAND: &str = r#"in=$(cat); case "$in" in *idle_prompt*) : ;; *) mkdir -p .lisa; printf '%s\n' '{"event":"manual-intervention","kind":"permission"}' >> .lisa/run-events.jsonl; if test -x .lisa/hooks/on-notify; then printf '%s' "$in" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT="$PWD" .lisa/hooks/on-notify attention "$in"; fi ;; esac"#;
+///
+/// Like the hook scripts, it addresses the project it belongs to rather than the
+/// directory the agent is standing in: `$LISA_PROJECT` when a Lisa pane exported
+/// one, `$PWD` for an operator's own session, which is what `$PWD` always meant
+/// here. Nothing is created outside an existing `.lisa/`, so a session reading an
+/// unrelated repository no longer leaves a ledger — or runs that project's
+/// `on-notify` — behind it.
+const NOTIFY_ATTENTION_COMMAND: &str = r#"in=$(cat); case "$in" in *idle_prompt*) : ;; *) proj="${LISA_PROJECT:-$PWD}"; if [ -d "$proj/.lisa" ]; then printf '%s\n' '{"event":"manual-intervention","kind":"permission"}' >> "$proj/.lisa/run-events.jsonl"; fi; if test -x "$proj/.lisa/hooks/on-notify"; then printf '%s' "$in" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT="$proj" "$proj/.lisa/hooks/on-notify" attention "$in"; fi ;; esac"#;
 
 /// Command for the `PreToolUse[AskUserQuestion]` hook. POSIX `sh` only (no jq,
 /// no bashisms). It (1) **unconditionally** writes `pane-$LISA_PANE_ID.awaiting`
@@ -434,7 +674,13 @@ const NOTIFY_ATTENTION_COMMAND: &str = r#"in=$(cat); case "$in" in *idle_prompt*
 /// when the user never enabled `on-notify`. A question
 /// containing an escaped `\"` truncates the greedy-free `[^"]*` capture; that
 /// degrades to the generic detail, never a hard failure (design Q3).
-const NOTIFY_QUESTION_COMMAND: &str = r#"mkdir -p .lisa/signals; [ -n "$LISA_PANE_ID" ] && date -u +%Y-%m-%dT%H:%M:%SZ > ".lisa/signals/pane-$LISA_PANE_ID.awaiting"; printf '%s\n' '{"event":"manual-intervention","kind":"question"}' >> .lisa/run-events.jsonl; in=$(cat); q=$(printf '%s' "$in" | sed -n 's/.*"question":[ ]*"\([^"]*\)".*/\1/p'); [ -z "$q" ] && q="agent is asking a question"; hdr=$(printf '%s' "$in" | sed -n 's/.*"header":[ ]*"\([^"]*\)".*/\1/p'); if test -x .lisa/hooks/on-notify; then printf '%s' "$in" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT="$PWD" LISA_QUESTION_HEADER="$hdr" .lisa/hooks/on-notify attention "$q"; fi"#;
+///
+/// The `.awaiting` signal is a scheduler input like every other signal, so it
+/// obeys the hook scripts' rule exactly: it is written to `$LISA_PROJECT`, the
+/// project the pane was leased from, and not written at all when the pane cannot
+/// name one. The ledger and the opt-in notify dispatch keep the `$PWD` meaning
+/// an operator's own session has always had.
+const NOTIFY_QUESTION_COMMAND: &str = r#"proj="${LISA_PROJECT:-$PWD}"; if [ -n "$LISA_PANE_ID" ] && [ -n "$LISA_PROJECT" ] && [ -d "$LISA_PROJECT/.lisa" ]; then mkdir -p "$LISA_PROJECT/.lisa/signals"; date -u +%Y-%m-%dT%H:%M:%SZ > "$LISA_PROJECT/.lisa/signals/pane-$LISA_PANE_ID.awaiting"; fi; if [ -d "$proj/.lisa" ]; then printf '%s\n' '{"event":"manual-intervention","kind":"question"}' >> "$proj/.lisa/run-events.jsonl"; fi; in=$(cat); q=$(printf '%s' "$in" | sed -n 's/.*"question":[ ]*"\([^"]*\)".*/\1/p'); [ -z "$q" ] && q="agent is asking a question"; hdr=$(printf '%s' "$in" | sed -n 's/.*"header":[ ]*"\([^"]*\)".*/\1/p'); if test -x "$proj/.lisa/hooks/on-notify"; then printf '%s' "$in" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT="$proj" LISA_QUESTION_HEADER="$hdr" "$proj/.lisa/hooks/on-notify" attention "$q"; fi"#;
 
 /// Generate .claude/settings.local.json with Stop, SessionStart, UserPromptSubmit, Notification
 /// (idle_prompt + catch-all attention), PostToolUse heartbeat, and
@@ -939,6 +1185,69 @@ mod tests {
         );
     }
 
+    /// Every shipped signal hook resolves its directory from the lease, and none
+    /// of them can reach `mkdir` without one. A hook that regains a relative
+    /// `SIGNAL_DIR` is the S-061-01 field failure exactly: it succeeds, and
+    /// leaves a plausible signal in a repository nobody pointed Lisa at.
+    #[test]
+    fn every_signal_hook_writes_where_its_lease_is() {
+        for (name, hook) in [
+            ("on-idle.sh", ON_IDLE_HOOK),
+            ("on-stop.sh", ON_STOP_HOOK),
+            ("on-clear.sh", ON_CLEAR_HOOK),
+            ("on-start.sh", ON_START_HOOK),
+            ("on-heartbeat.sh", ON_HEARTBEAT_HOOK),
+            ("on-ack.sh", ON_ACK_HOOK),
+        ] {
+            assert!(
+                hook.contains(r#"SIGNAL_DIR="$LISA_PROJECT/.lisa/signals""#),
+                "{name} must take its signal directory from the leased project"
+            );
+            assert!(
+                !hook.contains(r#"SIGNAL_DIR=".lisa/signals""#),
+                "{name} must not resolve signals against the agent's working directory"
+            );
+            // Written `[ -d … ]` where the hook proceeds on success and
+            // `[ ! -d … ]` where it bails, but the same fact either way.
+            assert!(
+                hook.contains(r#"-d "$LISA_PROJECT/.lisa" ]"#),
+                "{name} must refuse to create a signal tree outside a Lisa project"
+            );
+            let guard = hook
+                .find(r#"-d "$LISA_PROJECT/.lisa" ]"#)
+                .expect("guard present");
+            assert!(
+                guard < hook.find("mkdir -p").expect("mkdir present"),
+                "{name} must prove its lease before it creates anything"
+            );
+        }
+        // The two hooks whose event arrives with a payload drain stdin on the
+        // silent path, so an unattributable session never breaks its caller.
+        for (name, hook) in [("on-stop.sh", ON_STOP_HOOK), ("on-ack.sh", ON_ACK_HOOK)] {
+            assert!(
+                hook.contains("cat >/dev/null"),
+                "{name} must drain its payload when it stays silent"
+            );
+        }
+    }
+
+    /// The lease guard is copied into each standalone script; this is the one
+    /// text they are all measured against.
+    #[test]
+    fn the_lease_guard_is_one_text() {
+        for (name, hook) in [
+            ("on-idle.sh", ON_IDLE_HOOK),
+            ("on-clear.sh", ON_CLEAR_HOOK),
+            ("on-start.sh", ON_START_HOOK),
+            ("on-heartbeat.sh", ON_HEARTBEAT_HOOK),
+        ] {
+            assert!(
+                hook.contains(HOOK_LEASE_GUARD),
+                "{name} must carry the lease guard verbatim"
+            );
+        }
+    }
+
     #[test]
     fn test_on_idle_hook_content() {
         assert!(ON_IDLE_HOOK.starts_with("#!/bin/sh"));
@@ -983,15 +1292,23 @@ mod tests {
         if let Some(body) = marker {
             fs::write(signals.join("pane-7.lease"), body).unwrap();
         }
+        // Run from somewhere else entirely: the pane's project is the one it was
+        // leased from, never the directory the agent is standing in.
+        let elsewhere = tempfile::tempdir().unwrap();
         let status = Command::new("/bin/sh")
             .arg(&script)
-            .current_dir(root.path())
+            .current_dir(elsewhere.path())
+            .env("LISA_PROJECT", root.path())
             .env("LISA_PANE_ID", "7")
             .env("LISA_TICKET_ID", ticket_id)
             .env("LISA_ATTEMPT_ID", attempt_id)
             .status()
             .unwrap();
         assert!(status.success());
+        assert!(
+            !elsewhere.path().join(".lisa").exists(),
+            "the hook must not create a signal directory where it happens to run"
+        );
         let started = signals.join("pane-7.started");
         if started.exists() {
             assert_eq!(fs::read_to_string(&started).unwrap(), marker.unwrap());
@@ -1064,10 +1381,14 @@ mod tests {
         if let Some(body) = marker {
             fs::write(signals.join("pane-7.lease"), body).unwrap();
         }
+        // Run from somewhere else entirely: the pane's project is the one it was
+        // leased from, never the directory the agent is standing in.
+        let elsewhere = tempfile::tempdir().unwrap();
         let mut command = Command::new("/bin/sh");
         command
             .arg(&script)
-            .current_dir(root.path())
+            .current_dir(elsewhere.path())
+            .env("LISA_PROJECT", root.path())
             .env("LISA_PANE_ID", "7");
         if !ticket_id.is_empty() {
             command.env("LISA_TICKET_ID", ticket_id);
@@ -1077,6 +1398,10 @@ mod tests {
         }
         let status = command.status().unwrap();
         assert!(status.success());
+        assert!(
+            !elsewhere.path().join(".lisa").exists(),
+            "the hook must not create a signal directory where it happens to run"
+        );
         assert!(
             fs::read_dir(&signals).unwrap().flatten().all(|entry| !entry
                 .file_name()
@@ -1258,6 +1583,7 @@ mod tests {
         assert!(LISA_GITIGNORE.contains("codex/"));
         assert!(LISA_GITIGNORE.contains("run-events.jsonl"));
         assert!(LISA_GITIGNORE.contains("run-baseline.json"));
+        assert!(LISA_GITIGNORE.contains(lisa_core::liveness::SCHEDULER_ALIVE_NAME));
     }
 
     /// Lisa generates no agent context file for a project. That document states
@@ -1419,10 +1745,12 @@ mod tests {
         assert!(
             NOTIFY_QUESTION_COMMAND.contains(r#"sed -n 's/.*"question":[ ]*"\([^"]*\)".*/\1/p'"#)
         );
-        // It writes the awaiting signal unconditionally and only test-x-gates the notify.
-        assert!(NOTIFY_QUESTION_COMMAND.contains("pane-$LISA_PANE_ID.awaiting"));
+        // It writes the awaiting signal into the leased project — not the
+        // directory the agent walked to — and only test-x-gates the notify.
+        assert!(NOTIFY_QUESTION_COMMAND
+            .contains(r#""$LISA_PROJECT/.lisa/signals/pane-$LISA_PANE_ID.awaiting""#));
         assert!(NOTIFY_QUESTION_COMMAND.contains("LISA_REASON=question"));
-        assert!(NOTIFY_QUESTION_COMMAND.contains("test -x .lisa/hooks/on-notify"));
+        assert!(NOTIFY_QUESTION_COMMAND.contains(r#"test -x "$proj/.lisa/hooks/on-notify""#));
 
         // (i) Happy path: the real captured single-line payload shape.
         let payload = r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which approach should I use to build the feature?","header":"Approach","options":[]}]}}"#;
@@ -1453,10 +1781,15 @@ mod tests {
         use std::process::Stdio;
 
         let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".lisa")).unwrap();
+        // Both commands run from a repository the agent stepped into, and must
+        // land their facts in the leased project instead.
+        let elsewhere = tempfile::tempdir().unwrap();
         let question_payload = r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"secret question text","header":"Choice"}]}}"#;
         let mut question = Command::new("/bin/sh")
             .args(["-c", NOTIFY_QUESTION_COMMAND])
-            .current_dir(root.path())
+            .current_dir(elsewhere.path())
+            .env("LISA_PROJECT", root.path())
             .env("LISA_PANE_ID", "7")
             .stdin(Stdio::piped())
             .spawn()
@@ -1471,7 +1804,8 @@ mod tests {
 
         let mut permission = Command::new("/bin/sh")
             .args(["-c", NOTIFY_ATTENTION_COMMAND])
-            .current_dir(root.path())
+            .current_dir(elsewhere.path())
+            .env("LISA_PROJECT", root.path())
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
@@ -1489,6 +1823,61 @@ mod tests {
         assert!(events.contains(r#"{"event":"manual-intervention","kind":"permission"}"#));
         assert!(!events.contains("secret"));
         assert!(root.path().join(".lisa/signals/pane-7.awaiting").exists());
+        assert!(
+            !elsewhere.path().join(".lisa").exists(),
+            "neither command may leave anything in the repository it ran in"
+        );
+    }
+
+    /// An operator's own session has no pane and no leased project, and the two
+    /// interactive commands keep meaning what they always meant there: `$PWD`,
+    /// the project the operator is actually working in. What is gone is the
+    /// unconditional `mkdir` — nothing is created outside an existing `.lisa/`.
+    #[cfg(unix)]
+    #[test]
+    fn an_operator_session_records_in_its_own_project_and_nowhere_else() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join(".lisa")).unwrap();
+        let mut permission = Command::new("/bin/sh")
+            .args(["-c", NOTIFY_ATTENTION_COMMAND])
+            .current_dir(project.path())
+            .env_remove("LISA_PROJECT")
+            .env_remove("LISA_PANE_ID")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        permission
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"a permission prompt")
+            .unwrap();
+        assert!(permission.wait().unwrap().success());
+        let events = fs::read_to_string(project.path().join(".lisa/run-events.jsonl")).unwrap();
+        assert!(events.contains(r#""kind":"permission""#));
+
+        // The same session standing in a directory that is not a Lisa project
+        // writes nothing at all, and creates nothing to write into.
+        let stranger = tempfile::tempdir().unwrap();
+        let mut outside = Command::new("/bin/sh")
+            .args(["-c", NOTIFY_ATTENTION_COMMAND])
+            .current_dir(stranger.path())
+            .env_remove("LISA_PROJECT")
+            .env_remove("LISA_PANE_ID")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        outside
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"a permission prompt")
+            .unwrap();
+        assert!(outside.wait().unwrap().success());
+        assert!(!stranger.path().join(".lisa").exists());
     }
 
     #[cfg(unix)]
@@ -1585,12 +1974,16 @@ mod tests {
         assert!(ON_STOP_HOOK.contains("capture-usage"));
         // Outside a Lisa-managed pane the hook exits silently before the
         // capturer runs — the operator's own sessions must never see an error.
-        assert!(ON_STOP_HOOK.contains(r#"if [ -z "${LISA_PANE_ID:-}" ]; then"#));
+        assert!(
+            ON_STOP_HOOK.contains(r#"if [ -z "${LISA_PANE_ID:-}" ] || [ -z "${LISA_PROJECT:-}" ]"#)
+        );
         assert!(
             ON_STOP_HOOK.find(r#"[ -z "${LISA_PANE_ID:-}" ]"#).unwrap()
                 < ON_STOP_HOOK.find("capture-usage").unwrap(),
             "the no-pane guard must precede the capture-usage forward"
         );
+        // The capture ledger belongs beside the signals, in the leased project.
+        assert!(ON_STOP_HOOK.contains(r#"capture-usage --cwd "$LISA_PROJECT""#));
         // Capture before signal: the stop signal is the scheduler's cue to act
         // on the pane (advance the ticket, end the session), so the capture
         // must be durable before the signal appears — a session ended
