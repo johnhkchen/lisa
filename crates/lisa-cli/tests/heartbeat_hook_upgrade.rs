@@ -50,6 +50,11 @@ fn run_installed_hook(root: &Path, ticket_id: &str, attempt_id: &str) -> (bool, 
     let status = Command::new("/bin/sh")
         .arg(root.join(".lisa/hooks/on-heartbeat.sh"))
         .current_dir(root)
+        // The pane's launch line carries its project. The rc.2 hook ignores it
+        // and uses the working directory, which here is the same place — that
+        // sameness is what kept the relative path looking correct for so long
+        // (S-061-01); this test is about the identity check, not the path.
+        .env("LISA_PROJECT", root)
         .env("LISA_PANE_ID", "7")
         .env("LISA_TICKET_ID", ticket_id)
         .env("LISA_ATTEMPT_ID", attempt_id)
