@@ -267,7 +267,10 @@ If you cannot run `lisa init`, create these by hand.
 
 3. **Claude Code bindings.** Create `.claude/settings.local.json` with all six
    bindings. Each command is `test -x`-guarded so it stays silent until the script
-   exists. The matcher-less `Notification` entry is the catch-all that fires
+   exists, and addresses the script through `${LISA_PROJECT:-.}` — a client runs
+   hook commands in the agent's working directory, so a bare `.lisa/hooks/…` there
+   means whichever directory the agent walked into, or nothing at all. The
+   matcher-less `Notification` entry is the catch-all that fires
    `on-notify` for permission/attention prompts while skipping `idle_prompt` (already
    handled by `on-idle.sh`). The `PreToolUse[AskUserQuestion]` entry fires when an agent
    asks you a question:
@@ -276,19 +279,19 @@ If you cannot run `lisa init`, create these by hand.
    {
      "hooks": {
        "PostToolUse": [
-         { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh" } ] }
+         { "hooks": [ { "type": "command", "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-heartbeat.sh\"; test -x \"$h\" && \"$h\"" } ] }
        ],
        "PreToolUse": [
          { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "proj=\"${LISA_PROJECT:-$PWD}\"; if [ -n \"$LISA_PANE_ID\" ] && [ -n \"$LISA_PROJECT\" ] && [ -d \"$LISA_PROJECT/.lisa\" ]; then mkdir -p \"$LISA_PROJECT/.lisa/signals\"; date -u +%Y-%m-%dT%H:%M:%SZ > \"$LISA_PROJECT/.lisa/signals/pane-$LISA_PANE_ID.awaiting\"; fi; if [ -d \"$proj/.lisa\" ]; then printf '%s\\n' '{\"event\":\"manual-intervention\",\"kind\":\"question\"}' >> \"$proj/.lisa/run-events.jsonl\"; fi; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); if test -x \"$proj/.lisa/hooks/on-notify\"; then printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$proj\" LISA_QUESTION_HEADER=\"$hdr\" \"$proj/.lisa/hooks/on-notify\" attention \"$q\"; fi" } ] }
        ],
        "Stop": [
-         { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh" } ] }
+         { "hooks": [ { "type": "command", "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-stop.sh\"; test -x \"$h\" && \"$h\"" } ] }
        ],
        "SessionStart": [
-         { "matcher": "clear", "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh" } ] }
+         { "matcher": "clear", "hooks": [ { "type": "command", "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-clear.sh\"; test -x \"$h\" && \"$h\"" } ] }
        ],
        "Notification": [
-         { "matcher": "idle_prompt", "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh" } ] },
+         { "matcher": "idle_prompt", "hooks": [ { "type": "command", "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-idle.sh\"; test -x \"$h\" && \"$h\"" } ] },
          { "hooks": [ { "type": "command", "command": "in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) proj=\"${LISA_PROJECT:-$PWD}\"; if [ -d \"$proj/.lisa\" ]; then printf '%s\\n' '{\"event\":\"manual-intervention\",\"kind\":\"permission\"}' >> \"$proj/.lisa/run-events.jsonl\"; fi; if test -x \"$proj/.lisa/hooks/on-notify\"; then printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$proj\" \"$proj/.lisa/hooks/on-notify\" attention \"$in\"; fi ;; esac" } ] }
        ]
      }
@@ -314,8 +317,9 @@ If you cannot run `lisa init`, create these by hand.
 
 4. **Codex bindings.** Create `.codex/hooks.json` with `Stop`, `SessionStart`
    matched on `clear`, `PostToolUse`, and `UserPromptSubmit` command hooks pointing at
-   `on-stop.sh`, `on-clear.sh`, `on-heartbeat.sh`, and `on-ack.sh` respectively.
-   Lisa's Codex launch uses
+   `on-stop.sh`, `on-clear.sh`, `on-heartbeat.sh`, and `on-ack.sh` respectively, in
+   the same `h="${LISA_PROJECT:-.}/.lisa/hooks/<script>"; test -x "$h" && "$h"` form
+   as the Claude bindings. Lisa's Codex launch uses
    `--dangerously-bypass-hook-trust` for these generated definitions; project
    trust is still pre-seeded by `lisa doctor` and `lisa loop`.
 
