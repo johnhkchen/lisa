@@ -273,6 +273,70 @@ fn a_single_project_desk_behaves_exactly_as_before() {
     );
 }
 
+/// Everything above runs the script directly. A client does not: it runs the
+/// **binding** from `.claude/settings.local.json`, in the agent's working
+/// directory. A binding that names `.lisa/hooks/on-stop.sh` therefore reaches
+/// whatever is under the agent's feet — the other board's copy of the script,
+/// or, in a directory that is not a Lisa project, nothing at all. Both are
+/// driven here, through the bindings `lisa init` actually installed.
+#[test]
+fn the_installed_bindings_reach_this_projects_hooks_from_anywhere() {
+    let desk = desk();
+    let settings: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(desk.a.join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    let binding = |script: &str| -> String {
+        settings["hooks"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|entries| entries.as_array().unwrap())
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .filter_map(|hook| hook["command"].as_str())
+            .find(|command| command.contains(script))
+            .unwrap_or_else(|| panic!("{script} is bound"))
+            .to_string()
+    };
+
+    for cwd in [&desk.b, &desk.plain] {
+        for (script, payload) in lifecycle_hooks() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", &binding(script)])
+                .current_dir(cwd)
+                .env("LISA_PROJECT", &desk.a)
+                .env("LISA_PANE_ID", PANE)
+                .env("LISA_TICKET_ID", TICKET)
+                .env("LISA_ATTEMPT_ID", ATTEMPT)
+                .env("LISA_BIN", env!("CARGO_BIN_EXE_lisa"))
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            child.wait().unwrap();
+        }
+    }
+
+    assert_eq!(
+        signals(&desk.a),
+        vec![
+            "pane-1.ack",
+            "pane-1.alive",
+            "pane-1.heartbeat",
+            "pane-1.idle",
+            "pane-1.started",
+            "pane-1.stopped",
+        ],
+        "a binding run from a stranger's tree still reaches this project's hooks"
+    );
+    assert!(!desk.plain.join(".lisa").exists());
+}
+
 /// The `AskUserQuestion` binding writes a signal too, from inside
 /// `.claude/settings.local.json` rather than from a script. It obeys the same
 /// rule: the pane's question parks the pane in the project that leased it.
