@@ -24,8 +24,47 @@ The Stop hook also forwards its lifecycle payload to `lisa capture-usage`. Succe
 transcript observations append to `.lisa/<client>/captures.jsonl`. If an identified
 Stop has a missing, unreadable, or empty transcript, Lisa instead appends a durable row
 to `.lisa/<client>/no-captures.jsonl` carrying the pane, provider session, capture time,
-and reason. The hook leaves Lisa's stderr and exit status visible, so malformed identity
-or a failure to persist either outcome is not silently discarded.
+and reason. Both ledgers are written under `$LISA_PROJECT` (the hook passes
+`capture-usage --cwd "$LISA_PROJECT"`), so a session's usage lands beside its signals in
+the project that leased the pane. The hook leaves Lisa's stderr and exit status visible,
+so malformed identity or a failure to persist either outcome is not silently discarded.
+
+## Which project a signal belongs to
+
+A hook runs in the agent's **working directory**, and that is not the same fact as the
+project its pane was leased from. An agent that steps into a second repository to read
+something — ordinary work, and nothing Lisa wants to forbid — is standing somewhere else
+when its next hook fires.
+
+So every hook takes its project from **`$LISA_PROJECT`**, exported on the pane's launch
+line beside `$LISA_PANE_ID`, and writes to `$LISA_PROJECT/.lisa/signals/`. It never uses
+`$PWD`. On a desk that runs one loop at a time the two are the same directory, which is
+why a relative `.lisa/signals` looked correct for a long time; on a desk running two
+projects at once they are not, and the old behaviour split the difference badly — the
+true project lost a heartbeat, and the innocent repository gained a fresh `pane-<id>.*`
+file from a pane numbering it does not share. Its own launcher then refused to start a
+run, correctly, on evidence that was never its own.
+
+**A hook that cannot name its lease writes nothing.** If `$LISA_PANE_ID` or
+`$LISA_PROJECT` is missing, or `$LISA_PROJECT/.lisa/` is not there, the script exits 0
+without creating anything — the payload-carrying hooks (`on-stop.sh`, `on-ack.sh`) drain
+stdin first so they never break the caller's turn. Silence is the right answer because
+the alternative is a plausible file in a directory nobody pointed Lisa at, and nothing
+downstream can tell that such a file is a stranger's. An operator's own session has
+neither variable and stays silent for exactly this reason.
+
+If you find a `.lisa/signals/` in a repository that has never run Lisa, it is a leftover
+from that older behaviour. It is inert — nothing reads it but that project's own
+launcher, and only while the timestamps look recent — and **Lisa will not remove it for
+you**: `lisa clean` only ever touches directories inside the project you point it at, and
+a stranger's tree is not one of them. Delete it by hand when you meet it:
+
+```sh
+rm -rf .lisa/signals        # in a repository that does not use Lisa
+```
+
+In a repository that *does* use Lisa, leave the directory and remove only the foreign
+pane files; `lisa status` shows which panes that project actually holds.
 
 ## The five lifecycle hooks
 
@@ -43,8 +82,10 @@ and Codex bind their supported subsets through `.claude/settings.local.json` and
 | `on-ack.sh`        | `UserPromptSubmit`          | `.lisa/signals/pane-<id>.ack`       | assigned prompt accepted|
 | *(launch guard)*   | Codex TUI exits non-zero     | `.lisa/signals/pane-<id>.error`     | session failed          |
 
-Each script is POSIX `sh`, does `mkdir -p .lisa/signals`, and writes only when
-`$LISA_PANE_ID` is set (so it is inert outside a Lisa session). The ack hook atomically
+Each script is POSIX `sh` and writes only when the pane can name both itself
+(`$LISA_PANE_ID`) and its project (`$LISA_PROJECT`), so it is inert outside a Lisa
+session and never creates a directory in a repository it is only visiting — see
+**Which project a signal belongs to** above. The ack hook atomically
 preserves its raw JSON payload; the other lifecycle scripts write UTC timestamps. The
 **heartbeat** is the liveness primitive: the plugin reuses a pane only after a stretch
 of heartbeat *silence* — not on a stop/idle signal, which can fire before an agent is
@@ -130,9 +171,12 @@ guard; you can ignore it.)
 3. **From Claude Code's `PreToolUse[AskUserQuestion]` event**: when an agent calls the
    `AskUserQuestion` tool (it needs a decision from you), this binding fires
    `on-notify attention` with `LISA_REASON=question` and a best-effort first-question
-   string as the detail. It **also** writes `.lisa/signals/pane-<id>.awaiting` so the
-   plugin can avoid clobbering the pane while it waits on your answer. The signal write
-   is unconditional; only the `on-notify` dispatch is `test -x`-gated.
+   string as the detail. It **also** writes `$LISA_PROJECT/.lisa/signals/pane-<id>.awaiting`
+   so the plugin can avoid clobbering the pane while it waits on your answer. That signal
+   follows the lease like every other one, and is skipped when the pane cannot name a
+   project; only the `on-notify` dispatch is `test -x`-gated. The ledger row and the
+   notify dispatch fall back to `$PWD` when there is no `$LISA_PROJECT`, which is what an
+   operator's own session has always meant.
 
 A missing or non-executable `on-notify` is always a silent no-op — all three paths guard
 the notify dispatch with `test -x`.
@@ -193,10 +237,21 @@ After `lisa init`, optionally enable `on-notify` (see **Enable it** above), then
 
 If you cannot run `lisa init`, create these by hand.
 
-1. **Hook scripts.** Create `.lisa/hooks/` with the four `.sh` scripts above (each a
-   POSIX `sh` script that `mkdir -p .lisa/signals` and writes
-   `"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > ".lisa/signals/pane-$LISA_PANE_ID.<ext>"` when
-   `$LISA_PANE_ID` is set — `.idle`, `.stopped`, `.cleared`, `.heartbeat` respectively).
+1. **Hook scripts.** Create `.lisa/hooks/` with the four `.sh` scripts above. Each is a
+   POSIX `sh` script that opens with the same lease guard and then writes one file —
+   `.idle`, `.stopped`, `.cleared`, `.heartbeat` respectively:
+
+   ```sh
+   #!/bin/sh
+   [ -n "${LISA_PANE_ID:-}" ] || exit 0
+   [ -n "${LISA_PROJECT:-}" ] || exit 0
+   [ -d "$LISA_PROJECT/.lisa" ] || exit 0
+   SIGNAL_DIR="$LISA_PROJECT/.lisa/signals"
+   mkdir -p "$SIGNAL_DIR" || exit 0
+
+   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SIGNAL_DIR/pane-$LISA_PANE_ID.idle"
+   ```
+
    Make them executable:
    ```sh
    chmod +x .lisa/hooks/on-idle.sh .lisa/hooks/on-stop.sh \
@@ -224,7 +279,7 @@ If you cannot run `lisa init`, create these by hand.
          { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh" } ] }
        ],
        "PreToolUse": [
-         { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "mkdir -p .lisa/signals; [ -n \"$LISA_PANE_ID\" ] && date -u +%Y-%m-%dT%H:%M:%SZ > \".lisa/signals/pane-$LISA_PANE_ID.awaiting\"; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); test -x .lisa/hooks/on-notify && printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$PWD\" LISA_QUESTION_HEADER=\"$hdr\" .lisa/hooks/on-notify attention \"$q\"" } ] }
+         { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "proj=\"${LISA_PROJECT:-$PWD}\"; if [ -n \"$LISA_PANE_ID\" ] && [ -n \"$LISA_PROJECT\" ] && [ -d \"$LISA_PROJECT/.lisa\" ]; then mkdir -p \"$LISA_PROJECT/.lisa/signals\"; date -u +%Y-%m-%dT%H:%M:%SZ > \"$LISA_PROJECT/.lisa/signals/pane-$LISA_PANE_ID.awaiting\"; fi; if [ -d \"$proj/.lisa\" ]; then printf '%s\\n' '{\"event\":\"manual-intervention\",\"kind\":\"question\"}' >> \"$proj/.lisa/run-events.jsonl\"; fi; in=$(cat); q=$(printf '%s' \"$in\" | sed -n 's/.*\"question\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$q\" ] && q=\"agent is asking a question\"; hdr=$(printf '%s' \"$in\" | sed -n 's/.*\"header\":[ ]*\"\\([^\"]*\\)\".*/\\1/p'); if test -x \"$proj/.lisa/hooks/on-notify\"; then printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=question LISA_PROJECT=\"$proj\" LISA_QUESTION_HEADER=\"$hdr\" \"$proj/.lisa/hooks/on-notify\" attention \"$q\"; fi" } ] }
        ],
        "Stop": [
          { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh" } ] }
@@ -234,7 +289,7 @@ If you cannot run `lisa init`, create these by hand.
        ],
        "Notification": [
          { "matcher": "idle_prompt", "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh" } ] },
-         { "hooks": [ { "type": "command", "command": "test -x .lisa/hooks/on-notify || exit 0; in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$PWD\" .lisa/hooks/on-notify attention \"$in\" ;; esac" } ] }
+         { "hooks": [ { "type": "command", "command": "in=$(cat); case \"$in\" in *idle_prompt*) : ;; *) proj=\"${LISA_PROJECT:-$PWD}\"; if [ -d \"$proj/.lisa\" ]; then printf '%s\\n' '{\"event\":\"manual-intervention\",\"kind\":\"permission\"}' >> \"$proj/.lisa/run-events.jsonl\"; fi; if test -x \"$proj/.lisa/hooks/on-notify\"; then printf '%s' \"$in\" | LISA_EVENT=attention LISA_REASON=permission LISA_PROJECT=\"$proj\" \"$proj/.lisa/hooks/on-notify\" attention \"$in\"; fi ;; esac" } ] }
        ]
      }
    }
@@ -244,11 +299,18 @@ If you cannot run `lisa init`, create these by hand.
    `on-notify` is not executable, reads the payload from stdin once, skips
    `idle_prompt`, and otherwise invokes `on-notify attention "<payload>"` with
    `LISA_EVENT`/`LISA_REASON` set inline. The `PreToolUse[AskUserQuestion]` command is
-   likewise POSIX `sh`: it **always** writes the `pane-<id>.awaiting` signal (so the
-   plugin can hold the pane while you answer), best-effort extracts the first question
-   text with `sed`, and only then `test -x`-gates the `on-notify attention` call with
-   `LISA_REASON=question`. A question containing an escaped quote degrades to a generic
-   "agent is asking a question" detail rather than failing.
+   likewise POSIX `sh`: it writes the `pane-<id>.awaiting` signal whenever the pane can
+   name its project (so the plugin can hold the pane while you answer), best-effort
+   extracts the first question text with `sed`, and only then `test -x`-gates the
+   `on-notify attention` call with `LISA_REASON=question`. A question containing an
+   escaped quote degrades to a generic "agent is asking a question" detail rather than
+   failing.
+
+   Both commands address `$LISA_PROJECT` — the project the pane was leased from —
+   falling back to `$PWD` only for the ledger row and the notify dispatch, which is what
+   `$PWD` has always meant in an operator's own session. Neither creates anything outside
+   an existing `.lisa/`, so a session reading an unrelated repository leaves nothing
+   behind there and never runs *that* project's `on-notify`.
 
 4. **Codex bindings.** Create `.codex/hooks.json` with `Stop`, `SessionStart`
    matched on `clear`, `PostToolUse`, and `UserPromptSubmit` command hooks pointing at
