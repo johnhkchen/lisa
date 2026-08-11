@@ -2850,26 +2850,43 @@ depends_on: [T-999]
             "Should update settings.local.json to upgrade hooks"
         );
 
-        // Verify the updated content has guarded commands
+        // Verify the updated content has guarded, project-addressed commands:
+        // the guard keeps an absent script silent, and the script is reached
+        // through the leased project rather than the agent's working directory.
         if let InitAction::UpdateFile { content, .. } = &update_settings[0] {
-            assert!(
-                content.contains("test -x .lisa/hooks/on-stop.sh"),
-                "Stop hook should be guarded"
-            );
-            assert!(
-                content.contains("test -x .lisa/hooks/on-clear.sh"),
-                "Clear hook should be guarded"
-            );
-            assert!(
-                content.contains("test -x .lisa/hooks/on-idle.sh"),
-                "Idle hook should be guarded"
-            );
-            // No duplicate entries
-            assert_eq!(
-                content.matches("on-stop.sh").count(),
-                2,
-                "on-stop.sh should appear twice (guard + path)"
-            );
+            let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+            // Find each upgraded command by the script it names: merge appends
+            // new matchers, so positions are not stable across events.
+            let command_for = |script: &str| -> String {
+                parsed["hooks"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .flat_map(|entries| entries.as_array().unwrap())
+                    .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                    .filter_map(|hook| hook["command"].as_str())
+                    .find(|command| command.contains(script))
+                    .unwrap_or_else(|| panic!("{script} binding is present"))
+                    .to_string()
+            };
+            for script in ["on-stop.sh", "on-clear.sh", "on-idle.sh"] {
+                let command = command_for(script);
+                let command = command.as_str();
+                assert!(
+                    command.contains("test -x"),
+                    "{script} should stay guarded: {command}"
+                );
+                assert!(
+                    command.contains("${LISA_PROJECT:-.}/.lisa/hooks/"),
+                    "{script} should be reached through the leased project, not the \
+                     directory the agent is standing in: {command}"
+                );
+                assert_eq!(
+                    command.matches(script).count(),
+                    1,
+                    "{script} is named once in its command: {command}"
+                );
+            }
         }
     }
 

@@ -706,7 +706,7 @@ pub fn codex_hooks_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh"
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-heartbeat.sh\"; test -x \"$h\" && \"$h\""
           }
         ]
       }
@@ -716,7 +716,7 @@ pub fn codex_hooks_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-stop.sh\"; test -x \"$h\" && \"$h\""
           }
         ]
       }
@@ -727,7 +727,7 @@ pub fn codex_hooks_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh"
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-start.sh\"; test -x \"$h\" && \"$h\""
           }
         ]
       },
@@ -736,7 +736,7 @@ pub fn codex_hooks_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-clear.sh\"; test -x \"$h\" && \"$h\""
           }
         ]
       }
@@ -746,7 +746,7 @@ pub fn codex_hooks_json() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-ack.sh\"; test -x \"$h\" && \"$h\""
           }
         ]
       }
@@ -861,6 +861,24 @@ fn ensure_hook(
 /// PreToolUse[AskUserQuestion] question binding) into an existing
 /// settings.local.json. Returns the updated JSON string, or an error if the JSON
 /// is malformed.
+/// The guarded command that binds one lifecycle script to a client event.
+///
+/// The script is addressed through `$LISA_PROJECT` because a client runs its
+/// hook commands in the **agent's working directory**. A bare
+/// `.lisa/hooks/on-stop.sh` therefore means *that* directory's script: another
+/// project's copy of it when the agent is reading a second board, and nothing at
+/// all in a directory that is not a Lisa project — a pane that goes quiet by
+/// walking somewhere entirely ordinary. Naming the leased project makes the
+/// binding reach this project's own script wherever the session is standing,
+/// and the script then decides where to write.
+///
+/// `${LISA_PROJECT:-.}` keeps the previous meaning for a session that has no
+/// leased project: an operator's own, and a pane launched before Lisa exported
+/// the variable. `test -x` still makes an absent script a silent no-op.
+fn hook_binding(script: &str) -> String {
+    format!(r#"h="${{LISA_PROJECT:-.}}/.lisa/hooks/{script}"; test -x "$h" && "$h""#)
+}
+
 pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
     let mut root: serde_json::Value = serde_json::from_str(existing_json)
         .map_err(|e| format!("invalid JSON in settings.local.json: {}", e))?;
@@ -874,41 +892,36 @@ pub fn merge_hooks(existing_json: &str) -> Result<String, String> {
         .as_object_mut()
         .ok_or("settings.local.json 'hooks' is not an object")?;
 
-    ensure_hook(
-        hooks_obj,
-        "Stop",
-        None,
-        "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh",
-    );
+    ensure_hook(hooks_obj, "Stop", None, &hook_binding("on-stop.sh"));
     ensure_hook(
         hooks_obj,
         "SessionStart",
         Some("startup"),
-        "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh",
+        &hook_binding("on-start.sh"),
     );
     ensure_hook(
         hooks_obj,
         "SessionStart",
         Some("clear"),
-        "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh",
+        &hook_binding("on-clear.sh"),
     );
     ensure_hook(
         hooks_obj,
         "Notification",
         Some("idle_prompt"),
-        "test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh",
+        &hook_binding("on-idle.sh"),
     );
     ensure_hook(
         hooks_obj,
         "PostToolUse",
         None,
-        "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
+        &hook_binding("on-heartbeat.sh"),
     );
     ensure_hook(
         hooks_obj,
         "UserPromptSubmit",
         None,
-        "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh",
+        &hook_binding("on-ack.sh"),
     );
     // Catch-all (matcher-less) Notification entry for permission/attention payloads.
     // Distinct from the idle_prompt entry above: ensure_hook dedups a matcher-less
@@ -942,35 +955,30 @@ pub fn merge_codex_hooks(existing_json: &str) -> Result<String, String> {
         .as_object_mut()
         .ok_or("hooks.json 'hooks' is not an object")?;
 
-    ensure_hook(
-        hooks_obj,
-        "Stop",
-        None,
-        "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh",
-    );
+    ensure_hook(hooks_obj, "Stop", None, &hook_binding("on-stop.sh"));
     ensure_hook(
         hooks_obj,
         "SessionStart",
         Some("startup"),
-        "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh",
+        &hook_binding("on-start.sh"),
     );
     ensure_hook(
         hooks_obj,
         "SessionStart",
         Some("clear"),
-        "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh",
+        &hook_binding("on-clear.sh"),
     );
     ensure_hook(
         hooks_obj,
         "PostToolUse",
         Some(".*"),
-        "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
+        &hook_binding("on-heartbeat.sh"),
     );
     ensure_hook(
         hooks_obj,
         "UserPromptSubmit",
         None,
-        "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh",
+        &hook_binding("on-ack.sh"),
     );
 
     serde_json::to_string_pretty(&root).map_err(|e| format!("failed to serialize JSON: {}", e))
@@ -1510,7 +1518,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-            "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh"
+            hook_binding("on-ack.sh").as_str()
         );
         assert_eq!(parsed["hooks"]["SessionStart"][0]["matcher"], "startup");
         assert_eq!(parsed["hooks"]["SessionStart"][1]["matcher"], "clear");
@@ -1566,14 +1574,11 @@ mod tests {
         assert!(merged.contains("on-ack.sh"));
 
         let again = merge_codex_hooks(&merged).unwrap();
-        assert_eq!(again.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
-        assert_eq!(again.matches("test -x .lisa/hooks/on-start.sh").count(), 1);
-        assert_eq!(again.matches("test -x .lisa/hooks/on-clear.sh").count(), 1);
-        assert_eq!(
-            again.matches("test -x .lisa/hooks/on-heartbeat.sh").count(),
-            1
-        );
-        assert_eq!(again.matches("test -x .lisa/hooks/on-ack.sh").count(), 1);
+        assert_eq!(again.matches(&binding_json("on-stop.sh")).count(), 1);
+        assert_eq!(again.matches(&binding_json("on-start.sh")).count(), 1);
+        assert_eq!(again.matches(&binding_json("on-clear.sh")).count(), 1);
+        assert_eq!(again.matches(&binding_json("on-heartbeat.sh")).count(), 1);
+        assert_eq!(again.matches(&binding_json("on-ack.sh")).count(), 1);
     }
 
     #[test]
@@ -1622,7 +1627,7 @@ mod tests {
         assert!(result.contains("AskUserQuestion"));
         assert_eq!(count_question_commands(&result), 1);
         let again = merge_hooks(&result).unwrap();
-        assert_eq!(again.matches("test -x .lisa/hooks/on-ack.sh").count(), 1);
+        assert_eq!(again.matches(&binding_json("on-ack.sh")).count(), 1);
     }
 
     #[test]
@@ -1683,6 +1688,15 @@ mod tests {
             .filter_map(|h| h["command"].as_str())
             .filter(|c| *c == NOTIFY_QUESTION_COMMAND)
             .count()
+    }
+
+    /// One binding as it appears inside a serialized settings document, so a
+    /// test can count occurrences of the real command rather than a fragment.
+    fn binding_json(script: &str) -> String {
+        serde_json::to_string(&serde_json::Value::String(hook_binding(script)))
+            .unwrap()
+            .trim_matches('"')
+            .to_string()
     }
 
     #[test]
@@ -1922,8 +1936,8 @@ mod tests {
         let result = merge_hooks(&input).unwrap();
         // No duplicate hook entries (each command string contains the script name twice
         // due to the test -x guard, so count the full command instead)
-        assert_eq!(result.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
-        assert_eq!(result.matches("test -x .lisa/hooks/on-clear.sh").count(), 1);
+        assert_eq!(result.matches(&binding_json("on-stop.sh")).count(), 1);
+        assert_eq!(result.matches(&binding_json("on-clear.sh")).count(), 1);
         assert_eq!(result.matches("\"idle_prompt\"").count(), 1);
         // The catch-all attention command appears exactly once.
         assert_eq!(count_attention_commands(&result), 1);
@@ -1940,13 +1954,13 @@ mod tests {
   }
 }"#;
         let result = merge_hooks(input).unwrap();
-        // Should upgrade to guarded commands
-        assert!(result.contains("test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh"));
-        assert!(result.contains("test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh"));
-        assert!(result.contains("test -x .lisa/hooks/on-idle.sh && .lisa/hooks/on-idle.sh"));
+        // Should upgrade to guarded, project-addressed commands
+        assert!(result.contains(&binding_json("on-stop.sh")));
+        assert!(result.contains(&binding_json("on-clear.sh")));
+        assert!(result.contains(&binding_json("on-idle.sh")));
         // No duplicates — each hook entry appears once
-        assert_eq!(result.matches("test -x .lisa/hooks/on-stop.sh").count(), 1);
-        assert_eq!(result.matches("test -x .lisa/hooks/on-clear.sh").count(), 1);
+        assert_eq!(result.matches(&binding_json("on-stop.sh")).count(), 1);
+        assert_eq!(result.matches(&binding_json("on-clear.sh")).count(), 1);
         assert_eq!(result.matches("\"idle_prompt\"").count(), 1);
     }
 

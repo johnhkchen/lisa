@@ -4,7 +4,7 @@
       {
         "hooks": [
           {
-            "command": "test -x .lisa/hooks/on-heartbeat.sh && .lisa/hooks/on-heartbeat.sh",
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-heartbeat.sh\"; test -x \"$h\" && \"$h\"",
             "type": "command"
           }
         ],
@@ -15,7 +15,7 @@
       {
         "hooks": [
           {
-            "command": "test -x .lisa/hooks/on-clear.sh && .lisa/hooks/on-clear.sh",
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-clear.sh\"; test -x \"$h\" && \"$h\"",
             "type": "command"
           }
         ],
@@ -24,7 +24,7 @@
       {
         "hooks": [
           {
-            "command": "test -x .lisa/hooks/on-start.sh && .lisa/hooks/on-start.sh",
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-start.sh\"; test -x \"$h\" && \"$h\"",
             "type": "command"
           }
         ],
@@ -35,7 +35,7 @@
       {
         "hooks": [
           {
-            "command": "test -x .lisa/hooks/on-stop.sh && .lisa/hooks/on-stop.sh",
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-stop.sh\"; test -x \"$h\" && \"$h\"",
             "type": "command"
           }
         ]
@@ -45,7 +45,7 @@
       {
         "hooks": [
           {
-            "command": "test -x .lisa/hooks/on-ack.sh && .lisa/hooks/on-ack.sh",
+            "command": "h=\"${LISA_PROJECT:-.}/.lisa/hooks/on-ack.sh\"; test -x \"$h\" && \"$h\"",
             "type": "command"
           }
         ]
