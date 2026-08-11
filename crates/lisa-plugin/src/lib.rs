@@ -13473,6 +13473,59 @@ mod tests {
             .contains(".tmp.")));
     }
 
+    /// The stamp that lets `lisa status` tell a dead run from a slow session.
+    ///
+    /// It lands beside the signal directory rather than in it: `lisa status`
+    /// corroborates the stamp with "and the signal directory has gone quiet",
+    /// and a stamp written among the signals would make that second fact a
+    /// restatement of the first (T-060-01-01).
+    #[test]
+    fn a_running_scheduler_stamps_itself_beside_the_signal_directory() {
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let lisa_dir = temp.path().join(".lisa");
+        let signal_dir = lisa_dir.join("signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let state = State {
+            signal_dir: signal_dir.clone(),
+            ..State::default()
+        };
+
+        state.stamp_scheduler_alive();
+
+        let stamped = lisa_dir.join(lisa_core::liveness::SCHEDULER_ALIVE_NAME);
+        let recorded: lisa_core::liveness::SchedulerAlive =
+            serde_json::from_slice(&fs::read(&stamped).unwrap()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            recorded.age_secs(now).is_some_and(|age| age < 60),
+            "the stamp names the moment it was written"
+        );
+        assert_eq!(
+            recorded.poll_interval_secs,
+            POLL_INTERVAL_SECS.round() as u64
+        );
+        assert!(
+            signal_dir.read_dir().unwrap().next().is_none(),
+            "the stamp is not a pane signal and never enters the signal directory"
+        );
+
+        // Rewriting is what the tick does, and it must not accumulate files.
+        state.stamp_scheduler_alive();
+        assert_eq!(fs::read_dir(&lisa_dir).unwrap().count(), 2);
+    }
+
+    /// A plugin with nowhere to write — the shape every unit test uses — must
+    /// not panic or invent a path from an empty one.
+    #[test]
+    fn a_scheduler_with_no_signal_directory_stamps_nothing() {
+        State::default().stamp_scheduler_alive();
+    }
+
     #[test]
     fn publication_sites_preserve_serialization_and_collision_contracts() {
         use std::fs;

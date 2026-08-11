@@ -22,6 +22,7 @@ mod preownership_status;
 mod proposal;
 mod run_summary;
 mod runtime;
+mod seats;
 mod setup_guide;
 mod status;
 mod templates;
@@ -174,6 +175,28 @@ enum Commands {
 
         /// Print the list and change nothing, which is what a bare run does
         #[arg(long, conflicts_with = "remove")]
+        dry_run: bool,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Free the seats a run left behind when it stopped without shutting down.
+    ///
+    /// Last in the everyday list on purpose: it is the one command here an
+    /// operator reaches for only after something went wrong.
+    #[command(
+        display_order = 10,
+        after_help = "A bare run prints the list and changes nothing. Add --release to carry it \
+                      out.\n\nExample: lisa release-seats --path ./my-project"
+    )]
+    ReleaseSeats {
+        /// Release the listed seats instead of only listing them
+        #[arg(long, conflicts_with = "dry_run")]
+        release: bool,
+
+        /// Print the list and change nothing, which is what a bare run does
+        #[arg(long, conflicts_with = "release")]
         dry_run: bool,
 
         /// Path to the project root (defaults to current directory)
@@ -616,6 +639,20 @@ fn main() {
             let path = resolve_path(&path);
             require_lisa_project(&path);
             if let Err(e) = clean::run_clean(&path, remove) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::ReleaseSeats {
+            release,
+            dry_run: _,
+            path,
+        } => {
+            // Same shape as `clean`: `--dry-run` names the default out loud and
+            // earns its place by conflicting with the acting flag.
+            let path = resolve_path(&path);
+            require_lisa_project(&path);
+            if let Err(e) = seats::run_release_seats(&path, release) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

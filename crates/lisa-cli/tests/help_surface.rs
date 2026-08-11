@@ -56,17 +56,18 @@ Runs coding agents through your ticket board, so you don't have to approve every
 Usage: lisa <COMMAND>
 
 Commands:
-  init          Set up a project to run with Lisa
-  validate      Check your tickets and project setup for problems before a run
-  status        Show which tickets are ready to run and which are waiting, and why
-  notes         Read or acknowledge updates from work that kept moving
-  unblock       Verify what changed and let a waiting ticket run again
-  already-done  Finish a ticket whose work is already recorded in history
-  doctor        Check that the tools Lisa needs are installed
-  clean         Remove what an older Lisa left behind, once you have read the list
-  proposal      Settle a first-responder proposal for a waiting ticket
-  loop          Start a run: work through the ready tickets, in parallel where they don't collide
-  help          Print this message or the help of the given subcommand(s)
+  init           Set up a project to run with Lisa
+  validate       Check your tickets and project setup for problems before a run
+  status         Show which tickets are ready to run and which are waiting, and why
+  notes          Read or acknowledge updates from work that kept moving
+  unblock        Verify what changed and let a waiting ticket run again
+  already-done   Finish a ticket whose work is already recorded in history
+  doctor         Check that the tools Lisa needs are installed
+  clean          Remove what an older Lisa left behind, once you have read the list
+  proposal       Settle a first-responder proposal for a waiting ticket
+  loop           Start a run: work through the ready tickets, in parallel where they don't collide
+  release-seats  Free the seats a run left behind when it stopped without shutting down
+  help           Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help

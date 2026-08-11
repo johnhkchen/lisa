@@ -227,6 +227,52 @@ fn print_waiting_on_you(
     println!();
 }
 
+/// The seats a run left behind, if there are any.
+///
+/// Silent otherwise. This is a fault report, and a project where nothing is
+/// wrong should not have to read a line saying so — the `Status:` counts above
+/// already describe a healthy board. When it does speak it names the ticket in
+/// each seat, the evidence, and the one command that ends it, because the whole
+/// complaint this answers was that the state was undiscoverable rather than
+/// unrecoverable.
+fn abandoned_seat_lines(attempts: &[SeatAttempt], run: &crate::seats::RunReport) -> Vec<String> {
+    let abandoned: Vec<&SeatAttempt> = attempts
+        .iter()
+        .filter(|attempt| attempt.abandoned)
+        .collect();
+    if abandoned.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec!["Seats held by a run that is gone".to_string()];
+    for attempt in abandoned {
+        lines.push(format!(
+            "  pane {:<3} {:<12}  attempt {}  ({})",
+            attempt.pane_id,
+            attempt.ticket_id,
+            attempt.attempt_id,
+            attempt
+                .ticket_phase
+                .as_deref()
+                .unwrap_or("not on the board"),
+        ));
+    }
+    lines.push(format!("  {}", run.evidence));
+    lines.push("  To free them, read the list first: lisa release-seats".to_string());
+    lines
+}
+
+fn print_abandoned_seats(data: &StatusData) {
+    let lines = abandoned_seat_lines(&data.attempts, &data.run);
+    if lines.is_empty() {
+        return;
+    }
+    for line in lines {
+        println!("{line}");
+    }
+    println!();
+}
+
 fn print_status_notes(notes: &[QueuedNote]) {
     if notes.is_empty() {
         println!("Notes for you");
@@ -284,6 +330,16 @@ struct SeatAttempt {
     /// one. That is a fact about the markers themselves, which is why it can be
     /// stated here without reconstructing residency from the ledgers.
     superseded: bool,
+    /// Whether the run that placed this seat has stopped without withdrawing
+    /// it.
+    ///
+    /// True only when Lisa can say so from two agreeing facts — see
+    /// [`crate::seats`]. Doubt reads as `false`, because a seat wrongly called
+    /// free can put a second agent on a ticket somebody is working.
+    abandoned: bool,
+    /// The evidence behind `abandoned`, in the same words `lisa status` prints,
+    /// or `None` when the seat is not abandoned.
+    abandoned_reason: Option<String>,
 }
 
 /// Read every pane lease marker the scheduler has published, in pane order.
@@ -291,7 +347,11 @@ struct SeatAttempt {
 /// A marker that cannot be read or parsed is skipped rather than reported: a
 /// half-written file is the scheduler's business, and this reader must never
 /// turn one into a failure for a consumer asking what is running.
-fn read_seat_attempts(signal_dir: &Path, tickets: &[Ticket]) -> Vec<SeatAttempt> {
+fn read_seat_attempts(
+    signal_dir: &Path,
+    tickets: &[Ticket],
+    run: &crate::seats::RunReport,
+) -> Vec<SeatAttempt> {
     let phases: HashMap<&str, String> = tickets
         .iter()
         .map(|ticket| (ticket.id.as_str(), ticket.phase.to_string()))
@@ -326,6 +386,11 @@ fn read_seat_attempts(signal_dir: &Path, tickets: &[Ticket]) -> Vec<SeatAttempt>
             ticket_id: lease.ticket_id,
             attempt_id: lease.attempt_id,
             superseded: false,
+            // The verdict is about the run, not the pane: every marker in the
+            // directory predates the moment that run stopped, so they are
+            // abandoned together or not at all.
+            abandoned: run.seats_are_abandoned(),
+            abandoned_reason: run.seats_are_abandoned().then(|| run.evidence.clone()),
         });
     }
 
@@ -359,6 +424,8 @@ struct StatusData {
     tickets: Vec<Ticket>,
     ledger: Vec<ProvenanceLedgerRecord>,
     attempts: Vec<SeatAttempt>,
+    /// What Lisa can say about the run that placed those seats.
+    run: crate::seats::RunReport,
     /// `None` when the ticket directory holds no tickets: there is no board to
     /// describe, which is a fact rather than a failure.
     board: Option<StatusBoard>,
@@ -406,7 +473,8 @@ fn collect_status(root: &Path) -> Result<StatusData, String> {
         &root.join(".lisa/completion-journal.jsonl"),
         &root.join(".lisa/provenance.jsonl"),
     )?;
-    let attempts = read_seat_attempts(&root.join(".lisa/signals"), &tickets);
+    let run = crate::seats::assess_run(root, &resolved);
+    let attempts = read_seat_attempts(&root.join(".lisa/signals"), &tickets, &run);
 
     let board = if tickets.is_empty() {
         None
@@ -461,6 +529,7 @@ fn collect_status(root: &Path) -> Result<StatusData, String> {
         tickets,
         ledger: read_ledger(&ledger_path),
         attempts,
+        run,
         board,
         run_summary,
     })
@@ -498,6 +567,11 @@ fn print_status(data: &StatusData) -> Result<(), String> {
         format_config_summary(&data.resolved, data.completion_seal)
     );
     println!();
+
+    // Directly under the counts it qualifies: "2 in progress" on a board where
+    // the run that placed those seats is gone is the exact sentence that misled
+    // an operator for a day.
+    print_abandoned_seats(data);
 
     print_token_usage(&data.ledger);
 
@@ -1177,6 +1251,106 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("T-B") && line.contains("0 in")));
+    }
+
+    fn seat(pane_id: u32, ticket_id: &str, phase: &str, abandoned: bool) -> SeatAttempt {
+        SeatAttempt {
+            pane_id,
+            ticket_id: ticket_id.to_string(),
+            attempt_id: 1,
+            ticket_phase: Some(phase.to_string()),
+            superseded: false,
+            abandoned,
+            abandoned_reason: abandoned.then(|| "the run stopped 18h ago.".to_string()),
+        }
+    }
+
+    fn ended_run() -> crate::seats::RunReport {
+        crate::seats::RunReport {
+            liveness: crate::seats::RunLiveness::Ended,
+            evidence: "the run stopped 18h ago.".to_string(),
+        }
+    }
+
+    /// The section exists because "2 in progress" on a board where nothing is
+    /// running is the sentence that misled an operator for a day. It names the
+    /// seats, the evidence, and the way out.
+    #[test]
+    fn abandoned_seats_are_named_with_their_evidence_and_the_command() {
+        let attempts = vec![
+            seat(2, "T-008-06", "review", true),
+            seat(3, "T-008-07", "done", true),
+        ];
+
+        let lines = abandoned_seat_lines(&attempts, &ended_run());
+
+        assert_eq!(lines[0], "Seats held by a run that is gone");
+        assert!(lines[1].contains("pane 2") && lines[1].contains("T-008-06"));
+        assert!(lines[2].contains("pane 3") && lines[2].contains("T-008-07"));
+        assert!(lines[3].contains("the run stopped 18h ago."));
+        assert_eq!(
+            lines[4],
+            "  To free them, read the list first: lisa release-seats"
+        );
+    }
+
+    /// A healthy board says nothing at all. The counts above it already
+    /// describe one, and a fault report that fires when there is no fault
+    /// teaches an operator to skip it.
+    #[test]
+    fn a_board_with_no_abandoned_seat_prints_no_section() {
+        let attempts = vec![seat(0, "T-008-08", "implement", false)];
+        assert!(abandoned_seat_lines(&attempts, &ended_run()).is_empty());
+        assert!(abandoned_seat_lines(&[], &ended_run()).is_empty());
+    }
+
+    /// `attempts[]` has to carry the same truth the prose does — a consumer
+    /// reading the documented contract must not be the last to know.
+    #[test]
+    fn the_json_entry_carries_the_verdict_and_its_reason() {
+        let live = serde_json::to_value(seat(0, "T-008-08", "implement", false)).unwrap();
+        assert_eq!(live["abandoned"], serde_json::json!(false));
+        assert_eq!(live["abandoned_reason"], serde_json::Value::Null);
+
+        let gone = serde_json::to_value(seat(2, "T-008-06", "review", true)).unwrap();
+        assert_eq!(gone["abandoned"], serde_json::json!(true));
+        assert_eq!(gone["abandoned_reason"], "the run stopped 18h ago.");
+        // The fields a consumer already reads keep their meaning.
+        assert_eq!(gone["superseded"], serde_json::json!(false));
+        assert_eq!(gone["ticket_phase"], "review");
+    }
+
+    /// The verdict belongs to the run, so a lease Lisa cannot match to a ticket
+    /// still gets it — an entry left out of the diagnosis is one an operator
+    /// cannot act on.
+    #[test]
+    fn every_marker_from_an_ended_run_is_marked_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let signals = dir.path().join("signals");
+        fs::create_dir_all(&signals).unwrap();
+        fs::write(
+            signals.join("pane-0.lease"),
+            r#"{"ticket_id":"T-001","attempt_id":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            signals.join("pane-1.lease"),
+            r#"{"ticket_id":"T-GONE","attempt_id":4}"#,
+        )
+        .unwrap();
+
+        let ticket_path = dir.path().join("T-001.md");
+        fs::write(
+            &ticket_path,
+            "---\nid: T-001\ntitle: a\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n\nA.\n",
+        )
+        .unwrap();
+        let tickets = vec![lisa_core::ticket::parse_ticket(&ticket_path).unwrap()];
+
+        let attempts = read_seat_attempts(&signals, &tickets, &ended_run());
+        assert!(attempts.iter().all(|attempt| attempt.abandoned));
+        assert_eq!(attempts[1].ticket_phase, None);
+        assert!(attempts[1].abandoned_reason.is_some());
     }
 
     #[test]

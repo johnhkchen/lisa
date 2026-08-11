@@ -185,7 +185,11 @@ impl ProjectDirs {
 }
 
 /// Whether a path is safe to touch, and if not, why not in the operator's words.
-enum Reachability {
+///
+/// Shared with [`crate::seats`], which deletes a different class of file for a
+/// different reason but must refuse a symlinked path for exactly the same one —
+/// and must refuse it in the same words.
+pub(crate) enum Reachability {
     Safe,
     Refused(String),
 }
@@ -482,7 +486,7 @@ fn sorted_dir_entries(dir: &Path) -> Vec<PathBuf> {
 /// on the leaf alone is defeated by a symlinked parent, and a tree containing a
 /// link out of the project cannot be described honestly by a plan that never
 /// looked inside it.
-fn reachability(root: &Path, canonical_root: &Path, path: &Path) -> Reachability {
+pub(crate) fn reachability(root: &Path, canonical_root: &Path, path: &Path) -> Reachability {
     let Ok(relative) = path.strip_prefix(root) else {
         return Reachability::Refused("it sits outside the project root".to_string());
     };
@@ -541,14 +545,14 @@ fn first_symlink_within(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Render a path the way an operator would type it: relative to the project.
-fn display_relative(root: &Path, path: &Path) -> String {
+pub(crate) fn display_relative(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
 }
 
-fn plural(count: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
     if count == 1 {
         format!("{count} {one}")
     } else {
