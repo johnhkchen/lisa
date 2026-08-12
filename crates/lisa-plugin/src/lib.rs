@@ -21366,9 +21366,11 @@ mod tests {
     /// The ticker recomposes on every render; only a changed row reaches Zellij.
     #[test]
     fn plugin_pane_ticker_is_applied_once_per_change() {
-        let mut state = State::default();
-        state.permissions_granted = true;
-        state.plugin_pane_id = Some(7);
+        let mut state = State {
+            permissions_granted: true,
+            plugin_pane_id: Some(7),
+            ..State::default()
+        };
 
         assert!(state.set_pane_ticker("lisa · idle · 2/4 done".to_string()));
         assert!(!state.set_pane_ticker("lisa · idle · 2/4 done".to_string()));
@@ -21383,8 +21385,10 @@ mod tests {
     /// applied, or the first real one is suppressed by the dedupe gate.
     #[test]
     fn plugin_pane_ticker_waits_for_permission_and_a_pane() {
-        let mut state = State::default();
-        state.plugin_pane_id = Some(7);
+        let mut state = State {
+            plugin_pane_id: Some(7),
+            ..State::default()
+        };
         assert!(!state.set_pane_ticker("lisa · idle".to_string()));
         assert!(state.last_ticker.is_none());
 
