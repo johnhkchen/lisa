@@ -41,7 +41,7 @@
 use std::path::Path;
 
 use lisa_core::client::AgentClient;
-use lisa_core::route::{resolve_route, ResolvedRoute};
+use lisa_core::route::{resolve_route_with_default_model, ResolvedRoute};
 use lisa_core::types::Ticket;
 
 use crate::codex_ack::{tag_codex_assignment, CodexAssignmentRef};
@@ -514,9 +514,10 @@ fn adapter_for_route(route: &ResolvedRoute, lisa_bin: Option<&str>) -> Box<dyn A
 pub(crate) fn resolve_adapter(
     ticket: &Ticket,
     default_client: AgentClient,
+    default_model: Option<&str>,
     lisa_bin: Option<&str>,
 ) -> (Box<dyn AgentAdapter>, ResolvedRoute) {
-    let route = resolve_route(ticket, default_client);
+    let route = resolve_route_with_default_model(ticket, default_client, default_model);
     let adapter = adapter_for_route(&route, lisa_bin);
     (adapter, route)
 }
@@ -528,14 +529,15 @@ pub(crate) fn resolve_adapter(
 pub(crate) fn resolve_adapter_or_native(
     ticket: Option<&Ticket>,
     default_client: AgentClient,
+    default_model: Option<&str>,
     lisa_bin: Option<&str>,
 ) -> (Box<dyn AgentAdapter>, ResolvedRoute) {
     match ticket {
-        Some(t) => resolve_adapter(t, default_client, lisa_bin),
+        Some(t) => resolve_adapter(t, default_client, default_model, lisa_bin),
         None => {
             let route = ResolvedRoute {
                 agent: default_client,
-                model: None,
+                model: default_model.map(str::to_string),
                 requested_agent: None,
                 substituted: false,
                 note: None,
@@ -692,7 +694,7 @@ mod tests {
     #[test]
     fn resolver_returns_claude_default_for_unrouted_ticket() {
         let ticket = Ticket::new("T-001", "example");
-        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, None);
+        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, None, None);
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(adapter.readiness_mode(), ReadinessMode::SessionStart);
         assert_eq!(route.agent, AgentClient::Claude);
@@ -701,7 +703,7 @@ mod tests {
 
     #[test]
     fn resolver_or_native_handles_missing_ticket() {
-        let (adapter, route) = resolve_adapter_or_native(None, AgentClient::Claude, None);
+        let (adapter, route) = resolve_adapter_or_native(None, AgentClient::Claude, None, None);
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(adapter.readiness_mode(), ReadinessMode::SessionStart);
         assert_eq!(route.agent, AgentClient::Claude);
@@ -714,13 +716,13 @@ mod tests {
         // version-sensitive interactive /clear hook.
         let ticket = Ticket::new("T-002", "codex-example");
         assert_eq!(
-            resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"))
+            resolve_adapter(&ticket, AgentClient::Codex, None, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
             ResetStrategy::ExitThenFresh
         );
         assert_eq!(
-            resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa"))
+            resolve_adapter_or_native(None, AgentClient::Codex, None, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
             ResetStrategy::ExitThenFresh
@@ -734,7 +736,8 @@ mod tests {
         // A `agent: codex` ticket under a Claude loop default resolves to Codex.
         let mut ticket = Ticket::new("T-003", "routed-codex");
         ticket.agent = Some("codex".to_string());
-        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, Some("/abs/lisa"));
+        let (adapter, route) =
+            resolve_adapter(&ticket, AgentClient::Claude, None, Some("/abs/lisa"));
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert!(adapter
             .launch_command(
@@ -751,7 +754,8 @@ mod tests {
         // Invalid route → loop default (Codex here), substituted flag + note.
         let mut ticket = Ticket::new("T-004", "bad-route");
         ticket.agent = Some("gpt".to_string());
-        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Codex, Some("/abs/lisa"));
+        let (adapter, route) =
+            resolve_adapter(&ticket, AgentClient::Codex, None, Some("/abs/lisa"));
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(route.agent, AgentClient::Codex);
         assert!(route.substituted);
@@ -767,8 +771,10 @@ mod tests {
         a.model = Some("gpt-5".to_string());
         let b = Ticket::new("T-006", "on-default"); // no hint → default
 
-        let (adapter_a, route_a) = resolve_adapter(&a, AgentClient::Claude, Some("/abs/lisa"));
-        let (adapter_b, route_b) = resolve_adapter(&b, AgentClient::Claude, Some("/abs/lisa"));
+        let (adapter_a, route_a) =
+            resolve_adapter(&a, AgentClient::Claude, None, Some("/abs/lisa"));
+        let (adapter_b, route_b) =
+            resolve_adapter(&b, AgentClient::Claude, None, Some("/abs/lisa"));
 
         // Both native clients share the per-ticket process boundary; the
         // heterogeneity shows in readiness mode and the launched command.

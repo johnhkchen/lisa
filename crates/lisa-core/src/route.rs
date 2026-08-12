@@ -68,7 +68,25 @@ impl ResolvedRoute {
     ///
     /// See the [module docs](self) for precedence and fallback semantics.
     pub fn resolve(ticket: &Ticket, default_agent: AgentClient) -> Self {
-        let model = ticket.model.clone();
+        Self::resolve_with_default_model(ticket, default_agent, None)
+    }
+
+    /// Resolve a ticket's routing hint against the loop-level default agent and
+    /// the board's default model (`[agent].model` in `.lisa.toml`).
+    ///
+    /// Model precedence mirrors the agent's: `ticket model → board default →
+    /// the provider's own default`. The board default rides a substituted agent
+    /// exactly as a ticket's model does — a fallback changes which client runs,
+    /// not which model was asked for.
+    pub fn resolve_with_default_model(
+        ticket: &Ticket,
+        default_agent: AgentClient,
+        default_model: Option<&str>,
+    ) -> Self {
+        let model = ticket
+            .model
+            .clone()
+            .or_else(|| default_model.map(str::to_string));
         match ticket.agent.as_deref() {
             // No hint → the loop default. Identical to the pre-routing path.
             None => Self {
@@ -121,6 +139,15 @@ pub fn resolve_route(ticket: &Ticket, default_agent: AgentClient) -> ResolvedRou
     ResolvedRoute::resolve(ticket, default_agent)
 }
 
+/// Free-function alias for [`ResolvedRoute::resolve_with_default_model`].
+pub fn resolve_route_with_default_model(
+    ticket: &Ticket,
+    default_agent: AgentClient,
+    default_model: Option<&str>,
+) -> ResolvedRoute {
+    ResolvedRoute::resolve_with_default_model(ticket, default_agent, default_model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +197,26 @@ mod tests {
         let t2 = ticket_with(Some("bogus"), Some("gpt-5"));
         let r2 = resolve_route(&t2, AgentClient::Codex);
         assert_eq!(r2.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn board_default_model_fills_in_for_an_unrouted_ticket() {
+        let t = ticket_with(None, None);
+        let r = resolve_route_with_default_model(&t, AgentClient::Codex, Some("gpt-5-mini"));
+        assert_eq!(r.model.as_deref(), Some("gpt-5-mini"));
+        assert!(!r.substituted);
+    }
+
+    #[test]
+    fn a_ticket_model_outranks_the_board_default() {
+        let t = ticket_with(Some("claude"), Some("opus"));
+        let r = resolve_route_with_default_model(&t, AgentClient::Claude, Some("haiku"));
+        assert_eq!(r.model.as_deref(), Some("opus"));
+
+        // And a board naming no model leaves the provider's own default alone.
+        let plain =
+            resolve_route_with_default_model(&ticket_with(None, None), AgentClient::Claude, None);
+        assert_eq!(plain.model, None);
     }
 
     #[test]

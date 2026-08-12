@@ -132,6 +132,7 @@ the generated file.
 | `config:dirs.work` | Work-record folder | working default | Default is `docs/active/work`. | `test_resolve_defaults` | — |
 | `config:runtime.zellij` | Zellij runtime source | working default | Default is managed mode, which chooses the compatible runtime Lisa can support. | `test_resolve_zellij_runtime_modes_and_precedence` | — |
 | `config:agent.client` | Coding agent | working default | Without a key, Lisa detects installed agents and prefers Claude when both are present. | `test_resolve_client_from_detected_availability` | — |
+| `config:agent.model` | Model that agent runs | working default | Without a key, the agent runs whatever model it runs on its own, and the board reports no model of its own. | `test_agent_model_resolves_as_written_or_stays_absent` | — |
 | `config:guards.completion` | Finished-work seal | working default | Default is `auto`, which chooses the strongest seal the project supports. | `test_completion_guard_defaults_to_auto_and_resolves_all_valid_values` | — |
 | `config:triage.enabled` | First-responder inspection | working default | Default is `true`, so Lisa inspects work that needs help before asking the operator. | `triage_config_defaults_resolves_and_validates_bounds` | — |
 | `config:triage.timeout_secs` | First-responder time limit | working default | Default is `120` seconds. | `triage_config_defaults_resolves_and_validates_bounds` | — |

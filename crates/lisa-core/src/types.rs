@@ -689,6 +689,12 @@ pub struct PluginConfig {
     #[serde(default)]
     pub client: AgentClient,
 
+    /// The model this loop runs within its client by default, or `None` for the
+    /// client's own default. Opaque here — the adapter maps it to the provider's
+    /// `--model` flag — and outranked by a ticket's own `model:` frontmatter.
+    #[serde(default)]
+    pub model: Option<String>,
+
     /// Absolute path to the `lisa` binary, captured at `lisa loop` time via
     /// `current_exe()` and passed through the layout. Native adapters export it as
     /// `LISA_BIN` so lifecycle hooks can invoke `lisa capture-usage` without a
@@ -785,6 +791,7 @@ impl PluginConfig {
             wind_down_secs: Self::DEFAULT_WIND_DOWN_SECS,
             assignment_ack_timeout_secs: Self::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             client: AgentClient::default(),
+            model: None,
             lisa_bin: None,
             provider_caps: HashMap::new(),
             session_name: None,
@@ -874,6 +881,15 @@ impl PluginConfig {
             // panic parsing its config map.
             if let Ok(c) = AgentClient::parse(client) {
                 result.client = c;
+            }
+        }
+
+        if let Some(model) = config.get("model") {
+            // Empty string (layout emitted an unset value) is treated as absent
+            // so the adapter falls back to the provider's own default.
+            let model = model.trim();
+            if !model.is_empty() {
+                result.model = Some(model.to_string());
             }
         }
 
@@ -1678,6 +1694,23 @@ mod tests {
         map.insert("client".to_string(), "bogus".to_string());
         let config = PluginConfig::from_config_map(&map);
         assert_eq!(config.client, AgentClient::Claude);
+    }
+
+    #[test]
+    fn test_config_model_round_trip() {
+        assert_eq!(PluginConfig::new().model, None);
+
+        let mut map = BTreeMap::new();
+        map.insert("model".to_string(), "gpt-5-mini".to_string());
+        assert_eq!(
+            PluginConfig::from_config_map(&map).model.as_deref(),
+            Some("gpt-5-mini")
+        );
+
+        // An empty value is a layout that emitted an unset key, not a board
+        // asking for a model named "".
+        map.insert("model".to_string(), "  ".to_string());
+        assert_eq!(PluginConfig::from_config_map(&map).model, None);
     }
 
     #[test]

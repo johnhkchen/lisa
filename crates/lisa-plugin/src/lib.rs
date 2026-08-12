@@ -2475,6 +2475,7 @@ impl State {
             let (_, resolved) = resolve_adapter_or_native(
                 self.dag.get_ticket(&remedy.ticket_id),
                 self.config.client,
+                self.config.model.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
             let running = self
@@ -4632,6 +4633,7 @@ impl State {
         let (adapter, _) = resolve_adapter_or_native(
             self.dag.get_ticket(&ticket_id),
             self.config.client,
+            self.config.model.as_deref(),
             self.config.lisa_bin.as_deref(),
         );
         let ctx = SpawnContext {
@@ -5172,8 +5174,12 @@ impl State {
         let Some(resident_client) = self.agent_slots[slot_idx].last_client else {
             return self.begin_startup_recovery(pane_id, now);
         };
-        let (resident_adapter, _) =
-            resolve_adapter_or_native(None, resident_client, self.config.lisa_bin.as_deref());
+        let (resident_adapter, _) = resolve_adapter_or_native(
+            None,
+            resident_client,
+            self.config.model.as_deref(),
+            self.config.lisa_bin.as_deref(),
+        );
         let exit_command = resident_adapter.exit_command();
 
         self.revoke_current_lease(&ticket_id);
@@ -5442,6 +5448,7 @@ impl State {
         let (adapter, route) = resolve_adapter_or_native(
             self.dag.get_ticket(&ticket_id),
             self.config.client,
+            self.config.model.as_deref(),
             self.config.lisa_bin.as_deref(),
         );
         let ctx = SpawnContext {
@@ -5731,8 +5738,12 @@ impl State {
         // must not suppress the graceful exit command for the fresh fallback.
         self.awaiting_human.remove(&pane_id);
         self.notified_attention.remove(&pane_id);
-        let (adapter, _) =
-            resolve_adapter_or_native(None, AgentClient::Codex, self.config.lisa_bin.as_deref());
+        let (adapter, _) = resolve_adapter_or_native(
+            None,
+            AgentClient::Codex,
+            self.config.model.as_deref(),
+            self.config.lisa_bin.as_deref(),
+        );
         self.send_line_to_pane(adapter.exit_command(), PaneId::Terminal(pane_id));
         let slot = &mut self.agent_slots[slot_idx];
         slot.has_session = false;
@@ -6170,8 +6181,12 @@ impl State {
             .filter(|slot| slot.transition_state != TransitionState::Fenced && slot.has_session)
             .and_then(|slot| {
                 let resident = slot.last_client?;
-                let (adapter, _) =
-                    resolve_adapter_or_native(None, resident, self.config.lisa_bin.as_deref());
+                let (adapter, _) = resolve_adapter_or_native(
+                    None,
+                    resident,
+                    self.config.model.as_deref(),
+                    self.config.lisa_bin.as_deref(),
+                );
                 (adapter.reset_strategy() == ResetStrategy::ExitThenFresh
                     && adapter.completion_exit() == CompletionExit::Immediate)
                     .then(|| (slot.pane_id, adapter.exit_command(), resident))
@@ -6273,6 +6288,7 @@ impl State {
             let (adapter, route) = resolve_adapter_or_native(
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
+                self.config.model.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
 
@@ -6504,6 +6520,7 @@ impl State {
                 let (resident_adapter, _) = resolve_adapter_or_native(
                     None,
                     resident_client,
+                    self.config.model.as_deref(),
                     self.config.lisa_bin.as_deref(),
                 );
                 let exit_command = resident_adapter.exit_command();
@@ -6808,8 +6825,12 @@ impl State {
             .filter_map(|slot| slot.last_client.map(|client| (slot.pane_id, client)))
             .collect();
         for (pane_id, client) in candidates {
-            let (adapter, _) =
-                resolve_adapter_or_native(None, client, self.config.lisa_bin.as_deref());
+            let (adapter, _) = resolve_adapter_or_native(
+                None,
+                client,
+                self.config.model.as_deref(),
+                self.config.lisa_bin.as_deref(),
+            );
             if adapter.completion_exit() != CompletionExit::AfterRest {
                 continue;
             }
@@ -8811,6 +8832,7 @@ impl State {
             let (adapter, route) = resolve_adapter_or_native(
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
+                self.config.model.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
             if recovering && route.agent != AgentClient::Codex {
@@ -9067,6 +9089,7 @@ impl State {
             let (adapter, _route) = resolve_adapter_or_native(
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
+                self.config.model.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
             let follow_up = adapter.follow_up(&FollowUpContext {
@@ -28593,7 +28616,7 @@ owned\n\
         // (b) the delivered value is the bare finish-up prompt for the composer.
         let work_dir = Path::new("docs/active/work");
         let (adapter, _route) =
-            resolve_adapter_or_native(None, AgentClient::Codex, Some("/abs/lisa"));
+            resolve_adapter_or_native(None, AgentClient::Codex, None, Some("/abs/lisa"));
         let follow_up = adapter.follow_up(&FollowUpContext {
             work_dir,
             ticket_id: "T-CDX-01",

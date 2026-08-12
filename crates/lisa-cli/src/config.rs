@@ -80,6 +80,14 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
             "Chooses which coding agent Lisa drives. Omit it to detect agents on PATH; claude is the default when both are installed.",
     },
     ConfigKey {
+        path: "agent.model",
+        section: "agent",
+        key: "model",
+        default: "\"opus\"",
+        description:
+            "Chooses which model that agent runs. Omit it to use whatever the agent runs by default.",
+    },
+    ConfigKey {
         path: "guards.completion",
         section: "guards",
         key: "completion",
@@ -216,6 +224,11 @@ pub struct RuntimeConfig {
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct AgentConfig {
     pub client: Option<String>,
+    /// The model this board runs within its client, or `None` to leave the
+    /// choice to the client's own default. Opaque to Lisa — provider model
+    /// vocabulary lives with the provider — so it is passed through as written
+    /// and only checked for being a non-empty name.
+    pub model: Option<String>,
 }
 
 /// Directory configuration section.
@@ -266,6 +279,10 @@ pub struct ResolvedConfig {
     pub assignment_ack_timeout_secs: u64,
     pub phase_timeouts: std::collections::HashMap<String, u64>,
     pub client: AgentClient,
+    /// The model the board is configured to run within that client, or `None`
+    /// when it leaves that to the client's default. A ticket's own `model:`
+    /// frontmatter still outranks it at spawn.
+    pub model: Option<String>,
     pub(crate) client_resolution: ClientResolution,
     pub zellij_runtime: ZellijRuntimeRequest,
     /// Configured completion intent. A real loop pins this against its startup
@@ -292,6 +309,7 @@ impl Default for ResolvedConfig {
             assignment_ack_timeout_secs: PluginConfig::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
+            model: None,
             client_resolution: ClientResolution::Detected(AgentAvailability::Both),
             zellij_runtime: crate::runtime::default_runtime_request(),
             completion_mode: CompletionSealMode::Auto,
@@ -403,6 +421,13 @@ fn resolve_config_with_availability(
             .clone()
             .unwrap_or_else(|| defaults.project_version.clone()),
         client,
+        model: config
+            .agent
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
         client_resolution,
         zellij_runtime: match config.runtime.zellij.as_deref() {
             None => crate::runtime::default_runtime_request(),
@@ -725,6 +750,17 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     if let Some(client) = &config.agent.client {
         AgentClient::parse(client)?;
     }
+    // Lisa never interprets a model name — that vocabulary belongs to the
+    // provider — so the only thing it can honestly check is that a named model
+    // is actually a name.
+    if config
+        .agent
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err("[agent].model must name a model, or be left out entirely".to_string());
+    }
     if let Some(zellij) = config.runtime.zellij.as_deref() {
         if !matches!(zellij, "managed" | "system") && !Path::new(zellij).is_absolute() {
             return Err(format!(
@@ -840,6 +876,7 @@ work = {}
 
 [agent]
 {}
+{}
 
 [guards]
 {}
@@ -868,6 +905,7 @@ max_threads = {}
         key("dirs.work").default,
         key("runtime.zellij").commented_stub(),
         key("agent.client").commented_stub(),
+        key("agent.model").commented_stub(),
         key("guards.completion").commented_stub(),
         key("triage.enabled").commented_stub(),
         key("triage.timeout_secs").commented_stub(),
@@ -901,6 +939,7 @@ zellij = "managed"
 
 [agent]
 client = "codex"
+model = "gpt-5-mini"
 
 [guards]
 completion = "journal"
@@ -1395,6 +1434,38 @@ max_threads = 6
             resolve_config(&config, None, None).completion_mode,
             CompletionSealMode::Auto
         );
+    }
+
+    #[test]
+    fn test_agent_model_resolves_as_written_or_stays_absent() {
+        assert_eq!(
+            resolve_config(&LisaConfig::default(), None, None).model,
+            None
+        );
+
+        let named =
+            validate_config("[agent]\nclient = \"codex\"\nmodel = \"gpt-5-mini\"\n").unwrap();
+        assert!(named.warnings.is_empty());
+        assert_eq!(
+            resolve_config(&named.config, None, None).model.as_deref(),
+            Some("gpt-5-mini")
+        );
+
+        // Lisa never interprets the name, so an unfamiliar one is passed
+        // through rather than second-guessed.
+        let unfamiliar = validate_config("[agent]\nmodel = \"some-future-model\"\n").unwrap();
+        assert_eq!(
+            resolve_config(&unfamiliar.config, None, None)
+                .model
+                .as_deref(),
+            Some("some-future-model")
+        );
+    }
+
+    #[test]
+    fn test_agent_model_must_name_something() {
+        let error = validate_config("[agent]\nmodel = \"  \"\n").unwrap_err();
+        assert!(error.contains("[agent].model"), "{error}");
     }
 
     #[test]

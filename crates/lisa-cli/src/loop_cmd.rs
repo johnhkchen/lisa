@@ -509,6 +509,18 @@ fn generate_layout(
         None => String::new(),
     };
 
+    // The model this board runs within its client, when it names one. Absent
+    // key → the plugin leaves the choice to the client's own default, which is
+    // the pre-0.5 behaviour byte for byte. Quoted defensively: a model name is
+    // provider vocabulary Lisa passes through without interpreting.
+    let model_line = match config.model.as_deref() {
+        Some(model) => format!(
+            "                model \"{}\"\n",
+            model.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        None => String::new(),
+    };
+
     // Per-provider concurrency caps (T-026-02), emitted as `provider_cap_<name>`
     // keys the plugin parses back into PluginConfig.provider_caps. Sorted for
     // deterministic layout output. Empty map → no lines → layout byte-for-byte
@@ -549,7 +561,7 @@ fn generate_layout(
                 triage_enabled "{triage_enabled}"
                 triage_timeout_secs "{triage_timeout_secs}"
                 client "{client}"
-{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
+{model_line}{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
         }}
     }}
 }}
@@ -560,6 +572,7 @@ fn generate_layout(
         completion_seal = completion_seal,
         lisa_bin_line = lisa_bin_line,
         session_name_line = session_name_line,
+        model_line = model_line,
         provider_cap_lines = provider_cap_lines,
         ticket_dir = config.ticket_dir,
         story_dir = config.story_dir,
@@ -869,6 +882,27 @@ mod tests {
         };
         let layout = test_layout(&wasm_path, None, &config);
         assert!(layout.contains("client \"codex\""));
+    }
+
+    /// A board that names a model hands it to the scheduler; one that does not
+    /// emits no key at all, so the layout is byte-for-byte what it always was
+    /// and the client keeps choosing its own model.
+    #[test]
+    fn test_generate_layout_carries_the_configured_model_or_no_key() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let named = ResolvedConfig {
+            model: Some("gpt-5-mini".to_string()),
+            ..default_config()
+        };
+        assert!(test_layout(&wasm_path, None, &named).contains("model \"gpt-5-mini\""));
+
+        let unnamed = test_layout(&wasm_path, None, &default_config());
+        assert!(
+            !unnamed
+                .lines()
+                .any(|line| line.trim().starts_with("model ")),
+            "an unnamed model must emit no key:\n{unnamed}"
+        );
     }
 
     #[test]
