@@ -201,9 +201,14 @@ set -euo pipefail
 if [[ "${1:-}" == "--version" ]]; then
     exec "$LISA_LIVE_REAL_ZELLIJ" "$@"
 fi
-if [[ "${1:-}" == "--layout" && $# == 2 ]]; then
+if [[ "${1:-}" == "list-sessions" ]]; then
+    exec "$LISA_LIVE_REAL_ZELLIJ" "$@"
+fi
+# Lisa names the session after the project; this harness needs its own name to
+# keep one session addressable, so the recorded name is replaced here.
+if [[ "${1:-}" == "--session" && "${3:-}" == "--new-session-with-layout" && $# == 4 ]]; then
     exec "$LISA_LIVE_REAL_ZELLIJ" --session "$LISA_LIVE_SESSION" \
-        --new-session-with-layout "$2"
+        --new-session-with-layout "$4"
 fi
 echo "unexpected zellij invocation: $*" >&2
 exit 2

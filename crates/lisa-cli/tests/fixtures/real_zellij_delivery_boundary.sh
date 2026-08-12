@@ -283,9 +283,15 @@ set -euo pipefail
 if [[ "${1:-}" == "--version" ]]; then
     exec "$LISA_STUB_REAL_ZELLIJ" "$@"
 fi
-if [[ "${1:-}" == "--layout" && $# == 2 ]]; then
+if [[ "${1:-}" == "list-sessions" ]]; then
+    exec "$LISA_STUB_REAL_ZELLIJ" "$@"
+fi
+if [[ "${1:-}" == "--session" && "${3:-}" == "--new-session-with-layout" && $# == 4 ]]; then
+    # Record the name Lisa chose for the project, then start under the
+    # harness's own name so one session stays addressable across runs.
+    printf '%s\n' "$2" > "$LISA_STUB_EVIDENCE_DIR/zellij-session-name"
     exec "$LISA_STUB_REAL_ZELLIJ" --session "$LISA_STUB_SESSION" \
-        --new-session-with-layout "$2"
+        --new-session-with-layout "$4"
 fi
 echo "unexpected zellij invocation: $*" >&2
 exit 2
@@ -297,10 +303,20 @@ create_fixture() {
     local scenario=$1
     local root="$RUN_ROOT/$scenario"
     mkdir -p "$root/bin" "$root/evidence" "$root/home"
+    # The loop refuses to run Claude unattended until the one-time bypass
+    # confirmation exists. The fixture home is fresh every run, and the stub
+    # provider is not Claude, so the confirmation is declared here.
+    printf '%s\n' '{"bypassPermissionsModeAccepted": true}' > "$root/home/.claude.json"
     "$LISA_BIN" init --path "$root" --no-history >/dev/null
     mkdir -p "$root/docs/active/tickets" "$root/docs/active/stories"
-    cat > "$root/.lisa.toml" <<'TOML'
-version = "0.4.0"
+    # The binary refuses to start a loop on a project older than its own
+    # protocol, so the fixture states the version of the binary under test
+    # rather than a frozen one that goes stale at every bump.
+    local project_version
+    project_version=$("$LISA_BIN" --version | awk '{ print $2 }')
+    [[ -n "$project_version" ]] || fail "could not read the version of $LISA_BIN"
+    cat > "$root/.lisa.toml" <<TOML
+version = "$project_version"
 
 [dirs]
 tickets = "docs/active/tickets"
@@ -309,7 +325,6 @@ work = "docs/active/work"
 
 [scheduling]
 max_threads = 1
-auto_advance = false
 review_timeout_secs = 300
 session_timeout_secs = 0
 wind_down_secs = 1
@@ -404,6 +419,18 @@ stop_loop() {
     CURRENT_AGENT_PANE=
 }
 
+assert_session_named_after_project() {
+    local recorded="$CURRENT_ROOT/evidence/zellij-session-name"
+    [[ -f "$recorded" ]] || fail "lisa started zellij without naming the session"
+    local expected actual
+    expected=$(basename "$CURRENT_ROOT")
+    actual=$(< "$recorded")
+    # Exactly the project's name, or its next free run number when a session on
+    # this machine already holds the bare one.
+    [[ "$actual" == "$expected" || "$actual" == "$expected"-[0-9]* ]] \
+        || fail "session name $actual is not named after project $expected"
+}
+
 assert_launch_contract() {
     local scripts=()
     while IFS= read -r path; do scripts+=("$path"); done < <(find "$CURRENT_ROOT/.lisa/attempts" -name '.lisa-launch-*.sh' -type f | sort)
@@ -442,6 +469,7 @@ run_success() {
     CURRENT_ROOT=$(create_fixture success)
     CURRENT_SESSION="lisa-t035-success-$$"
     start_loop success "$CURRENT_ROOT" "$CURRENT_SESSION"
+    assert_session_named_after_project
     wait_until 15 "stub launch" event_count_is launch 1
     touch "$CURRENT_ROOT/evidence/start-gate"
     wait_until 10 "stub start publication" event_count_is start 1
