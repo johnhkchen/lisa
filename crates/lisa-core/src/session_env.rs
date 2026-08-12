@@ -73,6 +73,32 @@ pub fn inherited_markers() -> Vec<String> {
     markers_among(std::env::vars().map(|(name, _)| name))
 }
 
+/// A POSIX `sh` fragment that unsets every marker present in the shell that
+/// runs it.
+///
+/// The loop strips markers from the environment it hands to the multiplexer,
+/// which covers every pane of a run Lisa started. This covers the rest: a
+/// session an operator started themselves, a pane they attached from another
+/// shell, anything Lisa did not get to first. It is generated from the same
+/// constants as [`is_nested_session_marker`], so the shell and the Rust side
+/// cannot drift apart.
+///
+/// Written for `sh`, not for a specific shell: `env`, `cut`, and `grep` are the
+/// three tools a launch line can assume. A match set that is empty makes `grep`
+/// exit non-zero, which is why the loop must not run under `set -e`; nothing
+/// here sets it.
+pub fn posix_unset_fragment() -> String {
+    let mut alternatives: Vec<String> = NESTED_SESSION_NAMES
+        .iter()
+        .map(|name| format!("{name}$"))
+        .collect();
+    alternatives.extend(NESTED_SESSION_PREFIXES.iter().map(|p| (*p).to_string()));
+    format!(
+        "for lisa_inherited in $(env | cut -d= -f1 | grep -E '^({})'); do unset \"$lisa_inherited\"; done",
+        alternatives.join("|"),
+    )
+}
+
 /// One operator sentence naming what was dropped, or `None` when the
 /// environment was already clean and there is nothing to report.
 pub fn describe_cleared(markers: &[String]) -> Option<String> {
@@ -152,6 +178,57 @@ mod tests {
     fn a_clean_environment_reports_nothing() {
         assert_eq!(markers_among(["PATH", "HOME"]), Vec::<String>::new());
         assert_eq!(describe_cleared(&[]), None);
+    }
+
+    /// The fragment is not asserted against its own source text — it is run.
+    /// A shell fragment that merely *looks* right is what let this whole class
+    /// of failure through in the first place.
+    #[test]
+    fn the_shell_fragment_really_unsets_markers_and_keeps_everything_else() {
+        let script = format!("{}\nenv | cut -d= -f1 | sort", posix_unset_fragment());
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("CLAUDECODE", "1")
+            .env("CLAUDE_CODE_CHILD_SESSION", "1")
+            .env("CLAUDE_CODE_SESSION_ID", "abc")
+            .env("CLAUDE_CODE_NOT_INVENTED_YET", "x")
+            .env("CODEX_HOME", "/home/agent/.codex")
+            .env("LISA_PROJECT", "/repo")
+            .output()
+            .expect("sh is available on every host Lisa runs on");
+        assert!(output.status.success(), "fragment failed: {output:?}");
+
+        let names: Vec<&str> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        for gone in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_NOT_INVENTED_YET",
+        ] {
+            assert!(!names.contains(&gone), "{gone} survived: {names:?}");
+        }
+        for kept in ["CODEX_HOME", "LISA_PROJECT", "PATH"] {
+            assert!(names.contains(&kept), "{kept} was dropped: {names:?}");
+        }
+    }
+
+    /// A clean shell must not be a failure: the fragment runs before the launch
+    /// line, and an exit status from an empty `grep` must not reach it.
+    #[test]
+    fn the_shell_fragment_leaves_a_clean_environment_alone() {
+        let script = format!("{}\necho ok", posix_unset_fragment());
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env_remove("CLAUDECODE")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 
     #[test]

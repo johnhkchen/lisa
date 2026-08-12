@@ -14,6 +14,8 @@ mod pane_name;
 mod publication;
 mod quarantine;
 mod signal;
+mod stack;
+mod ticker;
 mod ui;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -1032,6 +1034,30 @@ pub struct State {
     /// Missing means the seat has no current assignment.
     seat_assignments: HashMap<u32, SeatAssignmentState>,
 
+    /// The last admitted heartbeat per pane, with the attempt that produced it.
+    /// Ordering only: the stack shows whichever working pane spoke last.
+    pane_heartbeats: HashMap<u32, stack::HeartbeatMark>,
+
+    /// Arrival ordinal for `pane_heartbeats`. A counter rather than a clock,
+    /// because the only question it answers is "which one was last".
+    heartbeat_seq: u64,
+
+    /// What the last `PaneUpdate` said about the agent stack: which member is
+    /// expanded, and whether anyone's focus is inside it.
+    stack_view: stack::StackView,
+
+    /// Whether the running zellij can expand a stack member without focusing
+    /// it. Resolved once from `get_zellij_version()`; `None` until the first
+    /// promotion is considered. `Some(false)` disables promotion entirely on
+    /// versions where the only expansion available moves the operator's focus.
+    stack_follow_supported: Option<bool>,
+
+    /// The (target, observed expansion) pair the last promotion was issued for.
+    /// Re-issuing for the same observation would repeat a request zellij has
+    /// not had a chance to answer; a new `PaneUpdate` retires the guard, so a
+    /// resize that drifts the expansion back is promoted again.
+    stack_promoted: Option<(u32, Option<u32>)>,
+
     /// Exact successfully published assignment for each ticket's current
     /// attempt. Lease authority remains in `current_leases`; this map retains
     /// the nonce-bearing path that later delivery and claim evidence must use.
@@ -1245,6 +1271,16 @@ pub struct State {
 
     /// When the loop started, used to compute `LISA_DURATION_SECS` on `complete`.
     loop_started_at: Option<std::time::SystemTime>,
+
+    /// The plugin's own pane, captured from `get_plugin_ids()` in `load()`.
+    /// `None` before load and in native tests, where the title has nowhere to
+    /// go and is therefore not composed at all.
+    plugin_pane_id: Option<u32>,
+
+    /// Last title applied to the plugin pane. The ticker is recomposed on every
+    /// render but handed to Zellij only when it differs from this, so a loop
+    /// whose facts have not changed makes no host calls.
+    last_ticker: Option<String>,
 }
 
 impl State {
@@ -1265,6 +1301,68 @@ impl State {
         self.last_pane_names.insert(pane_id, name.clone());
         rename_terminal_pane(pane_id, name);
         true
+    }
+
+    /// Apply a title to Lisa's own plugin pane, once, when it changes.
+    ///
+    /// The dedupe gate is what makes the ticker free to recompose on every
+    /// render: a loop whose facts have not moved issues no host call at all.
+    /// Unlike [`Self::rename_slot`] the cache is written *after* the permission
+    /// and pane-id checks, because a title that was never applied must not
+    /// suppress the first one that can be.
+    fn set_pane_ticker(&mut self, title: String) -> bool {
+        if !self.permissions_granted || self.last_ticker.as_deref() == Some(title.as_str()) {
+            return false;
+        }
+        let Some(pane_id) = self.plugin_pane_id else {
+            return false;
+        };
+
+        self.last_ticker = Some(title.clone());
+        rename_plugin_pane(pane_id, title);
+        true
+    }
+
+    /// Compose and apply the plugin pane's title from the state the dashboard
+    /// is about to render.
+    ///
+    /// Called from `render` with the already-built `PluginState`, so the title
+    /// costs one string per render and never a second pass over the DAG,
+    /// threads, or the ticket directory.
+    fn refresh_pane_ticker(&mut self, state: &ui::PluginState) {
+        if self.plugin_pane_id.is_none() {
+            return;
+        }
+        let project = ticker::project_label(&self.project_root);
+        let last_done = self.last_ticket_finished();
+        let title = ticker::compose(ticker::Ticker {
+            project: &project,
+            state,
+            last_done: last_done.as_ref().map(|(id, at)| (id.as_str(), *at)),
+        });
+        self.set_pane_ticker(title);
+    }
+
+    /// The most recent ticket to reach Done, with the instant it did.
+    ///
+    /// Read from the activity ring the dashboard's feed is rendered from, so
+    /// the title cannot disagree with the feed about what finished. The ring is
+    /// bounded at [`Self::MAX_ACTIVITY_LOG`] and scanned newest-first, so a
+    /// completion is normally found in the first few entries.
+    ///
+    /// `TicketPhaseChanged` rather than `PhaseCompleted`: the latter names the
+    /// phase a ticket *left*, which is `Review` for the ordinary path but the
+    /// Implement phase for an operator mark-done. Only the transition itself
+    /// says Done in every case.
+    fn last_ticket_finished(&self) -> Option<(String, std::time::Duration)> {
+        self.activity_log.iter().rev().find_map(|entry| match &entry.event {
+            ActivityEvent::TicketPhaseChanged {
+                ticket_id,
+                new_phase: Phase::Done,
+                ..
+            } => Some((ticket_id.clone(), entry.at)),
+            _ => None,
+        })
     }
 
     /// Give newly discovered, unassigned panes their initial idle names once
@@ -1362,6 +1460,14 @@ impl State {
     /// The pane receives only the returned `sh <path>` indirection. Publication
     /// uses a same-directory rename, so a successful return proves the shell can
     /// address a complete script. Callers must not queue pane input on `Err`.
+    ///
+    /// Every fresh provider process in a Lisa run starts from a script written
+    /// here, which is why the inherited-session strip belongs here rather than
+    /// in each adapter's payload: a provider added later cannot forget it.
+    /// The plugin runs in WASM and cannot read the pane shell's environment, so
+    /// the strip is unconditional — `unset` of an absent name costs nothing,
+    /// and starting an agent under another session's identity costs a whole
+    /// attempt with no transcript to show for it (T-062-01-04).
     fn prepare_fresh_launch(
         artifact_dir: &Path,
         pane_id: u32,
@@ -1375,7 +1481,12 @@ impl State {
         })?;
 
         let destination = artifact_dir.join(format!(".lisa-launch-{pane_id}.sh"));
-        let script = format!("#!/bin/sh\n{payload}\n");
+        let script = format!(
+            "#!/bin/sh\n\
+             # An agent must not inherit the identity of the session that started Lisa.\n\
+             {strip}\n{payload}\n",
+            strip = lisa_core::session_env::posix_unset_fragment(),
+        );
         let destination = RustPublication {
             path: PublicationPath {
                 destination,
@@ -4030,6 +4141,108 @@ impl State {
                 message: format!("Discovered {} agent pane slots", self.agent_slots.len()),
             });
         }
+    }
+
+    /// Record what this `PaneUpdate` says about the agent stack.
+    ///
+    /// Read from the same manifest the slots were discovered in, and restricted
+    /// to panes lisa owns: a collapsed stack member is one row of title bar, the
+    /// expanded one holds the rest of the stack's height, and focus is whatever
+    /// the manifest's focus flag says (a focused member can be collapsed — that
+    /// is precisely what an unguarded expansion does to the pane somebody is
+    /// reading).
+    fn observe_stack(&mut self, pane_manifest: &PaneManifest) {
+        let panes: Vec<stack::PaneObservation> = pane_manifest
+            .panes
+            .values()
+            .flatten()
+            .filter(|pane| !pane.is_plugin)
+            .filter(|pane| self.agent_slots.iter().any(|slot| slot.pane_id == pane.id))
+            .map(|pane| stack::PaneObservation {
+                pane_id: pane.id,
+                rows: pane.pane_rows,
+                focused: pane.is_focused,
+            })
+            .collect();
+        let view = stack::observe(&panes);
+        if view != self.stack_view {
+            // A fresh observation retires the last promotion's guard: whatever
+            // moved the expansion — a resize's relayout, the operator cycling
+            // the stack — is now visible and may be answered.
+            self.stack_promoted = None;
+            self.stack_view = view;
+        }
+    }
+
+    /// Remember that this pane produced work, in arrival order.
+    ///
+    /// Called from the heartbeat consumer *after* admission, so the mark can
+    /// only ever name the attempt the seat is actually holding.
+    fn note_stack_heartbeat(&mut self, pane_id: u32, lease: AttemptLease) {
+        self.heartbeat_seq += 1;
+        self.pane_heartbeats.insert(
+            pane_id,
+            stack::HeartbeatMark {
+                lease,
+                seq: self.heartbeat_seq,
+            },
+        );
+    }
+
+    /// Expand the working pane the operator would want to see, if they are not
+    /// in the stack right now.
+    ///
+    /// Everything that decides *whether* to move lives in `stack`; this is the
+    /// half that talks to zellij. The call is `show_pane_with_id(pane, false)`
+    /// — the `false` is `should_float_if_hidden` — which a zellij 0.44+ server
+    /// answers by expanding the stacked pane without touching focus. An older
+    /// server answers the same call by focusing the pane, so it is not made at
+    /// all there and the operator is told why once. See
+    /// [`stack::expands_without_focus`].
+    fn follow_active_pane(&mut self) {
+        let candidates: Vec<stack::Candidate> = self
+            .agent_slots
+            .iter()
+            .map(|slot| stack::Candidate {
+                pane_id: slot.pane_id,
+                lease: slot.attempt_lease.clone(),
+            })
+            .collect();
+        let Some(target) =
+            stack::promotion_target(self.stack_view, &candidates, &self.pane_heartbeats)
+        else {
+            return;
+        };
+
+        let supported = match self.stack_follow_supported {
+            Some(supported) => supported,
+            None => {
+                let version = get_zellij_version();
+                let supported = stack::expands_without_focus(&version);
+                self.stack_follow_supported = Some(supported);
+                if !supported {
+                    self.log_activity(ActivityEvent::Warning {
+                        message: format!(
+                            "Zellij {} expands a stacked pane only by focusing it; \
+                             leaving the stack alone (0.44+ follows the working pane)",
+                            version.trim()
+                        ),
+                    });
+                }
+                supported
+            }
+        };
+        if !supported {
+            return;
+        }
+
+        // One request per observation. The next PaneUpdate — including the one
+        // this request causes — clears the guard.
+        if self.stack_promoted == Some((target, self.stack_view.expanded)) {
+            return;
+        }
+        self.stack_promoted = Some((target, self.stack_view.expanded));
+        show_pane_with_id(PaneId::Terminal(target), false);
     }
 
     /// Return the explicit assignment state for a physical seat.
@@ -6887,6 +7100,9 @@ impl State {
                 continue;
             }
             self.bump_pane_activity(pane_id);
+            // The same admitted fact the clocks run on also orders the stack:
+            // this pane is the most recently working one.
+            self.note_stack_heartbeat(pane_id, candidate);
             // A heartbeat proves genuine progress — clear any attention debounce
             // so a pane that resumes and later re-stalls can notify again.
             self.notified_attention.remove(&pane_id);
@@ -8786,6 +9002,13 @@ impl State {
         // check approaches the same duration as the poll interval.
         self.request_world_recheck();
 
+        // Last, after every seat change this tick can make: show the working
+        // pane, if the operator is not standing in the stack. Heartbeats arrive
+        // on this timer, so this is where a change of "most recently active"
+        // becomes visible; the PaneUpdate path handles the shape changing
+        // underneath it.
+        self.follow_active_pane();
+
         // Log poll cycle summary
         let ready_count = self.dag.get_ready_tickets().len();
         let running_count = self
@@ -9945,7 +10168,12 @@ impl ZellijPlugin for State {
         // Absolute host project root (run_command runs on the host, where the
         // /host sandbox mount does not exist) and loop-start timestamp for
         // LISA_DURATION_SECS on completion.
-        self.project_root = get_plugin_ids().initial_cwd;
+        let plugin_ids = get_plugin_ids();
+        self.project_root = plugin_ids.initial_cwd;
+        // The pane this plugin is drawn in, so its title can be the loop's
+        // ticker instead of the `file:/…/lisa-plugin-<hash>.wasm` Zellij shows
+        // by default.
+        self.plugin_pane_id = Some(plugin_ids.plugin_id);
         self.loop_started_at = Some(std::time::SystemTime::now());
 
         // Stamp once at load rather than waiting for the first poll: a run that
@@ -10062,10 +10290,17 @@ impl ZellijPlugin for State {
 
             Event::PaneUpdate(pane_manifest) => {
                 self.discover_slots(&pane_manifest);
+                // The manifest is the only place the stack's shape and the
+                // operator's focus are visible, so the view is refreshed here
+                // and acted on immediately: a resize relayout drifts the
+                // expansion back to the last pane, and this is what puts it
+                // right without waiting for the poll.
+                self.observe_stack(&pane_manifest);
                 // Try scheduling in case slots just appeared
                 if self.permissions_granted {
                     self.schedule_ready_tickets();
                 }
+                self.follow_active_pane();
                 should_render = true;
             }
 
@@ -10134,11 +10369,17 @@ impl ZellijPlugin for State {
         }
 
         if self.terminated && !self.modal.open {
+            // The finished screen returns before the dashboard state exists,
+            // and the poll timer is not re-armed once a loop drains — so this
+            // is the last chance the title gets, and it composes without it.
+            let title = ticker::finished(&ticker::project_label(&self.project_root));
+            self.set_pane_ticker(title);
             println!("All tickets done. Lisa loop complete. Press [q] to quit.");
             return;
         }
 
         let ui_state = self.to_ui_state();
+        self.refresh_pane_ticker(&ui_state);
         ui::print_dashboard(&ui_state, rows, cols, self.scroll_offset, &mut self.dag_pan);
     }
 }
@@ -13821,15 +14062,48 @@ mod tests {
         assert_eq!(small_launcher, large_launcher);
         assert!(!large_launcher.contains(&large));
         assert!(large.len() > 500_000);
-        assert_eq!(
-            std::fs::read_to_string(artifact_dir.join(".lisa-launch-7.sh")).unwrap(),
-            format!("#!/bin/sh\n{large}\n")
-        );
+        let written = std::fs::read_to_string(artifact_dir.join(".lisa-launch-7.sh")).unwrap();
+        assert!(written.starts_with("#!/bin/sh\n"));
+        assert!(written.ends_with(&format!("{large}\n")));
         assert!(std::fs::read_dir(&artifact_dir).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
             .to_string_lossy()
             .contains(".tmp.")));
+    }
+
+    /// T-062-01-04: three tickets burned four attempts between them because
+    /// every agent Lisa launched inherited the marker of the session that had
+    /// started the loop, announced itself a nested child, and saved no
+    /// transcript. The plugin cannot read the pane shell's environment, so the
+    /// launcher it writes strips the markers itself — proven by running the
+    /// real script under a poisoned environment.
+    #[test]
+    fn test_launcher_starts_the_agent_without_an_inherited_session_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_dir = temp.path().join("attempt");
+        State::prepare_fresh_launch(&artifact_dir, 7, "env | cut -d= -f1 | sort").unwrap();
+
+        let output = std::process::Command::new("sh")
+            .arg(artifact_dir.join(".lisa-launch-7.sh"))
+            .env("CLAUDECODE", "1")
+            .env("CLAUDE_CODE_CHILD_SESSION", "1")
+            .env("CLAUDE_CODE_SESSION_ID", "poisoned")
+            .env("LISA_PROJECT", "/repo")
+            .output()
+            .unwrap();
+
+        let names: Vec<&str> = std::str::from_utf8(&output.stdout).unwrap().lines().collect();
+        assert!(output.status.success());
+        for gone in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            assert!(!names.contains(&gone), "{gone} reached the agent: {names:?}");
+        }
+        // The launch line's own environment is untouched.
+        assert!(names.contains(&"LISA_PROJECT"));
     }
 
     #[test]
@@ -20815,6 +21089,62 @@ mod tests {
         );
         assert!(!state.rename_slot(99, "lisa · idle".to_string()));
         assert!(!state.last_pane_names.contains_key(&99));
+    }
+
+    /// The ticker recomposes on every render; only a changed row reaches Zellij.
+    #[test]
+    fn plugin_pane_ticker_is_applied_once_per_change() {
+        let mut state = State::default();
+        state.permissions_granted = true;
+        state.plugin_pane_id = Some(7);
+
+        assert!(state.set_pane_ticker("lisa · idle · 2/4 done".to_string()));
+        assert!(!state.set_pane_ticker("lisa · idle · 2/4 done".to_string()));
+        assert!(state.set_pane_ticker("lisa · 1/4 working · T-1 <1m".to_string()));
+        assert_eq!(
+            state.last_ticker.as_deref(),
+            Some("lisa · 1/4 working · T-1 <1m")
+        );
+    }
+
+    /// A title composed before Zellij would accept it must not be remembered as
+    /// applied, or the first real one is suppressed by the dedupe gate.
+    #[test]
+    fn plugin_pane_ticker_waits_for_permission_and_a_pane() {
+        let mut state = State::default();
+        state.plugin_pane_id = Some(7);
+        assert!(!state.set_pane_ticker("lisa · idle".to_string()));
+        assert!(state.last_ticker.is_none());
+
+        state.permissions_granted = true;
+        state.plugin_pane_id = None;
+        assert!(!state.set_pane_ticker("lisa · idle".to_string()));
+        assert!(state.last_ticker.is_none());
+
+        state.plugin_pane_id = Some(7);
+        assert!(state.set_pane_ticker("lisa · idle".to_string()));
+    }
+
+    /// What the row calls "just finished" is the transition the feed shows, not
+    /// a phase name that happens to be the last one a ticket left.
+    #[test]
+    fn the_ticker_reads_the_finish_off_the_activity_ring() {
+        let mut state = State::default();
+        assert!(state.last_ticket_finished().is_none());
+
+        state.log_phase_transition("T-062-01-01", Phase::Implement, Phase::Review);
+        assert!(
+            state.last_ticket_finished().is_none(),
+            "reaching Review is not finishing"
+        );
+
+        state.log_phase_transition("T-062-01-02", Phase::Review, Phase::Done);
+        // An operator mark-done leaves from Implement; it is still a finish.
+        state.log_phase_transition("T-062-01-01", Phase::Implement, Phase::Done);
+
+        let (ticket_id, at) = state.last_ticket_finished().expect("a finished ticket");
+        assert_eq!(ticket_id, "T-062-01-01", "the newest finish wins the row");
+        assert!(!at.is_zero());
     }
 
     #[test]
