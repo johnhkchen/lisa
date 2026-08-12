@@ -46,7 +46,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     let heartbeat = dir.path().join("pane-1.heartbeat");
     fs::write(&heartbeat, &lease_json).unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::Heartbeats),
+        signal::ingest(dir.path(), SignalRequest::Heartbeats, None),
         vec![SignalRecord::Heartbeat {
             pane_id: 1,
             lease: lease.clone(),
@@ -57,7 +57,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     let started = dir.path().join("pane-2.started");
     fs::write(&started, &lease_json).unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::ProcessStarts),
+        signal::ingest(dir.path(), SignalRequest::ProcessStarts, None),
         vec![SignalRecord::ProcessStarted {
             pane_id: 2,
             lease: lease.clone(),
@@ -68,7 +68,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     let shell_ready = dir.path().join("pane-3.shell-ready");
     fs::write(&shell_ready, &lease_json).unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::ShellReady),
+        signal::ingest(dir.path(), SignalRequest::ShellReady, None),
         vec![SignalRecord::ShellReady {
             pane_id: 3,
             lease: lease.clone(),
@@ -84,7 +84,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     };
     fs::write(&claim_path, serde_json::to_string(&claim).unwrap()).unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::Claims),
+        signal::ingest(dir.path(), SignalRequest::Claims, None),
         vec![SignalRecord::Claim { pane_id: 4, claim }]
     );
     assert!(!claim_path.exists());
@@ -93,7 +93,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     let provider_payload = r#"{"hook_event_name":"UserPromptSubmit","provider":"codex"}"#;
     fs::write(&ack, provider_payload).unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::CodexAcknowledgements),
+        signal::ingest(dir.path(), SignalRequest::CodexAcknowledgements, None),
         vec![SignalRecord::CodexAcknowledgement {
             pane_id: 5,
             payload: provider_payload.to_string(),
@@ -104,7 +104,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     let awaiting = dir.path().join("pane-5.awaiting");
     fs::write(&awaiting, "presence body must not enter the record").unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::Awaiting),
+        signal::ingest(dir.path(), SignalRequest::Awaiting, None),
         vec![SignalRecord::Awaiting { pane_id: 5 }]
     );
     assert!(!awaiting.exists());
@@ -114,7 +114,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     fs::write(&pane_idle, "ignored").unwrap();
     fs::write(&legacy_idle, "ignored").unwrap();
     assert_eq!(
-        sorted(signal::ingest(dir.path(), SignalRequest::Idle)),
+        sorted(signal::ingest(dir.path(), SignalRequest::Idle, None)),
         sorted(vec![
             SignalRecord::Idle {
                 target: IdleTarget::Pane(6),
@@ -132,7 +132,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     fs::write(&stopped, "presence only").unwrap();
     fs::write(&cleared, "presence only").unwrap();
     assert_eq!(
-        sorted(signal::ingest(dir.path(), SignalRequest::Transitions)),
+        sorted(signal::ingest(dir.path(), SignalRequest::Transitions, None)),
         sorted(vec![
             SignalRecord::Stopped { pane_id: 7 },
             SignalRecord::Cleared { pane_id: 8 },
@@ -144,7 +144,7 @@ fn every_request_produces_its_exact_typed_record_contract() {
     let error = dir.path().join("pane-9.error");
     fs::write(&error, "provider failure detail must not enter the record").unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::Errors),
+        signal::ingest(dir.path(), SignalRequest::Errors, None),
         vec![SignalRecord::Error { pane_id: 9 }]
     );
     assert!(!error.exists());
@@ -156,18 +156,18 @@ fn recognition_keeps_strict_and_broad_deletion_policies_distinct() {
 
     let invalid_strict_name = dir.path().join("pane-seven.heartbeat");
     fs::write(&invalid_strict_name, "not a lease").unwrap();
-    assert!(signal::ingest(dir.path(), SignalRequest::Heartbeats).is_empty());
+    assert!(signal::ingest(dir.path(), SignalRequest::Heartbeats, None).is_empty());
     assert!(invalid_strict_name.exists());
 
     let malformed_strict_payload = dir.path().join("pane-7.heartbeat");
     fs::write(&malformed_strict_payload, "not a lease").unwrap();
-    assert!(signal::ingest(dir.path(), SignalRequest::Heartbeats).is_empty());
+    assert!(signal::ingest(dir.path(), SignalRequest::Heartbeats, None).is_empty());
     assert!(!malformed_strict_payload.exists());
 
     let raw_ack = dir.path().join("pane-8.ack");
     fs::write(&raw_ack, "not-json-but-still-provider-payload").unwrap();
     assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::CodexAcknowledgements),
+        signal::ingest(dir.path(), SignalRequest::CodexAcknowledgements, None),
         vec![SignalRecord::CodexAcknowledgement {
             pane_id: 8,
             payload: "not-json-but-still-provider-payload".to_string(),
@@ -177,19 +177,19 @@ fn recognition_keeps_strict_and_broad_deletion_policies_distinct() {
 
     let legacy_ack = dir.path().join("T-LEGACY.ack");
     fs::write(&legacy_ack, "legacy naming is idle-only").unwrap();
-    assert!(signal::ingest(dir.path(), SignalRequest::CodexAcknowledgements).is_empty());
+    assert!(signal::ingest(dir.path(), SignalRequest::CodexAcknowledgements, None).is_empty());
     assert!(legacy_ack.exists());
 
     let invalid_broad_idle = dir.path().join("pane-seven.idle");
     fs::write(&invalid_broad_idle, "ignored").unwrap();
-    assert!(signal::ingest(dir.path(), SignalRequest::Idle).is_empty());
+    assert!(signal::ingest(dir.path(), SignalRequest::Idle, None).is_empty());
     assert!(!invalid_broad_idle.exists());
 
     let invalid_broad_transition = dir.path().join("pane-seven.stopped");
     let unrelated_idle = dir.path().join("pane-10.idle");
     fs::write(&invalid_broad_transition, "ignored").unwrap();
     fs::write(&unrelated_idle, "owned by idle").unwrap();
-    assert!(signal::ingest(dir.path(), SignalRequest::Transitions).is_empty());
+    assert!(signal::ingest(dir.path(), SignalRequest::Transitions, None).is_empty());
     assert!(!invalid_broad_transition.exists());
     assert!(unrelated_idle.exists());
 }
@@ -211,7 +211,7 @@ fn typed_lease_ingestion_stays_separate_from_current_attempt_admission() {
     fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
 
     assert_eq!(
-        signal::ingest(&state.signal_dir, SignalRequest::Heartbeats),
+        signal::ingest(&state.signal_dir, SignalRequest::Heartbeats, None),
         vec![SignalRecord::Heartbeat {
             pane_id: PANE_ID,
             lease: stale.clone(),

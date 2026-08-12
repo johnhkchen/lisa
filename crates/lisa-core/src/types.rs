@@ -708,6 +708,17 @@ pub struct PluginConfig {
     #[serde(default)]
     pub provider_caps: HashMap<AgentClient, usize>,
 
+    /// The Zellij session this loop's plugin runs in, named by `lisa loop` and
+    /// passed through the layout.
+    ///
+    /// The plugin cannot ask Zellij for this — it lives inside the server, and
+    /// the server does not hand it back — so it arrives with everything else in
+    /// the layout or not at all. It is recorded in `.lisa/schedulers/` because
+    /// `zellij kill-session <name>` is the one measured way to stop a scheduler
+    /// whose client is already gone.
+    #[serde(default)]
+    pub session_name: Option<String>,
+
     /// Whether parked operator blocks receive one bounded first-responder pass.
     #[serde(default = "PluginConfig::default_triage_enabled")]
     pub triage_enabled: bool,
@@ -776,6 +787,7 @@ impl PluginConfig {
             client: AgentClient::default(),
             lisa_bin: None,
             provider_caps: HashMap::new(),
+            session_name: None,
             triage_enabled: Self::DEFAULT_TRIAGE_ENABLED,
             triage_timeout_secs: Self::DEFAULT_TRIAGE_TIMEOUT_SECS,
         }
@@ -870,6 +882,15 @@ impl PluginConfig {
             // the Codex adapter falls back to the bare `lisa`.
             if !lisa_bin.is_empty() {
                 result.lisa_bin = Some(lisa_bin.clone());
+            }
+        }
+
+        if let Some(session_name) = config.get("session_name") {
+            // Zellij invents a name when the launcher passes none, and the
+            // launcher cannot know which. Absent stays absent: a scheduler that
+            // does not know its session says so rather than guessing one.
+            if !session_name.is_empty() {
+                result.session_name = Some(session_name.clone());
             }
         }
 

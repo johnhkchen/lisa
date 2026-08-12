@@ -311,6 +311,14 @@ const STARTUP_GRACE_SECS: u64 = 8;
 /// same physical pane. The replacement cannot recursively recover again.
 const MAX_SAME_PANE_STARTUP_RELAUNCHES: u8 = 1;
 
+/// How far back a scheduler looks for somebody else's receipt for the start
+/// signal it never saw.
+///
+/// Ten minutes covers any plausible launch-to-acknowledgment window with room
+/// for a slow repository, and stops a receipt from an hour-old attempt in the
+/// same pane from explaining away an ordinary startup failure.
+const STARTUP_RECEIPT_LOOKBACK_SECS: u64 = 600;
+
 /// Strip the `/host/` prefix from a WASI sandbox path to get the host-relative path.
 ///
 /// Inside the WASI sandbox, the host filesystem is mounted at `/host/`.
@@ -318,6 +326,14 @@ const MAX_SAME_PANE_STARTUP_RELAUNCHES: u8 = 1;
 fn strip_host_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     PathBuf::from(s.strip_prefix("/host/").unwrap_or(&s).to_string())
+}
+
+/// Unix seconds for an instant, or `None` for one before the epoch — a clock
+/// Lisa cannot reason about, which every caller here turns into "say nothing".
+fn unix_secs(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs())
 }
 
 /// Lexically normalize an absolute host path without requiring the enclosing
@@ -1203,6 +1219,24 @@ pub struct State {
     /// artifacts (`.lisa/attempts/` under /host/).
     attempt_dir: PathBuf,
 
+    /// The registry every scheduler on this board writes itself into
+    /// (`.lisa/schedulers/` under /host/). Empty before `load()`, which is what
+    /// keeps native fixtures off disk.
+    scheduler_dir: PathBuf,
+
+    /// This scheduler's own identity in that registry. Empty before `load()`;
+    /// an empty id is what tells every writer here to stay quiet.
+    scheduler_id: String,
+
+    /// Unix seconds at which this scheduler started, carried so its record can
+    /// say how long it has been on the board.
+    scheduler_started_at: u64,
+
+    /// The other schedulers seen stamping this board, refreshed each poll.
+    /// Empty is the ordinary case; anything else is the failure this registry
+    /// exists to make visible.
+    other_schedulers: Vec<lisa_core::schedulers::SchedulerRecord>,
+
     /// Path to the append-only provenance ledger (`.lisa/provenance.jsonl` under
     /// /host/). One record is appended per ticket-run at teardown (T-027-01).
     /// Empty until `load()` runs — a native test that does not set it skips the
@@ -1308,6 +1342,11 @@ pub struct State {
     /// `None` before load and in native tests, where the title has nowhere to
     /// go and is therefore not composed at all.
     plugin_pane_id: Option<u32>,
+
+    /// The Zellij *server* pid, captured from `get_plugin_ids()` in `load()`.
+    /// Recorded in the scheduler registry because it is what `ps` and `lsof`
+    /// speak, and a detached scheduler is otherwise nameless from outside.
+    zellij_pid: Option<u32>,
 
     /// Last title applied to the plugin pane. The ticker is recomposed on every
     /// render but handed to Zellij only when it differs from this, so a loop
@@ -1896,6 +1935,155 @@ impl State {
             lisa_dir.join(lisa_core::liveness::SCHEDULER_ALIVE_NAME),
             &body,
         );
+        self.stamp_scheduler_record(now.as_secs());
+    }
+
+    /// Take a name for this scheduler and remember when it started.
+    ///
+    /// The id has to be unique among schedulers on one board and stable for
+    /// this process's whole life, so it is built from the two things that
+    /// differ between any two of them: the session they run in and the instant
+    /// they loaded. The plugin id joins the hash because two loops launched by
+    /// one script can share a clock reading at second resolution.
+    fn adopt_scheduler_identity(&mut self, started_at: std::time::SystemTime, plugin_id: u32) {
+        let since_epoch = started_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        self.scheduler_started_at = since_epoch.as_secs();
+        self.scheduler_id = lisa_core::schedulers::scheduler_id(
+            self.config.session_name.as_deref(),
+            since_epoch.as_nanos(),
+            u64::from(plugin_id),
+        );
+    }
+
+    /// This scheduler, as the signal directory's consumers should name it.
+    ///
+    /// `None` before `load()` — a native fixture consumes signals exactly as it
+    /// always did and writes no receipts.
+    fn signal_consumer(&self, now: u64) -> Option<signal::Consumer> {
+        if self.scheduler_id.is_empty() || self.scheduler_dir.as_os_str().is_empty() {
+            return None;
+        }
+        Some(signal::Consumer {
+            scheduler_id: self.scheduler_id.clone(),
+            registry: self.scheduler_dir.clone(),
+            now,
+        })
+    }
+
+    /// This scheduler as a consumer, stamped with the wall clock now.
+    fn consumer_now(&self) -> Option<signal::Consumer> {
+        self.signal_consumer(unix_secs(std::time::SystemTime::now())?)
+    }
+
+    /// Write this scheduler's own file in `.lisa/schedulers/`.
+    ///
+    /// The shared stamp above says *a* scheduler is here. This one says which,
+    /// which session to name to stop it, and which server pid holds the board —
+    /// the three facts nobody could recover from outside the process. Written
+    /// beside the shared stamp rather than instead of it: an older `lisa` on
+    /// the same project still reads only the shared file.
+    ///
+    /// Best-effort for the same reason its neighbour is: bookkeeping that
+    /// cannot be written must cost a diagnosis, never the run.
+    fn stamp_scheduler_record(&self, now: u64) {
+        if self.scheduler_id.is_empty() || self.scheduler_dir.as_os_str().is_empty() {
+            return;
+        }
+        let record = lisa_core::schedulers::SchedulerRecord::new(
+            self.scheduler_id.clone(),
+            self.config.session_name.clone(),
+            self.zellij_pid,
+            self.scheduler_started_at,
+            now,
+            POLL_INTERVAL_SECS.round() as u64,
+        );
+        let _ = lisa_core::schedulers::write_record(&self.scheduler_dir, &record);
+    }
+
+    /// Whether another scheduler consumed this pane's start signal recently,
+    /// and what to call it.
+    ///
+    /// Bounded by [`STARTUP_RECEIPT_LOOKBACK_SECS`] rather than by this
+    /// attempt's launch instant, which nothing on the seat records: any
+    /// same-pane start signal taken by somebody else inside that window is
+    /// contention, whichever attempt it belonged to.
+    fn started_signal_taken_by_another(
+        &self,
+        pane_id: u32,
+        now: std::time::SystemTime,
+    ) -> Option<String> {
+        if self.scheduler_id.is_empty() || self.scheduler_dir.as_os_str().is_empty() {
+            return None;
+        }
+        let now = unix_secs(now)?;
+        let receipt = lisa_core::schedulers::taken_by_another(
+            &self.scheduler_dir,
+            &self.scheduler_id,
+            &format!("pane-{pane_id}.started"),
+            now.saturating_sub(STARTUP_RECEIPT_LOOKBACK_SECS),
+        )?;
+        Some(self.scheduler_label(&receipt.scheduler_id))
+    }
+
+    /// What to call another scheduler in operator-facing prose: its session
+    /// name when it recorded one, its id otherwise.
+    fn scheduler_label(&self, scheduler_id: &str) -> String {
+        lisa_core::schedulers::read_roster_dir(&self.scheduler_dir)
+            .into_iter()
+            .find(|record| record.scheduler_id == scheduler_id)
+            .map(|record| record.label())
+            .unwrap_or_else(|| scheduler_id.to_string())
+    }
+
+    /// Read the registry and say out loud when this board has more than one
+    /// scheduler on it.
+    ///
+    /// A second scheduler is not an error this process can refuse — by the time
+    /// the plugin loads, the Zellij server is already running and already
+    /// polling. What it can do is refuse to be silent about it, on the surface
+    /// the operator is already looking at, with the command that ends the other
+    /// one. Each id is announced once: this runs every poll, and a warning
+    /// every five seconds is a warning nobody reads.
+    fn note_other_schedulers(&mut self, now: u64) {
+        if self.scheduler_id.is_empty() || self.scheduler_dir.as_os_str().is_empty() {
+            return;
+        }
+        let window = lisa_core::schedulers::live_window_secs(
+            POLL_INTERVAL_SECS.round() as u64,
+            self.config.wind_down_secs,
+        );
+        let others: Vec<lisa_core::schedulers::SchedulerRecord> =
+            lisa_core::schedulers::read_roster_dir(&self.scheduler_dir)
+                .into_iter()
+                .filter(|record| {
+                    record.scheduler_id != self.scheduler_id && record.is_live(now, window)
+                })
+                .collect();
+
+        for record in &others {
+            if self
+                .other_schedulers
+                .iter()
+                .any(|known| known.scheduler_id == record.scheduler_id)
+            {
+                continue;
+            }
+            let stop = record.stop_command().unwrap_or_else(|| {
+                "find its session with `zellij list-sessions` and stop it with `zellij \
+                 kill-session <name>`"
+                    .to_string()
+            });
+            self.log_activity(ActivityEvent::Warning {
+                message: format!(
+                    "another scheduler is running on this board: {} — two schedulers split \
+                     .lisa/signals/ between them. Stop it with: {stop}",
+                    record.label()
+                ),
+            });
+        }
+        self.other_schedulers = others;
     }
 
     /// Publish the lease marker copied by native heartbeat hooks. The rename is
@@ -5110,6 +5298,24 @@ impl State {
                 reset_deadline: self.assignment_ack_deadline(now),
             },
         );
+        // "Startup was not observed" is a claim about this scheduler's reading
+        // of the signal directory, and a second scheduler makes that reading
+        // unreliable: it consumes `pane-<id>.started` and this one concludes
+        // nothing started. The receipt in `.lisa/schedulers/` is the difference
+        // between a startup that did not happen and one this process was never
+        // shown, and the probe below is a dead end against the live session the
+        // second scheduler just launched. Fence the seat and name the cause.
+        if let Some(thief) = self.started_signal_taken_by_another(pane_id, now) {
+            return self.fail_startup_recovery(
+                pane_id,
+                &format!(
+                    "pane-{pane_id}.started was consumed by another scheduler on this board \
+                     ({thief}); this run never saw it. Stop the other scheduler — `lisa \
+                     schedulers` names it — and reset the ticket"
+                ),
+            );
+        }
+
         self.awaiting_human.remove(&pane_id);
         self.notified_attention.remove(&pane_id);
         self.clear_pane_reset_signals(pane_id);
@@ -7088,7 +7294,11 @@ impl State {
     /// TUI is still sitting there" is precisely what the exit hold exists to
     /// notice. Nothing else reads it; residency confers no authority anywhere.
     fn check_alive_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::Alive) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::Alive,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::Alive { pane_id } = record else {
                 continue;
             };
@@ -7105,7 +7315,11 @@ impl State {
     /// so an active session is never flagged stuck, never reclaimed by a timeout,
     /// and never has its pane reused.
     fn check_heartbeat_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::Heartbeats) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::Heartbeats,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::Heartbeat {
                 pane_id,
                 lease: candidate,
@@ -7170,7 +7384,11 @@ impl State {
     /// Consume provider-neutral process-start signals and promote only the
     /// exact current fresh attempt assigned to the addressed physical seat.
     fn check_process_start_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::ProcessStarts) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::ProcessStarts,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::ProcessStarted {
                 pane_id,
                 lease: candidate,
@@ -7189,7 +7407,11 @@ impl State {
     /// Consume attempt-scoped proof that an interrupted pane executed a command
     /// at its shell boundary. Only the exact reset successor may relaunch.
     fn check_shell_ready_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::ShellReady) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::ShellReady,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::ShellReady {
                 pane_id,
                 lease: candidate,
@@ -7204,7 +7426,11 @@ impl State {
     /// Consume agent-issued assignment claims and promote only the exact
     /// current nonce-bearing assignment retained for the addressed pane.
     fn check_claim_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::Claims) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::Claims,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::Claim { pane_id, claim } = record else {
                 continue;
             };
@@ -7225,7 +7451,11 @@ impl State {
     /// Consume raw provider `UserPromptSubmit` payloads and promote only the
     /// ticket/generation currently pending in the addressed physical seat.
     fn check_codex_ack_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::CodexAcknowledgements) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::CodexAcknowledgements,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::CodexAcknowledgement { pane_id, payload } = record else {
                 continue;
             };
@@ -7257,7 +7487,11 @@ impl State {
     /// only; a blocked-then-abandoned pane must still trip stale detection on the
     /// normal silence clock (reclaim exemption is T-020-04).
     fn check_awaiting_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::Awaiting) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::Awaiting,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::Awaiting { pane_id } = record else {
                 continue;
             };
@@ -7289,7 +7523,11 @@ impl State {
     fn check_idle_signals(&mut self) {
         self.idle_alerts.clear();
 
-        for record in signal::ingest(&self.signal_dir, SignalRequest::Idle) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::Idle,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::Idle { target } = record else {
                 continue;
             };
@@ -7498,7 +7736,11 @@ impl State {
     ///
     /// Signal files are deleted immediately after reading (same as `.idle` signals).
     fn check_transition_signals(&mut self) {
-        for record in signal::ingest(&self.signal_dir, SignalRequest::Transitions) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::Transitions,
+            self.consumer_now().as_ref(),
+        ) {
             match record {
                 SignalRecord::Stopped { pane_id } => {
                     // A stop signal is recent life — restart the wind-down
@@ -7534,7 +7776,11 @@ impl State {
     /// any body is ignored.
     fn check_error_signals(&mut self) -> Vec<FailureTransitionOutcome> {
         let mut outcomes = Vec::new();
-        for record in signal::ingest(&self.signal_dir, SignalRequest::Errors) {
+        for record in signal::ingest(
+            &self.signal_dir,
+            SignalRequest::Errors,
+            self.consumer_now().as_ref(),
+        ) {
             let SignalRecord::Error { pane_id } = record else {
                 continue;
             };
@@ -9096,6 +9342,14 @@ impl State {
         // decides there is nothing to do.
         self.stamp_scheduler_alive();
 
+        // And, in the same breath, read what everyone else wrote. A second
+        // scheduler can start at any point in a run, so this is a poll rather
+        // than a startup check: the board says how many are on it now, not how
+        // many were on it when this one loaded.
+        if let Some(now) = unix_secs(std::time::SystemTime::now()) {
+            self.note_other_schedulers(now);
+        }
+
         // Presence first: the exit policy asks only whether a process is in the
         // pane, and the answer must be current before any timeout decision —
         // including for a process that cannot name itself.
@@ -10408,6 +10662,7 @@ impl ZellijPlugin for State {
         // Signal directory for idle signal detection
         self.signal_dir = host.join(".lisa/signals");
         self.attempt_dir = host.join(".lisa/attempts");
+        self.scheduler_dir = host.join(lisa_core::schedulers::SCHEDULER_DIR);
 
         // Provenance ledger + per-provider usage-artifact directories.
         self.ledger_path = host.join(".lisa/provenance.jsonl");
@@ -10426,12 +10681,24 @@ impl ZellijPlugin for State {
         // ticker instead of the `file:/…/lisa-plugin-<hash>.wasm` Zellij shows
         // by default.
         self.plugin_pane_id = Some(plugin_ids.plugin_id);
-        self.loop_started_at = Some(std::time::SystemTime::now());
+        self.zellij_pid = Some(plugin_ids.zellij_pid);
+        let started_at = std::time::SystemTime::now();
+        self.loop_started_at = Some(started_at);
+
+        // Name this scheduler before it writes anything, so everything it does
+        // to the board from here on is attributable to one identity.
+        self.adopt_scheduler_identity(started_at, plugin_ids.plugin_id);
 
         // Stamp once at load rather than waiting for the first poll: a run that
         // starts and immediately places seats should never be readable as one
         // that already ended.
         self.stamp_scheduler_alive();
+        if let Some(now) = unix_secs(started_at) {
+            // Yesterday's zombie is the point of the registry, so only records
+            // long past any plausible run are swept.
+            lisa_core::schedulers::forget_long_dead(&self.scheduler_dir, now);
+            self.note_other_schedulers(now);
+        }
 
         // Subscribe to the events we need
         subscribe(&[
@@ -14032,6 +14299,207 @@ mod tests {
     #[test]
     fn a_scheduler_with_no_signal_directory_stamps_nothing() {
         State::default().stamp_scheduler_alive();
+    }
+
+    /// A scheduler that knows its own name, ready to write itself down.
+    fn registered_scheduler(root: &Path, session: &str, id: &str) -> State {
+        let signal_dir = root.join(".lisa/signals");
+        std::fs::create_dir_all(&signal_dir).unwrap();
+        let mut state = State {
+            signal_dir,
+            scheduler_dir: root.join(lisa_core::schedulers::SCHEDULER_DIR),
+            scheduler_id: id.to_string(),
+            zellij_pid: Some(9450),
+            config: PluginConfig {
+                session_name: Some(session.to_string()),
+                ..PluginConfig::new()
+            },
+            ..State::default()
+        };
+        state.scheduler_started_at = unix_secs(std::time::SystemTime::now()).unwrap();
+        state
+    }
+
+    /// The count the shared stamp cannot produce: three schedulers, three
+    /// files, each naming the session an operator would have to stop.
+    #[test]
+    fn every_scheduler_writes_its_own_record_so_the_board_can_be_counted() {
+        let temp = tempfile::tempdir().unwrap();
+        for (session, id) in [
+            ("blossoming-cymbal", "blossoming-cymbal-1"),
+            ("inventive-triceratops", "inventive-triceratops-2"),
+            ("fascinating-drum", "fascinating-drum-3"),
+        ] {
+            registered_scheduler(temp.path(), session, id).stamp_scheduler_alive();
+        }
+
+        let roster = lisa_core::schedulers::read_roster(temp.path());
+        assert_eq!(roster.len(), 3, "one file per scheduler, no merging");
+        let record = roster
+            .iter()
+            .find(|record| record.scheduler_id == "fascinating-drum-3")
+            .unwrap();
+        assert_eq!(record.session_name.as_deref(), Some("fascinating-drum"));
+        assert_eq!(record.zellij_pid, Some(9450));
+        assert_eq!(
+            record.stop_command().unwrap(),
+            "zellij kill-session fascinating-drum"
+        );
+        assert!(
+            temp.path().join(".lisa/scheduler.alive").exists(),
+            "the shared stamp keeps being written for readers that only know it"
+        );
+    }
+
+    /// The dashboard is where the operator already is, so that is where a
+    /// second scheduler gets announced — once, not every five seconds.
+    #[test]
+    fn a_second_scheduler_on_the_board_is_named_once_in_the_activity_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut live = registered_scheduler(temp.path(), "lisa", "lisa-live");
+        registered_scheduler(temp.path(), "fascinating-drum", "drum-zombie")
+            .stamp_scheduler_alive();
+        let now = unix_secs(std::time::SystemTime::now()).unwrap();
+
+        live.note_other_schedulers(now);
+        live.note_other_schedulers(now);
+
+        let warnings: Vec<&String> = live
+            .activity_events()
+            .filter_map(|event| match event {
+                ActivityEvent::Warning { message } if message.contains("another scheduler") => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "one warning per scheduler, not per tick");
+        assert!(warnings[0].contains("fascinating-drum"));
+        assert!(warnings[0].contains("zellij kill-session fascinating-drum"));
+        assert_eq!(live.other_schedulers.len(), 1);
+    }
+
+    /// A record nobody has stamped for seventeen hours is not another
+    /// scheduler; it is the corpse of one, and warning about it teaches the
+    /// operator to ignore the warning.
+    #[test]
+    fn a_scheduler_that_stopped_stamping_is_not_announced_as_a_second_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut live = registered_scheduler(temp.path(), "lisa", "lisa-live");
+        let now = unix_secs(std::time::SystemTime::now()).unwrap();
+        lisa_core::schedulers::write_record(
+            &live.scheduler_dir,
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "yesterday",
+                Some("fascinating-drum".to_string()),
+                None,
+                now - 18 * 3600,
+                now - 17 * 3600,
+                5,
+            ),
+        )
+        .unwrap();
+
+        live.note_other_schedulers(now);
+
+        assert!(live.other_schedulers.is_empty());
+        assert!(!live.activity_events().any(
+            |event| matches!(event, ActivityEvent::Warning { message } if message
+                .contains("another scheduler"))
+        ));
+    }
+
+    /// The incident's worst leg, closed: startup this scheduler never saw is
+    /// not the same as startup that never happened, and the receipt says which
+    /// one this is. The probe — which a live `--dangerously-skip-permissions`
+    /// session executes on the scheduler's behalf, forging its own readiness —
+    /// is exactly what must not be typed here.
+    #[test]
+    fn startup_recovery_fences_instead_of_probing_a_start_signal_another_scheduler_ate() {
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let signal_dir = temp.path().join(".lisa/signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, _lease) = resident_pane_fixture(&signal_dir, "T-EATEN");
+        state.scheduler_dir = temp.path().join(lisa_core::schedulers::SCHEDULER_DIR);
+        state.scheduler_id = "lisa-live".to_string();
+        let now = std::time::SystemTime::now();
+        let now_secs = unix_secs(now).unwrap();
+        lisa_core::schedulers::write_record(
+            &state.scheduler_dir,
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "drum-zombie",
+                Some("fascinating-drum".to_string()),
+                Some(30186),
+                now_secs - 17 * 3600,
+                now_secs,
+                5,
+            ),
+        )
+        .unwrap();
+        lisa_core::schedulers::append_receipt(
+            &state.scheduler_dir,
+            &lisa_core::schedulers::SignalReceipt::new(
+                now_secs - 2,
+                "drum-zombie",
+                "pane-1.started",
+            ),
+        )
+        .unwrap();
+
+        state.check_assignment_ack_timeouts_at(now);
+
+        assert!(
+            !state
+                .attempt_lifecycle
+                .iter()
+                .any(|event| matches!(event, AttemptLifecycleEvent::ShellInterrupted { .. })),
+            "the probe must not be typed into a pane a second scheduler just launched into"
+        );
+        assert!(matches!(
+            state.seat_assignment(1),
+            Some(SeatAssignmentState::StartupFailed)
+        ));
+        assert!(state.activity_events().any(|event| matches!(
+            event,
+            ActivityEvent::Error { message } | ActivityEvent::Warning { message }
+                if message.contains("consumed by another scheduler")
+                    && message.contains("fascinating-drum")
+        )));
+    }
+
+    /// With one scheduler on the board — every ordinary run — the recovery it
+    /// always did is the recovery it still does.
+    #[test]
+    fn startup_recovery_still_probes_when_no_other_scheduler_took_anything() {
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let signal_dir = temp.path().join(".lisa/signals");
+        fs::create_dir_all(&signal_dir).unwrap();
+        let (mut state, lease) = resident_pane_fixture(&signal_dir, "T-ALONE");
+        state.write_pane_lease_marker(1, &lease).unwrap();
+        state.scheduler_dir = temp.path().join(lisa_core::schedulers::SCHEDULER_DIR);
+        state.scheduler_id = "lisa-live".to_string();
+        let now = std::time::SystemTime::now();
+        // This scheduler's own receipt for the same signal is not contention.
+        lisa_core::schedulers::append_receipt(
+            &state.scheduler_dir,
+            &lisa_core::schedulers::SignalReceipt::new(
+                unix_secs(now).unwrap() - 2,
+                "lisa-live",
+                "pane-1.started",
+            ),
+        )
+        .unwrap();
+
+        state.check_assignment_ack_timeouts_at(now);
+
+        assert!(state
+            .attempt_lifecycle
+            .iter()
+            .any(|event| matches!(event, AttemptLifecycleEvent::ShellInterrupted { .. })));
     }
 
     #[test]

@@ -425,9 +425,13 @@ mod tests {
     #[test]
     fn three_schedulers_on_one_board_read_as_three() {
         let dir = tempfile::tempdir().unwrap();
-        for (index, id) in ["blossoming-cymbal", "inventive-triceratops", "fascinating-drum"]
-            .iter()
-            .enumerate()
+        for (index, id) in [
+            "blossoming-cymbal",
+            "inventive-triceratops",
+            "fascinating-drum",
+        ]
+        .iter()
+        .enumerate()
         {
             write_record(
                 dir.path(),
@@ -520,7 +524,11 @@ mod tests {
     fn forgetting_a_scheduler_takes_its_ledger_with_it() {
         let dir = tempfile::tempdir().unwrap();
         write_record(dir.path(), &record("gone", 0, 10)).unwrap();
-        append_receipt(dir.path(), &SignalReceipt::new(10, "gone", "pane-1.started")).unwrap();
+        append_receipt(
+            dir.path(),
+            &SignalReceipt::new(10, "gone", "pane-1.started"),
+        )
+        .unwrap();
 
         forget(dir.path(), "gone");
 
