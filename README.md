@@ -196,6 +196,7 @@ max_threads = 2
 | `dirs.work` | `docs/active/work` | Chooses where Lisa keeps work records. |
 | `runtime.zellij` | `managed` | Chooses how Lisa starts Zellij. |
 | `agent.client` | `claude` | Chooses which coding agent Lisa drives. Omit it to detect agents on PATH; claude is the default when both are installed. |
+| `agent.model` | `opus` | Chooses which model that agent runs. Omit it to use whatever the agent runs by default. |
 | `guards.completion` | `auto` | Controls how finished work is sealed. auto picks the strongest your project supports. |
 | `triage.enabled` | `true` | Lets Lisa inspect work that needs you before asking for help. |
 | `triage.timeout_secs` | `120` | Limits how long Lisa can inspect work that needs you. |
@@ -424,7 +425,9 @@ capture. The completion-seal line says how finished work is being recorded.
 
 If a run stopped without shutting down, the seats it was working still look
 busy. **Seats held by a run that is gone** names them, says how Lisa knows, and
-points at `lisa release-seats`.
+points at `lisa release-seats`. If more than one run is holding this board at
+once, that is named too — with each one's stop command, because a board with two
+schedulers on it reads exactly like a healthy one otherwise.
 
 ```bash
 lisa status
@@ -505,6 +508,12 @@ detached in the background, or sitting quietly on a question — the command say
 so and frees nothing. A seat Lisa isn't sure about stays held, because handing
 out a seat somebody is working is the mistake that costs you.
 
+The refusal tells you which of the two it is. *A run is working these seats*
+means your panes are writing and something is genuinely being done. *A scheduler
+is holding these seats* means a run exists but nothing has moved for a while —
+so the message names that run and the command that ends it, rather than leaving
+you with a sentence you can't act on.
+
 ### `lisa reset-ticket`
 
 Put a ticket back on the board when nothing is working on it.
@@ -527,7 +536,34 @@ A reset moves `phase` back to `ready` and `status` back to `open`, and touches
 nothing else — committed work stays, attempt history stays, and a ticket your
 board records as **done** is never a candidate. While a run is going, Lisa says
 so and changes nothing: press `r` in the Lisa pane instead, where the scheduler
-can release the seat in the same breath.
+can release the seat in the same breath. If the run holding the board is one you
+can't see, the refusal names it and `lisa schedulers` ends it.
+
+### `lisa schedulers`
+
+Show every run holding this board, and stop one that outlived its pane.
+
+Closing a loop's pane does not stop the run. `lisa loop` starts a Zellij
+*client*; the part that hands out tickets lives in the Zellij *server*, and the
+server keeps going. Close the pane, close the window, kill the `lisa loop`
+process — the run carries on holding seats and reading your panes' signals, with
+nothing on screen to say so. Start another loop and you have two of them, each
+seeing about half of what your agents write and quietly eating the other half.
+
+```bash
+lisa schedulers                              # who is running this board
+lisa schedulers --stop fascinating-drum      # end that one
+```
+
+Each line names the run, when it started, when it last checked in, its Zellij
+server, and the exact command that stops it. `--stop` runs that command for you.
+It ends the whole session, agent panes included, so you always name which one —
+and Lisa refuses the session your own terminal is sitting in, because a command
+that closes the window it is printing to can't tell you what it did.
+
+Starting a second run on a board that already has one is refused, with the first
+one named. That is the only thing standing between a quiet afternoon and two
+schedulers splitting your signals between them.
 
 ### `lisa unblock`
 

@@ -271,3 +271,9 @@ fn poll_tick_preserves_signal_admission_and_timeout_interleaving() {
         remainder = after;
     }
 }
+
+/// The same boundary with two consumers on it: one signal directory, two whole
+/// schedulers, and the start signal only one of them gets. Its own file, kept
+/// beside the single-consumer regressions it extends.
+#[path = "two_schedulers_one_board.rs"]
+mod two_schedulers_one_board;
