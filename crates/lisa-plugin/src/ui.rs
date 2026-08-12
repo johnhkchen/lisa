@@ -293,6 +293,11 @@ pub enum AlertType {
     IdleWithoutArtifact,
     /// Session exceeded the configured session_timeout_secs.
     TimedOut,
+    /// A pane's previous agent never released it, so nothing can be launched
+    /// there. Its own alert rather than a `Failed`: no session failed here —
+    /// none was ever started, and the operator's next move is to look at the
+    /// named pane rather than at transcripts that do not exist.
+    SeatHeld,
 }
 
 /// A health alert for the attention banner.
@@ -846,6 +851,7 @@ fn render_health_alerts(state: &PluginState, width: usize, output: &mut Vec<Stri
             AlertType::Stuck => ("! STUCK ", YELLOW),
             AlertType::IdleWithoutArtifact => ("⏸ IDLE  ", YELLOW),
             AlertType::TimedOut => ("⏱ TIMEOUT", YELLOW),
+            AlertType::SeatHeld => ("⛔ HELD  ", YELLOW),
         };
 
         let detail_max = inner_w.saturating_sub(24); // label + space + ticket_id + space

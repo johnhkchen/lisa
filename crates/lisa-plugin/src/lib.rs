@@ -17,6 +17,7 @@ mod signal;
 mod stack;
 mod ticker;
 mod ui;
+mod wedge;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -125,12 +126,23 @@ const AGENT_EXIT_GRACE_SECS: u64 = 8;
 /// command went in. While that evidence keeps arriving Lisa waits rather than
 /// typing a launch command into a live TUI, where it lands as a chat message:
 /// no process starts, no `.started` is ever written, and the ticket is never
-/// delivered. At the ceiling the pane is launched regardless, because a provider
-/// that dies while still emitting must not strand its seat — and if that launch
-/// does land in a TUI, `begin_resident_exit_retry` is the second line of
-/// defence. Sized for a cold provider start in a large project (~35s observed)
-/// plus the turn the old session may be in the middle of.
+/// delivered. At the ceiling Lisa stops waiting — but what it releases is the
+/// *ticket*, not the pane: the ticket goes back to the board for a different
+/// seat and the pane is marked wedged (see [`wedge`]). Launching anyway is what
+/// this constant used to authorise, and it is what turned one held pane into
+/// four spent attempts in T-062-01-04. Sized for a cold provider start in a
+/// large project (~35s observed) plus the turn the old session may be in the
+/// middle of.
 const AGENT_EXIT_CEILING_SECS: u64 = 90;
+
+/// How long a wedged pane must stay silent before Lisa believes its provider
+/// finally left and returns the pane to the rotation.
+///
+/// Deliberately the ceiling rather than the grace: this pane has already
+/// demonstrated that it can outlive an `/exit`, so it earns the same evidence
+/// held to a longer standard. Nothing new is measured — only silence, the same
+/// thing every other release in this file is decided on.
+const WEDGE_RELEASE_SECS: u64 = AGENT_EXIT_CEILING_SECS;
 
 /// The prompt text sent to an agent for a ticket.
 ///
@@ -907,6 +919,10 @@ enum DeclineReason {
     ProviderCapReached { agent: AgentClient },
     /// No compatible or recyclable pane slot is free.
     NoSlotAvailable,
+    /// No slot is free and at least one is held by an agent that would not
+    /// leave. Distinct from `NoSlotAvailable` because the remedy is different:
+    /// waiting fixes a busy loop, and only a look at the named pane fixes this.
+    SeatsWedged { panes: Vec<u32> },
     /// The only candidate pane is blocked on an agent question.
     PaneAwaitingQuestion { pane_id: u32 },
     /// An admitted ticket failed to launch. Failures are operator news, so the
@@ -925,6 +941,14 @@ impl DeclineReason {
             }
             Self::ProviderCapReached { agent } => format!("{} provider cap reached", agent),
             Self::NoSlotAvailable => "no compatible pane slot free".to_string(),
+            Self::SeatsWedged { panes } => format!(
+                "no pane slot free; {} still held by a previous agent",
+                panes
+                    .iter()
+                    .map(|pane| format!("#{}", pane))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::PaneAwaitingQuestion { pane_id } => {
                 format!("pane #{} is awaiting an answer", pane_id)
             }
@@ -1057,6 +1081,14 @@ pub struct State {
     /// not had a chance to answer; a new `PaneUpdate` retires the guard, so a
     /// resize that drifts the expansion back is promoted again.
     stack_promoted: Option<(u32, Option<u32>)>,
+
+    /// Panes whose agent did not release them after `/exit`, keyed by pane.
+    ///
+    /// A wedged pane is out of the rotation: the scheduler will not select it,
+    /// and nothing is typed into it. It leaves the map when the pane has been
+    /// silent long enough to believe the provider finally left, or when an
+    /// operator clears the seat. See [`wedge`].
+    wedged_seats: HashMap<u32, wedge::WedgedSeat>,
 
     /// Exact successfully published assignment for each ticket's current
     /// attempt. Lease authority remains in `current_leases`; this map retains
@@ -1355,14 +1387,17 @@ impl State {
     /// Implement phase for an operator mark-done. Only the transition itself
     /// says Done in every case.
     fn last_ticket_finished(&self) -> Option<(String, std::time::Duration)> {
-        self.activity_log.iter().rev().find_map(|entry| match &entry.event {
-            ActivityEvent::TicketPhaseChanged {
-                ticket_id,
-                new_phase: Phase::Done,
-                ..
-            } => Some((ticket_id.clone(), entry.at)),
-            _ => None,
-        })
+        self.activity_log
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.event {
+                ActivityEvent::TicketPhaseChanged {
+                    ticket_id,
+                    new_phase: Phase::Done,
+                    ..
+                } => Some((ticket_id.clone(), entry.at)),
+                _ => None,
+            })
     }
 
     /// Give newly discovered, unassigned panes their initial idle names once
@@ -5688,6 +5723,7 @@ impl State {
         let wind_down = std::time::Duration::from_secs(self.config.wind_down_secs);
         self.agent_slots.iter().position(|s| {
             s.ticket_id.is_none()
+                && !self.wedged_seats.contains_key(&s.pane_id)
                 && s.transition_state == TransitionState::Idle
                 && (!s.has_session || s.last_client.is_none() || s.last_client == Some(want))
                 && s.cooldown_until.is_none_or(|until| now >= until)
@@ -5713,6 +5749,7 @@ impl State {
             .iter()
             .position(|s| {
                 s.ticket_id.is_none()
+                    && !self.wedged_seats.contains_key(&s.pane_id)
                     && s.transition_state == TransitionState::Idle
                     && s.has_session
                     && s.last_client.is_some_and(|client| client != want)
@@ -6056,8 +6093,18 @@ impl State {
                 Some(SlotSelection::Compatible(idx)) => (idx, false),
                 Some(SlotSelection::Recycle(idx)) => (idx, true),
                 None => {
-                    pass.declined
-                        .push((ticket_id.clone(), DeclineReason::NoSlotAvailable));
+                    // Say which fact is in the way. A loop whose seats are all
+                    // busy recovers on its own; a loop whose seats are held
+                    // does not, and the operator needs to hear the difference
+                    // the first time rather than after three "Session failed".
+                    let reason = if self.wedged_seats.is_empty() {
+                        DeclineReason::NoSlotAvailable
+                    } else {
+                        let mut panes: Vec<u32> = self.wedged_seats.keys().copied().collect();
+                        panes.sort_unstable();
+                        DeclineReason::SeatsWedged { panes }
+                    };
+                    pass.declined.push((ticket_id.clone(), reason));
                     unscheduled += 1;
                     continue;
                 }
@@ -7006,20 +7053,6 @@ impl State {
     /// exists to act on. The exit policy asks the narrower, decaying question.
     fn provider_is_resident(&self, pane_id: u32) -> bool {
         self.resident_providers.contains_key(&pane_id)
-    }
-
-    /// Whether this pane emitted a provider hook within the last `window_secs`.
-    /// This is the decaying form the exit policy holds on, restated here so the
-    /// ceiling warning fires on exactly the releases the hold was delaying.
-    fn provider_was_noisy_within(
-        &self,
-        pane_id: u32,
-        now: std::time::SystemTime,
-        window_secs: u64,
-    ) -> bool {
-        self.last_provider_signal(pane_id).is_some_and(|last| {
-            now.duration_since(last).unwrap_or_default().as_secs() <= window_secs
-        })
     }
 
     /// Scan for `pane-<id>.alive` — the presence-only leg of the PostToolUse
@@ -8214,6 +8247,207 @@ impl State {
         }
     }
 
+    /// Take a pane out of the rotation and give its ticket back to the board.
+    ///
+    /// Called when a pane is still emitting provider hooks a full ceiling after
+    /// its `/exit`: the agent there did not leave, so nothing may be typed into
+    /// it. Four things happen, and the order matters — the ticket must be free
+    /// of this attempt before it can be scheduled anywhere else:
+    ///
+    /// 1. the attempt is recorded void, because the number it spent bought no
+    ///    session (see [`wedge::VoidAttempt`]);
+    /// 2. the ticket's phase is walked back from Implement to Ready, which is
+    ///    the field's step 3 — the one an operator had to do by hand, on the
+    ///    one field every assignment tells agents never to touch;
+    /// 3. the reservation and lease are released so the next pass may pick a
+    ///    different seat;
+    /// 4. the pane is remembered as wedged so that pass does not pick *this*
+    ///    one.
+    fn wedge_seat(
+        &mut self,
+        pane_id: u32,
+        ticket_id: Option<TicketId>,
+        now: std::time::SystemTime,
+    ) {
+        if self.wedged_seats.contains_key(&pane_id) {
+            return;
+        }
+
+        let attempt_id = self
+            .pane_attempt_lease(pane_id)
+            .map(|lease| lease.attempt_id);
+
+        self.log_activity(ActivityEvent::Warning {
+            message: match &ticket_id {
+                Some(ticket_id) => format!(
+                    "Pane {} still showed a live provider {}s after /exit; {} was not launched there and goes back to the board",
+                    pane_id, AGENT_EXIT_CEILING_SECS, ticket_id
+                ),
+                None => format!(
+                    "Pane {} still showed a live provider {}s after /exit; it is out of the rotation until it goes quiet",
+                    pane_id, AGENT_EXIT_CEILING_SECS
+                ),
+            },
+        });
+
+        if let Some(ticket_id) = &ticket_id {
+            if let Some(attempt_id) = attempt_id {
+                self.record_void_attempt(ticket_id, attempt_id, pane_id, now);
+            }
+            self.return_unstarted_ticket_to_ready(ticket_id);
+            if let Some(thread) = self.threads.get_mut(ticket_id) {
+                thread.fail();
+            }
+            self.threads.remove(ticket_id);
+            self.release_slot_for_ticket(ticket_id);
+        }
+
+        if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+            // The transition is over: it did not succeed, and leaving the slot
+            // in WaitingForExit would re-fire this decision on every poll.
+            slot.transition_state = TransitionState::Idle;
+            slot.transition_started_at = None;
+            slot.ticket_id = None;
+            slot.attempt_lease = None;
+        }
+        self.seat_assignments.remove(&pane_id);
+        self.wedged_seats.insert(
+            pane_id,
+            wedge::WedgedSeat {
+                ticket_id,
+                attempt_id,
+                since: now,
+            },
+        );
+    }
+
+    /// Durably note that an attempt number was spent without a session.
+    ///
+    /// Best-effort: a record that cannot be written is worth an activity line
+    /// and nothing more. Losing the note is untidy; refusing to release a
+    /// wedged seat over it would be the original bug with extra steps.
+    fn record_void_attempt(
+        &mut self,
+        ticket_id: &TicketId,
+        attempt_id: u64,
+        pane_id: u32,
+        now: std::time::SystemTime,
+    ) {
+        let record = wedge::VoidAttempt::held_pane(
+            ticket_id.clone(),
+            attempt_id,
+            pane_id,
+            provenance::system_time_to_epoch(now),
+        );
+        let path = wedge::void_record_path(&self.attempt_root(), ticket_id, attempt_id);
+        let body = match serde_json::to_vec_pretty(&record) {
+            Ok(body) => body,
+            Err(error) => {
+                self.log_activity(ActivityEvent::Warning {
+                    message: format!("Cannot record void attempt for {}: {}", ticket_id, error),
+                });
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = (RustPublication {
+            path: PublicationPath {
+                destination: path,
+                temporary_name: TemporaryName::Nonce {
+                    prefix: format!(".{}.tmp.", wedge::VoidAttempt::FILE_NAME),
+                },
+            },
+            body: &body,
+            errors: PublicationErrors {
+                write: "cannot write void attempt record",
+                publish: "cannot publish void attempt record",
+            },
+        })
+        .publish()
+        {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!("Cannot record void attempt for {}: {}", ticket_id, error),
+            });
+        }
+    }
+
+    /// Walk a ticket back to Ready when its attempt never started.
+    ///
+    /// Only from Implement, and only because Lisa put it there itself: the
+    /// scheduler advances Ready → Implement at dispatch as a scheduling
+    /// sentinel, so a dispatch that produced no session leaves a ticket
+    /// claiming to be under way with nobody working on it. Review and Done are
+    /// never touched — those phases were reached by an agent's own work.
+    fn return_unstarted_ticket_to_ready(&mut self, ticket_id: &TicketId) {
+        let Some(ticket) = self.dag.get_ticket(ticket_id) else {
+            return;
+        };
+        if ticket.phase != Phase::Implement || ticket.file_path.as_os_str().is_empty() {
+            return;
+        }
+        let file_path = ticket.file_path.clone();
+        if let Err(error) = ticket::update_ticket_phase(&file_path, Phase::Ready) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!(
+                    "Cannot return {} to Ready after a held pane: {}",
+                    ticket_id, error
+                ),
+            });
+            return;
+        }
+        let _ = ticket::update_ticket_status(&file_path, lisa_core::types::TicketStatus::Open);
+        self.logged_transitions.remove(ticket_id);
+        self.log_activity(ActivityEvent::TicketPhaseChanged {
+            ticket_id: ticket_id.clone(),
+            old_phase: Phase::Implement,
+            new_phase: Phase::Ready,
+        });
+        self.log_activity(ActivityEvent::Info {
+            message: format!(
+                "{} is back on the board; no session ever started",
+                ticket_id
+            ),
+        });
+    }
+
+    /// Return wedged panes to the rotation once they have been silent long
+    /// enough that the provider is believed gone.
+    fn release_recovered_wedged_seats(&mut self) {
+        let now = std::time::SystemTime::now();
+        let release_after = std::time::Duration::from_secs(WEDGE_RELEASE_SECS);
+        let released: Vec<u32> = self
+            .wedged_seats
+            .iter()
+            .filter(|(pane_id, seat)| {
+                seat.is_released(now, self.last_provider_signal(**pane_id), release_after)
+            })
+            .map(|(pane_id, _)| *pane_id)
+            .collect();
+
+        for pane_id in released {
+            self.wedged_seats.remove(&pane_id);
+            if let Some(slot) = self.agent_slots.iter_mut().find(|s| s.pane_id == pane_id) {
+                slot.has_session = false;
+                slot.last_client = None;
+                slot.cooldown_until = None;
+            }
+            self.rename_slot(
+                pane_id,
+                format_pane_name(PaneName::Idle {
+                    resident_agent: None,
+                }),
+            );
+            self.log_activity(ActivityEvent::Info {
+                message: format!(
+                    "Pane {} has been quiet for {}s; back in the rotation",
+                    pane_id, WEDGE_RELEASE_SECS
+                ),
+            });
+        }
+    }
+
     /// Check for transition deadlines and advance stalled transitions.
     ///
     /// One transition can stall: a session told to `/exit` that has not yet
@@ -8223,10 +8457,11 @@ impl State {
     /// firing provider hooks after the `/exit` demonstrably has not left, and
     /// typing a launch command into it would deliver the ticket to a chat box;
     /// that pane waits while it stays noisy, and in no case past
-    /// `AGENT_EXIT_CEILING_SECS`, after which it is launched anyway so a
-    /// dying-but-noisy provider cannot hold a seat. Activity clocks and pending
-    /// questions are still not exemptions.
+    /// `AGENT_EXIT_CEILING_SECS`, after which the ticket is released to find
+    /// another seat and the pane is marked wedged rather than launched into.
+    /// Activity clocks and pending questions are still not exemptions.
     fn check_transition_timeouts(&mut self) {
+        self.release_recovered_wedged_seats();
         let evaluator = DeadlineEvaluator::new(SystemClock);
         let now = evaluator.now();
         let actions = evaluator.transitions(
@@ -8244,28 +8479,23 @@ impl State {
         );
 
         let mut exit_ready: Vec<(u32, Option<TicketId>)> = Vec::new();
+        let mut wedged: Vec<(u32, Option<TicketId>)> = Vec::new();
         for action in actions {
             match action {
                 TransitionAction::ExitReady { pane_id, ticket_id } => {
                     exit_ready.push((pane_id, ticket_id));
                 }
+                TransitionAction::SeatWedged { pane_id, ticket_id } => {
+                    wedged.push((pane_id, ticket_id));
+                }
             }
         }
 
-        for (pane_id, ticket_id) in exit_ready {
-            if self.provider_was_noisy_within(pane_id, now, AGENT_EXIT_GRACE_SECS) {
-                // Only the ceiling released this pane. The relaunch is the
-                // escape hatch against a stranded seat, so say plainly that the
-                // next command may land in a TUI — the silent version of this
-                // exact moment is what made the field failure undiagnosable.
-                self.log_activity(ActivityEvent::Warning {
-                    message: format!(
-                        "Pane {} still showed a live provider {}s after /exit; relaunching at the exit ceiling",
-                        pane_id, AGENT_EXIT_CEILING_SECS
-                    ),
-                });
-            }
+        for (pane_id, ticket_id) in wedged {
+            self.wedge_seat(pane_id, ticket_id, now);
+        }
 
+        for (pane_id, ticket_id) in exit_ready {
             let Some(ticket_id) = ticket_id else {
                 // The pending ticket disappeared while the old client was
                 // exiting. Leave a clean shell available to either provider.
@@ -10777,6 +11007,21 @@ impl State {
                     "Check pane output".to_string(),
                     "Increase session_timeout_secs".to_string(),
                 ],
+            });
+        }
+
+        // Append held panes. Deliberately built from `wedged_seats` on every
+        // render rather than pushed once: the alert is true exactly as long as
+        // the pane is still held, and it disappears by itself when the pane is
+        // returned to the rotation.
+        let mut wedged: Vec<(&u32, &wedge::WedgedSeat)> = self.wedged_seats.iter().collect();
+        wedged.sort_by_key(|(pane_id, _)| **pane_id);
+        for (pane_id, seat) in wedged {
+            alerts.push(ui::HealthAlert {
+                ticket_id: seat.ticket_id.clone().unwrap_or_default(),
+                alert_type: ui::AlertType::SeatHeld,
+                detail: wedge::alert_detail(*pane_id, seat),
+                suggested_actions: wedge::suggested_actions(*pane_id),
             });
         }
 
@@ -13780,10 +14025,9 @@ mod tests {
         fs::write(&launch_destination, "old launch").unwrap();
         let launch_payload = "printf '%s' \"quote:' dollar:$() backtick:`x`\"";
         let launch_command = State::prepare_fresh_launch(&launch_dir, 7, launch_payload).unwrap();
-        assert_eq!(
-            fs::read_to_string(&launch_destination).unwrap(),
-            format!("#!/bin/sh\n{launch_payload}\n")
-        );
+        let published_launch = fs::read_to_string(&launch_destination).unwrap();
+        assert!(published_launch.starts_with("#!/bin/sh\n"));
+        assert!(published_launch.ends_with(&format!("{launch_payload}\n")));
         assert_eq!(
             launch_command,
             format!("sh {}", shell_quote(&launch_destination.to_string_lossy()))
@@ -14093,14 +14337,20 @@ mod tests {
             .output()
             .unwrap();
 
-        let names: Vec<&str> = std::str::from_utf8(&output.stdout).unwrap().lines().collect();
+        let names: Vec<&str> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .collect();
         assert!(output.status.success());
         for gone in [
             "CLAUDECODE",
             "CLAUDE_CODE_CHILD_SESSION",
             "CLAUDE_CODE_SESSION_ID",
         ] {
-            assert!(!names.contains(&gone), "{gone} reached the agent: {names:?}");
+            assert!(
+                !names.contains(&gone),
+                "{gone} reached the agent: {names:?}"
+            );
         }
         // The launch line's own environment is untouched.
         assert!(names.contains(&"LISA_PROJECT"));
@@ -21528,6 +21778,187 @@ mod tests {
             Some(SeatAssignmentState::ClaimTimedOut)
         );
         assert!(!codex.seat_is_owned(10));
+    }
+
+    /// The field state of T-062-01-04, built by hand: a pane told to `/exit`
+    /// whose agent is still emitting a full ceiling later, holding a ticket
+    /// that has never had a session.
+    ///
+    /// Two panes, because the interesting question is not only "does Lisa
+    /// refuse this seat" but "does the ticket get a different one".
+    fn held_pane_fixture() -> (State, tempfile::TempDir, AttemptLease) {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tickets_dir = dir.path().join("tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+        fs::write(
+            tickets_dir.join("T-HELD-the-pane-will-not-let-go.md"),
+            "---\nid: T-HELD\ntitle: held pane\ntype: task\nstatus: open\npriority: high\nphase: implement\n---\n",
+        )
+        .unwrap();
+        let tickets = lisa_core::ticket::scan_tickets(&tickets_dir).unwrap();
+
+        let lease = AttemptLease::mint("T-HELD".to_string(), None).unwrap();
+        let mut state = State {
+            dag: Dag::from_tickets(tickets).unwrap(),
+            config: PluginConfig {
+                ticket_dir: tickets_dir,
+                work_dir: dir.path().join("work"),
+                wind_down_secs: 0,
+                ..PluginConfig::new()
+            },
+            attempt_dir: dir.path().join(".lisa/attempts"),
+            signal_dir: dir.path().join("signals"),
+            project_root: dir.path().to_path_buf(),
+            permissions_granted: true,
+            slots_discovered: true,
+            ..State::default()
+        };
+        fs::create_dir_all(&state.signal_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+        state.agent_slots.push(AgentSlot {
+            pane_id: 10,
+            ticket_id: Some("T-HELD".to_string()),
+            attempt_lease: Some(lease.clone()),
+            // A recycle cleared this while the resident client was asked to go.
+            has_session: false,
+            transition_state: TransitionState::WaitingForExit,
+            transition_started_at: Some(now - std::time::Duration::from_secs(200)),
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: Some(AgentClient::Claude),
+        });
+        state.agent_slots.push(fresh_slot(11, None));
+        // The agent that will not leave: a provider hook fired a moment ago,
+        // long after the `/exit` went in.
+        state.resident_providers.insert(10, now);
+        state
+            .current_leases
+            .insert("T-HELD".to_string(), lease.clone());
+        state
+            .lease_high_water
+            .insert("T-HELD".to_string(), lease.clone());
+        let mut thread = lisa_core::types::Thread::new("T-HELD".to_string(), 10);
+        thread.attempt_lease = Some(lease.clone());
+        state.threads.insert("T-HELD".to_string(), thread);
+
+        (state, dir, lease)
+    }
+
+    /// The whole ticket in one test: the seat is refused rather than typed
+    /// into, the ticket goes back to the board, the attempt it spent is
+    /// recorded as having bought nothing, and the next pass seats the ticket
+    /// somewhere else.
+    #[test]
+    fn a_held_pane_does_not_receive_the_next_attempt_and_the_ticket_moves_seats() {
+        let (mut state, dir, lease) = held_pane_fixture();
+
+        state.check_transition_timeouts();
+
+        // 1. The pane is out of the rotation, and nothing was typed into it —
+        //    a launch would have gone through `send_line_to_pane`, and the
+        //    deferred Enter it queues is the trace it leaves behind.
+        let seat = state.wedged_seats.get(&10).expect("the pane is wedged");
+        assert_eq!(seat.ticket_id.as_deref(), Some("T-HELD"));
+        assert_eq!(seat.attempt_id, Some(lease.attempt_id));
+        assert!(
+            state.pending_enters.is_empty(),
+            "a held pane must be sent nothing at all"
+        );
+
+        // 2. The ticket is back on the board. This is the step the operator had
+        //    to do by hand in the field — on the one field agents are told
+        //    never to touch.
+        let ticket_file = dir
+            .path()
+            .join("tickets/T-HELD-the-pane-will-not-let-go.md");
+        let frontmatter = std::fs::read_to_string(&ticket_file).unwrap();
+        assert!(frontmatter.contains("phase: ready"), "{frontmatter}");
+        assert!(!state.threads.contains_key("T-HELD"));
+        assert_eq!(state.current_leases.get("T-HELD"), None);
+
+        // 3. The attempt number it spent is recorded as void, so `attempt 4`
+        //    cannot be read as four tries.
+        let void: wedge::VoidAttempt = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join(".lisa/attempts/T-HELD")
+                    .join(lease.attempt_id.to_string())
+                    .join("void.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(void.ticket_id, "T-HELD");
+        assert_eq!(void.attempt_id, lease.attempt_id);
+        assert_eq!(void.pane_id, 10);
+        assert!(void.reason.contains("No session ever started"));
+
+        // 4. The next pass seats it — on the other pane.
+        state.rebuild_dag();
+        state.schedule_ready_tickets();
+        assert_eq!(state.agent_slots[0].ticket_id, None, "pane 10 stays empty");
+        assert_eq!(
+            state.agent_slots[1].ticket_id.as_deref(),
+            Some("T-HELD"),
+            "the ticket takes the free seat instead"
+        );
+    }
+
+    /// With no other seat, the scheduler waits — and says which pane is in the
+    /// way. "Session failed", three times, is what sent the operator to
+    /// transcripts that were never written.
+    #[test]
+    fn with_every_seat_held_the_scheduler_waits_and_names_the_pane() {
+        let (mut state, _dir, _lease) = held_pane_fixture();
+        state.agent_slots.pop(); // leave only the held pane
+
+        state.check_transition_timeouts();
+        state.rebuild_dag();
+        state.schedule_ready_tickets();
+
+        assert!(state.threads.is_empty(), "nothing was scheduled");
+        let pass = state.last_scheduling_pass.as_ref().unwrap();
+        let (ticket_id, reason) = pass.declined.first().expect("the pass records the decline");
+        assert_eq!(ticket_id, "T-HELD");
+        assert_eq!(*reason, DeclineReason::SeatsWedged { panes: vec![10] });
+        assert!(reason.describe().contains("#10"));
+
+        // And the dashboard says the same thing in the operator's words.
+        let alerts = state.to_ui_state().alerts;
+        let held = alerts
+            .iter()
+            .find(|alert| alert.alert_type == ui::AlertType::SeatHeld)
+            .expect("a held pane is its own alert, not a failed session");
+        assert!(held.detail.contains("Pane 10"));
+        assert!(held.detail.contains("still held by its previous agent"));
+        assert!(alerts.iter().all(|alert| alert.detail != "Session failed"));
+    }
+
+    /// The pane comes back when its provider finally goes, and Lisa notices on
+    /// its own. Without this the only exit from a wedge is an operator.
+    #[test]
+    fn a_wedged_pane_returns_to_the_rotation_once_it_goes_quiet() {
+        let (mut state, _dir, _lease) = held_pane_fixture();
+        state.check_transition_timeouts();
+        assert!(state.wedged_seats.contains_key(&10));
+
+        // Still emitting: the wedge holds however long it has been there.
+        state.wedged_seats.get_mut(&10).unwrap().since =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+        state.check_transition_timeouts();
+        assert!(state.wedged_seats.contains_key(&10), "a talking pane holds");
+
+        // Quiet for the release window: believed departed.
+        state.resident_providers.insert(
+            10,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(WEDGE_RELEASE_SECS + 1),
+        );
+        state.check_transition_timeouts();
+        assert!(!state.wedged_seats.contains_key(&10));
+        assert!(!state.agent_slots[0].has_session);
     }
 
     /// The caller-side half, at the site whose text actually reaches an agent.

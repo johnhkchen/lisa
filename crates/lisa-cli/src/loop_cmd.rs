@@ -452,7 +452,7 @@ fn generate_layout(
     tab name="lisa" {{
         pane stacked=true size="70%" {{
 {agent_panes}        }}
-        pane size="30%" {{
+        pane size="30%" name="lisa · starting" {{
             plugin location="file://{wasm_path}" {{
                 git_root "{git_root}"
                 completion_seal "{completion_seal}"
@@ -499,9 +499,15 @@ fn run_zellij(
     session_name: Option<&str>,
     inherited_markers: &[String],
 ) -> Result<std::process::ExitStatus, String> {
-    zellij_command(zellij_path, root, layout_path, session_name, inherited_markers)
-        .status()
-        .map_err(|error| format!("Failed to run Zellij at {}: {error}", zellij_path.display()))
+    zellij_command(
+        zellij_path,
+        root,
+        layout_path,
+        session_name,
+        inherited_markers,
+    )
+    .status()
+    .map_err(|error| format!("Failed to run Zellij at {}: {error}", zellij_path.display()))
 }
 
 fn zellij_command(
@@ -819,6 +825,21 @@ mod tests {
         // max_threads=2 should produce 4 pane lines (2x)
         let pane_count = layout.matches("            pane").count();
         assert_eq!(pane_count, 4, "Expected 4 panes (2 * max_threads=2)");
+    }
+
+    /// Zellij titles an unnamed plugin pane with its `file:` location, which is
+    /// a temp path and a content hash. The plugin retitles itself on its first
+    /// render; this is the floor under that, and it also stands if the plugin
+    /// never loads.
+    #[test]
+    fn the_plugin_pane_is_named_before_the_plugin_can_name_it() {
+        let wasm_path = PathBuf::from("/var/folders/kn/T/lisa-plugin-8fd16992c4a2b9fd.wasm");
+        let layout = test_layout(&wasm_path, None, &default_config());
+
+        assert!(
+            layout.contains(r#"pane size="30%" name="lisa · starting" {"#),
+            "the dashboard pane carries a name of its own:\n{layout}"
+        );
     }
 
     #[test]

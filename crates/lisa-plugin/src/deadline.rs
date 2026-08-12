@@ -81,10 +81,23 @@ impl DeadlineEvaluator {
                         let noisy = candidate.last_provider_signal.is_some_and(|last| {
                             elapsed(now, last).as_secs() <= policy.exit_grace_secs
                         });
-                        if noisy && elapsed_secs <= policy.exit_ceiling_secs {
+                        if !noisy {
+                            return Some(TransitionAction::ExitReady {
+                                pane_id: candidate.pane_id,
+                                ticket_id: candidate.ticket_id,
+                            });
+                        }
+                        if elapsed_secs <= policy.exit_ceiling_secs {
                             return None;
                         }
-                        Some(TransitionAction::ExitReady {
+                        // Still emitting at the ceiling. The seat cannot be held
+                        // forever, and it also cannot be typed into: the launch
+                        // line would land in the resident TUI's chat box, which
+                        // is exactly what happened in T-062-01-04 — four
+                        // attempts, four assignment files, no session. So the
+                        // ceiling releases the *ticket* rather than the pane,
+                        // and says which pane it could not use.
+                        Some(TransitionAction::SeatWedged {
                             pane_id: candidate.pane_id,
                             ticket_id: candidate.ticket_id,
                         })
@@ -262,7 +275,16 @@ pub(crate) struct TransitionPolicy {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TransitionAction {
+    /// The pane returned to its shell: the next attempt may be launched there.
     ExitReady {
+        pane_id: u32,
+        ticket_id: Option<TicketId>,
+    },
+    /// The pane never returned to its shell. Its agent was still emitting a
+    /// full ceiling after `/exit`, so nothing may be typed there — the ticket
+    /// needs a different seat, and the pane needs an operator or a provider
+    /// that finally leaves.
+    SeatWedged {
         pane_id: u32,
         ticket_id: Option<TicketId>,
     },
@@ -386,8 +408,9 @@ mod tests {
                     started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(90)),
                     last_provider_signal: None,
                 },
-                // Resident and past the ceiling: the escape hatch fires so a
-                // noisy dying provider cannot hold the seat forever.
+                // Resident and past the ceiling: the ticket is released so a
+                // noisy provider cannot hold it forever — but the pane is
+                // reported wedged rather than relaunched into.
                 TransitionInput {
                     pane_id: 3,
                     ticket_id: Some("T-CEILING".into()),
@@ -416,7 +439,7 @@ mod tests {
                     pane_id: 2,
                     ticket_id: Some("T-QUIET".into()),
                 },
-                TransitionAction::ExitReady {
+                TransitionAction::SeatWedged {
                     pane_id: 3,
                     ticket_id: Some("T-CEILING".into()),
                 },
@@ -439,6 +462,71 @@ mod tests {
             policy(),
         );
         assert!(inside.is_empty());
+    }
+
+    /// The ceiling is a boundary between two different answers, not between
+    /// waiting and typing. Below it the pane is held; above it the pane is
+    /// declared wedged — and a pane that has actually gone quiet is released
+    /// normally no matter how long it took.
+    #[test]
+    fn the_exit_ceiling_wedges_a_held_pane_and_still_releases_a_quiet_one() {
+        let evaluator = evaluator(200);
+        let policy = || TransitionPolicy {
+            exit_grace_secs: 8,
+            exit_ceiling_secs: 90,
+        };
+
+        // Exactly at the ceiling, still emitting: keep waiting.
+        let at_ceiling = evaluator.transitions(
+            [TransitionInput {
+                pane_id: 1,
+                ticket_id: Some("T-AT".into()),
+                state: TransitionState::WaitingForExit,
+                started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(110)),
+                last_provider_signal: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(199)),
+            }],
+            policy(),
+        );
+        assert!(at_ceiling.is_empty());
+
+        // One second past it, still emitting: wedged, and never launched into.
+        let past_ceiling = evaluator.transitions(
+            [TransitionInput {
+                pane_id: 1,
+                ticket_id: Some("T-PAST".into()),
+                state: TransitionState::WaitingForExit,
+                started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(109)),
+                last_provider_signal: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(199)),
+            }],
+            policy(),
+        );
+        assert_eq!(
+            past_ceiling,
+            vec![TransitionAction::SeatWedged {
+                pane_id: 1,
+                ticket_id: Some("T-PAST".into()),
+            }]
+        );
+
+        // Past the ceiling but quiet for a grace: an ordinary release. A slow
+        // exit is not a wedge, and treating it as one would strand the seat.
+        let quiet_but_late = evaluator.transitions(
+            [TransitionInput {
+                pane_id: 2,
+                ticket_id: Some("T-LATE".into()),
+                state: TransitionState::WaitingForExit,
+                started: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(50)),
+                last_provider_signal: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(150)),
+            }],
+            policy(),
+        );
+        assert_eq!(
+            quiet_but_late,
+            vec![TransitionAction::ExitReady {
+                pane_id: 2,
+                ticket_id: Some("T-LATE".into()),
+            }]
+        );
     }
 
     #[test]
