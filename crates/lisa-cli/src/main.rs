@@ -20,6 +20,7 @@ mod loop_cmd;
 mod notes;
 mod preownership_status;
 mod proposal;
+mod reset_ticket;
 mod run_summary;
 mod runtime;
 mod seats;
@@ -198,6 +199,31 @@ enum Commands {
 
         /// Print the list and change nothing, which is what a bare run does
         #[arg(long, conflicts_with = "release")]
+        dry_run: bool,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Put a stalled ticket back on the board without editing it by hand.
+    #[command(
+        display_order = 11,
+        after_help = "A bare run prints the plan and changes nothing. Add --apply to carry it \
+                      out.\n\nA ticket stuck in implement or review with nobody working on it \
+                      goes back to ready; finished tickets and committed work are left \
+                      alone.\n\nExample: lisa reset-ticket T-062-01-03 --apply"
+    )]
+    ResetTicket {
+        /// Ticket to put back on the board (repeatable)
+        #[arg(required = true)]
+        ticket_ids: Vec<String>,
+
+        /// Reset the listed tickets instead of only listing them
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+
+        /// Print the plan and change nothing, which is what a bare run does
+        #[arg(long, conflicts_with = "apply")]
         dry_run: bool,
 
         /// Path to the project root (defaults to current directory)
@@ -654,6 +680,19 @@ fn main() {
             let path = resolve_path(&path);
             require_lisa_project(&path);
             if let Err(e) = seats::run_release_seats(&path, release) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::ResetTicket {
+            ticket_ids,
+            apply,
+            dry_run: _,
+            path,
+        } => {
+            let path = resolve_path(&path);
+            require_lisa_project(&path);
+            if let Err(e) = reset_ticket::run_reset_ticket(&path, &ticket_ids, apply) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

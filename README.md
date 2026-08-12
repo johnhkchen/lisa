@@ -505,6 +505,30 @@ detached in the background, or sitting quietly on a question — the command say
 so and frees nothing. A seat Lisa isn't sure about stays held, because handing
 out a seat somebody is working is the mistake that costs you.
 
+### `lisa reset-ticket`
+
+Put a ticket back on the board when nothing is working on it.
+
+Lisa moves a ticket to **implement** the moment it hands it to an agent. If that
+agent never really starts — its pane was still held by the agent before it, say —
+the ticket sits there claiming to be under way with nobody on it, and the field
+fix used to be opening the file and editing `phase:` by hand: the one line every
+assignment tells agents never to touch.
+
+**A bare run changes nothing.** It prints which tickets it would move, how many
+attempts each has spent, and how many of those never started a session at all.
+
+```bash
+lisa reset-ticket T-062-01-03           # print the plan, change nothing
+lisa reset-ticket T-062-01-03 --apply   # put it back on the board
+```
+
+A reset moves `phase` back to `ready` and `status` back to `open`, and touches
+nothing else — committed work stays, attempt history stays, and a ticket your
+board records as **done** is never a candidate. While a run is going, Lisa says
+so and changes nothing: press `r` in the Lisa pane instead, where the scheduler
+can release the seat in the same breath.
+
 ### `lisa unblock`
 
 Re-open a parked ticket after you've handled its ask. Lisa runs the blocker's

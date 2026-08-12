@@ -118,7 +118,7 @@ impl RunReport {
 }
 
 /// Seconds since the epoch, or `None` when the clock is before it.
-fn now_secs() -> Option<u64> {
+pub(crate) fn now_secs() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -195,7 +195,7 @@ pub(crate) fn assess_run(root: &Path, resolved: &config::ResolvedConfig) -> RunR
 /// The clock is a parameter so a test can state the passage of a day without
 /// rewriting timestamps on disk — backdating files tests the test harness, and
 /// this is the judgement worth testing.
-fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now: u64) -> RunReport {
+pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now: u64) -> RunReport {
     let stamp = read_stamp(root);
     let (window, window_reason) = match &stamp {
         Some(stamp) => (
