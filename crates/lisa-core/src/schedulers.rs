@@ -371,7 +371,7 @@ pub fn read_receipts(dir: &Path) -> Vec<SignalReceipt> {
                 .collect::<Vec<_>>()
         })
         .collect();
-    receipts.sort_by(|left, right| left.at.cmp(&right.at));
+    receipts.sort_by_key(|receipt| receipt.at);
     receipts
 }
 
@@ -386,12 +386,9 @@ pub fn taken_by_another(
     signal: &str,
     since: u64,
 ) -> Option<SignalReceipt> {
-    read_receipts(dir)
-        .into_iter()
-        .filter(|receipt| {
-            receipt.signal == signal && receipt.scheduler_id != scheduler_id && receipt.at >= since
-        })
-        .next_back()
+    read_receipts(dir).into_iter().rfind(|receipt| {
+        receipt.signal == signal && receipt.scheduler_id != scheduler_id && receipt.at >= since
+    })
 }
 
 #[cfg(test)]

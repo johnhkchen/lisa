@@ -71,7 +71,7 @@ fn second_scheduler_refusal(root: &Path) -> Option<String> {
     for record in &live {
         let age = record
             .age_secs(now)
-            .map(|age| crate::seats::humanize(age))
+            .map(crate::seats::humanize)
             .unwrap_or_else(|| "?".to_string());
         message.push_str(&format!(
             "\n  {} — last seen {age} ago{}",

@@ -31,6 +31,32 @@
 //! clearing a live one would put a second agent on a ticket somebody is
 //! working, which is the expensive mistake.
 //!
+//! ## What the shared stamp cannot say, and what replaces it
+//!
+//! `.lisa/scheduler.alive` is one file with as many writers as there are
+//! schedulers. Three of them keep it fresh exactly as convincingly as one, so
+//! "a scheduler stamped 4s ago" survived seventeen hours of a board being held
+//! by two runs nobody could see, and both recoveries Lisa offers refused on
+//! that sentence. The refusals were correct about the file and wrong about the
+//! world (S-063-01).
+//!
+//! So the verdict here is built from evidence that can be attributed:
+//!
+//! - **Who is here** comes from [`lisa_core::schedulers`] — one file per
+//!   scheduler, each naming its session and its Zellij server. A count is a
+//!   count, and every refusal below can name the run it is protecting and the
+//!   command that ends it.
+//! - **Whether anything is being worked** comes from `.lisa/signals/`, which
+//!   only a live pane or a live plugin moves. That is the difference between
+//!   [`RunLiveness::Working`] and [`RunLiveness::Stamping`]: a scheduler that
+//!   stamps proves a process exists, not that a ticket is progressing.
+//! - **The shared stamp remains the fallback** for a board whose scheduler
+//!   predates the registry, and nothing more than that.
+//!
+//! Both states still keep the seats — a stamping scheduler can dispatch at any
+//! moment — but they are no longer the same sentence, and the stamping one now
+//! ends at a command instead of at a wall.
+//!
 //! ## Why an explicit command
 //!
 //! The recovery already existed: run `lisa loop` again and it reassigns the
@@ -74,9 +100,13 @@ const ASSUMED_SESSION_BUDGET_SECS: u64 = 3600;
 /// What Lisa can say about the run that placed the seats on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunLiveness {
-    /// A scheduler stamped itself inside the window, or something in
-    /// `.lisa/signals/` moved inside it. Either way a run is here.
-    Running,
+    /// Something moved in `.lisa/signals/` inside the window: a pane wrote, or
+    /// a plugin consumed. A ticket is being worked.
+    Working,
+    /// A scheduler is stamping, but nothing has moved in `.lisa/signals/` for
+    /// longer than the window. A process exists; no work is visible. That is a
+    /// run waiting on a question — or a scheduler nobody meant to leave behind.
+    Stamping,
     /// Both tests agree: nothing has stamped and nothing has signalled.
     Ended,
     /// Neither running nor provably ended — a clock that disagrees, a signal
@@ -94,13 +124,26 @@ pub(crate) enum RunLiveness {
 pub(crate) struct RunReport {
     pub(crate) liveness: RunLiveness,
     pub(crate) evidence: String,
+    /// The schedulers stamping this board right now, named. Empty when the
+    /// registry has nothing live in it — including every board whose scheduler
+    /// predates the registry, where the shared stamp is all there is.
+    pub(crate) schedulers: Vec<lisa_core::schedulers::SchedulerRecord>,
 }
 
 impl RunReport {
-    fn running(evidence: String) -> Self {
+    fn working(evidence: String, schedulers: Vec<lisa_core::schedulers::SchedulerRecord>) -> Self {
         Self {
-            liveness: RunLiveness::Running,
+            liveness: RunLiveness::Working,
             evidence,
+            schedulers,
+        }
+    }
+
+    fn stamping(evidence: String, schedulers: Vec<lisa_core::schedulers::SchedulerRecord>) -> Self {
+        Self {
+            liveness: RunLiveness::Stamping,
+            evidence,
+            schedulers,
         }
     }
 
@@ -108,12 +151,49 @@ impl RunReport {
         Self {
             liveness: RunLiveness::Unclear,
             evidence,
+            schedulers: Vec::new(),
         }
     }
 
     /// True when Lisa is prepared to say the seats on disk are held by nobody.
     pub(crate) fn seats_are_abandoned(&self) -> bool {
         self.liveness == RunLiveness::Ended
+    }
+
+    /// True while anything is here to hold the seats — whether it is working or
+    /// only stamping.
+    pub(crate) fn holds_the_board(&self) -> bool {
+        matches!(self.liveness, RunLiveness::Working | RunLiveness::Stamping)
+    }
+
+    /// One sentence naming the schedulers on this board and how to stop them,
+    /// for a refusal that would otherwise be a dead end.
+    ///
+    /// `None` when the registry named nobody: there is nothing honest to add,
+    /// and inventing a command an operator cannot run is worse than silence.
+    pub(crate) fn how_to_stop(&self) -> Option<String> {
+        if self.schedulers.is_empty() {
+            return None;
+        }
+        let named: Vec<String> = self
+            .schedulers
+            .iter()
+            .map(|record| match record.stop_command() {
+                Some(command) => format!("{} — stop it with `{command}`", record.label()),
+                None => format!(
+                    "{} — Lisa was never told its session name; `zellij list-sessions` has it",
+                    record.label()
+                ),
+            })
+            .collect();
+        Some(format!(
+            "{} on this board: {}. `lisa schedulers` lists them.",
+            match named.len() {
+                1 => "One scheduler is running".to_string(),
+                count => format!("{count} schedulers are running"),
+            },
+            named.join("; ")
+        ))
     }
 }
 
@@ -196,6 +276,7 @@ pub(crate) fn assess_run(root: &Path, resolved: &config::ResolvedConfig) -> RunR
 /// rewriting timestamps on disk — backdating files tests the test harness, and
 /// this is the judgement worth testing.
 pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now: u64) -> RunReport {
+    let live = live_schedulers(root, resolved, now);
     let stamp = read_stamp(root);
     let (window, window_reason) = match &stamp {
         Some(stamp) => (
@@ -224,13 +305,59 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
         }
     };
 
+    // Work first, because work is the fact that matters and the only one a
+    // second scheduler cannot forge on another's behalf: whoever consumed it,
+    // something was written into that directory by a live pane or plugin.
+    let quiet = signals_quiet_for(root, now);
+    if let Some(quiet) = quiet.filter(|quiet| *quiet <= window) {
+        return RunReport::working(
+            format!(
+                "Something wrote in {SIGNAL_DIR}/ {} ago, which only a running pane or plugin \
+                 does.",
+                humanize(quiet)
+            ),
+            live,
+        );
+    }
+
+    // Nothing is moving. Anything still here is stamping and not visibly
+    // working, and the registry is what says who that is.
+    if !live.is_empty() {
+        let quiet_for = match quiet {
+            Some(quiet) => format!("nothing has moved in {SIGNAL_DIR}/ for {}", humanize(quiet)),
+            None => format!("there is no {SIGNAL_DIR}/ to read"),
+        };
+        let evidence = format!(
+            "{} stamping this board, and {quiet_for}. A stamping scheduler is a process that \
+             exists, not a ticket being worked.",
+            match live.len() {
+                1 => format!("{} is", live[0].label()),
+                _ => format!(
+                    "{} schedulers are ({})",
+                    live.len(),
+                    live.iter()
+                        .map(|record| record.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        );
+        return RunReport::stamping(evidence, live);
+    }
+
     let stamp_age = match &stamp {
         Some(stamp) => match stamp.age_secs(now) {
+            // No registry entry, but the shared stamp is fresh: a scheduler
+            // from a build that predates the registry. It is here, and that is
+            // all this file has ever been able to say about it.
             Some(age) if age <= window => {
-                return RunReport::running(format!(
-                    "Lisa's scheduler said it was running {} ago.",
-                    humanize(age)
-                ))
+                return RunReport::stamping(
+                    format!(
+                        "Lisa's scheduler said it was running {} ago.",
+                        humanize(age)
+                    ),
+                    Vec::new(),
+                )
             }
             Some(age) => Some(age),
             None => {
@@ -243,17 +370,11 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
         None => None,
     };
 
-    let Some(quiet) = signals_quiet_for(root, now) else {
+    let Some(quiet) = quiet else {
         return RunReport::unclear(format!(
             "There is no {SIGNAL_DIR}/ to read, so there is nothing to say about it."
         ));
     };
-    if quiet <= window {
-        return RunReport::running(format!(
-            "Something wrote in {SIGNAL_DIR}/ {} ago, which only a running pane or plugin does.",
-            humanize(quiet)
-        ));
-    }
 
     let seen = match stamp_age {
         Some(age) => format!(
@@ -270,7 +391,31 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
             quiet_for = humanize(quiet),
             waited = humanize(window),
         ),
+        schedulers: Vec::new(),
     }
+}
+
+/// The schedulers that have stamped their own record inside the window.
+///
+/// Empty means the registry says nobody, which on a board whose scheduler
+/// predates it is not the same as nobody being here — hence the shared stamp
+/// staying in the decision below.
+fn live_schedulers(
+    root: &Path,
+    resolved: &config::ResolvedConfig,
+    now: u64,
+) -> Vec<lisa_core::schedulers::SchedulerRecord> {
+    lisa_core::schedulers::read_roster(root)
+        .into_iter()
+        .filter(|record| {
+            record.is_live(
+                now,
+                record
+                    .live_window_secs(resolved.wind_down_secs)
+                    .max(MIN_STAMPED_WINDOW_SECS),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -429,12 +574,21 @@ fn run_release_seats_with_writer(
             format_args!(
                 "Nothing to release: {}. {}",
                 match report.liveness {
-                    RunLiveness::Running => "a run is holding these seats",
+                    RunLiveness::Working => "a run is working these seats",
+                    RunLiveness::Stamping => "a scheduler is holding these seats",
                     _ => "Lisa cannot say these seats are free",
                 },
                 report.evidence
             ),
         )?;
+        // A stamping scheduler is the state this refusal used to be a dead end
+        // in: correct about the file, silent about which run to go and stop.
+        if report.liveness == RunLiveness::Stamping {
+            if let Some(how) = report.how_to_stop() {
+                write_line(out, format_args!(""))?;
+                write_line(out, format_args!("{how}"))?;
+            }
+        }
         write_line(out, format_args!(""))?;
         for action in &plan {
             write_line(out, format_args!("{}", action.line(root)))?;
@@ -568,8 +722,9 @@ mod tests {
         stamp(dir.path(), now, 4);
 
         let report = assess(dir.path(), now);
-        assert_eq!(report.liveness, RunLiveness::Running);
+        assert_eq!(report.liveness, RunLiveness::Stamping);
         assert!(report.evidence.contains("said it was running"));
+        assert!(report.holds_the_board());
         assert!(!report.seats_are_abandoned());
     }
 
@@ -582,7 +737,9 @@ mod tests {
         let now = later(6 * 3600);
         stamp(dir.path(), now, 10);
 
-        assert_eq!(assess(dir.path(), now).liveness, RunLiveness::Running);
+        let report = assess(dir.path(), now);
+        assert_eq!(report.liveness, RunLiveness::Stamping);
+        assert!(report.holds_the_board(), "a stamping run keeps its seats");
     }
 
     /// The other half: a scheduler whose stamp is stale but whose panes are
@@ -594,7 +751,7 @@ mod tests {
         stamp(dir.path(), now, 86_400);
 
         let report = assess(dir.path(), now);
-        assert_eq!(report.liveness, RunLiveness::Running);
+        assert_eq!(report.liveness, RunLiveness::Working);
         assert!(report.evidence.contains(".lisa/signals/"));
     }
 
@@ -618,7 +775,7 @@ mod tests {
         let dir = project();
         assert_eq!(
             assess(dir.path(), later(20 * 60)).liveness,
-            RunLiveness::Running,
+            RunLiveness::Working,
             "20 minutes of quiet is inside the default hour-long budget"
         );
 
@@ -651,7 +808,9 @@ mod tests {
     #[test]
     fn a_tiny_configured_wind_down_cannot_shrink_the_window_below_the_floor() {
         let dir = project();
-        let now = later(45);
+        // Far enough out that the signal directory is quiet and the stamp is
+        // the only thing left holding the seats.
+        let now = later(70);
         stamp(dir.path(), now, 45);
         let resolved = config::ResolvedConfig {
             wind_down_secs: 5,
@@ -660,9 +819,99 @@ mod tests {
 
         assert_eq!(
             assess_run_at(dir.path(), &resolved, now).liveness,
-            RunLiveness::Running,
+            RunLiveness::Stamping,
             "45s is inside the {MIN_STAMPED_WINDOW_SECS}s floor"
         );
+    }
+
+    /// Register a scheduler that stamped `age` seconds before `now`.
+    fn register(root: &Path, id: &str, session: &str, now: u64, age: u64) {
+        lisa_core::schedulers::write_record(
+            &lisa_core::schedulers::roster_dir(root),
+            &lisa_core::schedulers::SchedulerRecord::new(
+                id,
+                Some(session.to_string()),
+                Some(30186),
+                now - 17 * 3600,
+                now - age,
+                5,
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The sentence the day turned on. Three schedulers stamping a board where
+    /// nothing has moved for hours is not "a run is working these seats", and
+    /// the refusal has to name every one of them.
+    #[test]
+    fn schedulers_stamping_a_quiet_board_are_named_rather_than_summed_into_a_run() {
+        let dir = project();
+        let now = later(86_400);
+        stamp(dir.path(), now, 4);
+        register(dir.path(), "cymbal", "blossoming-cymbal", now, 3);
+        register(dir.path(), "drum", "fascinating-drum", now, 4);
+
+        let report = assess(dir.path(), now);
+
+        assert_eq!(report.liveness, RunLiveness::Stamping);
+        assert!(
+            report.holds_the_board(),
+            "seats stay while anything is here"
+        );
+        assert!(report.evidence.contains("2 schedulers are"));
+        assert!(report.evidence.contains("blossoming-cymbal"));
+        assert!(report.evidence.contains("fascinating-drum"));
+        let how = report
+            .how_to_stop()
+            .expect("a named scheduler can be stopped");
+        assert!(how.contains("zellij kill-session fascinating-drum"));
+        assert!(how.contains("lisa schedulers"));
+    }
+
+    /// The other half of the same distinction: panes writing means work, and
+    /// work is not something a second scheduler can fake on another's behalf.
+    #[test]
+    fn a_board_whose_panes_are_writing_reads_as_working_not_merely_stamping() {
+        let dir = project();
+        let now = later(3);
+        register(dir.path(), "cymbal", "blossoming-cymbal", now, 2);
+
+        let report = assess(dir.path(), now);
+
+        assert_eq!(report.liveness, RunLiveness::Working);
+        assert_eq!(report.schedulers.len(), 1, "the run is still named");
+    }
+
+    /// A registry record left by a scheduler that stopped must not hold seats
+    /// the shared stamp would also have released.
+    #[test]
+    fn a_registry_record_from_a_dead_scheduler_does_not_hold_the_seats() {
+        let dir = project();
+        let now = later(86_400);
+        register(dir.path(), "gone", "lisa", now, 17 * 3600);
+
+        let report = assess(dir.path(), now);
+
+        assert_eq!(report.liveness, RunLiveness::Ended);
+        assert!(report.seats_are_abandoned());
+    }
+
+    /// The refusal an operator reads while a scheduler holds a quiet board:
+    /// still a refusal, no longer a dead end.
+    #[test]
+    fn a_stamping_scheduler_refuses_the_release_and_says_which_run_to_stop() {
+        let dir = project();
+        let now = later(86_400);
+        register(dir.path(), "drum", "fascinating-drum", now, 4);
+
+        let mut out = Vec::new();
+        run_release_seats_with_writer(dir.path(), true, &mut out, now).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+
+        assert!(printed.contains("a scheduler is holding these seats"));
+        assert!(printed.contains("zellij kill-session fascinating-drum"));
+        assert!(printed.contains("skip     .lisa/signals/pane-0.lease"));
+        assert!(dir.path().join(SIGNAL_DIR).join("pane-0.lease").exists());
     }
 
     #[test]
@@ -727,7 +976,7 @@ mod tests {
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("Nothing to release"));
-        assert!(printed.contains("a run is holding these seats"));
+        assert!(printed.contains("a run is working these seats"));
         assert!(printed.contains("skip     .lisa/signals/pane-0.lease"));
         assert!(dir.path().join(SIGNAL_DIR).join("pane-0.lease").exists());
     }

@@ -222,11 +222,29 @@ fn run_reset_ticket_with_writer(
     // operator always sees what they were asking for even when Lisa says no.
     if let Some(now) = now_secs() {
         let report = assess_run_at(root, &resolved, now);
-        if report.liveness == RunLiveness::Running {
+        if report.holds_the_board() {
+            // Two refusals, not one. A run that is working wants the operator
+            // to use the pane; a scheduler that is only stamping wants them to
+            // find out which scheduler that is — the case where this message
+            // used to send an operator round a loop with no exit (S-063-01).
+            let next_step = match report.liveness {
+                RunLiveness::Stamping => format!(
+                    "Press r in the Lisa pane if you can still see it. If you cannot, that run is \
+                     going without a window: {}",
+                    report.how_to_stop().unwrap_or_else(|| {
+                        "run `lisa schedulers` to see what is holding this board.".to_string()
+                    })
+                ),
+                _ => "Press r in the Lisa pane to reset a ticket while the run is going, or stop \
+                      the run and try again."
+                    .to_string(),
+            };
             return Err(format!(
-                "A Lisa run is using this board, so nothing was changed. Press r in the Lisa \
-                 pane to reset a ticket while the run is going, or stop the run and try again.\n\
-                 Evidence: {}",
+                "{} is using this board, so nothing was changed. {next_step}\nEvidence: {}",
+                match report.liveness {
+                    RunLiveness::Stamping => "A Lisa scheduler",
+                    _ => "A Lisa run",
+                },
                 report.evidence
             ));
         }

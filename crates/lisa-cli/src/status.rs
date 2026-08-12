@@ -273,6 +273,49 @@ fn print_abandoned_seats(data: &StatusData) {
     println!();
 }
 
+/// Who is running this board, when that is not exactly one scheduler.
+///
+/// Silent for the ordinary case, loud for the one that cost a day: `lisa
+/// status` read perfectly normally while three schedulers held the board, and
+/// nothing an operator could type would have told them otherwise (S-063-01).
+fn contested_board_lines(run: &crate::seats::RunReport) -> Vec<String> {
+    if run.schedulers.len() < 2 {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "{} are running on this board",
+        run.schedulers.len()
+    )];
+    for record in &run.schedulers {
+        lines.push(format!(
+            "  {}{}",
+            record.label(),
+            match record.stop_command() {
+                Some(command) => format!("  —  stop it with: {command}"),
+                None => String::new(),
+            }
+        ));
+    }
+    lines.push(
+        "  They split the signals your panes write between them, so each one sees part of what \
+         is happening and the others take the rest."
+            .to_string(),
+    );
+    lines.push("  To see them and stop all but one: lisa schedulers".to_string());
+    lines
+}
+
+fn print_contested_board(data: &StatusData) {
+    let lines = contested_board_lines(&data.run);
+    if lines.is_empty() {
+        return;
+    }
+    for line in lines {
+        println!("{line}");
+    }
+    println!();
+}
+
 fn print_status_notes(notes: &[QueuedNote]) {
     if notes.is_empty() {
         println!("Notes for you");
@@ -573,6 +616,10 @@ fn print_status(data: &StatusData) -> Result<(), String> {
     // an operator for a day.
     print_abandoned_seats(data);
 
+    // And beside it, the other way those counts can lie: a board being worked
+    // by more schedulers than anybody started.
+    print_contested_board(data);
+
     print_token_usage(&data.ledger);
 
     // Print execution waves
@@ -820,6 +867,18 @@ fn status_payload(data: &StatusData) -> serde_json::Value {
         "notes": notes,
         "waiting_on_you": waiting_on_you,
         "attempts": data.attempts,
+        // One entry per scheduler stamping this board. A reader counting these
+        // is asking the question the shared heartbeat could never answer, so
+        // the array is present even when it holds one — and empty on a board
+        // whose scheduler predates the registry.
+        "schedulers": data.run.schedulers.iter().map(|record| serde_json::json!({
+            "id": record.scheduler_id,
+            "session_name": record.session_name,
+            "zellij_pid": record.zellij_pid,
+            "started_at": record.started_at,
+            "stamped_at": record.stamped_at,
+            "stop_command": record.stop_command(),
+        })).collect::<Vec<_>>(),
         "token_usage": token_usage_view(&data.ledger),
         "run_summary": data.run_summary,
         "config": ConfigView {
@@ -1269,6 +1328,7 @@ mod tests {
         crate::seats::RunReport {
             liveness: crate::seats::RunLiveness::Ended,
             evidence: "the run stopped 18h ago.".to_string(),
+            schedulers: Vec::new(),
         }
     }
 
@@ -1292,6 +1352,48 @@ mod tests {
             lines[4],
             "  To free them, read the list first: lisa release-seats"
         );
+    }
+
+    fn stamping_run(sessions: &[&str]) -> crate::seats::RunReport {
+        crate::seats::RunReport {
+            liveness: crate::seats::RunLiveness::Stamping,
+            evidence: "2 schedulers are stamping this board.".to_string(),
+            schedulers: sessions
+                .iter()
+                .map(|session| {
+                    lisa_core::schedulers::SchedulerRecord::new(
+                        format!("{session}-id"),
+                        Some((*session).to_string()),
+                        Some(9450),
+                        1_000,
+                        2_000,
+                        5,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The line `lisa status` could not print on the day: how many schedulers
+    /// are on this board, which, and how to stop each one.
+    #[test]
+    fn a_board_with_more_than_one_scheduler_names_every_one_of_them() {
+        let lines =
+            contested_board_lines(&stamping_run(&["blossoming-cymbal", "fascinating-drum"]));
+
+        assert_eq!(lines[0], "2 are running on this board");
+        assert!(lines[1].contains("blossoming-cymbal"));
+        assert!(lines[1].contains("zellij kill-session blossoming-cymbal"));
+        assert!(lines[2].contains("fascinating-drum"));
+        assert!(lines.last().unwrap().contains("lisa schedulers"));
+    }
+
+    /// One scheduler is what a run looks like, and a report that fires on the
+    /// healthy case is a report nobody reads.
+    #[test]
+    fn one_scheduler_prints_no_section_at_all() {
+        assert!(contested_board_lines(&stamping_run(&["lisa"])).is_empty());
+        assert!(contested_board_lines(&ended_run()).is_empty());
     }
 
     /// A healthy board says nothing at all. The counts above it already
