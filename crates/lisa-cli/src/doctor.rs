@@ -1168,6 +1168,38 @@ mod tests {
         assert!(matches!(reports[0].result, CheckResult::Skipped { .. }));
     }
 
+    /// The operator reading `lisa doctor` is the one person who can see the
+    /// poisoned shell before a run starts, so this line has to name every
+    /// marker it found — during the field failure the count alone would have
+    /// been a shrug. It must also stay informational: nothing here is the
+    /// operator's mistake, and the run they start next is already protected.
+    #[test]
+    fn the_environment_section_names_every_marker_and_says_lisa_drops_them() {
+        let line = format_inherited_session_markers(&[
+            "CLAUDECODE".to_string(),
+            "CLAUDE_CODE_CHILD_SESSION".to_string(),
+            "CLAUDE_CODE_SESSION_ID".to_string(),
+        ]);
+        assert!(line.contains("3 markers"), "{line}");
+        for marker in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            assert!(line.contains(marker), "{marker} unnamed in: {line}");
+        }
+        assert!(line.contains("Lisa drops them"), "{line}");
+
+        let single = format_inherited_session_markers(&["CLAUDECODE".to_string()]);
+        assert!(single.contains("1 marker would reach"), "{single}");
+    }
+
+    #[test]
+    fn a_clean_shell_gets_one_plain_sentence_and_no_warning() {
+        let line = format_inherited_session_markers(&[]);
+        assert_eq!(line, "  Nothing here marks another agent's session.\n");
+    }
+
     #[test]
     fn test_format_report_all_ok() {
         let checks = vec![
