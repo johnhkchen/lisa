@@ -23,6 +23,7 @@ mod proposal;
 mod run_summary;
 mod runtime;
 mod seats;
+mod session_name;
 mod setup_guide;
 mod status;
 mod templates;

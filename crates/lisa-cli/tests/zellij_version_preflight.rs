@@ -188,6 +188,22 @@ fn loop_auto_without_git_uses_journal_instead_of_requiring_git() {
     assert!(!stderr.contains("Failed to discover Git root"));
 }
 
+#[test]
+fn loop_reports_a_session_named_after_the_project() {
+    // Unnamed, Zellij invents an animal, and that animal is what
+    // `zellij list-sessions`, the status bar, and the terminal tab show. The
+    // fixture project directory is named `project`, so the report is too.
+    let output = run_with_zellij_version_and_path("loop", "zellij 0.44.3", false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "loop failed: {stderr}");
+    assert!(
+        stdout.contains("Session: project"),
+        "startup report did not name the session after the project:\n{stdout}"
+    );
+}
+
 fn assert_supported_loop_preflight(version: &str) {
     let output = run_with_zellij_version("loop", version);
     if output.status.success() {

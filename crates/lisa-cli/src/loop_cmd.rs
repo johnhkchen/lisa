@@ -177,9 +177,15 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     std::fs::write(&layout_path, &layout)
         .map_err(|e| format!("Failed to write layout to {}: {}", layout_path.display(), e))?;
 
+    // Name the session after the project before anything is spawned: the name
+    // is what `zellij list-sessions`, the status bar, and the terminal tab all
+    // show, and a taken name has to cost a number rather than the start.
+    let naming = crate::session_name::resolve(root, &zellij_runtime.path);
+
     println!("Lisa loop starting...");
     println!("  WASM plugin: {}", wasm_path.display());
     println!("  Layout: {}", layout_path.display());
+    println!("  Session: {}", naming.describe());
     println!("  Zellij mode: {}", zellij_runtime.mode);
     println!("  Zellij version: {}", zellij_runtime.version);
     println!("  Zellij path: {}", zellij_runtime.path.display());
@@ -194,7 +200,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     println!();
 
     crate::run_summary::record_run_baseline(root)?;
-    let status = run_zellij(&zellij_runtime.path, root, &layout_path)?;
+    let status = run_zellij(&zellij_runtime.path, root, &layout_path, naming.name())?;
 
     let tickets = lisa_core::ticket::scan_tickets(root.join(&config.ticket_dir))
         .map_err(|error| format!("Failed to scan tickets after Lisa loop: {error}"))?;
@@ -474,15 +480,38 @@ fn run_zellij(
     zellij_path: &Path,
     root: &Path,
     layout_path: &Path,
+    session_name: Option<&str>,
 ) -> Result<std::process::ExitStatus, String> {
-    zellij_command(zellij_path, root, layout_path)
+    zellij_command(zellij_path, root, layout_path, session_name)
         .status()
         .map_err(|error| format!("Failed to run Zellij at {}: {error}", zellij_path.display()))
 }
 
-fn zellij_command(zellij_path: &Path, root: &Path, layout_path: &Path) -> Command {
+fn zellij_command(
+    zellij_path: &Path,
+    root: &Path,
+    layout_path: &Path,
+    session_name: Option<&str>,
+) -> Command {
     let mut command = Command::new(zellij_path);
-    command.arg("--layout").arg(layout_path).current_dir(root);
+    // `--layout` with `--session` means "add these tabs to that session", so it
+    // fails with `Session 'steer' not found` instead of starting one (measured
+    // against Zellij 0.44.3). `--new-session-with-layout` is the pairing that
+    // starts a named session. With no name to pass, Zellij invents one from
+    // `--layout` exactly as it always did.
+    match session_name {
+        Some(session_name) => {
+            command
+                .arg("--session")
+                .arg(session_name)
+                .arg("--new-session-with-layout")
+                .arg(layout_path);
+        }
+        None => {
+            command.arg("--layout").arg(layout_path);
+        }
+    }
+    command.current_dir(root);
     command
 }
 
@@ -557,6 +586,7 @@ mod tests {
                 zellij_path,
                 Path::new("/repo"),
                 Path::new("/repo/.lisa-layout.kdl"),
+                None,
             );
             assert_eq!(command.get_program(), zellij_path.as_os_str());
             assert_eq!(
@@ -565,6 +595,29 @@ mod tests {
             );
             assert_eq!(command.get_current_dir(), Some(Path::new("/repo")));
         }
+    }
+
+    #[test]
+    fn test_zellij_command_names_the_session_after_the_project() {
+        let command = zellij_command(
+            Path::new("/opt/pinned/zellij"),
+            Path::new("/repo"),
+            Path::new("/repo/.lisa-layout.kdl"),
+            Some("steer"),
+        );
+
+        // Measured against Zellij 0.44.3: `--layout` with `--session` adds tabs
+        // to a session of that name and fails when there is none, so a named
+        // start has to say `--new-session-with-layout`.
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                "--session",
+                "steer",
+                "--new-session-with-layout",
+                "/repo/.lisa-layout.kdl"
+            ]
+        );
     }
 
     #[test]
