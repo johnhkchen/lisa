@@ -758,6 +758,11 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     append_completion_seal_report(&mut output, &completion);
     reports.push(project_report);
 
+    output.push_str("\n\nChecking the environment agents will start in...\n\n");
+    output.push_str(&format_inherited_session_markers(
+        &lisa_core::session_env::inherited_markers(),
+    ));
+
     // Clean stale Zellij plugin cache
     output.push_str("\n\nChecking Zellij plugin cache...\n\n");
     if let Some(dir) = zellij_cache_dir() {
@@ -809,6 +814,25 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Report what this shell would hand down to an agent, and say plainly that
+/// Lisa drops it rather than leaving the operator to run `env -u` themselves.
+///
+/// Informational, never a failure: an operator who runs `lisa doctor` from
+/// inside their own agent session has done nothing wrong, and the run they
+/// start next is already protected.
+fn format_inherited_session_markers(markers: &[String]) -> String {
+    if markers.is_empty() {
+        return "  Nothing here marks another agent's session.\n".to_string();
+    }
+    format!(
+        "  This shell is inside an agent session; {} marker{} would reach a new agent:\n    {}\n  \
+         Lisa drops them when it starts a run, so an agent never inherits another one's identity.\n",
+        markers.len(),
+        if markers.len() == 1 { "" } else { "s" },
+        markers.join("\n    "),
+    )
 }
 
 fn append_completion_seal_line(output: &mut String, seal: lisa_core::completion::CompletionSeal) {

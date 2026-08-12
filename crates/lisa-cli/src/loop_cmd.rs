@@ -199,8 +199,24 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     }
     println!();
 
+    // The one thing an agent must not inherit is the identity of the session
+    // that started the loop. Read it here, on the host, before anything is
+    // spawned: everything below this line — zellij, the panes, the agents in
+    // them — descends from this process's environment.
+    let inherited = lisa_core::session_env::inherited_markers();
+    if let Some(sentence) = lisa_core::session_env::describe_cleared(&inherited) {
+        println!("  {sentence}");
+        println!();
+    }
+
     crate::run_summary::record_run_baseline(root)?;
-    let status = run_zellij(&zellij_runtime.path, root, &layout_path, naming.name())?;
+    let status = run_zellij(
+        &zellij_runtime.path,
+        root,
+        &layout_path,
+        naming.name(),
+        &inherited,
+    )?;
 
     let tickets = lisa_core::ticket::scan_tickets(root.join(&config.ticket_dir))
         .map_err(|error| format!("Failed to scan tickets after Lisa loop: {error}"))?;
@@ -481,8 +497,9 @@ fn run_zellij(
     root: &Path,
     layout_path: &Path,
     session_name: Option<&str>,
+    inherited_markers: &[String],
 ) -> Result<std::process::ExitStatus, String> {
-    zellij_command(zellij_path, root, layout_path, session_name)
+    zellij_command(zellij_path, root, layout_path, session_name, inherited_markers)
         .status()
         .map_err(|error| format!("Failed to run Zellij at {}: {error}", zellij_path.display()))
 }
@@ -492,8 +509,16 @@ fn zellij_command(
     root: &Path,
     layout_path: &Path,
     session_name: Option<&str>,
+    inherited_markers: &[String],
 ) -> Command {
     let mut command = Command::new(zellij_path);
+    // Everything the session ever spawns inherits this environment, so the
+    // markers are dropped once, here, rather than at each of the places that
+    // later starts an agent. A pane's own launch line strips them again — the
+    // second line of defence covers a session an operator started themselves.
+    for marker in inherited_markers {
+        command.env_remove(marker);
+    }
     // `--layout` with `--session` means "add these tabs to that session", so it
     // fails with `Session 'steer' not found` instead of starting one (measured
     // against Zellij 0.44.3). `--new-session-with-layout` is the pairing that
@@ -587,6 +612,7 @@ mod tests {
                 Path::new("/repo"),
                 Path::new("/repo/.lisa-layout.kdl"),
                 None,
+                &[],
             );
             assert_eq!(command.get_program(), zellij_path.as_os_str());
             assert_eq!(
@@ -604,6 +630,7 @@ mod tests {
             Path::new("/repo"),
             Path::new("/repo/.lisa-layout.kdl"),
             Some("steer"),
+            &[],
         );
 
         // Measured against Zellij 0.44.3: `--layout` with `--session` adds tabs
@@ -618,6 +645,46 @@ mod tests {
                 "/repo/.lisa-layout.kdl"
             ]
         );
+    }
+
+    /// The field failure in T-062-01-04: the loop was started from inside a
+    /// Claude Code session, the session's markers reached every pane, and each
+    /// agent Lisa launched treated itself as a nested child — transcripts off,
+    /// three tickets failing with nothing written down. The session Lisa starts
+    /// must not carry them.
+    #[test]
+    fn test_zellij_session_does_not_inherit_agent_session_markers() {
+        let markers = vec![
+            "CLAUDECODE".to_string(),
+            "CLAUDE_CODE_CHILD_SESSION".to_string(),
+            "CLAUDE_CODE_SESSION_ID".to_string(),
+        ];
+        let command = zellij_command(
+            Path::new("/opt/pinned/zellij"),
+            Path::new("/repo"),
+            Path::new("/repo/.lisa-layout.kdl"),
+            None,
+            &markers,
+        );
+
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(removed, markers);
+    }
+
+    #[test]
+    fn test_zellij_command_touches_no_environment_when_nothing_was_inherited() {
+        let command = zellij_command(
+            Path::new("/opt/pinned/zellij"),
+            Path::new("/repo"),
+            Path::new("/repo/.lisa-layout.kdl"),
+            None,
+            &[],
+        );
+        assert_eq!(command.get_envs().count(), 0);
     }
 
     #[test]
