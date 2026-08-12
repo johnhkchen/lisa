@@ -12,7 +12,7 @@ set -euo pipefail
 
 : "${LISA_BIN:?set LISA_BIN to the freshly built lisa executable}"
 
-for dependency in bash git jq python3 zellij zsh; do
+for dependency in bash git jq pkill python3 zellij zsh; do
     command -v "$dependency" >/dev/null 2>&1 || {
         echo "missing required command: $dependency" >&2
         exit 1
@@ -34,6 +34,26 @@ PROJECT=steer
 ROOT="$RUN_ROOT/$PROJECT"
 LOOP_PID=
 
+# Take the run root away, and never let that decide the harness's verdict.
+#
+# The loop runs behind `forkpty`, so the runner's death leaves the CLI, the
+# stub provider and Zellij's own server alive for a moment -- and a process
+# that is still alive is still writing into the fixture, which is exactly what
+# makes `rm -rf` fail with "Directory not empty". Retry while they drain. A
+# fixture that outlives the test is untidy; it is not a verdict on the row the
+# test just read, and under `set -e` an unguarded `rm` here would silently
+# replace one with the other.
+remove_run_root() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        rm -rf "$RUN_ROOT" 2>/dev/null && return 0
+        sleep 1
+    done
+    rm -rf "$RUN_ROOT" 2>/dev/null \
+        || echo "could not remove the fixture at $RUN_ROOT" >&2
+    return 0
+}
+
 cleanup() {
     local status=$?
     "$REAL_ZELLIJ" kill-session "$SESSION" >/dev/null 2>&1 || true
@@ -41,10 +61,13 @@ cleanup() {
         kill "$LOOP_PID" >/dev/null 2>&1 || true
         wait "$LOOP_PID" >/dev/null 2>&1 || true
     fi
+    # Everything this run started names the run root on its command line, and
+    # nothing else on the machine does.
+    pkill -f "$RUN_ROOT" >/dev/null 2>&1 || true
     if [[ "$KEEP_FIXTURES" == 1 && $status -ne 0 ]]; then
         echo "retained failed fixtures at $RUN_ROOT" >&2
     else
-        rm -rf "$RUN_ROOT"
+        remove_run_root
     fi
     exit "$status"
 }
