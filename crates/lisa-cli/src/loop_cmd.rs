@@ -35,6 +35,64 @@ fn validate_project_protocol(config: &ResolvedConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse to start a second scheduler on a board that already has a live one,
+/// and say which one and how to stop it.
+///
+/// The window is the scheduler's own cadence, not the project's wind-down: a
+/// loop the operator just quit must become startable again in about a minute,
+/// and a wind-down of five minutes would make a restart after a crash feel
+/// broken. A stamp dated ahead of this machine's clock is not evidence of
+/// anything and never blocks a start.
+fn second_scheduler_refusal(root: &Path) -> Option<String> {
+    let now = crate::seats::now_secs()?;
+    let live: Vec<lisa_core::schedulers::SchedulerRecord> =
+        lisa_core::schedulers::read_roster(root)
+            .into_iter()
+            .filter(|record| {
+                record.is_live(
+                    now,
+                    lisa_core::schedulers::live_window_secs(record.poll_interval_secs, 0),
+                )
+            })
+            .collect();
+    if live.is_empty() {
+        return None;
+    }
+
+    let mut message = format!(
+        "{} already running on this board, so Lisa did not start another one. Two schedulers \
+         split the signals the panes write between them, and neither can tell a signal the other \
+         took from one that never arrived.\n",
+        match live.len() {
+            1 => "There is a run".to_string(),
+            count => format!("There are {count} runs"),
+        }
+    );
+    for record in &live {
+        let age = record
+            .age_secs(now)
+            .map(|age| crate::seats::humanize(age))
+            .unwrap_or_else(|| "?".to_string());
+        message.push_str(&format!(
+            "\n  {} — last seen {age} ago{}",
+            record.label(),
+            match record.zellij_pid {
+                Some(pid) => format!(", zellij server pid {pid}"),
+                None => String::new(),
+            }
+        ));
+        if let Some(stop) = record.stop_command() {
+            message.push_str(&format!("\n    stop it with: {stop}"));
+        }
+    }
+    message.push_str(
+        "\n\nIf you already closed its window, the run is still there: closing a pane stops the \
+         client, not the run. `lisa schedulers` lists them, and `lisa schedulers --stop <id>` \
+         ends one. If you just stopped it, give it a minute and try again.",
+    );
+    Some(message)
+}
+
 fn format_dependency_preflight_error(client: AgentClient, failures: &[String]) -> String {
     format!(
         "Dependency preflight failed for {client}:\n{}\n\nRun `lisa doctor` for the complete dependency report and install guidance.",
@@ -70,6 +128,14 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
 
     if dry_run {
         return run_dry(root, config);
+    }
+
+    // Two schedulers on one board split `.lisa/signals/` between them, and
+    // neither can tell a signal the other took from one that was never
+    // written. Nothing in a running loop reveals that, so the check belongs
+    // here — the last moment before a second one exists.
+    if let Some(refusal) = second_scheduler_refusal(root) {
+        return Err(refusal);
     }
 
     println!("{}", config.client_announcement());
@@ -165,22 +231,25 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     // is on the pane shell's PATH. current_exe() failure degrades to bare `lisa`.
     let lisa_bin = std::env::current_exe().ok();
 
+    // Name the session after the project before anything is spawned: the name
+    // is what `zellij list-sessions`, the status bar, and the terminal tab all
+    // show, and a taken name has to cost a number rather than the start. The
+    // plugin is told the same name in its layout below, because it is the only
+    // way a scheduler can record which session to stop it by.
+    let naming = crate::session_name::resolve(root, &zellij_runtime.path);
+
     // Generate KDL layout
     let layout = generate_layout(
         &wasm_path,
         lisa_bin.as_deref(),
         &git_root,
         completion.seal(),
+        naming.name(),
         config,
     );
     let layout_path = root.join(".lisa-layout.kdl");
     std::fs::write(&layout_path, &layout)
         .map_err(|e| format!("Failed to write layout to {}: {}", layout_path.display(), e))?;
-
-    // Name the session after the project before anything is spawned: the name
-    // is what `zellij list-sessions`, the status bar, and the terminal tab all
-    // show, and a taken name has to cost a number rather than the start.
-    let naming = crate::session_name::resolve(root, &zellij_runtime.path);
 
     println!("Lisa loop starting...");
     println!("  WASM plugin: {}", wasm_path.display());
@@ -309,11 +378,14 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
         .completion_mode
         .explicit_seal()
         .unwrap_or(CompletionSeal::Commit);
+    // A dry run starts nothing, so it names no session: the layout it prints is
+    // the shape, not the run.
     let layout = generate_layout(
         &wasm_path,
         lisa_bin.as_deref(),
         &git_root,
         completion_seal,
+        None,
         config,
     );
     println!();
@@ -407,6 +479,7 @@ fn generate_layout(
     lisa_bin: Option<&Path>,
     git_root: &Path,
     completion_seal: CompletionSeal,
+    session_name: Option<&str>,
     config: &ResolvedConfig,
 ) -> String {
     // Create 2x max_threads pane slots so transitions don't block scheduling.
@@ -424,6 +497,15 @@ fn generate_layout(
     // lifecycle-hook usage capture. An absent key falls back to PATH.
     let lisa_bin_line = match lisa_bin {
         Some(p) => format!("                lisa_bin \"{}\"\n", p.display()),
+        None => String::new(),
+    };
+
+    // The session this loop is about to start. The plugin runs inside the
+    // Zellij server and cannot ask which session that is, so a scheduler that
+    // is handed no name records none — and `lisa schedulers` says so rather
+    // than printing a name that would not stop anything.
+    let session_name_line = match session_name {
+        Some(name) => format!("                session_name \"{name}\"\n"),
         None => String::new(),
     };
 
@@ -467,7 +549,7 @@ fn generate_layout(
                 triage_enabled "{triage_enabled}"
                 triage_timeout_secs "{triage_timeout_secs}"
                 client "{client}"
-{provider_cap_lines}{lisa_bin_line}            }}
+{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
         }}
     }}
 }}
@@ -477,6 +559,7 @@ fn generate_layout(
         git_root = git_root.display(),
         completion_seal = completion_seal,
         lisa_bin_line = lisa_bin_line,
+        session_name_line = session_name_line,
         provider_cap_lines = provider_cap_lines,
         ticket_dir = config.ticket_dir,
         story_dir = config.story_dir,
@@ -561,8 +644,83 @@ mod tests {
             lisa_bin,
             Path::new("/repo"),
             CompletionSeal::Commit,
+            Some("lisa"),
             config,
         )
+    }
+
+    /// The plugin cannot ask Zellij which session it is in, so the layout is
+    /// the only way it ever learns — and the name is what `lisa schedulers`
+    /// later hands an operator to stop it with.
+    #[test]
+    fn the_layout_tells_the_plugin_which_session_it_is_running_in() {
+        let layout = test_layout(Path::new("/tmp/lisa-plugin.wasm"), None, &default_config());
+        assert!(layout.contains("session_name \"lisa\""));
+
+        let unnamed = generate_layout(
+            Path::new("/tmp/lisa-plugin.wasm"),
+            None,
+            Path::new("/repo"),
+            CompletionSeal::Commit,
+            None,
+            &default_config(),
+        );
+        assert!(
+            !unnamed.contains("session_name"),
+            "a run Zellij named itself records no session rather than a wrong one"
+        );
+    }
+
+    /// The refusal an operator sees when they start a second loop on a board
+    /// that already has one — the whole point of the registry.
+    #[test]
+    fn a_live_scheduler_on_the_board_refuses_a_second_loop_and_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::seats::now_secs().unwrap();
+        lisa_core::schedulers::write_record(
+            &lisa_core::schedulers::roster_dir(dir.path()),
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "drum",
+                Some("fascinating-drum".to_string()),
+                Some(30186),
+                now - 17 * 3600,
+                now - 3,
+                5,
+            ),
+        )
+        .unwrap();
+
+        let refusal = second_scheduler_refusal(dir.path()).expect("a live scheduler refuses");
+        assert!(refusal.contains("There is a run already running on this board"));
+        assert!(refusal.contains("fascinating-drum (drum)"));
+        assert!(refusal.contains("zellij kill-session fascinating-drum"));
+        assert!(refusal.contains("closing a pane stops the client, not the run"));
+    }
+
+    /// A record from a run that stopped must not lock the operator out of
+    /// starting a new one — including a minute after they quit the last.
+    #[test]
+    fn a_scheduler_that_stopped_stamping_does_not_refuse_the_next_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::seats::now_secs().unwrap();
+        lisa_core::schedulers::write_record(
+            &lisa_core::schedulers::roster_dir(dir.path()),
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "gone",
+                Some("lisa".to_string()),
+                None,
+                now - 3600,
+                now - 300,
+                5,
+            ),
+        )
+        .unwrap();
+
+        assert!(second_scheduler_refusal(dir.path()).is_none());
+        assert!(
+            second_scheduler_refusal(tempfile::tempdir().unwrap().path()).is_none(),
+            "a board no scheduler has written on refuses nothing"
+        );
     }
 
     #[test]
@@ -600,6 +758,7 @@ mod tests {
             None,
             Path::new("/project"),
             CompletionSeal::Journal,
+            Some("lisa"),
             &default_config(),
         );
 

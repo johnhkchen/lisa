@@ -68,6 +68,7 @@ Commands:
   loop           Start a run: work through the ready tickets, in parallel where they don't collide
   release-seats  Free the seats a run left behind when it stopped without shutting down
   reset-ticket   Put a stalled ticket back on the board without editing it by hand
+  schedulers     Show every run holding this board, and stop one that outlived its pane
   help           Print this message or the help of the given subcommand(s)
 
 Options:

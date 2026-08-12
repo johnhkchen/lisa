@@ -23,6 +23,7 @@ mod proposal;
 mod reset_ticket;
 mod run_summary;
 mod runtime;
+mod schedulers;
 mod seats;
 mod session_name;
 mod setup_guide;
@@ -225,6 +226,23 @@ enum Commands {
         /// Print the plan and change nothing, which is what a bare run does
         #[arg(long, conflicts_with = "apply")]
         dry_run: bool,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show every run holding this board, and stop one that outlived its pane.
+    #[command(
+        display_order = 12,
+        after_help = "Closing a loop's pane stops the client, not the run: the part that \
+                      schedules lives in the Zellij server, which keeps going. A bare run lists \
+                      what is here and changes nothing.\n\nExamples:\n  lisa schedulers\n  lisa \
+                      schedulers --stop fascinating-drum"
+    )]
+    Schedulers {
+        /// Stop this run, by the name or id `lisa schedulers` prints
+        #[arg(long, value_name = "ID")]
+        stop: Option<String>,
 
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
@@ -693,6 +711,14 @@ fn main() {
             let path = resolve_path(&path);
             require_lisa_project(&path);
             if let Err(e) = reset_ticket::run_reset_ticket(&path, &ticket_ids, apply) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Schedulers { stop, path } => {
+            let path = resolve_path(&path);
+            require_lisa_project(&path);
+            if let Err(e) = schedulers::run_schedulers(&path, stop.as_deref()) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
