@@ -608,8 +608,7 @@ fi
 /// when a scheduler was last here, which is a fact about this machine at this
 /// moment and never about the project, so it belongs in history even less than
 /// the signal files do.
-pub const LISA_GITIGNORE: &str =
-    "signals/\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n";
+pub const LISA_GITIGNORE: &str = "signals/\nattempts/\nclaude/\ncodex/\nschedulers/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n";
 
 /// The on-notify hook SAMPLE, scaffolded as `.lisa/hooks/on-notify.sample`.
 /// User-owned attention/completion notification hook. It is deliberately a
@@ -1589,6 +1588,7 @@ mod tests {
         assert!(LISA_GITIGNORE.contains("run-events.jsonl"));
         assert!(LISA_GITIGNORE.contains("run-baseline.json"));
         assert!(LISA_GITIGNORE.contains(lisa_core::liveness::SCHEDULER_ALIVE_NAME));
+        assert!(LISA_GITIGNORE.contains(&format!("{}/", lisa_core::schedulers::SCHEDULER_DIR_NAME)));
     }
 
     /// Lisa generates no agent context file for a project. That document states

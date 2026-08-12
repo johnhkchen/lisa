@@ -328,12 +328,12 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
             None => format!("there is no {SIGNAL_DIR}/ to read"),
         };
         let evidence = format!(
-            "{} stamping this board, and {quiet_for}. A stamping scheduler is a process that \
-             exists, not a ticket being worked.",
+            "{}, and {quiet_for}. A stamping scheduler is a process that exists, not a ticket \
+             being worked.",
             match live.len() {
-                1 => format!("{} is", live[0].label()),
+                1 => format!("{} is stamping this board", live[0].label()),
                 _ => format!(
-                    "{} schedulers are ({})",
+                    "{} schedulers are stamping this board ({})",
                     live.len(),
                     live.iter()
                         .map(|record| record.label())
