@@ -13,6 +13,7 @@ pub mod operator_override;
 pub mod parking;
 pub mod provenance;
 pub mod route;
+pub mod schedulers;
 pub mod session_env;
 pub mod ticket;
 pub mod triage;
