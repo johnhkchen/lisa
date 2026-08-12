@@ -1563,6 +1563,28 @@ impl State {
     /// Construct a bounded shell command whose successful execution positively
     /// proves that the pane returned to a shell command boundary. The payload is
     /// the exact scheduler-minted successor lease and publication is atomic.
+    ///
+    /// **Known limit of this evidence (T-062-01-04).** The probe travels down
+    /// the same channel as everything else Lisa types, and a resident TUI reads
+    /// that channel too. In the field an agent that had not exited read the
+    /// probe as a message and ran it — its transcript says *"Shell-ready signal
+    /// written for pane-2 … waiting on the scheduler to send the ticket
+    /// prompt"* — so the signal arrived while the pane's shell was still behind
+    /// a live session, and both sides believed the handshake had completed.
+    ///
+    /// What the probe actually attests is *someone here can run a shell
+    /// command*, which is not *the pane's shell is what reads my keystrokes*.
+    /// The two differ exactly in the case the probe exists to detect, and no
+    /// typed command can tell them apart, because a shell and a TUI both accept
+    /// typed lines. Evidence for vacancy has to come from outside the keystroke
+    /// channel — the host, asked whether a provider process is still running
+    /// under this pane's shell.
+    ///
+    /// Until that exists, the exit path does not rely on this probe at all: a
+    /// pane that keeps emitting provider hooks past the ceiling is declared
+    /// wedged rather than probed or launched into (see [`wedge`]). The probe
+    /// remains in the startup-recovery path, where the same forgery is still
+    /// possible and is bounded by that path's single relaunch.
     fn shell_readiness_probe(
         signal_dir: &Path,
         pane_id: u32,
