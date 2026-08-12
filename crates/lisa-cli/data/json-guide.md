@@ -75,7 +75,7 @@ only want to know "could a run start here", read the exit status and ignore the 
 | `attempts[]` | `{pane_id, ticket_id, attempt_id, ticket_phase, superseded, abandoned, abandoned_reason}` — see below. |
 | `token_usage` | `{tickets[], tickets_joined, tokens_in, tokens_out, not_yet_joined[]}`. |
 | `run_summary` | The latest run's counts, or `null` when there is no board. |
-| `config` | `{max_threads, session_timeout_secs, phase_timeouts}`. |
+| `config` | `{max_threads, session_timeout_secs, phase_timeouts, client, model}` — see below. |
 
 `status` and `phase` are spelled exactly as the prose spells them — `open`, `in_progress`,
 `blocked`, `review`, `done`, `cancelled` for status; `ready`, `implement`, `review`, `done` for
@@ -85,6 +85,28 @@ Two fields sound alike and are not. `counts.blocked` counts tickets whose depend
 finished yet — nobody is waiting on a person. A ticket that is waiting on *you* is in
 `waiting_on_you`, one entry per ticket, with the ask and the reason. If you want "how many things
 need me", count `waiting_on_you`.
+
+### What `config` says about what runs the board
+
+`client` and `model` answer "what does this board run on", which is the question
+a consumer choosing *where to send work* is really asking. They carry the same
+stability promise as the rest of `config`.
+
+- `client` is always one of the names Lisa knows — `claude`, `codex`. A board
+  that names none in `.lisa.toml` still resolves to one, so this is the client
+  that *would* run, not a copy of a line somebody wrote down.
+- `model` is the model that board runs within that client, or `null` when it
+  leaves the choice to the client's own default. `null` is an answer, not a
+  missing field.
+
+Both describe what the board is **configured** to run, so both are there on a
+board that has never run anything. An individual ticket may still route itself
+to another client or model in its own frontmatter; what actually ran is in the
+attempt ledger, not here.
+
+Nothing about credentials crosses this boundary — no keys, no endpoints, no
+environment. The question this answers is what runs the board, not how it
+authenticates.
 
 ### What `attempts` does and does not tell you
 
@@ -134,7 +156,7 @@ you do not have to look, and `lisa release-seats` exists so you never have to re
 | `ready_count` | Tickets that could start now. |
 | `error_count` / `warning_count` | How many problems of each kind. |
 | `problems[]` | `{path, category, severity, message}` — `severity` is `error` or `warning`. |
-| `config` | `{max_threads, session_timeout_secs, phase_timeouts}`. |
+| `config` | `{max_threads, session_timeout_secs, phase_timeouts, client, model}` — see below. |
 
 `path` names the file or place the problem is about; `message` is the reason, the same sentence the
 prose prints.

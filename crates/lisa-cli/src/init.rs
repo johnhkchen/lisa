@@ -1757,6 +1757,8 @@ fn validate_payload(
             max_threads: resolved.max_threads,
             session_timeout_secs: resolved.session_timeout_secs,
             phase_timeouts,
+            client: resolved.client.as_str(),
+            model: resolved.model.clone(),
         },
     })
 }
@@ -3367,7 +3369,7 @@ depends_on: [T-999]
         };
         assert_eq!(
             merged,
-            "signals/\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n"
+            "signals/\nattempts/\nclaude/\ncodex/\nschedulers/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n"
         );
         assert!(merged.starts_with("signals/"));
 
@@ -3377,7 +3379,7 @@ depends_on: [T-999]
             InitAction::NoOp { reason, .. } if reason == "already up to date"
         ));
 
-        let spaced = "  signals/  \n attempts/ \n\tclaude/\t\ncodex/\n run-events.jsonl \n\trun-baseline.json\t\n scheduler.alive ";
+        let spaced = "  signals/  \n attempts/ \n\tclaude/\t\ncodex/\n\tschedulers/\t\n run-events.jsonl \n\trun-baseline.json\t\n scheduler.alive ";
         fs::write(&path, spaced).unwrap();
         assert!(matches!(
             plan_append_only_gitignore(path, templates::LISA_GITIGNORE),
@@ -3507,7 +3509,7 @@ depends_on: [T-999]
         assert!(second_output.contains("Files changed:\n  none\n"));
         assert_eq!(
             fs::read_to_string(gitignore_path).unwrap(),
-            "signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n"
+            "signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\nschedulers/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n"
         );
     }
 
@@ -3562,7 +3564,7 @@ depends_on: [T-999]
         });
         assert_eq!(
             planned_gitignore.map(String::as_str),
-            Some("signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n")
+            Some("signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\nschedulers/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n")
         );
         assert_eq!(
             fs::read(dir.path().join("docs/knowledge/lisa-workflow.md")).unwrap(),
@@ -3581,7 +3583,7 @@ depends_on: [T-999]
         let upgraded_gitignore = fs::read_to_string(dir.path().join(".lisa/.gitignore")).unwrap();
         assert_eq!(
             upgraded_gitignore,
-            "signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n"
+            "signals/\nhooks/ntfy-topic\nattempts/\nclaude/\ncodex/\nschedulers/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n"
         );
 
         let ignored = Command::new("git")

@@ -424,3 +424,52 @@ fn the_guide_and_the_help_point_at_each_other() {
         );
     }
 }
+
+/// A board that names what it runs says so in one read, before anything has
+/// run on it. A consumer choosing *where* to send work asks this question of
+/// six boards at once and cannot open six private `.lisa.toml` files to get it.
+#[test]
+fn a_board_naming_a_client_and_model_carries_both_in_its_envelope() {
+    let (_temp, root) = project();
+    fs::write(
+        root.join(".lisa.toml"),
+        "[agent]\nclient = \"codex\"\nmodel = \"gpt-5-mini\"\n",
+    )
+    .unwrap();
+
+    for command in ["status", "validate"] {
+        let data = data(&lisa(&root, &[command, "--json"]));
+        assert_eq!(
+            data["config"]["client"], "codex",
+            "{command} lost the configured client: {data}"
+        );
+        assert_eq!(
+            data["config"]["model"], "gpt-5-mini",
+            "{command} lost the configured model: {data}"
+        );
+    }
+}
+
+/// A board that names neither still answers: the client it would run — one of
+/// the names Lisa knows — and `null` for the model, meaning "whatever that
+/// client runs by default". Null is an answer here, not a missing field.
+#[test]
+fn a_board_naming_nothing_still_answers_with_a_client_and_a_null_model() {
+    let (_temp, root) = project();
+    fs::write(root.join(".lisa.toml"), "[scheduling]\nmax_threads = 2\n").unwrap();
+
+    for command in ["status", "validate"] {
+        let data = data(&lisa(&root, &[command, "--json"]));
+        let client = data["config"]["client"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{command} must name a client: {data}"));
+        assert!(
+            ["claude", "codex"].contains(&client),
+            "{command} named an unknown client {client:?}"
+        );
+        assert!(
+            data["config"]["model"].is_null(),
+            "{command} invented a model for a board that names none: {data}"
+        );
+    }
+}

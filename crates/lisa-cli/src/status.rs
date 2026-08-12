@@ -885,6 +885,8 @@ fn status_payload(data: &StatusData) -> serde_json::Value {
             max_threads: data.resolved.max_threads,
             session_timeout_secs: data.resolved.session_timeout_secs,
             phase_timeouts,
+            client: data.resolved.client.as_str(),
+            model: data.resolved.model.clone(),
         },
     })
 }

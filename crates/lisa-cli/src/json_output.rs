@@ -74,6 +74,15 @@ pub struct ConfigView {
     /// Seconds, or `0` when the human output says `disabled`.
     pub session_timeout_secs: u64,
     pub phase_timeouts: BTreeMap<String, u64>,
+    /// Which agent client this board runs — `claude`, `codex`. Always a name:
+    /// a board that names none in `.lisa.toml` still resolves to one, and a
+    /// consumer deciding where to send work is asking what would run, not what
+    /// was written down.
+    pub client: &'static str,
+    /// The model that board runs within its client, or `null` when it leaves
+    /// that to the client's own default. Board-level intent, answerable before
+    /// anything has ever run here; a ticket may still route itself elsewhere.
+    pub model: Option<String>,
 }
 
 /// What one command has to say, and the exit status that goes with it.
