@@ -453,6 +453,67 @@ pub fn scan_tickets_with_diagnostics<P: AsRef<Path>>(dir: P) -> Result<ScanResul
     Ok(ScanResult { tickets, errors })
 }
 
+/// What the ticket directory looks like right now, without reading a ticket.
+///
+/// Parsing every ticket answers "what is on the board". This answers the much
+/// cheaper question a scheduler with nothing to do actually needs: *has
+/// anything changed since I last looked?* It is a `read_dir` plus one
+/// `metadata` per `.md` file — no file contents are read and no ticket is
+/// parsed — so it stays affordable at a poll cadence on a board that may sit
+/// finished for hours.
+///
+/// The value is a hash of every `.md` entry's name, length, and modification
+/// time, summed so the arbitrary order `read_dir` returns them in cannot change
+/// it. It is only ever compared with another fingerprint taken by the same
+/// process, so the hasher's per-process seed does not matter and the number is
+/// never written down.
+///
+/// `None` means the directory could not be described — it is missing, or a
+/// file's metadata or modification time is unavailable on this platform. A
+/// caller must read that as *changed*: failing toward doing the work costs a
+/// rescan, and failing the other way would fence a scheduler off from tickets
+/// it can plainly see.
+pub fn scan_fingerprint<P: AsRef<Path>>(dir: P) -> Option<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut total: u64 = 0;
+    let mut files: u64 = 0;
+
+    for entry in fs::read_dir(dir.as_ref()).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let metadata = entry.metadata().ok()?;
+        if metadata.is_dir() {
+            continue;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        entry.file_name().hash(&mut hasher);
+        metadata.len().hash(&mut hasher);
+        // A modification time from before the epoch is not evidence of
+        // anything, so it hashes as zero rather than discarding the whole
+        // fingerprint; a modification time this platform cannot report at all
+        // does discard it, because then nothing here can see an edit.
+        metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0)
+            .hash(&mut hasher);
+
+        total = total.wrapping_add(hasher.finish());
+        files = files.wrapping_add(1);
+    }
+
+    Some(total ^ files.rotate_left(32))
+}
+
 /// Recursively scans a directory tree for all ticket files (*.md).
 ///
 /// # Arguments
@@ -1040,6 +1101,51 @@ This ticket has no blocks field at all.
         assert_eq!(result.tickets[0].id, "T-001");
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].0, dir.path().join("T-BAD.md"));
+    }
+
+    #[test]
+    fn a_fingerprint_answers_has_anything_changed_without_reading_a_ticket() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket = |id: &str, phase: &str| {
+            format!(
+                "---\nid: {id}\ntitle: t\ntype: task\nstatus: open\npriority: high\nphase: {phase}\n---\nBody\n"
+            )
+        };
+
+        // An empty directory has a fingerprint, and taking it twice agrees.
+        let empty = scan_fingerprint(dir.path()).unwrap();
+        assert_eq!(scan_fingerprint(dir.path()).unwrap(), empty);
+
+        // A ticket filed onto the board changes it. This is the case a drained
+        // scheduler wakes on.
+        fs::write(dir.path().join("T-001.md"), ticket("T-001", "ready")).unwrap();
+        let one = scan_fingerprint(dir.path()).unwrap();
+        assert_ne!(one, empty);
+        assert_eq!(scan_fingerprint(dir.path()).unwrap(), one);
+
+        // So does a second one, and so does removing it again.
+        fs::write(dir.path().join("T-002.md"), ticket("T-002", "ready")).unwrap();
+        let two = scan_fingerprint(dir.path()).unwrap();
+        assert_ne!(two, one);
+        fs::remove_file(dir.path().join("T-002.md")).unwrap();
+        assert_eq!(scan_fingerprint(dir.path()).unwrap(), one);
+
+        // An edit that leaves the file exactly as long — a phase advancing from
+        // `ready` to `implem` would be one — still changes it, because the
+        // modification time is part of the answer.
+        fs::write(dir.path().join("T-001.md"), ticket("T-001", "donex")).unwrap();
+        assert_ne!(scan_fingerprint(dir.path()).unwrap(), one);
+
+        // Files that are not tickets are not on the board.
+        let unrelated = scan_fingerprint(dir.path()).unwrap();
+        fs::write(dir.path().join("notes.txt"), "scratch").unwrap();
+        assert_eq!(scan_fingerprint(dir.path()).unwrap(), unrelated);
+
+        // A directory that is not there cannot be described, and says so rather
+        // than reporting "nothing changed".
+        assert!(scan_fingerprint(dir.path().join("gone")).is_none());
     }
 
     #[test]
