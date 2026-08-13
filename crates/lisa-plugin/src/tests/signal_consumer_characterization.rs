@@ -31,7 +31,7 @@ fn add_running_attempt(state: &mut State) -> AttemptLease {
 }
 
 #[test]
-fn poll_tick_preserves_the_nine_consumer_order() {
+fn poll_tick_preserves_the_eight_consumer_order() {
     let source = include_str!("../lib.rs");
     let poll_tick = source
         .split_once("    fn poll_tick(&mut self) {")
@@ -44,7 +44,6 @@ fn poll_tick_preserves_the_nine_consumer_order() {
         "self.check_heartbeat_signals();",
         "self.check_awaiting_signals();",
         "self.check_process_start_signals();",
-        "self.check_shell_ready_signals();",
         "self.check_claim_signals();",
         "self.check_codex_ack_signals();",
         "self.check_idle_signals();",
@@ -66,7 +65,6 @@ fn recognized_records_are_one_shot_before_payload_or_state_admission() {
     let cases = [
         ("heartbeat", "pane-7.heartbeat", "not-json"),
         ("process-start", "pane-7.started", "not-json"),
-        ("shell-ready", "pane-7.shell-ready", "not-json"),
         ("claim", "pane-7.claim", "not-json"),
         ("codex-ack", "pane-7.ack", "not-json"),
         ("awaiting", "pane-7.awaiting", "body-is-ignored"),
@@ -83,7 +81,6 @@ fn recognized_records_are_one_shot_before_payload_or_state_admission() {
         match consumer {
             "heartbeat" => state.check_heartbeat_signals(),
             "process-start" => state.check_process_start_signals(),
-            "shell-ready" => state.check_shell_ready_signals(),
             "claim" => state.check_claim_signals(),
             "codex-ack" => state.check_codex_ack_signals(),
             "awaiting" => state.check_awaiting_signals(),
@@ -107,7 +104,6 @@ fn idle_alone_admits_the_legacy_ticket_filename_family() {
     let cases = [
         ("heartbeat", "T-LEGACY.heartbeat"),
         ("process-start", "T-LEGACY.started"),
-        ("shell-ready", "T-LEGACY.shell-ready"),
         ("claim", "T-LEGACY.claim"),
         ("codex-ack", "T-LEGACY.ack"),
         ("awaiting", "T-LEGACY.awaiting"),
@@ -124,7 +120,6 @@ fn idle_alone_admits_the_legacy_ticket_filename_family() {
         match consumer {
             "heartbeat" => state.check_heartbeat_signals(),
             "process-start" => state.check_process_start_signals(),
-            "shell-ready" => state.check_shell_ready_signals(),
             "claim" => state.check_claim_signals(),
             "codex-ack" => state.check_codex_ack_signals(),
             "awaiting" => state.check_awaiting_signals(),
@@ -212,13 +207,15 @@ fn process_start_requires_the_current_starting_lease_and_only_marks_ready() {
     assert!(!state.seat_is_owned(PANE_ID));
 }
 
-/// The reset no longer advances the generation, so the lease that proves shell
-/// readiness is the *retained* one — the same attempt the launch line carried,
-/// which is also the attempt still named by `pane-10.lease`. Anything else is
-/// rejected, and admitting the right one is the moment the successor is minted,
-/// so the relaunch runs under a generation of its own.
+/// The silent window, end to end, for the pane that is genuinely empty.
+///
+/// The old contract minted a successor the moment a `.shell-ready` arrived —
+/// a file only whoever was reading the pane's keystrokes could produce. There
+/// is no such file any more. What ends this window is the *absence* of every
+/// signal for a whole acknowledgment budget, which is the one reading that says
+/// nothing is in the pane, and only then does Lisa type again.
 #[test]
-fn shell_ready_requires_the_exact_reset_generation_then_mints_the_successor() {
+fn a_silent_window_is_what_mints_the_successor_and_relaunches() {
     let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
     state.config.assignment_ack_timeout_secs = 1;
     fs::create_dir_all(&state.signal_dir).unwrap();
@@ -231,35 +228,40 @@ fn shell_ready_requires_the_exact_reset_generation_then_mints_the_successor() {
         }) => deadline,
         other => panic!("expected Starting, got {other:?}"),
     };
+    // Only the launch line's own deferred Enter is outstanding here; the window
+    // must not add to it.
+    let enters_before = state.pending_enters.len();
     state.check_assignment_ack_timeouts_at(deadline);
+
+    // Nothing was typed and nothing was minted: the launched attempt is held
+    // open so the process it named can still announce itself.
     assert_eq!(state.current_leases["T-NAME"], launched);
     assert!(matches!(
         state.seat_assignment(10),
-        Some(SeatAssignmentState::ResettingStartup { generation, .. })
+        Some(SeatAssignmentState::ObservingStartup { generation, .. })
             if generation == launched.attempt_id
     ));
+    assert_eq!(
+        state.pending_enters.len(),
+        enters_before,
+        "the window queues no keystroke of its own"
+    );
+    let launches_before = state
+        .activity_log
+        .iter()
+        .filter(|entry| matches!(entry.event, ActivityEvent::SessionLaunch { .. }))
+        .count();
+    assert_eq!(launches_before, 1);
 
-    let path = state.signal_dir.join("pane-10.shell-ready");
-    let not_the_reset_generation = AttemptLease {
-        ticket_id: "T-NAME".to_string(),
-        attempt_id: launched.attempt_id + 1,
+    // The budget elapses with the signal directory empty the whole way.
+    let observe_deadline = match state.seat_assignment(10) {
+        Some(SeatAssignmentState::ObservingStartup {
+            observe_deadline, ..
+        }) => observe_deadline,
+        other => panic!("expected ObservingStartup, got {other:?}"),
     };
-    fs::write(
-        &path,
-        serde_json::to_string(&not_the_reset_generation).unwrap(),
-    )
-    .unwrap();
-    state.check_shell_ready_signals();
-    assert!(!path.exists());
-    assert!(matches!(
-        state.seat_assignment(10),
-        Some(SeatAssignmentState::ResettingStartup { .. })
-    ));
-    assert_eq!(state.current_leases["T-NAME"], launched);
+    state.check_assignment_ack_timeouts_at(observe_deadline);
 
-    fs::write(&path, serde_json::to_string(&launched).unwrap()).unwrap();
-    state.check_shell_ready_signals();
-    assert!(!path.exists());
     let successor = state.current_leases["T-NAME"].clone();
     assert_eq!(successor.attempt_id, launched.attempt_id + 1);
     assert!(matches!(
@@ -270,53 +272,27 @@ fn shell_ready_requires_the_exact_reset_generation_then_mints_the_successor() {
             ..
         }) if generation == successor.attempt_id
     ));
-
-    // The mismatch must be rejected in both directions. The case above uses a
-    // generation ABOVE the reset's, which no process could ever hold; this one
-    // uses the dangerous adversary that really does appear on disk — a
-    // `.shell-ready` left over from the attempt this reset just revoked.
-    //
-    // Measured, so the comment does not claim more than it pins: this rejection
-    // is layered, and loosening the seat-generation gate alone does not surface
-    // here, because `&slot_lease != candidate` refuses the predecessor on its
-    // own. That is the point worth keeping — a stale shell proof has to get past
-    // every gate, not just the one a refactor happens to touch.
-    state.seat_assignments.insert(
-        10,
-        SeatAssignmentState::ResettingStartup {
-            generation: successor.attempt_id,
-            reset_deadline: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
-        },
-    );
-    fs::write(&path, serde_json::to_string(&launched).unwrap()).unwrap();
-    state.check_shell_ready_signals();
-    assert!(!path.exists());
-    assert!(
-        matches!(
-            state.seat_assignment(10),
-            Some(SeatAssignmentState::ResettingStartup { generation, .. })
-                if generation == successor.attempt_id
-        ),
-        "a revoked predecessor's shell proof must not end the reset"
-    );
+    assert_eq!(state.lease_high_water["T-NAME"], successor);
+    let marker: AttemptLease =
+        serde_json::from_str(&fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap())
+            .unwrap();
     assert_eq!(
-        state.current_leases["T-NAME"], successor,
-        "and it must not mint anything"
+        marker, successor,
+        "the relaunch replaces the marker so the abandoned launch can no longer announce itself"
     );
+    assert!(state.activity_events().any(|event| matches!(
+        event,
+        ActivityEvent::Info { message } if message.contains("no provider hook")
+    )));
 }
 
-/// The reset window must stay announceable. The pane marker is retained at the
-/// same generation, so a provider that was merely slow — a large repository can
-/// take longer to reach an interactive prompt than the whole acknowledgment
-/// budget — still byte-matches its own launch identity, publishes `.started`,
-/// and ends the reset with real evidence instead of a forgeable shell probe.
-///
-/// It also has to end cleanly. The reset typed a probe into the pane and queued
-/// its Enter; nobody ran the probe, so admitting the seat here must cancel that
-/// Enter, or the assignment would be typed onto the probe residue and submitted
-/// as one mangled prompt.
+/// The window must stay announceable. The pane marker is retained at the same
+/// generation, so a provider that was merely slow — a large repository can take
+/// longer to reach an interactive prompt than the whole acknowledgment budget —
+/// still byte-matches its own launch identity, publishes `.started`, and ends
+/// the window with the seat intact.
 #[test]
-fn a_slow_startup_ends_the_reset_without_a_second_launch() {
+fn a_slow_startup_ends_the_window_without_a_second_launch() {
     let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
     state.config.assignment_ack_timeout_secs = 1;
     fs::create_dir_all(&state.signal_dir).unwrap();
@@ -334,21 +310,10 @@ fn a_slow_startup_ends_the_reset_without_a_second_launch() {
     let marker: AttemptLease =
         serde_json::from_str(&fs::read_to_string(state.signal_dir.join("pane-10.lease")).unwrap())
             .unwrap();
-    assert_eq!(marker, launched, "the reset must not withdraw the marker");
-    assert!(
-        !state.pending_enters.is_empty(),
-        "the reset probe queued a deferred Enter"
-    );
+    assert_eq!(marker, launched, "the window must not withdraw the marker");
 
-    // Both the late process start and an answered probe arrive in one tick.
-    // `poll_tick` consumes starts first, so the real evidence wins.
     fs::write(
         state.signal_dir.join("pane-10.started"),
-        serde_json::to_string(&launched).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        state.signal_dir.join("pane-10.shell-ready"),
         serde_json::to_string(&launched).unwrap(),
     )
     .unwrap();
@@ -358,21 +323,6 @@ fn a_slow_startup_ends_the_reset_without_a_second_launch() {
         Some(SeatAssignmentState::ReadyForAssignment {
             generation: launched.attempt_id
         })
-    );
-    assert!(
-        state
-            .pending_enters
-            .iter()
-            .all(|pending| pending.pane_id != PaneId::Terminal(10)),
-        "the unrun probe's Enter must not survive to submit the assignment on top of it"
-    );
-    state.check_shell_ready_signals();
-    assert_eq!(
-        state.seat_assignment(10),
-        Some(SeatAssignmentState::ReadyForAssignment {
-            generation: launched.attempt_id
-        }),
-        "a shell probe must not relaunch over a provider that proved it started"
     );
     assert_eq!(state.current_leases["T-NAME"], launched);
     assert!(!state.seat_is_owned(10));
@@ -395,15 +345,17 @@ fn a_slow_startup_ends_the_reset_without_a_second_launch() {
     ));
 }
 
-/// The reset clears the pane's lifecycle signals, and the two it must not clear
-/// are `lease` and `started` — the marker because the window is unannounceable
-/// without it, and `started` because of this race: `poll_tick` consumes process
-/// starts near its top and evaluates acknowledgment deadlines near its bottom,
-/// so a provider that finishes booting in between publishes real evidence that
-/// the reset would otherwise delete unread. Everything else the pane wrote
-/// belongs to the launch being abandoned and goes.
+/// The window clears nothing, and that is a change from the reset it replaced.
+///
+/// The old reset swept the pane's signals on its way in and kept only `lease`
+/// and `started`. Every file it swept — `.ack`, `.stopped`, `.alive` — is
+/// evidence about who is in the pane, which is the exact question this window is
+/// open to answer, and deleting it unread is how a live agent's answer went
+/// missing in the field. `poll_tick` consumes these families near its top and
+/// evaluates acknowledgment deadlines near its bottom, so anything sitting here
+/// arrived within this tick and is current.
 #[test]
-fn the_reset_keeps_start_evidence_that_arrived_while_it_was_deciding() {
+fn the_window_keeps_every_signal_that_arrived_while_it_was_deciding() {
     let (mut state, _dir) = pane_name_schedule_state("claude", AgentClient::Claude, None);
     state.config.assignment_ack_timeout_secs = 1;
     fs::create_dir_all(&state.signal_dir).unwrap();
@@ -417,8 +369,8 @@ fn the_reset_keeps_start_evidence_that_arrived_while_it_was_deciding() {
         other => panic!("expected Starting, got {other:?}"),
     };
 
-    // This tick's `check_process_start_signals` has already run. The provider
-    // reaches SessionStart now, a few milliseconds before the deadline check.
+    // This tick's consumers have already run. Both of these land in the
+    // milliseconds before the deadline check.
     fs::write(
         state.signal_dir.join("pane-10.started"),
         serde_json::to_string(&launched).unwrap(),
@@ -434,15 +386,15 @@ fn the_reset_keeps_start_evidence_that_arrived_while_it_was_deciding() {
 
     assert!(
         state.signal_dir.join("pane-10.started").is_file(),
-        "the reset must not delete unread proof that the provider started"
+        "the window must not delete unread proof that the provider started"
     );
     assert!(
-        !state.signal_dir.join("pane-10.stopped").exists(),
-        "everything that belongs to the abandoned launch is still cleared"
+        state.signal_dir.join("pane-10.stopped").is_file(),
+        "nor unread proof that somebody is in the pane answering"
     );
 
-    // Next tick reads it, and it is admissible because the reset kept the
-    // generation it names.
+    // Next tick reads the start, and it is admissible because the window kept
+    // the generation it names.
     state.check_process_start_signals();
     assert_eq!(
         state.seat_assignment(10),

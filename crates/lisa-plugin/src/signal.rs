@@ -26,7 +26,6 @@ pub(crate) enum SignalRequest {
     Alive,
     Heartbeats,
     ProcessStarts,
-    ShellReady,
     Claims,
     CodexAcknowledgements,
     Awaiting,
@@ -59,10 +58,6 @@ pub(crate) enum SignalRecord {
         lease: AttemptLease,
     },
     ProcessStarted {
-        pane_id: u32,
-        lease: AttemptLease,
-    },
-    ShellReady {
         pane_id: u32,
         lease: AttemptLease,
     },
@@ -183,12 +178,6 @@ fn ingest_path(
             let pane_id = pane_id_from_signal_filename(path.file_name()?, ".started")?;
             ingest_lease(path, pane_id, request, consumer, |pane_id, lease| {
                 SignalRecord::ProcessStarted { pane_id, lease }
-            })
-        }
-        SignalRequest::ShellReady => {
-            let pane_id = pane_id_from_signal_filename(path.file_name()?, ".shell-ready")?;
-            ingest_lease(path, pane_id, request, consumer, |pane_id, lease| {
-                SignalRecord::ShellReady { pane_id, lease }
             })
         }
         SignalRequest::Claims => {

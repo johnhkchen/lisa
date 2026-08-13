@@ -100,25 +100,15 @@ impl RustPublication<'_> {
     }
 }
 
-/// A shell-side sibling-temp publication rendered for later pane execution.
-pub(crate) struct ShellPublication<'a> {
-    pub(crate) path: PublicationPath,
-    pub(crate) body: &'a str,
-}
-
-impl ShellPublication<'_> {
-    /// Render the existing shell collision contract without host-side I/O.
-    pub(crate) fn command(self) -> Result<String, String> {
-        let resolved = self.path.resolve()?;
-        Ok(format!(
-            "command printf '%s' {} > {} && command mv {} {}",
-            shell_quote(self.body),
-            shell_quote(&resolved.temporary.to_string_lossy()),
-            shell_quote(&resolved.temporary.to_string_lossy()),
-            shell_quote(&resolved.destination.to_string_lossy()),
-        ))
-    }
-}
+// There is deliberately no shell-side counterpart to [`RustPublication`].
+//
+// One existed: it rendered `printf … > tmp && mv tmp <signal>` for Lisa to type
+// into a pane, and the startup-recovery probe was its only caller. What it asked
+// for was a signal file written by whoever was reading the pane's keystrokes —
+// which against a live agent is either a forged readiness proof or, from an
+// agent correctly taught never to write under `.lisa/`, a refusal (S-067-01).
+// Every publication Lisa depends on is now performed by Lisa or by a hook, in
+// this process, through `RustPublication`.
 
 /// Encode one arbitrary UTF-8 value as one POSIX shell argument.
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -268,40 +258,24 @@ mod tests {
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 
+    /// The structural half of removing the readiness probe (T-067-01-01).
+    ///
+    /// A pane-typed publication is the only mechanism Lisa ever had for asking
+    /// the thing reading a pane's keystrokes to create a signal file, so the
+    /// guarantee "no recovery path asks the pane's occupant to write a lisa
+    /// signal" is kept by this module having no way to render one.
     #[test]
-    fn shell_rendering_rejects_escape_but_accepts_literal_hostile_filename_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("pane-3.shell-ready");
-        let error = ShellPublication {
-            path: PublicationPath {
-                destination: destination.clone(),
-                temporary_name: TemporaryName::Exact {
-                    file_name: "../foreign-ticket/signal".to_string(),
-                },
-            },
-            body: "unpublished shell body",
-        }
-        .command()
-        .unwrap_err();
-        assert!(error.starts_with("invalid publication temporary name "));
-        assert!(!error.contains("unpublished shell body"));
+    fn no_publication_can_be_rendered_for_something_else_to_execute() {
+        let source = include_str!("publication.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module marker remains available")
+            .0;
 
-        let hostile_name = "literal ' ; $() `x`.tmp";
-        let command = ShellPublication {
-            path: PublicationPath {
-                destination,
-                temporary_name: TemporaryName::Exact {
-                    file_name: hostile_name.to_string(),
-                },
-            },
-            body: "body ' ; $() `x`",
-        }
-        .command()
-        .unwrap();
-        assert!(command.contains(&shell_quote(
-            &temp.path().join(hostile_name).to_string_lossy()
-        )));
-        assert!(command.contains(&shell_quote("body ' ; $() `x`")));
-        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert!(!production.contains("struct ShellPublication"));
+        assert!(
+            !production.contains("command mv"),
+            "no publication may be rendered as a shell command for a pane to run"
+        );
     }
 }

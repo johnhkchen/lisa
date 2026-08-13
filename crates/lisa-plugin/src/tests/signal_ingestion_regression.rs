@@ -65,16 +65,13 @@ fn every_request_produces_its_exact_typed_record_contract() {
     );
     assert!(!started.exists());
 
-    let shell_ready = dir.path().join("pane-3.shell-ready");
-    fs::write(&shell_ready, &lease_json).unwrap();
-    assert_eq!(
-        signal::ingest(dir.path(), SignalRequest::ShellReady, None),
-        vec![SignalRecord::ShellReady {
-            pane_id: 3,
-            lease: lease.clone(),
-        }]
-    );
-    assert!(!shell_ready.exists());
+    // `.shell-ready` is deliberately absent from this table. Every other family
+    // here is written by Lisa or by a hook; that one was written by whatever was
+    // reading a pane's keystrokes, which is why it is gone (T-067-01-01). One
+    // left on disk by an older Lisa is now inert — no request family recognizes
+    // the name, so nothing consumes it and nothing acts on it.
+    let stale_shell_ready = dir.path().join("pane-3.shell-ready");
+    fs::write(&stale_shell_ready, &lease_json).unwrap();
 
     let claim_path = dir.path().join("pane-4.claim");
     let claim = lisa_core::claim::AssignmentClaim {
@@ -148,6 +145,11 @@ fn every_request_produces_its_exact_typed_record_contract() {
         vec![SignalRecord::Error { pane_id: 9 }]
     );
     assert!(!error.exists());
+
+    // Every family above has been consumed. The one file still sitting there is
+    // the retired probe answer: no consumer claims it, so it cannot relaunch a
+    // pane or end a recovery.
+    assert!(stale_shell_ready.exists());
 }
 
 #[test]
@@ -252,7 +254,6 @@ fn poll_tick_preserves_signal_admission_and_timeout_interleaving() {
         "self.check_awaiting_signals();",
         "self.deliver_ready_assignments();",
         "self.check_process_start_signals();",
-        "self.check_shell_ready_signals();",
         "self.check_claim_signals();",
         "self.check_codex_ack_signals();",
         "self.check_artifact_advances();",

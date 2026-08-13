@@ -130,15 +130,18 @@ fn a_started_signal_the_live_scheduler_never_sees_no_longer_ends_in_a_probe() {
 
     // 4. The live scheduler's acknowledgment window expires. Before the
     //    receipt existed, this is where it interrupted a running Claude and
-    //    typed a probe the session answered on its behalf.
+    //    typed a probe the session answered on its behalf. The probe is gone,
+    //    and so is the silent window that replaced it: this seat is fenced with
+    //    the real diagnosis instead.
     live.check_assignment_ack_timeouts_at(SystemTime::now());
 
     assert!(
-        !live
-            .attempt_lifecycle
-            .iter()
-            .any(|event| matches!(event, AttemptLifecycleEvent::ShellInterrupted { .. })),
-        "no probe is typed into a pane whose start signal went to another scheduler"
+        !live.attempt_lifecycle.iter().any(|event| matches!(
+            event,
+            AttemptLifecycleEvent::StartupObservationOpened { .. }
+        )),
+        "no window is opened on a pane whose start signal went to another scheduler; \
+         waiting for evidence a second scheduler is eating is waiting forever"
     );
     assert!(matches!(
         live.seat_assignment(PANE_ID),
