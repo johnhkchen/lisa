@@ -193,6 +193,70 @@ fn status_json_document_agrees_with_the_prose() {
     assert!(prose.contains("Completed: 0 of 2 tickets; 2 remain."));
 }
 
+/// The field failure end to end: a ticket sitting in `review` that no seat
+/// holds is named in both renderings, with the ledger's reason beside it.
+///
+/// Before this, the same board printed as ordinary work in progress and the
+/// document said nothing at all, which is how twelve minutes of agent time on
+/// two tickets came to leave the desk's own accounting empty.
+#[test]
+fn a_ticket_under_way_that_nothing_is_working_is_named_in_both_renderings() {
+    let (_temp, root) = project();
+    fs::write(
+        root.join("docs/active/tickets/T-001.md"),
+        "---\nid: T-001\ntitle: first-thing\ntype: task\nstatus: in_progress\npriority: high\nphase: review\n---\n\n## Acceptance Criteria\n\n- It works\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".lisa/provenance.jsonl"),
+        concat!(
+            r#"{"schema_version":11,"seal":"journal","record_type":"attempt-launch","ticket_id":"T-001","attempt_lease":{"ticket_id":"T-001","attempt_id":1},"pane_id":1,"provider":"anthropic","assignment":"assignment-1-77.md","occurred_at":1786650742}"#,
+            "\n",
+            r#"{"schema_version":11,"seal":"journal","ticket_id":"T-001","attempt_lease":{"ticket_id":"T-001","attempt_id":1},"outcome":"seat-lost","reason":"positive shell readiness was never proven","authoritative":false,"fenced":true,"requested":{"method":"claude","provider":"anthropic","model":null},"actual":{"method":"claude","provider":"anthropic","model":null},"started_at":1786650000,"ended_at":1786650720,"wall_clock_secs":720,"tokens_in":null,"tokens_out":null,"cost_usd":null,"concurrency_at_spawn":1,"pane_id":1}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let prose = stdout_of(&lisa(&root, &["status"]));
+    let data = data(&lisa(&root, &["status", "--json"]));
+
+    let stranded = data["stranded"].as_array().unwrap();
+    assert_eq!(stranded.len(), 1, "{data}");
+    assert_eq!(stranded[0]["ticket_id"], "T-001");
+    assert_eq!(stranded[0]["phase"], "review");
+    assert_eq!(stranded[0]["attempt_id"], 1);
+    let evidence = stranded[0]["evidence"].as_str().unwrap();
+    assert!(evidence.contains("lost its seat"), "{evidence}");
+    assert!(
+        evidence.contains("positive shell readiness was never proven"),
+        "{evidence}"
+    );
+
+    assert!(prose.contains("Tickets nobody is working"), "{prose}");
+    assert!(prose.contains("T-001"), "{prose}");
+    assert!(prose.contains(evidence), "{prose}");
+
+    // And the spend that went with it is counted as lost rather than omitted.
+    let lost = strings(&data["token_usage"]["lost_with_the_seat"]);
+    assert_eq!(lost, vec!["T-001".to_string()]);
+    assert!(prose.contains("Lost with the seat: 1 ticket"), "{prose}");
+}
+
+/// The shape is documented where a consumer is told to look.
+#[test]
+fn the_guide_names_the_tickets_nobody_is_working() {
+    let guide = stdout_of(
+        &Command::new(env!("CARGO_BIN_EXE_lisa"))
+            .arg("json-guide")
+            .output()
+            .unwrap(),
+    );
+    for marker in ["stranded", "lost_with_the_seat", "attempt-launch"] {
+        assert!(guide.contains(marker), "json-guide is missing {marker:?}");
+    }
+}
+
 /// The verdict, the ready count, and every problem named by file and reason.
 #[test]
 fn validate_json_document_agrees_with_the_prose() {

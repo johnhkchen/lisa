@@ -7,11 +7,12 @@ use lisa_core::dag::{CycleDetectionResult, Dag, DagError, DagStats};
 use lisa_core::disposition::RemedyOwner;
 use lisa_core::notes::{collect_notes, QueuedNote};
 use lisa_core::parking::{collect_parked_remedies, ParkedRemedy};
+use lisa_core::provenance::RunOutcome;
 use lisa_core::provenance::{
-    correct_usage, latest_world_rechecks, usage_gap, ProvenanceLedgerRecord,
+    correct_usage, latest_world_rechecks, lost_seat_usage_gap, usage_gap, ProvenanceLedgerRecord,
     WorldRecheckObservation,
 };
-use lisa_core::types::{AttemptLease, Ticket};
+use lisa_core::types::{AttemptLease, Phase, Ticket};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
@@ -50,6 +51,14 @@ struct TokenUsageView {
     tokens_out: u64,
     /// Completed tickets whose usage capture is pending or never arrived.
     not_yet_joined: Vec<String>,
+    /// Tickets whose seat was taken away with no tokens joined.
+    ///
+    /// Separate from `not_yet_joined` because the prognosis differs. A
+    /// completed ticket's capture is normally late, not absent — the Stop hook
+    /// fired and the sweep will join it. A seat lost before its session ever
+    /// stopped produced no capture at all, and nothing later can invent one.
+    /// Counting them apart is what keeps that spend from disappearing.
+    lost_with_the_seat: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,6 +90,7 @@ fn token_usage_view(records: &[ProvenanceLedgerRecord]) -> TokenUsageView {
         tokens_in,
         tokens_out,
         not_yet_joined: usage_gap(records),
+        lost_with_the_seat: lost_seat_usage_gap(records),
     }
 }
 
@@ -108,6 +118,16 @@ fn token_usage_lines(records: &[ProvenanceLedgerRecord]) -> Vec<String> {
             if view.tickets_joined == 1 { "" } else { "s" },
             group_thousands(view.tokens_in),
             group_thousands(view.tokens_out),
+        ));
+    }
+
+    let lost = view.lost_with_the_seat.len();
+    if lost > 0 {
+        lines.push(format!(
+            "  Lost with the seat: {} ticket{} — the pane went before its session could report \
+             what it spent, so those tokens are not recoverable.",
+            lost,
+            if lost == 1 { "" } else { "s" },
         ));
     }
 
@@ -221,6 +241,147 @@ fn print_waiting_on_you(
     }
 
     println!("Waiting on you");
+    for line in lines {
+        println!("{line}");
+    }
+    println!();
+}
+
+/// A ticket the board says is under way that nothing is working.
+///
+/// `implement` and `review` both mean *an agent has this*. When no pane lease
+/// marker names the ticket, nothing does, and the board is describing work that
+/// is not happening. That state is reachable honestly — the scheduler fences a
+/// seat and withdraws its marker in the same breath — so the answer is not to
+/// stop it happening but to stop it being silent about it.
+///
+/// The word each one gets comes from the ledger, and the whole point of the
+/// row-writing changes beside this is that there is now something to read.
+/// `evidence` is the last thing the ledger has to say about this ticket, in a
+/// sentence, including the case where it says nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StrandedTicket {
+    ticket_id: String,
+    /// `implement` or `review`, spelled as the board spells it.
+    phase: String,
+    /// The last attempt the ledger names for this ticket, or `null` when it
+    /// names none.
+    attempt_id: Option<u64>,
+    /// The ledger's last word, as one sentence.
+    evidence: String,
+}
+
+/// The last thing the ledger says about one ticket, in a sentence.
+///
+/// Ledger order is append order, so the last matching row is the latest fact.
+/// Only rows that speak to *this attempt's fate* count: a launch row that is
+/// never answered is itself the finding, which is why it is folded in here
+/// rather than filtered out.
+fn ledger_last_word(ticket_id: &str, ledger: &[ProvenanceLedgerRecord]) -> (Option<u64>, String) {
+    let mut last: Option<(Option<u64>, String)> = None;
+    for record in ledger {
+        let word = match record {
+            ProvenanceLedgerRecord::AttemptLaunch(launch) if launch.ticket_id == ticket_id => (
+                Some(launch.attempt_lease.attempt_id),
+                format!(
+                    "attempt {} was launched and nothing has recorded how it ended",
+                    launch.attempt_lease.attempt_id
+                ),
+            ),
+            ProvenanceLedgerRecord::Execution(exec) if exec.ticket_id == ticket_id => {
+                let attempt = Some(exec.attempt_lease.attempt_id);
+                let sentence = match exec.outcome {
+                    RunOutcome::SeatLost => format!(
+                        "attempt {} lost its seat: {}",
+                        exec.attempt_lease.attempt_id,
+                        exec.reason.as_deref().unwrap_or("no reason was recorded"),
+                    ),
+                    RunOutcome::Failed => {
+                        format!("attempt {} failed", exec.attempt_lease.attempt_id)
+                    }
+                    RunOutcome::TimedOut => {
+                        format!("attempt {} timed out", exec.attempt_lease.attempt_id)
+                    }
+                    RunOutcome::Done => format!(
+                        "attempt {} recorded done, but the board still says it is under way",
+                        exec.attempt_lease.attempt_id
+                    ),
+                };
+                (attempt, sentence)
+            }
+            ProvenanceLedgerRecord::AssignmentTransition(transition)
+                if transition.ticket_id == ticket_id =>
+            {
+                (
+                    Some(transition.attempt_lease.attempt_id),
+                    format!(
+                        "attempt {} ended before an agent owned it ({}): {}",
+                        transition.attempt_lease.attempt_id,
+                        serde_json::to_string(&transition.state)
+                            .unwrap_or_default()
+                            .trim_matches('"'),
+                        transition.reason,
+                    ),
+                )
+            }
+            _ => continue,
+        };
+        last = Some(word);
+    }
+    last.unwrap_or((
+        None,
+        "the ledger has no record of an attempt on this ticket".to_string(),
+    ))
+}
+
+fn stranded_tickets(
+    tickets: &[Ticket],
+    attempts: &[SeatAttempt],
+    ledger: &[ProvenanceLedgerRecord],
+) -> Vec<StrandedTicket> {
+    tickets
+        .iter()
+        .filter(|ticket| matches!(ticket.phase, Phase::Implement | Phase::Review))
+        .filter(|ticket| {
+            !attempts
+                .iter()
+                .any(|attempt| attempt.ticket_id == ticket.id)
+        })
+        .map(|ticket| {
+            let (attempt_id, evidence) = ledger_last_word(&ticket.id, ledger);
+            StrandedTicket {
+                ticket_id: ticket.id.clone(),
+                phase: ticket.phase.to_string(),
+                attempt_id,
+                evidence,
+            }
+        })
+        .collect()
+}
+
+/// Silent when there are none, for the same reason the abandoned-seat report
+/// is: a healthy board should not have to read a line saying nothing is wrong.
+fn stranded_ticket_lines(stranded: &[StrandedTicket]) -> Vec<String> {
+    if stranded.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Tickets nobody is working".to_string()];
+    for ticket in stranded {
+        lines.push(format!(
+            "  {:<12} {:<10} {}",
+            ticket.ticket_id, ticket.phase, ticket.evidence
+        ));
+    }
+    lines.push("  The board says these are under way and no pane holds them.".to_string());
+    lines.push("  To hand one back: lisa reset-ticket <ticket-id> --apply".to_string());
+    lines
+}
+
+fn print_stranded_tickets(data: &StatusData) {
+    let lines = stranded_ticket_lines(&data.stranded);
+    if lines.is_empty() {
+        return;
+    }
     for line in lines {
         println!("{line}");
     }
@@ -467,6 +628,8 @@ struct StatusData {
     tickets: Vec<Ticket>,
     ledger: Vec<ProvenanceLedgerRecord>,
     attempts: Vec<SeatAttempt>,
+    /// Tickets the board says are under way that no seat holds.
+    stranded: Vec<StrandedTicket>,
     /// What Lisa can say about the run that placed those seats.
     run: crate::seats::RunReport,
     /// `None` when the ticket directory holds no tickets: there is no board to
@@ -562,6 +725,9 @@ fn collect_status(root: &Path) -> Result<StatusData, String> {
     let run_summary =
         crate::run_summary::collect_run_summary(root, &tickets, Path::new(&work_dir_rel));
 
+    let ledger = read_ledger(&ledger_path);
+    let stranded = stranded_tickets(&tickets, &attempts, &ledger);
+
     Ok(StatusData {
         ticket_dir_rel,
         resolved,
@@ -570,8 +736,9 @@ fn collect_status(root: &Path) -> Result<StatusData, String> {
         rechecks,
         notes,
         tickets,
-        ledger: read_ledger(&ledger_path),
+        ledger,
         attempts,
+        stranded,
         run,
         board,
         run_summary,
@@ -615,6 +782,11 @@ fn print_status(data: &StatusData) -> Result<(), String> {
     // the run that placed those seats is gone is the exact sentence that misled
     // an operator for a day.
     print_abandoned_seats(data);
+
+    // The same qualification from the other side. An abandoned seat is a marker
+    // outliving its run; this is a ticket outliving its marker, which is what a
+    // scheduler that fenced a live pane leaves behind.
+    print_stranded_tickets(data);
 
     // And beside it, the other way those counts can lie: a board being worked
     // by more schedulers than anybody started.
@@ -867,6 +1039,9 @@ fn status_payload(data: &StatusData) -> serde_json::Value {
         "notes": notes,
         "waiting_on_you": waiting_on_you,
         "attempts": data.attempts,
+        // The complement of `attempts`: tickets the board says are under way
+        // that no entry in `attempts` names. Empty on a healthy board.
+        "stranded": data.stranded,
         // One entry per scheduler stamping this board. A reader counting these
         // is asking the question the shared heartbeat could never answer, so
         // the array is present even when it holds one — and empty on a board
@@ -907,6 +1082,141 @@ mod tests {
 
     fn write_ticket(dir: &Path, filename: &str, content: &str) {
         fs::write(dir.join("docs/active/tickets").join(filename), content).unwrap();
+    }
+
+    fn under_way(id: &str, phase: Phase) -> Ticket {
+        let mut ticket = Ticket::new(id, format!("ticket-{id}"));
+        ticket.phase = phase;
+        ticket
+    }
+
+    fn held_seat(ticket_id: &str) -> SeatAttempt {
+        SeatAttempt {
+            pane_id: 1,
+            ticket_id: ticket_id.to_string(),
+            attempt_id: 1,
+            ticket_phase: Some("review".to_string()),
+            superseded: false,
+            abandoned: false,
+            abandoned_reason: None,
+        }
+    }
+
+    fn ledger_rows(raw: &str) -> Vec<ProvenanceLedgerRecord> {
+        raw.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The field failure, read back from `lisa status`: two tickets advanced to
+    /// `review`, no seat holding either, and — before this — nothing on the
+    /// board that could say why.
+    #[test]
+    fn a_ticket_under_way_with_no_seat_is_named_and_carries_the_ledgers_reason() {
+        let ledger = ledger_rows(concat!(
+            r#"{"schema_version":11,"seal":"commit","record_type":"attempt-launch","ticket_id":"T-019-01","attempt_lease":{"ticket_id":"T-019-01","attempt_id":1},"pane_id":1,"provider":"anthropic","assignment":"assignment-1-77.md","occurred_at":1786650742}"#,
+            "\n",
+            r#"{"schema_version":11,"seal":"commit","ticket_id":"T-019-01","attempt_lease":{"ticket_id":"T-019-01","attempt_id":1},"outcome":"seat-lost","reason":"positive shell readiness was never proven","authoritative":false,"fenced":true,"requested":{"method":"claude","provider":"anthropic","model":null},"actual":{"method":"claude","provider":"anthropic","model":null},"started_at":1786650000,"ended_at":1786650720,"wall_clock_secs":720,"tokens_in":null,"tokens_out":null,"cost_usd":null,"concurrency_at_spawn":1,"pane_id":1}"#,
+            "\n",
+            r#"{"schema_version":11,"seal":"commit","record_type":"attempt-launch","ticket_id":"T-019-03","attempt_lease":{"ticket_id":"T-019-03","attempt_id":2},"pane_id":2,"provider":"anthropic","assignment":"assignment-2-91.md","occurred_at":1786650742}"#,
+            "\n",
+        ));
+
+        let stranded = stranded_tickets(
+            &[
+                under_way("T-019-01", Phase::Review),
+                under_way("T-019-03", Phase::Review),
+                under_way("T-020-01", Phase::Implement),
+                under_way("T-021-01", Phase::Ready),
+                under_way("T-022-01", Phase::Done),
+            ],
+            &[held_seat("T-020-01")],
+            &ledger,
+        );
+
+        let named: Vec<&str> = stranded
+            .iter()
+            .map(|entry| entry.ticket_id.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec!["T-019-01", "T-019-03"],
+            "a held ticket, a ready one and a finished one are not stranded"
+        );
+
+        assert_eq!(stranded[0].attempt_id, Some(1));
+        assert!(
+            stranded[0].evidence.contains("lost its seat")
+                && stranded[0]
+                    .evidence
+                    .contains("positive shell readiness was never proven"),
+            "{}",
+            stranded[0].evidence
+        );
+
+        assert_eq!(stranded[1].attempt_id, Some(2));
+        assert!(
+            stranded[1]
+                .evidence
+                .contains("nothing has recorded how it ended"),
+            "a launch with no answer is itself the finding: {}",
+            stranded[1].evidence
+        );
+
+        let lines = stranded_ticket_lines(&stranded).join("\n");
+        assert!(lines.contains("Tickets nobody is working"));
+        assert!(lines.contains("lisa reset-ticket <ticket-id> --apply"));
+    }
+
+    /// The pre-schema-11 board, which is the one the bug was found on: an
+    /// operator still gets a named state, and the sentence says the ledger is
+    /// the thing that is empty.
+    #[test]
+    fn a_stranded_ticket_with_no_ledger_row_at_all_still_says_so() {
+        let stranded = stranded_tickets(&[under_way("T-019-01", Phase::Review)], &[], &[]);
+
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].attempt_id, None);
+        assert_eq!(
+            stranded[0].evidence,
+            "the ledger has no record of an attempt on this ticket"
+        );
+    }
+
+    /// Silence is the healthy board's report. Nothing to say, nothing printed.
+    #[test]
+    fn a_board_whose_seats_all_hold_prints_nothing_about_stranded_tickets() {
+        let stranded = stranded_tickets(
+            &[
+                under_way("T-020-01", Phase::Implement),
+                under_way("T-022-01", Phase::Done),
+            ],
+            &[held_seat("T-020-01")],
+            &[],
+        );
+
+        assert!(stranded.is_empty());
+        assert!(stranded_ticket_lines(&stranded).is_empty());
+    }
+
+    /// The two token gaps are different facts and must not be summed into one.
+    #[test]
+    fn tokens_lost_with_a_seat_are_counted_apart_from_a_late_capture() {
+        let ledger = ledger_rows(concat!(
+            r#"{"schema_version":11,"seal":"commit","ticket_id":"T-019-01","attempt_lease":{"ticket_id":"T-019-01","attempt_id":1},"outcome":"seat-lost","reason":"pane fenced","authoritative":false,"fenced":true,"requested":{"method":"claude","provider":"anthropic","model":null},"actual":{"method":"claude","provider":"anthropic","model":null},"started_at":1786650000,"ended_at":1786650720,"wall_clock_secs":720,"tokens_in":null,"tokens_out":null,"cost_usd":null,"concurrency_at_spawn":1,"pane_id":1}"#,
+            "\n",
+            r#"{"schema_version":11,"seal":"commit","ticket_id":"T-018-01","attempt_lease":{"ticket_id":"T-018-01","attempt_id":1},"outcome":"done","authoritative":true,"fenced":false,"requested":{"method":"claude","provider":"anthropic","model":null},"actual":{"method":"claude","provider":"anthropic","model":null},"started_at":1786640000,"ended_at":1786640600,"wall_clock_secs":600,"tokens_in":null,"tokens_out":null,"cost_usd":null,"concurrency_at_spawn":1,"pane_id":2}"#,
+            "\n",
+        ));
+
+        let view = token_usage_view(&ledger);
+        assert_eq!(view.lost_with_the_seat, vec!["T-019-01".to_string()]);
+        assert_eq!(view.not_yet_joined, vec!["T-018-01".to_string()]);
+
+        let lines = token_usage_lines(&ledger).join("\n");
+        assert!(lines.contains("Lost with the seat: 1 ticket"));
+        assert!(lines.contains("not recoverable"));
+        assert!(lines.contains("Not yet joined: 1 completed ticket"));
     }
 
     #[test]

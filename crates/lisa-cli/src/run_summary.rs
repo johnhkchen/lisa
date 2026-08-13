@@ -26,6 +26,7 @@ struct RunBaseline {
 struct OutcomeCounts {
     failed: usize,
     timed_out: usize,
+    seats_lost: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -136,6 +137,10 @@ pub(crate) struct RunSummary {
     /// is a different fact from "no failures".
     pub(crate) failed: Option<usize>,
     pub(crate) timed_out: Option<usize>,
+    /// Attempts the scheduler took the seat away from. Counted separately
+    /// because `failed: 0` on a run that lost two seats is the summary being
+    /// wrong in the direction that matters — it reads as a clean run.
+    pub(crate) seats_lost: Option<usize>,
     /// `None` when the installed hooks cannot track approval gates.
     pub(crate) manual_interventions: Option<ManualInterventions>,
     pub(crate) evidence: Vec<String>,
@@ -177,6 +182,7 @@ pub(crate) fn collect_run_summary(
         tickets_remaining: total.saturating_sub(completed),
         failed: outcomes.map(|counts| counts.failed),
         timed_out: outcomes.map(|counts| counts.timed_out),
+        seats_lost: outcomes.map(|counts| counts.seats_lost),
         manual_interventions: interventions.map(|counts| ManualInterventions {
             questions: counts.questions,
             permissions: counts.permissions,
@@ -219,13 +225,20 @@ pub(crate) fn render_run_summary(
         tickets_remaining: remaining,
         failed,
         timed_out,
+        seats_lost,
         manual_interventions: interventions,
         evidence,
     } = summary;
     let (total, completed, remaining) = (*total, *completed, *remaining);
-    let outcomes = failed
-        .zip(*timed_out)
-        .map(|(failed, timed_out)| OutcomeCounts { failed, timed_out });
+    let outcomes =
+        failed
+            .zip(*timed_out)
+            .zip(*seats_lost)
+            .map(|((failed, timed_out), seats_lost)| OutcomeCounts {
+                failed,
+                timed_out,
+                seats_lost,
+            });
     let interventions = interventions.map(|counts| InterventionCounts {
         questions: counts.questions,
         permissions: counts.permissions,
@@ -253,11 +266,11 @@ pub(crate) fn render_run_summary(
     }
 
     if let Some(counts) = outcomes {
-        if counts.failed > 0 || counts.timed_out > 0 {
+        if counts != OutcomeCounts::default() {
             writeln!(
                 output,
-                "Run issues: {} failed, {} timed out.",
-                counts.failed, counts.timed_out
+                "Run issues: {} failed, {} timed out, {} lost their seat.",
+                counts.failed, counts.timed_out, counts.seats_lost
             )?;
         }
     }
@@ -309,6 +322,7 @@ fn load_outcomes(
         match value.get("outcome").and_then(serde_json::Value::as_str) {
             Some("failed") => counts.failed += 1,
             Some("timed-out") => counts.timed_out += 1,
+            Some("seat-lost") => counts.seats_lost += 1,
             _ => {}
         }
     })
@@ -476,7 +490,47 @@ mod tests {
         );
 
         assert!(output.contains("Completed: 1 of 2 tickets; 1 remains."));
-        assert!(output.contains("Run issues: 1 failed, 0 timed out."));
+        assert!(output.contains("Run issues: 1 failed, 0 timed out, 0 lost their seat."));
+        assert!(!output.contains("completed the board without asking you"));
+    }
+
+    /// The exact shape of the field failure: two attempts that ran for twelve
+    /// minutes, lost their seats, and left a summary reporting `failed: 0`.
+    #[test]
+    fn a_run_that_lost_two_seats_does_not_report_itself_as_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        write_baseline(dir.path(), "", "");
+        fs::write(
+            dir.path().join(PROVENANCE_PATH),
+            concat!(
+                "{\"ticket_id\":\"T-019-01\",\"outcome\":\"seat-lost\"}\n",
+                "{\"ticket_id\":\"T-019-03\",\"outcome\":\"seat-lost\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let summary = collect_run_summary(
+            dir.path(),
+            &[
+                ticket("T-019-01", Phase::Review),
+                ticket("T-019-03", Phase::Review),
+            ],
+            Path::new("docs/active/work"),
+        )
+        .unwrap();
+        assert_eq!(summary.failed, Some(0));
+        assert_eq!(summary.timed_out, Some(0));
+        assert_eq!(summary.seats_lost, Some(2));
+
+        let output = render(
+            dir.path(),
+            &[
+                ticket("T-019-01", Phase::Review),
+                ticket("T-019-03", Phase::Review),
+            ],
+        );
+
+        assert!(output.contains("Run issues: 0 failed, 0 timed out, 2 lost their seat."));
         assert!(!output.contains("completed the board without asking you"));
     }
 

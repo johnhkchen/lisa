@@ -75,9 +75,10 @@ only want to know "could a run start here", read the exit status and ignore the 
 | `notes[]` | `{ticket_id, attempt_id, generation, summary, criterion_quote, evidence_citation}` for each unread note. |
 | `waiting_on_you[]` | Each waiting ticket: `{ticket_id, remedy_owner, ask, reason, steps[], check, check_timeout_secs, origin, proposal}`. |
 | `attempts[]` | `{pane_id, ticket_id, attempt_id, ticket_phase, superseded, abandoned, abandoned_reason}` — see below. |
+| `stranded[]` | `{ticket_id, phase, attempt_id, evidence}` — tickets the board says are under way that no seat holds. See below. |
 | `run_location` | `{state, session, sessions[], attach_command}` — where the run is. See below. |
 | `schedulers[]` | `{id, session_name, zellij_pid, started_at, stamped_at, stop_command}`, one per scheduler stamping this board. See below. |
-| `token_usage` | `{tickets[], tickets_joined, tokens_in, tokens_out, not_yet_joined[]}`. |
+| `token_usage` | `{tickets[], tickets_joined, tokens_in, tokens_out, not_yet_joined[], lost_with_the_seat[]}`. |
 | `run_summary` | The latest run's counts, or `null` when there is no board. |
 | `config` | `{max_threads, session_timeout_secs, phase_timeouts, client, model}` — see below. |
 
@@ -220,6 +221,27 @@ run, treat `abandoned` as "this one is not a reason to hold off".
 
 Nothing clears these on its own. `lisa release-seats` prints which seats it believes are free, and
 why, and removes them only when the operator adds `--release`.
+
+### The other side of that: `stranded`
+
+`attempts` is a marker that can outlive the attempt it names. `stranded` is the opposite — a ticket
+that outlived its marker. An entry is a ticket whose `phase` is `implement` or `review`, which both
+mean *an agent has this*, where nothing in `attempts` names it. Nothing is working it.
+
+This state is reachable honestly. When the scheduler ends an attempt by fencing its pane, it
+withdraws that pane's lease marker in the same breath, and the ticket keeps whatever phase its agent
+had already reached. So the board goes on reporting work that stopped, and until this field existed
+there was nothing an operator could read about it.
+
+- `phase` is `implement` or `review`, spelled as the board spells it.
+- `attempt_id` is the last attempt the ledger names for this ticket, or `null` when it names none.
+- `evidence` is the ledger's last word about that ticket in one sentence — the attempt lost its
+  seat and why, or it failed, or it timed out, or it was launched and nothing recorded its end, or
+  the ledger has no record of it at all. That last case is history: from schema 11 on, every
+  launched attempt writes an `attempt-launch` row before its agent starts.
+
+`stranded` describes tickets, not panes, so it does not overlap `attempts`: a ticket appears in one
+or the other, never both. `lisa reset-ticket <id> --apply` hands one back to the board.
 
 Do not read `.lisa/signals/` yourself — and do not delete anything in it either. Those files are
 single-consumer and the plugin deletes them as it reads them; a second reader loses that race by
