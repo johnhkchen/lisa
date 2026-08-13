@@ -62,6 +62,54 @@ pub(crate) const REGENERATION_WINDOW_SECS: u64 = 600;
 /// dropped is charged to the budget rather than blocking every later one.
 pub(crate) const ADOPTION_TIMEOUT_SECS: u64 = 10;
 
+/// Whether this Zellij answers `open_terminal` by writing the created pane's id
+/// back to the plugin.
+///
+/// It matters because this plugin is built against the zellij-tile **0.43** SDK,
+/// whose `open_terminal` writes the command and reads nothing. Zellij 0.44 added
+/// a reply (`OpenTerminalResponse`, the new pane's id) and writes it to the
+/// plugin's stdin regardless. Nobody reads it, so the next event the host
+/// delivers decodes those leftover bytes instead of itself:
+///
+/// ```text
+/// panicked at crates/lisa-plugin/src/lib.rs: called `Result::unwrap()` on an `Err` value:
+/// DecodeError { description: "invalid wire type: LengthDelimited (expected Varint)",
+///               stack: [("Event", "name")] }
+/// ```
+///
+/// Zellij logs *"Failed to apply event to plugin"* and carries on, so the plugin
+/// survives — minus one event. Measured against 0.44.3: when that event was the
+/// poll `Timer`, the scheduler stopped ticking for the rest of the run while the
+/// dashboard went on rendering a board that looked healthy. Heartbeats piled up
+/// unconsumed in `.lisa/signals/` and nothing anywhere said why.
+///
+/// So the reply is drained on the versions that send one, and not read on the
+/// versions that do not — where a read would be the same bug in reverse.
+pub(crate) fn open_terminal_replies(zellij_version: &str) -> bool {
+    let Some((major, minor)) = parse_version(zellij_version) else {
+        // An unreadable version is treated as one that does not reply: leaving
+        // a stray object costs one event, and reading one that was never
+        // written could cost every event after it.
+        return false;
+    };
+    (major, minor) >= (0, 44)
+}
+
+/// Parse the leading `major.minor` out of a Zellij version string, which arrives
+/// as `0.44.3` and has historically also been seen as `zellij 0.44.3` and
+/// `v0.44.3`.
+fn parse_version(raw: &str) -> Option<(u32, u32)> {
+    let token = raw
+        .split_whitespace()
+        .last()?
+        .trim_start_matches(['v', 'V'])
+        .trim();
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// What the layout declared against what the manifest showed.
 ///
 /// The default — nothing declared, nothing seen — is the state before the first
@@ -326,6 +374,22 @@ mod tests {
             now += REGENERATION_WINDOW_SECS + 1;
         }
         assert!(!budget.has_given_up());
+    }
+
+    #[test]
+    fn only_the_zellij_that_answers_open_terminal_has_its_answer_read() {
+        assert!(open_terminal_replies("0.44.3"));
+        assert!(open_terminal_replies("0.45.0"));
+        assert!(open_terminal_replies("1.0.0"));
+        assert!(open_terminal_replies("zellij 0.44.0"));
+        assert!(open_terminal_replies("v0.44.1"));
+        // 0.43 writes no reply; reading one would consume the next event.
+        assert!(!open_terminal_replies("0.43.1"));
+        assert!(!open_terminal_replies("0.40.1"));
+        // An unreadable version is treated as one that does not reply.
+        assert!(!open_terminal_replies(""));
+        assert!(!open_terminal_replies("unknown"));
+        assert!(!open_terminal_replies("0"));
     }
 
     #[test]

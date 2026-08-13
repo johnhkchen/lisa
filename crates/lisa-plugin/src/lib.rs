@@ -1158,6 +1158,12 @@ pub struct State {
     /// the state of every directly constructed test that does not want it.
     heal_root: PathBuf,
 
+    /// Whether this Zellij answers `open_terminal` with the new pane's id, which
+    /// has to be read off the plugin's stdin or it is decoded as the next event.
+    /// Resolved once from `get_zellij_version()`; `None` until the first pane is
+    /// asked for. See [`heal::open_terminal_replies`].
+    open_terminal_replies: Option<bool>,
+
     /// What healing asked Zellij to do, in order. Native tests observe the
     /// requests instead of invoking plugin host calls, the same way
     /// [`close_fenced_pane`] is observed through its state transition.
@@ -4610,14 +4616,44 @@ impl State {
 
     /// Ask Zellij for a terminal pane at the project root.
     ///
-    /// The plugin already holds every permission this needs — it asks for
-    /// `ChangeApplicationState` at load, and has been renaming panes with it
-    /// since the first version. It has simply never made one.
+    /// Two things had to be added for this one call. `OpenTerminalsOrPlugins` —
+    /// renaming and closing panes need only `ChangeApplicationState`, which is
+    /// why the plugin had never asked for it — and the drain below.
     fn open_regenerated_pane(&mut self) {
         #[cfg(not(test))]
-        open_terminal(&self.project_root);
+        {
+            // Resolved *before* the command and never after. `get_zellij_version`
+            // reads its own answer off the same one-line stdin channel, so asking
+            // it afterwards reads the pane id as the version and leaves the
+            // version behind to be decoded as the next event — the bug below,
+            // moved one step along and no less fatal.
+            let reply_to_drain = self.open_terminal_replies();
+            open_terminal(&self.project_root);
+            // 0.44+ writes the new pane's id back to the plugin and the 0.43 SDK
+            // this is built against never reads it. Left there, it is decoded as
+            // the next event and takes that event with it — see
+            // [`heal::open_terminal_replies`], which is also why this is version
+            // -gated rather than drained unconditionally.
+            if reply_to_drain {
+                let _ = bytes_from_stdin();
+            }
+        }
         #[cfg(test)]
         self.heal_calls.push(HealCall::OpenedPane);
+    }
+
+    /// Whether the running Zellij answers `open_terminal`. Resolved once, from
+    /// the same `get_zellij_version()` the stack promotion is gated on.
+    #[cfg_attr(test, allow(dead_code))]
+    fn open_terminal_replies(&mut self) -> bool {
+        match self.open_terminal_replies {
+            Some(replies) => replies,
+            None => {
+                let replies = heal::open_terminal_replies(&get_zellij_version());
+                self.open_terminal_replies = Some(replies);
+                replies
+            }
+        }
     }
 
     /// Restate the agent stack, in layout order, with `members` in it.
@@ -11567,11 +11603,19 @@ impl ZellijPlugin for State {
 
         // Request permissions needed to write commands to agent terminal panes
         // and to invoke the on-notify hook on the host (RunCommands).
+        //
+        // `OpenTerminalsOrPlugins` is what lets the loop put back a coding pane
+        // it lost. Measured against Zellij 0.44.3: without it `open_terminal`
+        // is dropped by the server silently — no pane, no error, and the only
+        // thing that says so is the regeneration budget running out. Renaming
+        // and closing panes need only `ChangeApplicationState`, which is why
+        // this one had never been asked for.
         request_permission(&[
             PermissionType::WriteToStdin,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadApplicationState,
             PermissionType::RunCommands,
+            PermissionType::OpenTerminalsOrPlugins,
         ]);
 
         // Initial DAG build with startup diagnostics

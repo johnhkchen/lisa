@@ -600,6 +600,7 @@ const PLUGIN_PERMISSIONS: &[&str] = &[
     "ChangeApplicationState",
     "ReadApplicationState",
     "RunCommands",
+    "OpenTerminalsOrPlugins",
 ];
 
 /// Pre-grant the lisa plugin's permissions in Zellij's `permissions.kdl`.
@@ -951,6 +952,46 @@ mod tests {
                 "missing permission {permission}"
             );
         }
+    }
+
+    /// The pre-granted set is the plugin's own `request_permission` list, and
+    /// nothing checked that until it was wrong.
+    ///
+    /// A permission the plugin asks for and this list omits does not fail
+    /// loudly: Zellij shows a prompt inside the plugin pane, the pane renders
+    /// blank, and the loop waits forever for a keypress nobody knows to make.
+    /// Measured against Zellij 0.44.3 while adding `OpenTerminalsOrPlugins` —
+    /// the whole board simply never scheduled, and the only evidence was an
+    /// empty pane.
+    #[test]
+    fn the_pre_granted_permissions_are_the_ones_the_plugin_asks_for() {
+        let plugin_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lisa-plugin/src/lib.rs"
+        ));
+        let call = plugin_source
+            .split_once("request_permission(&[")
+            .expect("the plugin still requests its permissions in one call")
+            .1
+            .split_once("]);")
+            .expect("the request_permission call is still closed")
+            .0;
+
+        let requested: Vec<&str> = call
+            .split(',')
+            .filter_map(|entry| entry.trim().strip_prefix("PermissionType::"))
+            .collect();
+
+        assert!(!requested.is_empty(), "no permissions parsed from: {call}");
+        let mut requested_sorted = requested.clone();
+        requested_sorted.sort_unstable();
+        let mut granted_sorted = PLUGIN_PERMISSIONS.to_vec();
+        granted_sorted.sort_unstable();
+        assert_eq!(
+            requested_sorted, granted_sorted,
+            "the plugin asks for {requested:?} but the pre-grant writes {PLUGIN_PERMISSIONS:?}; \
+             Zellij prompts for the difference and the loop hangs on a blank pane"
+        );
     }
 
     fn mock_found(name: &'static str, version: &str) -> DependencyCheck {
