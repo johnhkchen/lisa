@@ -547,6 +547,38 @@ so and changes nothing: press `r` in the Lisa pane instead, where the scheduler
 can release the seat in the same breath. If the run holding the board is one you
 can't see, the refusal names it and `lisa schedulers` ends it.
 
+### `lisa heal-panes`
+
+Ask a running loop to put back a coding pane it lost.
+
+`lisa loop` lays out twice as many coding panes as it runs tickets, so a pane
+finishing up never blocks a new ticket from starting. Those panes are made once,
+at launch. A pane that dies afterwards — its shell exited, its terminal crashed,
+Lisa closed it on an agent that went silent — used to be gone for the rest of the
+session, and the run carried on at less concurrency than it was asked for with
+every screen still reading healthy. On one board that was four panes down to two.
+
+The loop watches for this on its own now: it counts its coding panes whenever
+Zellij says the panes changed, puts back what is missing, and says so in its own
+title (`myproject · 3/4 panes`). This command is the door for whoever notices
+first — a monitoring script, a person reading the tab.
+
+```bash
+lisa heal-panes            # ask, and read the answer
+lisa heal-panes --json     # the same answer for another program
+```
+
+It creates nothing. It leaves the ask in the project and the loop decides: the
+plugin runs inside the Zellij server and is the only thing that can put a pane
+back where the layout wanted it. You get one of three answers — **healed**,
+**already fine**, or a **refusal** that says what to do instead. If nothing
+answers at all, that is reported as nothing answering, which means something
+different: no loop is running here, or its dashboard has stopped ticking.
+
+Regeneration is bounded. Three panes in ten minutes and the loop stops asking,
+says so once, and carries on with the panes it has — a pane that dies the instant
+it is made must not become a loop. Restarting the run is the way back.
+
 ### `lisa schedulers`
 
 Show every run holding this board, and stop one that outlived its pane.
