@@ -46,7 +46,9 @@ lisa schedulers             # every run holding this board
 ```
 
 Both work from anywhere that can reach the checkout, which is the point: a phone
-over SSH can read a board being worked on a Codespace.
+over SSH can read a board being worked on a Codespace. `lisa status --json`
+carries `run_location`, so a program reading a headless board learns the session
+holding it without anyone having to guess a name.
 
 **Nothing else.** In particular:
 
