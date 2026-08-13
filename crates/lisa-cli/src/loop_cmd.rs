@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 
@@ -6,6 +7,78 @@ use crate::config::ResolvedConfig;
 use crate::templates::PLUGIN_WASM;
 use lisa_core::client::AgentClient;
 use lisa_core::completion::CompletionSeal;
+
+/// How a loop was asked to run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoopRequest {
+    /// Print what a run would do and start nothing.
+    pub dry_run: bool,
+    /// Run where there is no terminal to run in. Lisa opens one of its own,
+    /// nobody watches it, and the dashboard has no audience — see
+    /// [`crate::headless`].
+    pub headless: bool,
+}
+
+/// Where the Zellij client gets the terminal it will not start without.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// The caller's own terminal, exactly as every run has always worked.
+    Inherited,
+    /// One Lisa opens, drains, and discards.
+    OwnedPty,
+}
+
+/// What an operator is told when they start a run from somewhere with no
+/// terminal and have not asked for a headless one.
+///
+/// This is the message that replaces a measured failure — `could not enable
+/// raw mode: Os { code: 6, message: "Device not configured" }`, followed by
+/// `zellij exited with status: exit status: 101` — which said nothing about
+/// what to do next.
+fn no_terminal_refusal() -> String {
+    "Lisa found no terminal to start this run in, and Zellij will not start without one.\n\n  \
+     Run it without one instead:  lisa loop --headless\n\n\
+     A headless run opens a terminal of its own that nobody is looking at, so the agents still \
+     get the panes they need. What you give up is the dashboard: watch the board with `lisa \
+     status`, or `lisa status --json` from a program, and end the run with `zellij kill-session \
+     <name>` or `lisa schedulers --stop <id>`."
+        .to_string()
+}
+
+/// Decide where the terminal comes from, and refuse rather than let Zellij
+/// fail obscurely.
+///
+/// A headless run is asked for and never inferred: the pane-per-agent
+/// arrangement with a dashboard beside it is the good one, and it stays the
+/// default everywhere a terminal exists.
+fn resolve_launch(headless: bool, has_terminal: bool) -> Result<Launch, String> {
+    if headless {
+        Ok(Launch::OwnedPty)
+    } else if has_terminal {
+        Ok(Launch::Inherited)
+    } else {
+        Err(no_terminal_refusal())
+    }
+}
+
+/// What a headless run says in place of the dashboard it is not drawing.
+fn headless_announcement(session: Option<&str>) -> String {
+    let watch = match session {
+        Some(name) => format!(
+            "  Watch it:  lisa status  (or `lisa status --json` from a program)\n  \
+             Look at it, if you ever get a terminal:  zellij attach {name}\n  \
+             End it:    zellij kill-session {name}"
+        ),
+        None => "  Watch it:  lisa status  (or `lisa status --json` from a program)\n  \
+                 End it:    lisa schedulers --stop <id>"
+            .to_string(),
+    };
+    format!(
+        "Headless: Lisa opened a terminal of its own, and no dashboard is being drawn.\n\
+         The agents still run in Zellij panes and their hooks write the same signals.\n{watch}\n\
+         Ctrl-C stops watching; the run stays on the board until its session ends."
+    )
+}
 
 /// Providers that may be scheduled in this loop: the loop default plus every
 /// valid per-ticket route. Preflight must cover all of them, not just the default.
@@ -196,7 +269,7 @@ fn embedded_wasm_error() -> String {
 ///
 /// In dry-run mode, scans tickets, builds the DAG, and prints what would happen
 /// without writing files or launching zellij.
-pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(), String> {
+pub fn run_loop(root: &Path, config: &ResolvedConfig, request: LoopRequest) -> Result<(), String> {
     // Validate project structure first (cheap, no external deps)
     if !root.join(".lisa.toml").exists() {
         return Err("No .lisa.toml found. Run `lisa init` first.".to_string());
@@ -210,7 +283,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
 
     validate_project_protocol(config)?;
 
-    if dry_run {
+    if request.dry_run {
         return run_dry(root, config);
     }
 
@@ -345,6 +418,12 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     std::fs::write(&layout_path, &layout)
         .map_err(|e| format!("Failed to write layout to {}: {}", layout_path.display(), e))?;
 
+    // Where the terminal comes from. Last of the refusals, because it is the
+    // only one about the launch itself: everything a project can be wrong
+    // about has already been said by here, and a caller with no terminal hears
+    // this instead of Zellij's raw-mode error two steps later.
+    let launch = resolve_launch(request.headless, std::io::stdin().is_terminal())?;
+
     println!("Lisa loop starting...");
     println!("  WASM plugin: {}", wasm_path.display());
     println!("  Layout: {}", layout_path.display());
@@ -360,6 +439,10 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     if let Some(caps) = format_provider_caps(config) {
         println!("  Provider caps: {}", caps);
     }
+    if launch == Launch::OwnedPty {
+        println!();
+        println!("{}", headless_announcement(naming.name()));
+    }
     println!();
 
     // The one thing an agent must not inherit is the identity of the session
@@ -373,22 +456,49 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     }
 
     crate::run_summary::record_run_baseline(root)?;
-    let status = run_zellij(
+    let exit = run_zellij(
         &zellij_runtime.path,
         root,
         &layout_path,
         naming.name(),
         &inherited,
+        launch,
     )?;
 
     let tickets = lisa_core::ticket::scan_tickets(root.join(&config.ticket_dir))
         .map_err(|error| format!("Failed to scan tickets after Lisa loop: {error}"))?;
     crate::run_summary::print_run_summary(root, &tickets, Path::new(&config.work_dir))?;
 
-    if status.success() {
+    if exit.status.success() || exit.stopped_on_request {
+        if exit.stopped_on_request {
+            println!();
+            println!(
+                "Stopped watching. The run is still on the board until its session ends{}",
+                match naming.name() {
+                    Some(name) => format!(" — end it with `zellij kill-session {name}`."),
+                    None => ". `lisa schedulers` lists it.".to_string(),
+                }
+            );
+        }
         Ok(())
     } else {
-        Err(format!("zellij exited with status: {status}"))
+        Err(zellij_failure(&exit))
+    }
+}
+
+/// A Zellij that stopped badly, said as much of itself as it managed to print.
+///
+/// In a run with a window the operator watched it happen. In a headless one
+/// nobody did, so the first thing the client wrote into the terminal Lisa
+/// opened is the only account there is.
+fn zellij_failure(exit: &ZellijExit) -> String {
+    match &exit.transcript_head {
+        Some(text) => format!(
+            "zellij exited with status: {}\n\nWhat it printed into the terminal Lisa opened for \
+             it, before it stopped:\n{text}",
+            exit.status
+        ),
+        None => format!("zellij exited with status: {}", exit.status),
     }
 }
 
@@ -682,22 +792,51 @@ fn generate_layout(
     )
 }
 
+/// How the Zellij client ended, and what it had to say for itself.
+struct ZellijExit {
+    status: std::process::ExitStatus,
+    /// True when Lisa asked it to stop — Ctrl-C, a `kill`, or a dropped SSH
+    /// connection on a headless run. Not a failure: closing the window has
+    /// always stopped the client and left the run.
+    stopped_on_request: bool,
+    /// The first of what a headless client printed, kept so a client that dies
+    /// at startup can still explain itself to a caller who saw nothing.
+    transcript_head: Option<String>,
+}
+
 fn run_zellij(
     zellij_path: &Path,
     root: &Path,
     layout_path: &Path,
     session_name: Option<&str>,
     inherited_markers: &[String],
-) -> Result<std::process::ExitStatus, String> {
-    zellij_command(
+    launch: Launch,
+) -> Result<ZellijExit, String> {
+    let mut command = zellij_command(
         zellij_path,
         root,
         layout_path,
         session_name,
         inherited_markers,
-    )
-    .status()
-    .map_err(|error| format!("Failed to run Zellij at {}: {error}", zellij_path.display()))
+    );
+    match launch {
+        Launch::Inherited => command
+            .status()
+            .map(|status| ZellijExit {
+                status,
+                stopped_on_request: false,
+                transcript_head: None,
+            })
+            .map_err(|error| format!("Failed to run Zellij at {}: {error}", zellij_path.display())),
+        Launch::OwnedPty => {
+            let run = crate::headless::run_on_pty(command)?;
+            Ok(ZellijExit {
+                status: run.status,
+                stopped_on_request: run.interrupted,
+                transcript_head: run.transcript_head(),
+            })
+        }
+    }
 }
 
 fn zellij_command(
@@ -775,6 +914,87 @@ mod tests {
         assert!(
             !unnamed.contains("session_name"),
             "a run Zellij named itself records no session rather than a wrong one"
+        );
+    }
+
+    /// A run on a host with no terminal is asked for, never guessed at. The
+    /// pane-per-agent arrangement with a dashboard beside it is the good one,
+    /// and every machine that can have it keeps it.
+    #[test]
+    fn headless_is_asked_for_and_a_terminal_is_used_wherever_there_is_one() {
+        assert_eq!(resolve_launch(false, true), Ok(Launch::Inherited));
+        assert_eq!(resolve_launch(true, true), Ok(Launch::OwnedPty));
+        assert_eq!(resolve_launch(true, false), Ok(Launch::OwnedPty));
+    }
+
+    /// The measured failure this ticket is named for:
+    ///
+    /// ```text
+    /// could not enable raw mode: Os { code: 6, message: "Device not configured" }
+    /// Error: zellij exited with status: exit status: 101
+    /// ```
+    ///
+    /// A caller with no terminal now hears it from Lisa instead, with the way
+    /// through in the sentence.
+    #[test]
+    fn a_caller_with_no_terminal_is_told_the_word_that_starts_a_run_anyway() {
+        let refusal = resolve_launch(false, false).unwrap_err();
+        assert!(refusal.contains("no terminal"), "{refusal}");
+        assert!(refusal.contains("lisa loop --headless"), "{refusal}");
+        assert!(
+            refusal.contains("lisa status"),
+            "it must name what replaces the dashboard: {refusal}"
+        );
+        assert!(
+            refusal.contains("zellij kill-session"),
+            "and how a run with nobody watching it ends: {refusal}"
+        );
+    }
+
+    /// The dashboard is a person's view and a headless host has no person. Say
+    /// what is gone and what to read instead, rather than leaving the operator
+    /// to notice the silence.
+    #[test]
+    fn a_headless_run_says_what_it_is_not_drawing_and_what_to_read_instead() {
+        let named = headless_announcement(Some("steer"));
+        assert!(named.contains("no dashboard is being drawn"), "{named}");
+        assert!(named.contains("lisa status --json"), "{named}");
+        assert!(named.contains("zellij attach steer"), "{named}");
+        assert!(named.contains("zellij kill-session steer"), "{named}");
+        assert!(
+            named.contains("hooks write the same signals"),
+            "a pane is still a Zellij pane: {named}"
+        );
+
+        // A session Zellij named itself has no name Lisa can print, so the
+        // unnamed form must not invent one.
+        let unnamed = headless_announcement(None);
+        assert!(!unnamed.contains("zellij attach"), "{unnamed}");
+        assert!(unnamed.contains("lisa schedulers --stop"), "{unnamed}");
+    }
+
+    /// Nobody is looking at a headless run, so a client that dies at startup
+    /// has to carry its own account of it out.
+    #[test]
+    fn a_headless_client_that_dies_reports_what_it_printed() {
+        let exit = ZellijExit {
+            status: std::process::Command::new("/usr/bin/false")
+                .status()
+                .expect("a `false` to exit"),
+            stopped_on_request: false,
+            transcript_head: Some("  could not enable raw mode".to_string()),
+        };
+        let error = zellij_failure(&exit);
+        assert!(error.contains("zellij exited with status"), "{error}");
+        assert!(error.contains("could not enable raw mode"), "{error}");
+
+        let silent = ZellijExit {
+            transcript_head: None,
+            ..exit
+        };
+        assert_eq!(
+            zellij_failure(&silent),
+            format!("zellij exited with status: {}", silent.status)
         );
     }
 
@@ -1279,7 +1499,7 @@ mod tests {
     fn test_run_loop_refuses_uninitialised_project() {
         let dir = tempfile::tempdir().unwrap();
         let config = default_config();
-        let result = run_loop(dir.path(), &config, false);
+        let result = run_loop(dir.path(), &config, LoopRequest::default());
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.contains(".lisa.toml"), "error was: {error}");
@@ -1291,7 +1511,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         let config = default_config();
-        let result = run_loop(dir.path(), &config, false);
+        let result = run_loop(dir.path(), &config, LoopRequest::default());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("tickets"));
     }
@@ -1300,7 +1520,14 @@ mod tests {
     fn test_dry_run_refuses_uninitialised_project() {
         let dir = tempfile::tempdir().unwrap();
         let config = default_config();
-        let result = run_loop(dir.path(), &config, true);
+        let result = run_loop(
+            dir.path(),
+            &config,
+            LoopRequest {
+                dry_run: true,
+                ..LoopRequest::default()
+            },
+        );
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.contains(".lisa.toml"), "error was: {error}");
@@ -1318,7 +1545,15 @@ mod tests {
         assert!(!dir.path().join("CLAUDE.md").exists());
 
         let config = default_config();
-        assert!(run_loop(dir.path(), &config, true).is_ok());
+        assert!(run_loop(
+            dir.path(),
+            &config,
+            LoopRequest {
+                dry_run: true,
+                ..LoopRequest::default()
+            },
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1327,7 +1562,14 @@ mod tests {
         std::fs::write(dir.path().join(".lisa.toml"), "").unwrap();
         std::fs::create_dir_all(dir.path().join("docs/active/tickets")).unwrap();
         let config = default_config();
-        let result = run_loop(dir.path(), &config, true);
+        let result = run_loop(
+            dir.path(),
+            &config,
+            LoopRequest {
+                dry_run: true,
+                ..LoopRequest::default()
+            },
+        );
         assert!(result.is_ok());
     }
 
@@ -1341,7 +1583,15 @@ mod tests {
             ..default_config()
         };
 
-        let error = run_loop(dir.path(), &config, true).unwrap_err();
+        let error = run_loop(
+            dir.path(),
+            &config,
+            LoopRequest {
+                dry_run: true,
+                ..LoopRequest::default()
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("0.4.0-rc.5"));
         assert!(error.contains(crate::config::LISA_VERSION));
         assert!(error.contains("lisa init"));
@@ -1392,7 +1642,14 @@ Child ticket.
         .unwrap();
 
         let config = default_config();
-        let result = run_loop(dir.path(), &config, true);
+        let result = run_loop(
+            dir.path(),
+            &config,
+            LoopRequest {
+                dry_run: true,
+                ..LoopRequest::default()
+            },
+        );
         assert!(result.is_ok());
     }
 }

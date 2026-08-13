@@ -86,6 +86,15 @@ fn run_with_zellij_version_and_path_and_home(
 
     Command::new(env!("CARGO_BIN_EXE_lisa"))
         .arg(command)
+        // A test process has no controlling terminal, so a loop that gets all
+        // the way to its launch has to be the run that needs none. Every
+        // refusal these fixtures are about is raised before that point, so the
+        // flag changes nothing they measure.
+        .args(if command == "loop" {
+            &["--headless"][..]
+        } else {
+            &[][..]
+        })
         .args(["--path", root.to_str().unwrap()])
         .env("PATH", path)
         .env("HOME", home)
@@ -319,6 +328,8 @@ fn loop_refuses_a_board_whose_session_is_still_running() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
         .arg("loop")
+        // No controlling terminal in a test process; see the helper above.
+        .arg("--headless")
         .args(["--path", root.to_str().unwrap()])
         .env("PATH", &bin)
         .env("HOME", &home)
@@ -388,6 +399,8 @@ fn loop_starts_past_an_exited_session_of_the_same_name() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
         .arg("loop")
+        // No controlling terminal in a test process; see the helper above.
+        .arg("--headless")
         .args(["--path", root.to_str().unwrap()])
         .env("PATH", &bin)
         .env("HOME", &home)

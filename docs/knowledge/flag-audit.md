@@ -68,6 +68,7 @@ rows with the live command tree and config catalog.
 | `flag:lisa/file-ticket:--story` | Name the story the new ticket belongs to | working default | Without the flag, Lisa reads `story:` from the draft; a draft that names it too must name the same one. | `the_draft_may_name_the_story_on_its_own` | — |
 | `flag:lisa/loop:--client` | Override the detected coding agent | working default | Without the flag, explicit config wins, then Lisa detects installed agents and prefers Claude when both are present. | `test_resolve_client_from_detected_availability` | — |
 | `flag:lisa/loop:--dry-run` | Preview a run | working default | Default is off, so Lisa starts the run unless a preview is requested. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/loop:--headless` | Run where there is no terminal | working default | Default is off: every machine with a terminal keeps the pane-per-agent run with a dashboard beside it, and a caller with no terminal is told this word by name rather than left to guess it. | `headless_is_asked_for_and_a_terminal_is_used_wherever_there_is_one` | — |
 | `flag:lisa/loop:--max-threads` | Override the concurrent-agent limit | working default | Without the flag, Lisa uses `.lisa.toml` and then the default of `2`. | `test_resolve_cli_overrides_default` | — |
 | `flag:lisa/loop:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 

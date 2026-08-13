@@ -12,6 +12,7 @@ mod currency;
 mod detect;
 mod doctor;
 mod file_ticket;
+mod headless;
 mod hooks_guide;
 mod init;
 mod json_guide;
@@ -487,6 +488,10 @@ enum Commands {
         /// Show what would be done without launching zellij
         #[arg(long)]
         dry_run: bool,
+
+        /// Run on a host with no terminal: Lisa opens one, and draws no dashboard
+        #[arg(long)]
+        headless: bool,
     },
 }
 
@@ -980,6 +985,7 @@ fn main() {
             max_threads,
             client,
             dry_run,
+            headless,
         } => {
             let path = resolve_path(&path);
             require_lisa_project(&path);
@@ -1003,7 +1009,8 @@ fn main() {
                 eprintln!("Warning: {}", w);
             }
             let resolved = config::resolve_config(&validation.config, max_threads, cli_client);
-            if let Err(e) = loop_cmd::run_loop(&path, &resolved, dry_run) {
+            let request = loop_cmd::LoopRequest { dry_run, headless };
+            if let Err(e) = loop_cmd::run_loop(&path, &resolved, request) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

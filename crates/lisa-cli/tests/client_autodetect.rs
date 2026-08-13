@@ -208,11 +208,14 @@ fn client_flag_beats_codex_only_detection() {
     assert!(!stdout.contains(CODEX_ONLY_ANNOUNCEMENT));
 }
 
+/// `--headless` because a test process has no controlling terminal, and a
+/// loop that reaches its launch there must be asked for the run that needs
+/// none. What is under test is the announcement, which is the same either way.
 #[test]
 fn loop_start_announces_the_detected_client() {
     let output = run_fixture(
         "loop",
-        &[],
+        &["--headless"],
         InstalledAgents {
             claude: false,
             codex: true,

@@ -251,6 +251,7 @@ Options:
       --max-threads <MAX_THREADS>  Maximum concurrent Claude sessions (overrides .lisa.toml)
       --client <CLIENT>            Agent client to drive (claude | codex); overrides .lisa.toml [agent].client
       --dry-run                    Show what would be done without launching zellij
+      --headless                   Run on a host with no terminal: Lisa opens one, and draws no dashboard
   -h, --help                       Print help
 
 Example: lisa loop --path ./my-project --max-threads 3
