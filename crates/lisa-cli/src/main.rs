@@ -13,6 +13,7 @@ mod detect;
 mod doctor;
 mod file_ticket;
 mod headless;
+mod heal_panes;
 mod hooks_guide;
 mod init;
 mod json_guide;
@@ -235,7 +236,7 @@ enum Commands {
     },
     /// Show every run holding this board, and stop one that outlived its pane.
     #[command(
-        display_order = 12,
+        display_order = 13,
         after_help = "Closing a loop's pane stops the client, not the run: the part that \
                       schedules lives in the Zellij server, which keeps going. A bare run lists \
                       what is here and changes nothing.\n\nExamples:\n  lisa schedulers\n  lisa \
@@ -250,9 +251,38 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Ask a running loop to put back a coding pane it lost.
+    #[command(
+        display_order = 12,
+        after_help = "A pane that dies takes a seat with it, and until the loop notices, the run \
+                      is quietly working on fewer panes than its layout made. The loop watches \
+                      for this on its own; this is the door for whoever spots it first.\n\nThis \
+                      command creates nothing. It leaves the ask in the project and the running \
+                      loop decides — it is the only thing that can put a pane back where the \
+                      layout wanted it. You get one of three answers: healed, already fine, or a \
+                      refusal that says what to do instead.\n\nExamples:\n  lisa heal-panes\n  \
+                      lisa heal-panes --json"
+    )]
+    HealPanes {
+        /// Who is asking, for the loop's activity feed
+        #[arg(long, value_name = "NAME", default_value = "operator")]
+        asked_by: String,
+
+        /// Seconds to wait for the loop's answer
+        #[arg(long, value_name = "SECONDS")]
+        timeout_secs: Option<u64>,
+
+        /// Print one JSON document instead of prose, for another program to read
+        #[arg(long)]
+        json: bool,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     /// Put a new ticket on the board, from a draft you pipe in.
     #[command(
-        display_order = 13,
+        display_order = 14,
         after_help = "The draft comes in on stdin, frontmatter first. Lisa allocates the id, adds \
                       it to the story's ticket list, and refuses the whole thing if the ticket \
                       would not be one it can read.\n\nExample: lisa file-ticket --story S-065-01 \
@@ -749,6 +779,29 @@ fn main() {
             if let Err(e) = schedulers::run_schedulers(&path, stop.as_deref()) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::HealPanes {
+            asked_by,
+            timeout_secs,
+            json,
+            path,
+        } => {
+            let path = resolve_path(&path);
+            require_lisa_project(&path);
+            match heal_panes::run_heal_panes(&path, &asked_by, timeout_secs, json) {
+                Ok(outcome) => {
+                    // A refusal and a silence are both answers the caller asked
+                    // for and both mean the board is still short, so they leave
+                    // by the same door a script can branch on.
+                    if !outcome.is_satisfied() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Validate {
