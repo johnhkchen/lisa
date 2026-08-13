@@ -27543,11 +27543,13 @@ owned\n\
     }
 
     /// Every recorder leg in one table. `.alive` is the presence-only leg of the
-    /// heartbeat hook and records on its own. `.stopped` is the trap: Claude's Stop
-    /// hook fires at the end of every assistant turn, not at teardown, so it is
-    /// residency and never departure. `.shell-ready` and `.error` assert the
-    /// opposite claim and must never record — the field transcript shows a live
-    /// TUI executing the readiness probe on the scheduler's behalf.
+    /// heartbeat hook and records on its own. `.stopped` is the trap: Claude's
+    /// Stop hook fires at the end of every assistant turn, not at teardown, so
+    /// it is residency and never departure. `.error` asserts the opposite claim
+    /// — the provider is gone — and must never record. `.shell-ready` is here
+    /// for a different reason: it is the retired probe answer, and the row
+    /// proves it now reaches no consumer at all, so a file with that name can
+    /// no longer be evidence about anything.
     #[test]
     fn test_only_live_process_hooks_record_residency_and_only_for_known_panes() {
         use std::fs;
