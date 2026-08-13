@@ -75,6 +75,8 @@ only want to know "could a run start here", read the exit status and ignore the 
 | `notes[]` | `{ticket_id, attempt_id, generation, summary, criterion_quote, evidence_citation}` for each unread note. |
 | `waiting_on_you[]` | Each waiting ticket: `{ticket_id, remedy_owner, ask, reason, steps[], check, check_timeout_secs, origin, proposal}`. |
 | `attempts[]` | `{pane_id, ticket_id, attempt_id, ticket_phase, superseded, abandoned, abandoned_reason}` — see below. |
+| `run_location` | `{state, session, sessions[], attach_command}` — where the run is. See below. |
+| `schedulers[]` | `{id, session_name, zellij_pid, started_at, stamped_at, stop_command}`, one per scheduler stamping this board. See below. |
 | `token_usage` | `{tickets[], tickets_joined, tokens_in, tokens_out, not_yet_joined[]}`. |
 | `run_summary` | The latest run's counts, or `null` when there is no board. |
 | `config` | `{max_threads, session_timeout_secs, phase_timeouts, client, model}` — see below. |
@@ -109,6 +111,83 @@ attempt ledger, not here.
 Nothing about credentials crosses this boundary — no keys, no endpoints, no
 environment. The question this answers is what runs the board, not how it
 authenticates.
+
+### Where the run is: `run_location`
+
+`run_summary` says what a run *did*. `run_location` says where a run *is*, so a
+program that wants to look at a board — or wants to know whether one already has
+something beside it — does not have to inspect panes or guess a session name.
+
+```json
+"run_location": {
+  "state": "idle",
+  "session": "fascinating-drum",
+  "sessions": ["fascinating-drum"],
+  "attach_command": "zellij attach fascinating-drum"
+}
+```
+
+`state` is one of four answers, and the last two are not the same:
+
+- `"working"` — a scheduler is on this board and something moved in Lisa's
+  signal directory recently. A ticket is being worked.
+- `"idle"` — a scheduler is on this board and nothing is moving. **A run that has
+  finished every ticket is `idle`, not `none`.** It is still resident, it still
+  holds the board, and it is still the session to attach to. Treating a finished
+  run as an absent one is what put two schedulers on one board here on
+  2026-08-12.
+- `"none"` — Lisa has no evidence of a scheduler. This is an answer, not
+  silence.
+- `"unknown"` — Lisa could not look: a clock it cannot read a date against, a
+  directory it cannot open. Not a verdict on anything.
+
+`session` is the session holding the board when exactly one does, and `null`
+otherwise — on an empty board, on a board with two runs (`sessions` lists both),
+and on a run Lisa knows is here but was never told the name of. That last case is
+why `state` and `session` are separate fields: **a run that cannot be placed and
+a board with no run are opposite answers**, and reading a null `session` as "no
+run" gets them backwards. Read `state` first.
+
+`sessions` is every session named by a scheduler here, sorted. `attach_command`
+is the exact command that opens `session`, or `null` when there is no single one
+to open.
+
+**What travels.** A session name does. It is what `zellij attach` takes, and it
+means the same thing typed on the far end of `gh codespace ssh` as it does on the
+machine that wrote it — which is the point, because the board may well be read
+from somewhere else. Everything in `run_location` is that kind of fact.
+
+**What does not.** `schedulers[].zellij_pid` is a process id on the machine that
+wrote it and means nothing anywhere else; feed it to `ps` or `lsof` on that host
+or ignore it. The same goes for anything you might reach for under `.lisa/` —
+paths and sockets are local.
+
+**Do not decide to start a run on this field alone.** `lisa loop` refuses a
+second scheduler on evidence `lisa status` does not have — among other things it
+asks Zellij what sessions are open, which a one-shot status command deliberately
+does not do. Run `lisa loop` and read its refusal; it names the session, how to
+look at it, and how to end it.
+
+### Who is running it: `schedulers`
+
+One entry per scheduler stamping this board, oldest run first. `run_location`
+above is the decision; this is what it was decided from.
+
+- `id` — Lisa's own name for that scheduler, unique on this board.
+- `session_name` — the Zellij session it runs in, or `null` when Lisa was never
+  told one.
+- `zellij_pid` — the Zellij *server* pid. Machine-local, as above, and not a way
+  to stop anything: killing it was measured not to work.
+- `started_at` / `stamped_at` — Unix seconds: when it started, and when it last
+  said it was here.
+- `stop_command` — the exact command that ends it, or `null` when Lisa cannot
+  name one honestly.
+
+The array is present even when it holds one entry, and **more than one entry is a
+fault, not a bigger board**: two schedulers split the signals the panes write
+between them and neither can tell a signal the other took from one that never
+arrived. An empty array on a board whose `run_location.state` is not `none` means
+a scheduler is here from a build that predates this registry.
 
 ### What `attempts` does and does not tell you
 

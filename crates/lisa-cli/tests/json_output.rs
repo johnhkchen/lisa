@@ -473,3 +473,205 @@ fn a_board_naming_nothing_still_answers_with_a_client_and_a_null_model() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `run_location` — where the run on this board is (S-066-01).
+//
+// The fixtures below write scheduler records by hand rather than starting a
+// Zellij session, which no test can do. That is exactly the shape the plugin
+// publishes into `.lisa/schedulers/`, and `lisa-core::schedulers` round-trips
+// it in its own unit tests; what these fixtures are for is the decision Lisa
+// makes on top of it.
+// ---------------------------------------------------------------------------
+
+fn seconds_since_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("this machine's clock is before 1970")
+        .as_secs()
+}
+
+/// Put a scheduler on this board, stamped now, in the session named.
+///
+/// `session` of `None` is a real case, not a defensive one: a run Lisa was
+/// never told the session name of is a run it knows is here and cannot place.
+fn scheduler_on(root: &Path, id: &str, session: Option<&str>) {
+    let now = seconds_since_epoch();
+    let dir = root.join(".lisa/schedulers");
+    fs::create_dir_all(&dir).unwrap();
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "scheduler_id": id,
+        "session_name": session,
+        "zellij_pid": 9450,
+        "started_at": now.saturating_sub(3600),
+        "stamped_at": now,
+        "poll_interval_secs": 5,
+    });
+    fs::write(
+        dir.join(format!("{id}.alive")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Age `.lisa/signals/` so nothing reads as having moved in it.
+///
+/// A board that has finished every ticket looks precisely like this: the
+/// scheduler is still stamping and the signal directory has been still for
+/// hours. `lisa init` creates the directory a moment before the test runs, so
+/// without this every fixture would read as freshly worked.
+fn quiet_signals(root: &Path) {
+    let status = Command::new("touch")
+        .arg("-t")
+        .arg("202001010000")
+        .arg(root.join(".lisa/signals"))
+        .status()
+        .expect("failed to run touch");
+    assert!(status.success(), "could not age the signal directory");
+}
+
+fn run_location(root: &Path) -> Value {
+    data(&lisa(root, &["status", "--json"]))["run_location"].clone()
+}
+
+/// The whole point of the field: a board with a run on it says which session
+/// holds it, and says it in the envelope rather than inside a refusal nobody
+/// asked for. `rail up` had to inspect panes for this; a phone had to guess.
+#[test]
+fn a_board_with_a_run_says_which_session_holds_it() {
+    let (_temp, root) = project();
+    scheduler_on(&root, "lisa-9c1f4b0a", Some("fascinating-drum"));
+
+    let location = run_location(&root);
+
+    assert_eq!(location["state"], "working", "{location}");
+    assert_eq!(location["session"], "fascinating-drum", "{location}");
+    assert_eq!(strings(&location["sessions"]), ["fascinating-drum"]);
+    assert_eq!(
+        location["attach_command"], "zellij attach fascinating-drum",
+        "the one command a phone over SSH needs: {location}"
+    );
+}
+
+/// Absent means absent. A board nobody is running says so, rather than leaving
+/// a reader to conclude it from silence — which is what every field in the
+/// envelope did before this one.
+#[test]
+fn a_board_with_no_run_says_none_rather_than_falling_silent() {
+    let (_temp, root) = project();
+
+    let location = run_location(&root);
+
+    assert_eq!(location["state"], "none", "{location}");
+    assert!(location["session"].is_null(), "{location}");
+    assert!(strings(&location["sessions"]).is_empty(), "{location}");
+    assert!(location["attach_command"].is_null(), "{location}");
+}
+
+/// The 2026-08-12 incident, asked of the envelope instead of the loop. A run
+/// that has finished every ticket is still resident, still holds the board, and
+/// is still the session an operator attaches to — so it is reported, and
+/// reported as `idle` rather than as work in flight. Reading it as absent is
+/// what put a second scheduler on this board.
+#[test]
+fn a_board_whose_run_has_finished_still_says_where_it_is() {
+    let (_temp, root) = project();
+    let tickets = root.join("docs/active/tickets");
+    for id in ["T-001", "T-002"] {
+        fs::write(
+            tickets.join(format!("{id}.md")),
+            format!("---\nid: {id}\ntitle: finished-thing\ntype: task\nstatus: done\npriority: high\nphase: done\n---\n\n## Acceptance Criteria\n\n- It works\n"),
+        )
+        .unwrap();
+    }
+    scheduler_on(&root, "lisa-9c1f4b0a", Some("fascinating-drum"));
+    quiet_signals(&root);
+
+    let data = data(&lisa(&root, &["status", "--json"]));
+    let location = &data["run_location"];
+
+    assert_eq!(
+        data["counts"]["done"], data["counts"]["total"],
+        "this fixture is only interesting on a drained board: {data}"
+    );
+    assert_ne!(
+        location["state"], "none",
+        "a finished run is not an absent one: {location}"
+    );
+    assert_eq!(
+        location["state"], "idle",
+        "a resident run with nothing moving is not work in flight: {location}"
+    );
+    assert_eq!(location["session"], "fascinating-drum", "{location}");
+    assert_eq!(
+        location["attach_command"], "zellij attach fascinating-drum",
+        "{location}"
+    );
+}
+
+/// The other half of "absent means absent": a run Lisa knows is here but was
+/// never told the session name of. Today both this and an empty board are
+/// silence, and they are opposite answers — one may be started on, one must
+/// not be.
+#[test]
+fn a_run_lisa_cannot_place_is_not_a_board_with_no_run() {
+    let (_temp, root) = project();
+    scheduler_on(&root, "scheduler-1f0ab3c4", None);
+    quiet_signals(&root);
+
+    let location = run_location(&root);
+
+    assert_eq!(
+        location["state"], "idle",
+        "a scheduler with no session name is still a scheduler: {location}"
+    );
+    assert!(
+        location["session"].is_null() && strings(&location["sessions"]).is_empty(),
+        "Lisa must not invent a session it was never told: {location}"
+    );
+    assert!(location["attach_command"].is_null(), "{location}");
+}
+
+/// Seven Zellij sessions have run on this desk at once, and two schedulers have
+/// run on one board. Naming either one as *the* run would send a caller to an
+/// arbitrary half of the problem, so `session` declines and `sessions` lists
+/// both.
+#[test]
+fn a_board_with_two_runs_names_both_and_picks_neither() {
+    let (_temp, root) = project();
+    scheduler_on(&root, "lisa-9c1f4b0a", Some("fascinating-drum"));
+    scheduler_on(&root, "lisa-2-77b10e5d", Some("blossoming-cymbal"));
+
+    let location = run_location(&root);
+
+    assert_eq!(
+        strings(&location["sessions"]),
+        ["blossoming-cymbal", "fascinating-drum"],
+        "sorted, so a consumer can compare two readings: {location}"
+    );
+    assert!(location["session"].is_null(), "{location}");
+    assert!(location["attach_command"].is_null(), "{location}");
+    assert_ne!(location["state"], "none", "{location}");
+}
+
+/// The field is documented where a consumer is told to look, with the same
+/// promise as everything else in the guide. A shape nobody can find is not an
+/// interface.
+#[test]
+fn the_guide_names_where_the_run_is() {
+    let guide = stdout_of(
+        &Command::new(env!("CARGO_BIN_EXE_lisa"))
+            .arg("json-guide")
+            .output()
+            .unwrap(),
+    );
+    for marker in [
+        "run_location",
+        "attach_command",
+        "\"idle\"",
+        "gh codespace ssh",
+    ] {
+        assert!(guide.contains(marker), "json-guide is missing {marker:?}");
+    }
+}
