@@ -608,7 +608,11 @@ fi
 /// when a scheduler was last here, which is a fact about this machine at this
 /// moment and never about the project, so it belongs in history even less than
 /// the signal files do.
-pub const LISA_GITIGNORE: &str = "signals/\nattempts/\nclaude/\ncodex/\nschedulers/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\n";
+///
+/// `pane-heal.*` is one `lisa heal-panes` ask and the scheduler's answer to it
+/// (T-067-01-03) — a question about this session's panes, asked and answered
+/// within seconds, and never anything a later reader of the project wants.
+pub const LISA_GITIGNORE: &str = "signals/\nattempts/\nclaude/\ncodex/\nschedulers/\nrun-events.jsonl\nrun-baseline.json\nscheduler.alive\npane-heal.request\npane-heal.answer\n";
 
 /// The on-notify hook SAMPLE, scaffolded as `.lisa/hooks/on-notify.sample`.
 /// User-owned attention/completion notification hook. It is deliberately a
@@ -1589,6 +1593,19 @@ mod tests {
         assert!(LISA_GITIGNORE.contains("run-baseline.json"));
         assert!(LISA_GITIGNORE.contains(lisa_core::liveness::SCHEDULER_ALIVE_NAME));
         assert!(LISA_GITIGNORE.contains(&format!("{}/", lisa_core::schedulers::SCHEDULER_DIR_NAME)));
+        // A pane-heal ask is transient session state, and an ask left untracked
+        // in a working tree is the kind of litter a ticket commit sweeps up by
+        // accident. Written as the file names the two sides actually use.
+        for path in [
+            lisa_core::pane_heal::PANE_HEAL_REQUEST_FILE,
+            lisa_core::pane_heal::PANE_HEAL_ANSWER_FILE,
+        ] {
+            let name = path.strip_prefix(".lisa/").expect("a path under .lisa/");
+            assert!(
+                LISA_GITIGNORE.contains(name),
+                "{name} is written into .lisa/ and is not ignored"
+            );
+        }
     }
 
     /// Lisa generates no agent context file for a project. That document states
