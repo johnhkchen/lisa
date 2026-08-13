@@ -11,6 +11,7 @@ mod config;
 mod currency;
 mod detect;
 mod doctor;
+mod file_ticket;
 mod hooks_guide;
 mod init;
 mod json_guide;
@@ -247,6 +248,28 @@ enum Commands {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
+    },
+    /// Put a new ticket on the board, from a draft you pipe in.
+    #[command(
+        display_order = 13,
+        after_help = "The draft comes in on stdin, frontmatter first. Lisa allocates the id, adds \
+                      it to the story's ticket list, and refuses the whole thing if the ticket \
+                      would not be one it can read.\n\nExample: lisa file-ticket --story S-065-01 \
+                      < draft.md\n\nFor another program to read: lisa file-ticket --json. What the \
+                      fields mean and which ones you can rely on: lisa json-guide"
+    )]
+    FileTicket {
+        /// Story the ticket belongs to; the draft may name it instead
+        #[arg(long)]
+        story: Option<String>,
+
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Print one JSON document instead of prose, for another program to read
+        #[arg(long)]
+        json: bool,
     },
     /// Settle a first-responder proposal for a waiting ticket.
     #[command(display_order = 8)]
@@ -851,6 +874,19 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::FileTicket { story, path, json } => {
+            let path = resolve_path(&path);
+            if json {
+                std::process::exit(match lisa_project_gate(&path) {
+                    Ok(()) => file_ticket::run_file_ticket(&path, story, true),
+                    Err(message) => {
+                        json_output::emit("file-ticket", json_output::Outcome::Failure(message))
+                    }
+                });
+            }
+            require_lisa_project(&path);
+            std::process::exit(file_ticket::run_file_ticket(&path, story, false));
         }
         Commands::Proposal { action } => {
             let (ticket_id, path, action) = match action {

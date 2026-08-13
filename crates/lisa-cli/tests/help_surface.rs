@@ -1,7 +1,7 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 20 of Lisa's own subcommands still resolve,
+//!   (a) all 21 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
 //!   (d) the five machinery-invoked plumbing commands stay outside the
@@ -15,7 +15,7 @@
 use std::process::{Command, Output};
 
 /// The commands an operator runs, foregrounded in `--help`.
-const OPERATOR_COMMANDS: [&str; 10] = [
+const OPERATOR_COMMANDS: [&str; 11] = [
     "init",
     "validate",
     "status",
@@ -26,6 +26,7 @@ const OPERATOR_COMMANDS: [&str; 10] = [
     "clean",
     "proposal",
     "loop",
+    "file-ticket",
 ];
 
 /// The five machinery-invoked commands: omitted from Clap's generated list but
@@ -69,6 +70,7 @@ Commands:
   release-seats  Free the seats a run left behind when it stopped without shutting down
   reset-ticket   Put a stalled ticket back on the board without editing it by hand
   schedulers     Show every run holding this board, and stop one that outlived its pane
+  file-ticket    Put a new ticket on the board, from a draft you pipe in
   help           Print this message or the help of the given subcommand(s)
 
 Options:
@@ -88,7 +90,7 @@ struct OperatorHelpSnapshot {
     expected: &'static str,
 }
 
-const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 10] = [
+const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 11] = [
     OperatorHelpSnapshot {
         command: "init",
         expected: r#"Set up a project to run with Lisa
@@ -254,10 +256,29 @@ Options:
 Example: lisa loop --path ./my-project --max-threads 3
 "#,
     },
+    OperatorHelpSnapshot {
+        command: "file-ticket",
+        expected: r#"Put a new ticket on the board, from a draft you pipe in
+
+Usage: lisa file-ticket [OPTIONS]
+
+Options:
+      --story <STORY>  Story the ticket belongs to; the draft may name it instead
+      --path <PATH>    Path to the project root (defaults to current directory) [default: .]
+      --json           Print one JSON document instead of prose, for another program to read
+  -h, --help           Print help
+
+The draft comes in on stdin, frontmatter first. Lisa allocates the id, adds it to the story's ticket list, and refuses the whole thing if the ticket would not be one it can read.
+
+Example: lisa file-ticket --story S-065-01 < draft.md
+
+For another program to read: lisa file-ticket --json. What the fields mean and which ones you can rely on: lisa json-guide
+"#,
+    },
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 20] = [
+const OWN_COMMANDS: [&str; 21] = [
     "init",
     "validate",
     "status",
@@ -268,6 +289,7 @@ const OWN_COMMANDS: [&str; 20] = [
     "clean",
     "proposal",
     "loop",
+    "file-ticket",
     "agent-exec",
     "capture-usage",
     "claim",
@@ -362,14 +384,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 20 own subcommands resolves — including the hidden
+/// (a) Every one of the 21 own subcommands resolves — including the hidden
 /// five, which `--help` reaches even though they are absent from the listing.
 #[test]
-fn all_twenty_subcommands_resolve() {
+fn all_pinned_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        20,
-        "the pinned command set must be exactly 20"
+        21,
+        "the pinned command set must be exactly 21"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);
