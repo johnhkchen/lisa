@@ -2,15 +2,16 @@
 
 Lisa runs coding agents through your ticket board, so you don't have to approve every step by hand.
 
-This guide is for a program, not a person: a status strip, a dashboard, a script. `lisa status`
-and `lisa validate` already work out the whole answer and then write it as prose. Add `--json` and
-they hand you the answer itself instead.
+This guide is for a program, not a person: a status strip, a dashboard, a script. `lisa status`,
+`lisa validate` and `lisa file-ticket` already work out the whole answer and then write it as
+prose. Add `--json` and they hand you the answer itself instead.
 
     lisa status --json
     lisa validate --json
+    lisa file-ticket --story S-065-01 --json < draft.md
 
-Everything else is unchanged. Without `--json` both commands print exactly the prose they always
-did, and the exit status means exactly what it always meant.
+Everything else is unchanged. Without `--json` all three print exactly the prose they always did,
+and the exit status means exactly what it always meant.
 
 ## What you get
 
@@ -33,7 +34,7 @@ Every document has the same envelope:
 
 - `schema` and `schema_version` — the contract this document was written to.
 - `lisa_version` — which build answered.
-- `command` — `status` or `validate`.
+- `command` — `status`, `validate`, or `file-ticket`.
 - `ok` — whether Lisa could work out an answer at all. **Not** whether the answer was good news.
 - `error` — `null` when `ok` is true; otherwise `{"message": "…"}` carrying the same sentence the
   prose would have printed.
@@ -51,6 +52,7 @@ contract; it never replaces it.
 | --- | --- | --- |
 | `lisa validate --json` | every check passed | problems were found, **or** Lisa could not answer |
 | `lisa status --json` | the board was reported | Lisa could not answer |
+| `lisa file-ticket --json` | the ticket is on the board | nothing was filed |
 
 `lisa validate --json` finding problems is an *answer*: `ok` is `true`, `error` is `null`,
 `data.verdict` is `"failed"`, `data.problems` lists what is wrong, and the exit status is 1. If you
@@ -160,6 +162,59 @@ you do not have to look, and `lisa release-seats` exists so you never have to re
 
 `path` names the file or place the problem is about; `message` is the reason, the same sentence the
 prose prints.
+
+## `lisa file-ticket --json`
+
+This is the one command here that writes something, so read its exit status first. Exit `0` means
+the ticket is on the board. Any non-zero means **nothing was written at all** — not the ticket, not
+the story's list — and `error.message` is the reason, the same sentence a person would have read.
+
+The draft arrives on stdin: frontmatter, then the body. Lisa does the bookkeeping and none of the
+writing.
+
+```
+---
+title: a-short-kebab-case-name
+type: task
+priority: medium
+depends_on: []
+---
+
+## Context
+
+Why this work matters.
+
+## Acceptance Criteria
+
+- What has to be true when it is done.
+```
+
+A draft may set `title`, `type`, `priority`, `story`, `depends_on`, `agent`, and `model`, and
+`title` is the only one it must set. `id`, `phase`, `status`, and `blocks` are Lisa's, and a draft
+that sets one of them is refused by name rather than quietly overwritten. Any other key is refused
+too, so a misspelled field is never silently dropped.
+
+`data` carries:
+
+| Field | What it is |
+| --- | --- |
+| `ticket_id` | The id Lisa allocated. Callers do not choose it and do not need to read the folder to guess it. |
+| `path` | Repository-relative path of the ticket that was written. |
+| `story` | The story it was filed under. |
+| `story_path` | Repository-relative path of that story. |
+| `story_list_updated` | `true` when Lisa added the id to the story's `tickets:` list, `false` when the list already named it. |
+| `phase` / `status` | Always `ready` and `open`. A filed ticket is on the board. |
+| `warnings[]` | Remarks that did not stop the filing, worded the way `lisa validate` words a warning. |
+
+What is checked before anything lands is the ticket-scoped part of `lisa validate`: the draft
+parses, every field value is one Lisa knows, the story exists, every `depends_on` id is really on
+the board, and the allocated id is free. Board-wide verdicts are not borrowed — `lisa validate`
+fails a board with no ready ticket, and refusing to file into one of those would refuse exactly the
+boards worth refilling.
+
+Filing into a board with a run going is expected and safe. Two callers filing at once cannot take
+the same id, and the ticket file appears in one step, so a scheduler mid-scan reads either no
+ticket or a whole one.
 
 ## What you can rely on
 
