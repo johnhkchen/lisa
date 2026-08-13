@@ -411,7 +411,15 @@ lisa loop
 lisa loop --max-threads 4        # Override concurrent session limit
 lisa loop --client codex         # Drive Codex instead of Claude (overrides .lisa.toml)
 lisa loop --dry-run              # Show what would launch without starting
+lisa loop --headless             # Run on a host with no terminal at all
 ```
+
+`--headless` is for a machine that cannot show you a window — a container, a
+server you reach with `ssh -T`, a GitHub Codespace. Zellij will not start
+without a terminal, so Lisa opens one nobody is watching; the agents still get
+their panes, and the dashboard is replaced by `lisa status` and `lisa status
+--json` from wherever you are. Everywhere with a terminal keeps the ordinary
+run. See [docs/knowledge/headless-board.md](docs/knowledge/headless-board.md).
 
 ### `lisa status`
 

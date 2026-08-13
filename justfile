@@ -103,6 +103,17 @@ init PATH:
 validate PATH=".":
     cargo run -p lisa-cli -- validate --path {{PATH}}
 
+# Run a whole board on a host with no GUI and no terminal (T-066-01-02).
+# Builds the current working tree into a Debian container and runs the leg with
+# no `-t`, so the run really has no controlling terminal — the Codespace case,
+# reproduced rather than simulated. Takes a few minutes the first time; the
+# Rust build layer caches afterwards.
+#   just headless-leg
+# Runbook and the recorded transcript: docs/knowledge/headless-board.md
+headless-leg:
+    docker build -f docker/headless-board/Dockerfile -t lisa-headless-board .
+    docker run --rm --name lisa-headless-leg lisa-headless-board
+
 # Enter the Chromebook-test fixture (E-046): builds the image, verifies the
 # fixture invariants in a disposable container, then opens an interactive
 # capped shell as `tester`. The container is KEPT after exit — it is evidence

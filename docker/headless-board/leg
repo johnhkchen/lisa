@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# The headless-board leg (T-066-01-02).
+#
+# Runs a whole board on a host that has no GUI, no WezTerm, and — started by
+# `docker run` without `-t` — no controlling terminal at all. Everything it
+# claims, it reads back out of the running system: Zellij's own session and
+# layout, the signal files Lisa's hooks wrote, the controlling terminal each
+# process actually holds, and `lisa status --json`.
+#
+# Prints a transcript and ends with `headless-board: PASS` or a numbered list
+# of what failed.
+set -uo pipefail
+
+PROJECT=$HOME/demo
+BIN=$HOME/bin
+SESSION=demo
+LOOP_LOG=$HOME/loop.log
+SEEN_SIGNALS=$HOME/signals-seen.txt
+FAILURES=()
+STEP=0
+
+step() {
+    STEP=$((STEP + 1))
+    printf '\n=== %s. %s\n' "$STEP" "$1"
+}
+
+fail() {
+    FAILURES+=("$1")
+    printf 'FAIL: %s\n' "$1" >&2
+}
+
+strip_ansi() {
+    sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g'
+}
+
+zellij_bin() {
+    find "$HOME/.local/share/lisa" -type f -name zellij 2>/dev/null | head -1
+}
+
+wait_until() {
+    local timeout=$1 description=$2
+    shift 2
+    local deadline=$(( $(date +%s) + timeout ))
+    while [ "$(date +%s)" -le "$deadline" ]; do
+        if "$@"; then
+            return 0
+        fi
+        sleep 1
+    done
+    fail "timed out after ${timeout}s waiting for $description"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+step "the host: no GUI, no WezTerm, no terminal"
+# ---------------------------------------------------------------------------
+printf 'uname:   %s\n' "$(uname -srm)"
+printf 'tty:     %s\n' "$(tty 2>&1)"
+printf 'DISPLAY: %s\n' "${DISPLAY:-unset}"
+printf 'WAYLAND_DISPLAY: %s\n' "${WAYLAND_DISPLAY:-unset}"
+printf 'wezterm: %s\n' "$(command -v wezterm || echo absent)"
+printf 'lisa:    %s\n' "$(lisa --version)"
+if [ -t 0 ] || [ -t 1 ]; then
+    fail "this leg was given a terminal; run it without \`-t\` or it proves nothing"
+fi
+
+# ---------------------------------------------------------------------------
+step "a board to run"
+# ---------------------------------------------------------------------------
+mkdir -p "$BIN" "$PROJECT/docs/active/tickets" "$PROJECT/docs/active/stories"
+cp /headless/agent-stub "$BIN/claude"
+chmod 0755 "$BIN/claude"
+export PATH="$BIN:$PATH"
+# Claude's one-time confirmation is the operator's to give; the stand-in agent
+# has no such dialog, and Lisa still refuses to launch without the record.
+printf '%s\n' '{"bypassPermissionsModeAccepted": true}' > "$HOME/.claude.json"
+
+cat > "$PROJECT/docs/active/stories/S-HEAD.md" <<'STORY'
+---
+id: S-HEAD
+title: a-board-with-no-gui
+status: active
+---
+
+# A board with no GUI
+
+Two tickets, so the leg sees two panes.
+STORY
+
+for id in T-HEAD-01 T-HEAD-02; do
+    cat > "$PROJECT/docs/active/tickets/$id.md" <<TICKET
+---
+id: $id
+story: S-HEAD
+title: run-where-there-is-no-terminal
+type: task
+status: open
+priority: high
+phase: ready
+depends_on: []
+---
+
+## Context
+
+A stand-in agent runs this in a pane on a headless host.
+
+## Acceptance Criteria
+
+- [ ] The pane exists and has a terminal.
+TICKET
+done
+
+version=$(lisa --version | awk '{ print $2 }')
+cat > "$PROJECT/.lisa.toml" <<TOML
+version = "$version"
+
+[dirs]
+tickets = "docs/active/tickets"
+stories = "docs/active/stories"
+work = "docs/active/work"
+
+[scheduling]
+max_threads = 2
+review_timeout_secs = 600
+session_timeout_secs = 0
+wind_down_secs = 5
+assignment_ack_timeout_secs = 60
+
+[agent]
+client = "claude"
+
+[guards]
+completion = "journal"
+TOML
+lisa validate --path "$PROJECT" | tail -3
+
+# ---------------------------------------------------------------------------
+step "lisa loop, with no terminal and no flag"
+# ---------------------------------------------------------------------------
+refusal=$(lisa loop --path "$PROJECT" 2>&1)
+printf '%s\n' "$refusal"
+case "$refusal" in
+    *"--headless"*) : ;;
+    *) fail "the refusal did not name \`lisa loop --headless\`" ;;
+esac
+case "$refusal" in
+    *"raw mode"*) fail "the operator was handed Zellij's raw-mode error" ;;
+esac
+
+# ---------------------------------------------------------------------------
+step "lisa loop --headless"
+# ---------------------------------------------------------------------------
+# `.started` and `.ack` are read and removed by the scheduler, so a listing
+# taken afterwards would show neither. Watch the directory instead and keep
+# the union of everything that ever appeared in it.
+: > "$SEEN_SIGNALS"
+( while :; do
+      ls -1 "$PROJECT/.lisa/signals" 2>/dev/null >> "$SEEN_SIGNALS"
+      sleep 0.05
+  done ) &
+WATCHER_PID=$!
+
+( cd "$PROJECT" && lisa loop --headless --path "$PROJECT" > "$LOOP_LOG" 2>&1 ) &
+LOOP_PID=$!
+
+ZELLIJ=$(zellij_bin)
+printf 'zellij: %s\n' "${ZELLIJ:-not installed yet}"
+
+session_is_up() {
+    ZELLIJ=${ZELLIJ:-$(zellij_bin)}
+    [ -n "$ZELLIJ" ] || return 1
+    # Zellij colours the listing even with nothing attached, so the name is
+    # not at the start of the line until the escapes come off.
+    "$ZELLIJ" list-sessions 2>/dev/null | strip_ansi | grep -q "^$SESSION "
+}
+wait_until 90 "the Zellij session" session_is_up
+sed -n '1,22p' "$LOOP_LOG"
+
+# ---------------------------------------------------------------------------
+step "the session, read back out of Zellij"
+# ---------------------------------------------------------------------------
+"$ZELLIJ" list-sessions 2>&1 | sed 's/^/  /'
+timeout 15 "$ZELLIJ" --session "$SESSION" action dump-layout 2>&1 | sed 's/^/  /' | head -30
+
+# ---------------------------------------------------------------------------
+step "the agents: a pane each, with a terminal each"
+# ---------------------------------------------------------------------------
+an_agent_started() {
+    compgen -G "$PROJECT/evidence/agent-pane-*.txt" > /dev/null
+}
+if wait_until 120 "an agent pane" an_agent_started; then
+    sleep 5
+    for note in "$PROJECT"/evidence/agent-pane-*.txt; do
+        printf -- '--- %s\n' "$(basename "$note")"
+        sed 's/^/  /' "$note"
+        grep -q 'stdin: terminal' "$note" \
+            || fail "$(basename "$note"): the agent had no terminal"
+        grep -q 'tty: /dev/' "$note" \
+            || fail "$(basename "$note"): the agent could not name its terminal"
+    done
+fi
+
+# Which processes hold a controlling terminal, from outside Zellij entirely.
+# The leg's own shell is on `?`; the panes are on pts devices.
+printf -- '--- controlling terminals (ps)\n'
+ps -eo pid,ppid,tty,args | grep -Ev 'grep|ps -eo' | sed 's/^/  /' | head -25
+
+# ---------------------------------------------------------------------------
+step "what replaces the dashboard: lisa status --json"
+# ---------------------------------------------------------------------------
+board_is_done() {
+    [ "$(lisa status --json --path "$PROJECT" | jq -r '.data.counts.done')" = 2 ]
+}
+wait_until 240 "both tickets to finish" board_is_done
+lisa status --json --path "$PROJECT" \
+    | jq '{counts: .data.counts, ready: .data.ready, completion_seal: .data.completion_seal}'
+lisa status --path "$PROJECT" 2>/dev/null | sed -n '1,24p'
+
+# ---------------------------------------------------------------------------
+step "the signals, written by .lisa/hooks/ in those panes"
+# ---------------------------------------------------------------------------
+printf -- '--- every signal that appeared while the run was on\n'
+sort -u "$SEEN_SIGNALS" | sed 's/^/  /'
+printf -- '--- what each pane recorded of its own hooks\n'
+for hooklog in "$PROJECT"/evidence/hooks-pane-*.log; do
+    [ -e "$hooklog" ] || continue
+    printf '  %s:\n' "$(basename "$hooklog")"
+    sort -u "$hooklog" | sed 's/^/    /'
+done
+# The four the scheduler runs on. `.stopped` is deliberately not among them:
+# Lisa completes the ticket and recycles the seat the moment the review
+# artifacts land, so the agent's Stop hook races that recycle and often loses.
+for suffix in started ack alive heartbeat; do
+    grep -q "\.$suffix\$" "$SEEN_SIGNALS" \
+        || fail "no pane ever wrote a .$suffix signal"
+done
+
+# ---------------------------------------------------------------------------
+step "one scheduler, still"
+# ---------------------------------------------------------------------------
+second=$(lisa loop --headless --path "$PROJECT" 2>&1)
+printf '%s\n' "$second" | head -12
+case "$second" in
+    *"already running on this board"*) : ;;
+    *) fail "a second scheduler was allowed onto the board" ;;
+esac
+
+# ---------------------------------------------------------------------------
+step "ending a run nobody is watching"
+# ---------------------------------------------------------------------------
+kill "$WATCHER_PID" 2>/dev/null
+"$ZELLIJ" kill-session "$SESSION" >/dev/null 2>&1 \
+    || fail "could not end the session"
+wait "$LOOP_PID"
+printf 'lisa loop exited %s\n' "$?"
+tail -12 "$LOOP_LOG"
+
+# ---------------------------------------------------------------------------
+printf '\n===========================================================\n'
+if [ ${#FAILURES[@]} -eq 0 ]; then
+    echo "headless-board: PASS"
+    exit 0
+fi
+echo "headless-board: FAIL"
+for failure in "${FAILURES[@]}"; do
+    printf '  - %s\n' "$failure"
+done
+exit 1

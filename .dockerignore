@@ -1,0 +1,5 @@
+# Build contexts here are the repository root (docker/headless-board), and the
+# two things that dwarf the source are of no use inside an image.
+target
+.git
+.lisa/attempts

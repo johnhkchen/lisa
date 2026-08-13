@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# A stand-in for Claude Code inside a headless pane (T-066-01-02).
+#
+# It is not an imitation of the signal protocol: it calls the very hook scripts
+# `lisa init` installed under `.lisa/hooks/`, at the same four moments Claude
+# Code calls them (SessionStart[startup], UserPromptSubmit, PostToolUse, Stop).
+# So `pane-N.started`, `.ack`, `.alive`, `.heartbeat` and `.stopped` are written
+# by Lisa's own shipped scripts, running in a pane on a host with no terminal.
+#
+# The one thing it adds is a note about the terminal it was given, which is the
+# question the leg is asking: an agent needs a terminal, and on a headless host
+# it has to come from somewhere.
+set -uo pipefail
+
+if [ "${1:-}" = "--version" ]; then
+    echo "claude-stub (lisa headless leg) 1.0.0"
+    exit 0
+fi
+
+project=${LISA_PROJECT:-$PWD}
+hooks="$project/.lisa/hooks"
+signals="$project/.lisa/signals"
+pane=${LISA_PANE_ID:-unknown}
+evidence="$project/evidence"
+mkdir -p "$evidence"
+log="$evidence/hooks-pane-$pane.log"
+
+# Run one of Lisa's hook scripts and say what it left behind. A signal that is
+# already gone is not a signal that was not written: the scheduler reads
+# `.started` and `.ack` and removes them, which is the whole point of them.
+run_hook() {
+    local script=$1 signal=$2
+    local hook="$hooks/$script"
+    if [ ! -x "$hook" ]; then
+        echo "$script: not installed" >> "$log"
+        return 0
+    fi
+    "$hook"
+    if [ -e "$signals/pane-$pane.$signal" ]; then
+        echo "$script -> pane-$pane.$signal written" >> "$log"
+    else
+        echo "$script -> pane-$pane.$signal written and already taken by the scheduler" >> "$log"
+    fi
+}
+
+# --- SessionStart[startup] -------------------------------------------------
+run_hook on-start.sh started
+
+# What this pane was actually handed. `tty` and `stty` both answer for stdin,
+# which is the pane's own terminal — not Lisa's, and not the operator's.
+{
+    echo "pane: $pane"
+    echo "ticket: ${LISA_TICKET_ID:-none}"
+    echo "attempt: ${LISA_ATTEMPT_ID:-none}"
+    if [ -t 0 ]; then echo "stdin: terminal"; else echo "stdin: not a terminal"; fi
+    echo "tty: $(tty 2>&1)"
+    echo "size: $(stty size 2>&1)"
+    echo "TERM: ${TERM:-unset}"
+    echo "ZELLIJ_SESSION_NAME: ${ZELLIJ_SESSION_NAME:-unset}"
+    echo "process: $$ on $(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')"
+} > "$evidence/agent-pane-$pane.txt"
+
+echo "stub agent in pane $pane, terminal $(tty 2>&1)"
+
+# --- the assignment, typed into this pane ----------------------------------
+assignment=
+prompt=
+while IFS= read -r line; do
+    case "$line" in
+        "Read and follow the complete assignment at "*)
+            prompt=$line
+            assignment=${line#Read and follow the complete assignment at }
+            assignment=${assignment%.}
+            ;;
+        "LISA_ASSIGNMENT "*)
+            [ -n "$prompt" ] || continue
+            prompt=$(printf '%s\n%s' "$prompt" "$line")
+            # UserPromptSubmit: the hook reads the raw payload on stdin.
+            printf '{"hook_event_name":"UserPromptSubmit","prompt":%s}' \
+                "$(printf '%s' "$prompt" | jq -Rs .)" \
+                > "$evidence/ack-payload-$pane.json"
+            run_hook on-ack.sh ack < "$evidence/ack-payload-$pane.json"
+            prompt=
+
+            # PostToolUse, once per file written, as a working agent would.
+            run_hook on-heartbeat.sh heartbeat
+            work=$(dirname "$assignment")
+            mkdir -p "$work"
+            cat > "$work/review.md" <<REVIEW
+# Review
+
+A stand-in agent ran this ticket in a Zellij pane on a host with no terminal
+of its own. It did no source work; what it demonstrates is that the pane, the
+terminal in it, and Lisa's own signal hooks all arrived.
+
+- Terminal this pane was given: $(tty 2>&1), $(stty size 2>&1)
+- Signals published by \`.lisa/hooks/\`: see evidence/hooks-pane-$pane.log
+REVIEW
+            run_hook on-heartbeat.sh heartbeat
+            printf '{"disposition":"pass","reason":null}\n' \
+                > "$work/review-disposition.json"
+            echo "stub agent wrote its review for ${LISA_TICKET_ID:-?}"
+            # Stop: the end of a turn, which is where Claude Code fires it.
+            run_hook on-stop.sh stopped
+            break
+            ;;
+    esac
+done
+
+# Lisa completes the ticket from here. Stay resident until the pane is
+# recycled, heartbeating the way a working agent does.
+while :; do
+    sleep 5
+    run_hook on-heartbeat.sh heartbeat
+done
