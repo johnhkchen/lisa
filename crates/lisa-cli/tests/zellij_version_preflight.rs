@@ -267,3 +267,139 @@ fn doctor_names_unparseable_zellij_output_as_unsupported() {
     assert!(stdout.contains(">= 0.43.0"));
     assert_runtime_remedy(&stdout);
 }
+
+/// A run that finished its board and stayed resident, at the boundary an
+/// operator actually stands at. On 2026-08-12 this exact sequence — a live
+/// session, a scheduler with nothing left to stamp about — printed
+/// `Session: lisa-2` and started a second scheduler on one board. The session
+/// alone has to stop it, with no registry entry anywhere and no stamp to read.
+#[test]
+fn loop_refuses_a_board_whose_session_is_still_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        "{\"bypassPermissionsModeAccepted\": true}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".lisa.toml"),
+        format!(
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+
+    // A Zellij holding one dead session and one running one, both named for
+    // this project directory — the shape `zellij list-sessions` printed that
+    // morning.
+    write_executable(
+        &bin.join("zellij"),
+        "#!/bin/sh\n\
+         if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; exit 0; fi\n\
+         if [ \"${1:-}\" = \"list-sessions\" ]; then\n\
+         printf '%s\\n' 'project [Created 19h ago] (EXITED - attach to resurrect)'\n\
+         printf '%s\\n' 'project-2 [Created 4h ago]'\n\
+         printf '%s\\n' 'unrelated-panda [Created 1h ago]'\n\
+         exit 0\n\
+         fi\n\
+         printf '%s\\n' 'zellij was started' > \"$(dirname \"$0\")/started\"\n\
+         exit 0\n",
+    );
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
+        .arg("loop")
+        .args(["--path", root.to_str().unwrap()])
+        .env("PATH", &bin)
+        .env("HOME", &home)
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "loop must refuse:\n{stdout}");
+    assert!(
+        stderr.contains("There is a run already running on this board"),
+        "loop did not refuse the running session:\n{stderr}"
+    );
+    assert!(stderr.contains("project-2 — a Zellij session still open on this board"));
+    assert!(stderr.contains("zellij attach project-2"));
+    assert!(stderr.contains("zellij kill-session project-2"));
+    assert!(
+        !stdout.contains("Session: project-3"),
+        "the numbering must never get its turn:\n{stdout}"
+    );
+    assert!(
+        !bin.join("started").exists(),
+        "a refused loop must not have launched Zellij"
+    );
+}
+
+/// The other half of the same fact: a session that only *exited* under this
+/// board's name is a crashed run, not a second scheduler. It costs the start a
+/// number, exactly as it always did.
+#[test]
+fn loop_starts_past_an_exited_session_of_the_same_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        "{\"bypassPermissionsModeAccepted\": true}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".lisa.toml"),
+        format!(
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("zellij"),
+        "#!/bin/sh\n\
+         if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; exit 0; fi\n\
+         if [ \"${1:-}\" = \"list-sessions\" ]; then\n\
+         printf '%s\\n' 'project [Created 19h ago] (EXITED - attach to resurrect)'\n\
+         exit 0\n\
+         fi\n\
+         exit 0\n",
+    );
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
+        .arg("loop")
+        .args(["--path", root.to_str().unwrap()])
+        .env("PATH", &bin)
+        .env("HOME", &home)
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "loop must start: {stderr}");
+    assert!(
+        stdout.contains("Session: project-2"),
+        "a dead session still costs a number and not the start:\n{stdout}"
+    );
+}

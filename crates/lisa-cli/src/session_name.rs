@@ -15,9 +15,17 @@
 //!
 //! Zellij refuses a duplicate name outright, and being dead is no exception —
 //! `Session with name "steer" already exists, but is dead.` is exit 1, not a
-//! start. A crashed run leaves exactly that behind, so a taken name never
-//! stops the loop here: the next free numbered name is used instead and the
-//! old session is left where the operator can still find it.
+//! start. A crashed run leaves exactly that behind, so a *dead* taken name
+//! never stops the loop here: the next free numbered name is used instead and
+//! the old session is left where the operator can still find it.
+//!
+//! A *running* session of this project's own name is the other case entirely,
+//! and this module is where the loop learns about it. The session is where the
+//! scheduler lives — the plugin runs inside the Zellij server, and the server
+//! outlives every client — so a session still up under this board's name is a
+//! scheduler still on this board, whether or not it has any work left to do.
+//! [`BoardSessions::running_here`] is that fact, and `loop_cmd` refuses on it.
+//! The numbering below therefore only ever numbers around the dead.
 
 use std::path::Path;
 use std::process::Command;
@@ -76,9 +84,76 @@ impl SessionNaming {
     }
 }
 
-/// Decide this run's session name by asking Zellij which names are held.
-pub(crate) fn resolve(root: &Path, zellij_path: &Path) -> SessionNaming {
-    choose(&project_base(root), &existing_session_names(zellij_path))
+/// One session Zellij is holding, and whether it is still running.
+///
+/// Two different facts live on one listing line. A name is *taken* whether the
+/// session runs or exited, because Zellij will not reuse it either way; a
+/// session is *running* when its server is still up, which is when a scheduler
+/// can still be inside it. The loop needs both: a taken name costs a number, a
+/// running one on this board stops the start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Session {
+    name: String,
+    running: bool,
+}
+
+/// What Zellij says about this board: the name this run would take, and every
+/// session already running under one of this board's names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoardSessions {
+    naming: SessionNaming,
+    running_here: Vec<String>,
+}
+
+impl BoardSessions {
+    /// How this run's session would be named.
+    pub(crate) fn naming(&self) -> &SessionNaming {
+        &self.naming
+    }
+
+    /// Sessions running right now under this board's own names — the project's
+    /// name, or one of its numbered runs. Each one is a Zellij server that may
+    /// still hold a scheduler, so each one is grounds to refuse a second loop.
+    pub(crate) fn running_here(&self) -> &[String] {
+        &self.running_here
+    }
+}
+
+/// Decide this run's session name, and find any session already running on this
+/// board, by asking Zellij what it is holding.
+pub(crate) fn resolve(root: &Path, zellij_path: &Path) -> BoardSessions {
+    survey(&project_base(root), &existing_sessions(zellij_path))
+}
+
+/// Read one listing into the two facts the loop acts on.
+fn survey(base: &str, sessions: &[Session]) -> BoardSessions {
+    let taken: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+    let running_here: Vec<String> = sessions
+        .iter()
+        .filter(|session| session.running && names_this_board(base, &session.name))
+        .map(|session| session.name.clone())
+        .collect();
+
+    BoardSessions {
+        naming: choose(base, &taken),
+        running_here,
+    }
+}
+
+/// Whether a session name is one this project's own naming could have produced:
+/// its name, or one of its numbered runs.
+///
+/// Deliberately exact. `lisa-2` is this board's second run; `lisa-live-codex`
+/// is somebody's hand-named session that merely starts the same way, and
+/// refusing a start over it would be a lockout with no way out.
+fn names_this_board(base: &str, name: &str) -> bool {
+    if name == base {
+        return true;
+    }
+    name.strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|run| run.parse::<u32>().ok())
+        .is_some_and(|run| (2..=MAX_RUN_NUMBER).contains(&run))
 }
 
 /// The project's own session name: its directory, made safe to use as one.
@@ -144,31 +219,50 @@ fn choose(base: &str, taken: &[String]) -> SessionNaming {
     }
 }
 
-/// Every session name Zellij currently holds, running or `EXITED`.
+/// Every session Zellij currently holds, running or `EXITED`.
+///
+/// The long listing rather than `--short`, because `--short` prints names only
+/// and the marker that separates a running session from a dead one is the rest
+/// of the line.
 ///
 /// `list-sessions` exits non-zero when there are no sessions at all, so the
-/// exit status carries no information this needs: the names it printed do. A
-/// listing that cannot be read is an empty one, which at worst costs the run
-/// the project's name and never the start.
-fn existing_session_names(zellij_path: &Path) -> Vec<String> {
+/// exit status carries no information this needs: the lines it printed do. A
+/// listing that cannot be read is an empty one — at worst that costs the run
+/// the project's name, and a Zellij that cannot be run is a Zellij holding
+/// nothing.
+fn existing_sessions(zellij_path: &Path) -> Vec<Session> {
     let output = Command::new(zellij_path)
         .arg("list-sessions")
-        .arg("--short")
         .arg("--no-formatting")
         .output();
 
     match output {
-        Ok(output) => parse_session_names(&String::from_utf8_lossy(&output.stdout)),
+        Ok(output) => parse_sessions(&String::from_utf8_lossy(&output.stdout)),
         Err(_) => Vec::new(),
     }
 }
 
-/// Read session names out of `zellij list-sessions --short --no-formatting`.
-fn parse_session_names(listing: &str) -> Vec<String> {
+/// Read `zellij list-sessions --no-formatting`, one session per line:
+///
+/// ```text
+/// lisa [Created 19h 22m ago] (EXITED - attach to resurrect)
+/// lisa-2 [Created 6m 18s ago] (current)
+/// ```
+///
+/// A session counts as running unless the line says it exited. That direction
+/// is the safe one: a marker a future Zellij renames reads as a running
+/// session, which costs a refusal an operator can clear, rather than as a dead
+/// one, which costs a second scheduler nobody notices.
+fn parse_sessions(listing: &str) -> Vec<Session> {
     listing
         .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(str::to_string)
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?;
+            Some(Session {
+                name: name.to_string(),
+                running: !line.contains("EXITED"),
+            })
+        })
         .collect()
 }
 
@@ -321,28 +415,93 @@ mod tests {
         );
     }
 
-    #[test]
-    fn listing_reads_live_and_exited_names_alike() {
-        let listing = "steer\nlisa\nauspicious-panda\n";
+    fn session(name: &str, running: bool) -> Session {
+        Session {
+            name: name.to_string(),
+            running,
+        }
+    }
 
+    /// Measured against Zellij 0.44.3 on 2026-08-13.
+    const LISTING: &str = "\
+auspicious-panda [Created 1day 17h 32m 54s ago] (EXITED - attach to resurrect)
+lisa [Created 19h 22m 14s ago] (EXITED - attach to resurrect)
+screen-design [Created 18h 38m 36s ago]
+lisa-2 [Created 6m 18s ago] (current)
+";
+
+    #[test]
+    fn listing_reads_which_sessions_are_still_running() {
         assert_eq!(
-            parse_session_names(listing),
-            vec!["steer", "lisa", "auspicious-panda"]
+            parse_sessions(LISTING),
+            vec![
+                session("auspicious-panda", false),
+                session("lisa", false),
+                session("screen-design", true),
+                session("lisa-2", true),
+            ]
         );
     }
 
     #[test]
     fn an_empty_or_annotated_listing_is_read_without_inventing_names() {
-        assert!(parse_session_names("").is_empty());
-        assert!(parse_session_names("\n\n").is_empty());
-        // `--short` prints bare names; tolerate a marker if a version adds one.
-        assert_eq!(parse_session_names("steer (current)\n"), vec!["steer"]);
+        assert!(parse_sessions("").is_empty());
+        assert!(parse_sessions("\n\n").is_empty());
+        // A bare name — what `--short` prints — is a session Lisa knows
+        // nothing against, so it counts as running.
+        assert_eq!(parse_sessions("steer\n"), vec![session("steer", true)]);
     }
 
     #[test]
     fn an_unrunnable_zellij_costs_the_name_and_not_the_run() {
         let missing = PathBuf::from("/nonexistent/zellij-that-is-not-there");
 
-        assert!(existing_session_names(&missing).is_empty());
+        assert!(existing_sessions(&missing).is_empty());
+    }
+
+    /// The 2026-08-12 incident, read off a real listing: a board whose run had
+    /// finished, whose session was still up, and whose next `lisa loop` took
+    /// the name `lisa-2` and started a second scheduler. The session is the
+    /// evidence, and it is on this line whether the run has work left or not.
+    #[test]
+    fn a_session_still_running_on_this_board_is_reported_alongside_the_name() {
+        let sessions = parse_sessions(LISTING);
+
+        let board = survey("lisa", &sessions);
+        assert_eq!(board.running_here(), ["lisa-2"]);
+        assert_eq!(board.naming().name(), Some("lisa-3"));
+
+        // The same listing says nothing against a different project whose own
+        // session is dead.
+        let other = survey("auspicious-panda", &sessions);
+        assert!(other.running_here().is_empty());
+        assert_eq!(other.naming().name(), Some("auspicious-panda-2"));
+    }
+
+    /// A crashed run's `EXITED` session still holds the name and still costs a
+    /// number — the case the numbering exists for, and the only one left now
+    /// that a running session refuses the start outright.
+    #[test]
+    fn an_exited_session_takes_the_name_without_holding_the_board() {
+        let board = survey("steer", &[session("steer", false)]);
+
+        assert!(board.running_here().is_empty());
+        assert_eq!(board.naming().name(), Some("steer-2"));
+    }
+
+    #[test]
+    fn only_this_boards_own_names_count_as_this_board() {
+        assert!(names_this_board("lisa", "lisa"));
+        assert!(names_this_board("lisa", "lisa-2"));
+        assert!(names_this_board("lisa", "lisa-99"));
+        // Past the numbering, so not a name this board would ever take.
+        assert!(!names_this_board("lisa", "lisa-100"));
+        assert!(!names_this_board("lisa", "lisa-1"));
+        // Hand-named sessions that merely start the same way, and a project
+        // whose name merely starts with this one's.
+        assert!(!names_this_board("lisa", "lisa-live-codex-7409"));
+        assert!(!names_this_board("lisa", "lisa-field-current-8443"));
+        assert!(!names_this_board("lisa", "lisandra"));
+        assert!(!names_this_board("lisa", "screen-design"));
     }
 }

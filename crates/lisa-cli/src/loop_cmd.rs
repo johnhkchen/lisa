@@ -35,27 +35,100 @@ fn validate_project_protocol(config: &ResolvedConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse to start a second scheduler on a board that already has a live one,
-/// and say which one and how to stop it.
+/// Something already on this board, as the refusal reads it out.
+struct BoardHolder {
+    /// Who it is and what says so, in one line.
+    line: String,
+    /// The Zellij session it runs in, when Lisa knows one. Both commands an
+    /// operator wants — go look at it, end it — are named after this.
+    session: Option<String>,
+}
+
+/// Refuse to start a second scheduler on a board that already has one, and say
+/// which one, how to look at it, and how to end it.
 ///
-/// The window is the scheduler's own cadence, not the project's wind-down: a
-/// loop the operator just quit must become startable again in about a minute,
-/// and a wind-down of five minutes would make a restart after a crash feel
-/// broken. A stamp dated ahead of this machine's clock is not evidence of
-/// anything and never blocks a start.
-fn second_scheduler_refusal(root: &Path) -> Option<String> {
+/// Two independent kinds of evidence, because one of them was not enough. A
+/// *stamp* says a scheduler is working here; it is fresh only while the board
+/// has work left, and on 2026-08-12 a board that had finished 204 of 204
+/// tickets read as empty while its session, its Zellij server, and the plugin
+/// inside it were all still up — so `lisa loop` started a second scheduler on
+/// it. A *running session* under this board's own name says a scheduler is
+/// resident here whether or not it has anything left to do, and that is the
+/// question that mattered: **a finished run is not an absent one.**
+///
+/// The stamp window is the scheduler's own cadence, not the project's
+/// wind-down: a loop the operator just quit must become startable again in
+/// about a minute, and a wind-down of five minutes would make a restart after a
+/// crash feel broken. A stamp dated ahead of this machine's clock is not
+/// evidence of anything and never blocks a start.
+///
+/// Refusing is the answer here rather than attaching: `lisa loop` was asked to
+/// start a run, and silently handing the caller somebody else's running board
+/// instead is a different thing than it asked for — impossible, besides, for a
+/// caller with no terminal. So the refusal names `zellij attach` and the next
+/// keystroke is the operator's.
+fn second_scheduler_refusal(
+    root: &Path,
+    running_here: &[String],
+    current_session: Option<&str>,
+) -> Option<String> {
     let now = crate::seats::now_secs()?;
-    let live: Vec<lisa_core::schedulers::SchedulerRecord> =
-        lisa_core::schedulers::read_roster(root)
-            .into_iter()
-            .filter(|record| {
-                record.is_live(
-                    now,
-                    lisa_core::schedulers::live_window_secs(record.poll_interval_secs, 0),
-                )
-            })
-            .collect();
-    if live.is_empty() {
+    let roster = lisa_core::schedulers::read_roster(root);
+    let mut holders: Vec<BoardHolder> = Vec::new();
+    let mut spoken_for: HashSet<&str> = HashSet::new();
+
+    for record in &roster {
+        if !record.is_live(
+            now,
+            lisa_core::schedulers::live_window_secs(record.poll_interval_secs, 0),
+        ) {
+            continue;
+        }
+        if let Some(session) = record.session_name.as_deref() {
+            spoken_for.insert(session);
+        }
+        let age = record
+            .age_secs(now)
+            .map(crate::seats::humanize)
+            .unwrap_or_else(|| "?".to_string());
+        holders.push(BoardHolder {
+            line: format!(
+                "{} — last seen {age} ago{}",
+                record.label(),
+                match record.zellij_pid {
+                    Some(pid) => format!(", zellij server pid {pid}"),
+                    None => String::new(),
+                }
+            ),
+            session: record.session_name.clone(),
+        });
+    }
+
+    // A session on this board that no fresh stamp accounts for: a run that
+    // finished its tickets and stayed resident, or one whose scheduler stopped
+    // stamping for any other reason. The session is still there, and so is
+    // whatever is inside it.
+    for session in running_here {
+        if spoken_for.contains(session.as_str()) {
+            continue;
+        }
+        holders.push(BoardHolder {
+            line: format!(
+                "{session} — a Zellij session still open on this board{}{}",
+                match last_stamp_age(&roster, session, now) {
+                    Some(age) => format!(", whose scheduler last checked in {age} ago"),
+                    None => String::new(),
+                },
+                match current_session {
+                    Some(current) if current == session => " — the one this terminal is in",
+                    _ => "",
+                }
+            ),
+            session: Some(session.clone()),
+        });
+    }
+
+    if holders.is_empty() {
         return None;
     }
 
@@ -63,34 +136,45 @@ fn second_scheduler_refusal(root: &Path) -> Option<String> {
         "{} already running on this board, so Lisa did not start another one. Two schedulers \
          split the signals the panes write between them, and neither can tell a signal the other \
          took from one that never arrived.\n",
-        match live.len() {
+        match holders.len() {
             1 => "There is a run".to_string(),
             count => format!("There are {count} runs"),
         }
     );
-    for record in &live {
-        let age = record
-            .age_secs(now)
-            .map(crate::seats::humanize)
-            .unwrap_or_else(|| "?".to_string());
-        message.push_str(&format!(
-            "\n  {} — last seen {age} ago{}",
-            record.label(),
-            match record.zellij_pid {
-                Some(pid) => format!(", zellij server pid {pid}"),
-                None => String::new(),
-            }
-        ));
-        if let Some(stop) = record.stop_command() {
-            message.push_str(&format!("\n    stop it with: {stop}"));
+    for holder in &holders {
+        message.push_str(&format!("\n  {}", holder.line));
+        match &holder.session {
+            Some(session) => message.push_str(&format!(
+                "\n    look at it with: zellij attach {session}\
+                 \n    stop it with:    zellij kill-session {session}"
+            )),
+            None => message.push_str(
+                "\n    Lisa was never told this one's session name; find it with \
+                 `zellij list-sessions`",
+            ),
         }
     }
     message.push_str(
-        "\n\nIf you already closed its window, the run is still there: closing a pane stops the \
-         client, not the run. `lisa schedulers` lists them, and `lisa schedulers --stop <id>` \
+        "\n\nA run stays on the board until its session ends. Closing the window stops the \
+         client, not the run, and a run that has finished every ticket is still sitting there \
+         with nothing to do. `lisa schedulers` lists them, and `lisa schedulers --stop <id>` \
          ends one. If you just stopped it, give it a minute and try again.",
     );
     Some(message)
+}
+
+/// How long ago the freshest scheduler that ever ran in this session stamped.
+fn last_stamp_age(
+    roster: &[lisa_core::schedulers::SchedulerRecord],
+    session: &str,
+    now: u64,
+) -> Option<String> {
+    roster
+        .iter()
+        .filter(|record| record.session_name.as_deref() == Some(session))
+        .filter_map(|record| record.age_secs(now))
+        .min()
+        .map(crate::seats::humanize)
 }
 
 fn format_dependency_preflight_error(client: AgentClient, failures: &[String]) -> String {
@@ -130,11 +214,32 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
         return run_dry(root, config);
     }
 
+    // Freeze one configured runtime decision before any launch side effects.
+    // The resulting path is the exact executable reported by doctor and run
+    // below; managed and pinned modes never fall back to PATH. It is resolved
+    // here, first, because the refusal below has to be able to ask this exact
+    // Zellij what it is holding.
+    let zellij_runtime = crate::runtime::resolve_zellij_runtime(&config.zellij_runtime)?;
+
+    // Name the session after the project before anything is spawned: the name
+    // is what `zellij list-sessions`, the status bar, and the terminal tab all
+    // show, and a taken name has to cost a number rather than the start. The
+    // plugin is told the same name in its layout below, because it is the only
+    // way a scheduler can record which session to stop it by.
+    //
+    // The same listing says which sessions are still *running* under this
+    // board's names, which is the fact the refusal below turns on.
+    let sessions = crate::session_name::resolve(root, &zellij_runtime.path);
+
     // Two schedulers on one board split `.lisa/signals/` between them, and
     // neither can tell a signal the other took from one that was never
     // written. Nothing in a running loop reveals that, so the check belongs
     // here — the last moment before a second one exists.
-    if let Some(refusal) = second_scheduler_refusal(root) {
+    if let Some(refusal) = second_scheduler_refusal(
+        root,
+        sessions.running_here(),
+        crate::schedulers::current_session().as_deref(),
+    ) {
         return Err(refusal);
     }
 
@@ -153,11 +258,6 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
             )
         })?,
     };
-
-    // Freeze one configured runtime decision before any launch side effects.
-    // The resulting path is the exact executable reported by doctor and run
-    // below; managed and pinned modes never fall back to PATH.
-    let zellij_runtime = crate::runtime::resolve_zellij_runtime(&config.zellij_runtime)?;
 
     let clients = configured_clients(root, config);
 
@@ -231,14 +331,8 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, dry_run: bool) -> Result<(
     // is on the pane shell's PATH. current_exe() failure degrades to bare `lisa`.
     let lisa_bin = std::env::current_exe().ok();
 
-    // Name the session after the project before anything is spawned: the name
-    // is what `zellij list-sessions`, the status bar, and the terminal tab all
-    // show, and a taken name has to cost a number rather than the start. The
-    // plugin is told the same name in its layout below, because it is the only
-    // way a scheduler can record which session to stop it by.
-    let naming = crate::session_name::resolve(root, &zellij_runtime.path);
-
     // Generate KDL layout
+    let naming = sessions.naming();
     let layout = generate_layout(
         &wasm_path,
         lisa_bin.as_deref(),
@@ -703,11 +797,103 @@ mod tests {
         )
         .unwrap();
 
-        let refusal = second_scheduler_refusal(dir.path()).expect("a live scheduler refuses");
+        let refusal =
+            second_scheduler_refusal(dir.path(), &[], None).expect("a live scheduler refuses");
         assert!(refusal.contains("There is a run already running on this board"));
         assert!(refusal.contains("fascinating-drum (drum)"));
         assert!(refusal.contains("zellij kill-session fascinating-drum"));
-        assert!(refusal.contains("closing a pane stops the client, not the run"));
+        assert!(refusal.contains("zellij attach fascinating-drum"));
+        assert!(refusal.contains("Closing the window stops the client, not the run"));
+    }
+
+    /// The failure this ticket is named for. The board had finished — 204 of
+    /// 204 tickets — so its scheduler had stopped stamping while its Zellij
+    /// session, and the plugin inside it, kept running. Every stamp said no
+    /// scheduler was here; the session said otherwise, and the session was
+    /// right. A finished run is not an absent one.
+    #[test]
+    fn a_finished_run_still_sitting_in_its_session_refuses_the_next_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::seats::now_secs().unwrap();
+        lisa_core::schedulers::write_record(
+            &lisa_core::schedulers::roster_dir(dir.path()),
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "lisa-9c1f4b0a",
+                Some("lisa".to_string()),
+                Some(9450),
+                now - 4 * 3600,
+                now - 25 * 60,
+                5,
+            ),
+        )
+        .unwrap();
+
+        // The stamp is 25 minutes cold, so the roster alone refuses nothing.
+        assert!(second_scheduler_refusal(dir.path(), &[], None).is_none());
+
+        let refusal = second_scheduler_refusal(dir.path(), &["lisa".to_string()], None)
+            .expect("a session still running on this board refuses");
+        assert!(refusal.contains("There is a run already running on this board"));
+        assert!(refusal.contains("lisa — a Zellij session still open on this board"));
+        assert!(
+            refusal.contains("last checked in 25m ago"),
+            "the stale stamp is still worth reading out: {refusal}"
+        );
+        assert!(refusal.contains("zellij attach lisa"));
+        assert!(refusal.contains("zellij kill-session lisa"));
+        assert!(refusal.contains("finished every ticket is still sitting there"));
+    }
+
+    /// A board with no registry at all — a session started by a Lisa that
+    /// predates it, or one whose stamp was never written — still refuses.
+    /// The session is evidence on its own.
+    #[test]
+    fn a_running_session_refuses_even_with_nothing_in_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let refusal = second_scheduler_refusal(
+            dir.path(),
+            &["lisa".to_string(), "lisa-2".to_string()],
+            Some("lisa-2"),
+        )
+        .expect("a running session refuses on its own");
+        assert!(refusal.contains("There are 2 runs already running on this board"));
+        assert!(
+            !refusal.contains("checked in"),
+            "no stamp to read: {refusal}"
+        );
+        assert!(
+            refusal.contains(
+                "lisa-2 — a Zellij session still open on this board — the one this \
+                              terminal is in"
+            ),
+            "the session the operator is sitting in says so: {refusal}"
+        );
+    }
+
+    /// One run, one entry: the live stamp and the running session are the same
+    /// scheduler seen twice, and an operator reading two would go looking for a
+    /// second one that is not there.
+    #[test]
+    fn a_stamping_scheduler_and_its_session_are_one_run_not_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::seats::now_secs().unwrap();
+        lisa_core::schedulers::write_record(
+            &lisa_core::schedulers::roster_dir(dir.path()),
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "lisa-9c1f4b0a",
+                Some("lisa".to_string()),
+                Some(9450),
+                now - 600,
+                now - 3,
+                5,
+            ),
+        )
+        .unwrap();
+
+        let refusal = second_scheduler_refusal(dir.path(), &["lisa".to_string()], None).unwrap();
+        assert!(refusal.contains("There is a run already running on this board"));
+        assert_eq!(refusal.matches("zellij kill-session lisa").count(), 1);
     }
 
     /// A record from a run that stopped must not lock the operator out of
@@ -729,9 +915,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(second_scheduler_refusal(dir.path()).is_none());
+        assert!(second_scheduler_refusal(dir.path(), &[], None).is_none());
         assert!(
-            second_scheduler_refusal(tempfile::tempdir().unwrap().path()).is_none(),
+            second_scheduler_refusal(tempfile::tempdir().unwrap().path(), &[], None).is_none(),
             "a board no scheduler has written on refuses nothing"
         );
     }

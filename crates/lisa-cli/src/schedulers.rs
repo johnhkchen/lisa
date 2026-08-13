@@ -61,7 +61,7 @@ pub fn run_schedulers(root: &Path, stop: Option<&str>) -> Result<(), String> {
 }
 
 /// The Zellij session this process is sitting in, when it is in one.
-fn current_session() -> Option<String> {
+pub(crate) fn current_session() -> Option<String> {
     std::env::var("ZELLIJ_SESSION_NAME")
         .ok()
         .filter(|name| !name.is_empty())
