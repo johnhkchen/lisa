@@ -665,6 +665,21 @@ fn completion_failure_reason(ticket_id: &str) -> String {
     )
 }
 
+/// One unreadable ticket file, worded for the activity feed.
+///
+/// Shared by the startup scan and every rescan so the same broken file reads
+/// the same way whenever it is found, and so a file already reported at
+/// start-up is not reported again by the first poll.
+fn scan_error_message((path, error): &(PathBuf, ticket::TicketError)) -> String {
+    format!(
+        "Skipped {} — Lisa can't read it: {}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?"),
+        error,
+    )
+}
+
 fn review_block_action(owner: RemedyOwner, retries_consumed: u8) -> ReviewBlockAction {
     match owner {
         RemedyOwner::Agent if retries_consumed < MAX_AGENT_BLOCK_RETRIES => {
@@ -1191,8 +1206,28 @@ pub struct State {
     /// selection change, so the details are always one keypress deep.
     desk_expanded: bool,
 
-    /// Whether the loop has terminated (all tickets done).
+    /// Whether the loop has drained its board — every ticket done, nothing
+    /// running. The scheduler keeps ticking in this state; what it does with a
+    /// tick is all that changes.
     terminated: bool,
+
+    /// What the ticket directory looked like when this scheduler last built a
+    /// DAG from it, as [`ticket::scan_fingerprint`]. Only consulted while the
+    /// board is drained, where it is the whole difference between a tick that
+    /// costs a `read_dir` and one that parses every ticket on the board.
+    /// `None` means unknown, which reads as *changed*.
+    last_ticket_fingerprint: Option<u64>,
+
+    /// The ticket files that could not be parsed at the last scan, already
+    /// worded for a reader. Kept so a file that is broken for an hour is
+    /// reported once rather than twelve times a minute, and so its repair is
+    /// reported too.
+    last_scan_errors: std::collections::BTreeSet<String>,
+
+    /// Whether this drain has already been announced. Draining is worth a
+    /// notification; sitting drained is not, and the scheduler now sits there
+    /// awake.
+    completion_announced: bool,
 
     /// Modal for manually marking tickets as done.
     modal: MarkDoneModal,
@@ -4292,8 +4327,13 @@ impl State {
     /// Scan tickets directory and rebuild the DAG.
     /// Returns true if any ticket phases changed since last build.
     fn rebuild_dag(&mut self) -> bool {
-        let mut tickets = match ticket::scan_tickets(&self.config.ticket_dir) {
-            Ok(tickets) => tickets,
+        // The fingerprint is taken before the scan, never after: a ticket
+        // written during the scan must not be recorded as one this DAG already
+        // contains, or the cheap look on a drained board would skip it forever.
+        self.last_ticket_fingerprint = ticket::scan_fingerprint(&self.config.ticket_dir);
+
+        let scanned = match ticket::scan_tickets_with_diagnostics(&self.config.ticket_dir) {
+            Ok(scanned) => scanned,
             Err(e) => {
                 self.log_activity(ActivityEvent::Error {
                     message: format!("Failed to scan tickets: {}", e),
@@ -4301,6 +4341,8 @@ impl State {
                 return false;
             }
         };
+        self.report_scan_errors(&scanned.errors);
+        let mut tickets = scanned.tickets;
 
         for scanned in &mut tickets {
             self.mask_completion_transaction(scanned);
@@ -4348,6 +4390,43 @@ impl State {
                 false
             }
         }
+    }
+
+    /// Put ticket files that will not parse in front of the operator.
+    ///
+    /// A skipped ticket is a ticket that will never be worked, and until now the
+    /// only thing that said so was an `eprintln!` inside the WASM sandbox, which
+    /// goes nowhere a person is looking. The dashboard's activity feed is where
+    /// `load()`'s startup diagnostics report the same fact, so a file that
+    /// breaks at ten in the morning now reads the same as one that was already
+    /// broken at start-up.
+    ///
+    /// Reported on the edge, not on the level: the scan runs every five seconds
+    /// and a feed that repeats one broken file forever is a feed nobody reads.
+    /// The repair is worth a line too — it is how an operator who just fixed the
+    /// frontmatter learns that Lisa agrees.
+    fn report_scan_errors(&mut self, errors: &[(PathBuf, ticket::TicketError)]) {
+        let current: std::collections::BTreeSet<String> =
+            errors.iter().map(scan_error_message).collect();
+
+        if current == self.last_scan_errors {
+            return;
+        }
+
+        let fresh: Vec<String> = current
+            .difference(&self.last_scan_errors)
+            .cloned()
+            .collect();
+        for message in fresh {
+            self.log_activity(ActivityEvent::Error { message });
+        }
+        if current.is_empty() && !self.last_scan_errors.is_empty() {
+            self.log_activity(ActivityEvent::Info {
+                message: "Every ticket file reads cleanly again".to_string(),
+            });
+        }
+
+        self.last_scan_errors = current;
     }
 
     /// Discover agent pane slots from PaneUpdate.
@@ -9373,6 +9452,28 @@ impl State {
             self.note_other_schedulers(now);
         }
 
+        // A board that has finished is not a scheduler that has stopped. It
+        // keeps this cadence — the stamp above depends on it, and so does a
+        // ticket filed onto a quiet board, which is exactly the moment a refill
+        // presses. What changes is only what the tick costs: while nothing on
+        // the board has moved, the tick ends here, having looked at the ticket
+        // directory rather than read it. The first look that differs wakes the
+        // scheduler and falls through to an ordinary poll.
+        if self.terminated {
+            if !self.ticket_dir_changed() {
+                self.arm_timer(POLL_INTERVAL_SECS);
+                return;
+            }
+            self.terminated = false;
+            // A directory that could not be described at all has nothing to
+            // report here — the scan below says what went wrong with it.
+            if self.last_ticket_fingerprint.is_some() {
+                self.log_activity(ActivityEvent::Info {
+                    message: "Ticket directory changed — rescanning a finished board".to_string(),
+                });
+            }
+        }
+
         // Presence first: the exit policy asks only whether a process is in the
         // pane, and the answer must be current before any timeout decision —
         // including for a process that cannot name itself.
@@ -9558,33 +9659,57 @@ impl State {
 
         // Check for clean termination — all tickets done, no work remaining
         if self.check_all_done() {
-            self.log_activity(ActivityEvent::AllTicketsDone);
+            // Draining is the event. Announce it once per drain: the timer goes
+            // on running from here, so "we are still finished" would otherwise
+            // be news every five seconds.
+            if !self.completion_announced {
+                self.log_activity(ActivityEvent::AllTicketsDone);
 
-            // Notify the operator that the loop finished. Fires once per
-            // completion (timer not re-armed); re-fires if keep_working() resets
-            // `terminated` and the DAG later drains again.
-            let tickets_done = self
-                .dag
-                .tickets()
-                .filter(|t| t.phase == Phase::Done)
-                .count();
-            let mut env: Vec<(&str, String)> =
-                vec![("LISA_TICKETS_DONE", tickets_done.to_string())];
-            if let Some(start) = self.loop_started_at {
-                if let Ok(d) = std::time::SystemTime::now().duration_since(start) {
-                    env.push(("LISA_DURATION_SECS", d.as_secs().to_string()));
+                let tickets_done = self
+                    .dag
+                    .tickets()
+                    .filter(|t| t.phase == Phase::Done)
+                    .count();
+                let mut env: Vec<(&str, String)> =
+                    vec![("LISA_TICKETS_DONE", tickets_done.to_string())];
+                if let Some(start) = self.loop_started_at {
+                    if let Ok(d) = std::time::SystemTime::now().duration_since(start) {
+                        env.push(("LISA_DURATION_SECS", d.as_secs().to_string()));
+                    }
                 }
+                let detail = format!("{} tickets done", tickets_done);
+                self.fire_notify("complete", &detail, &env);
+                self.completion_announced = true;
             }
-            let detail = format!("{} tickets done", tickets_done);
-            self.fire_notify("complete", &detail, &env);
 
+            // The board the next tick compares against is the one `rebuild_dag()`
+            // recorded earlier in this tick, before it read a single ticket.
+            // Deliberately not re-taken here: a ticket filed while this tick was
+            // running is not in this DAG, and recording it now would be a
+            // promise to ignore it forever.
             self.terminated = true;
-            // Don't re-arm the timer — loop is complete
-            return;
+        } else {
+            self.completion_announced = false;
         }
 
-        // Re-arm the timer
+        // Re-arm the timer. Unconditionally: a scheduler with nothing to do is
+        // still a scheduler, and every recovery command on the desk reads the
+        // stamp that only a tick writes.
         self.arm_timer(POLL_INTERVAL_SECS);
+    }
+
+    /// Whether the ticket directory looks different from the last time this
+    /// scheduler built a DAG from it.
+    ///
+    /// Cheap by construction — see [`ticket::scan_fingerprint`] — and pessimistic
+    /// by design: a directory that cannot be described reads as changed, so the
+    /// answer to "should I look properly?" is never *no* on the strength of an
+    /// error.
+    fn ticket_dir_changed(&mut self) -> bool {
+        let current = ticket::scan_fingerprint(&self.config.ticket_dir);
+        let changed = current.is_none() || current != self.last_ticket_fingerprint;
+        self.last_ticket_fingerprint = current;
+        changed
     }
 
     /// Format a single ActivityEvent as a one-line string for the state snapshot.
@@ -10761,6 +10886,11 @@ impl ZellijPlugin for State {
             self.mask_completion_transaction(scanned);
         }
 
+        // Startup diagnostics report these below. Recording them here is what
+        // stops the first poll's rescan from reporting the same broken files a
+        // second time, five seconds later.
+        self.last_scan_errors = scan_result.errors.iter().map(scan_error_message).collect();
+
         let dag_result = Dag::from_tickets(scan_result.tickets.clone());
 
         // Run startup diagnostics (pure function, no side effects)
@@ -10911,12 +11041,15 @@ impl ZellijPlugin for State {
         }
 
         if self.terminated && !self.modal.open {
-            // The finished screen returns before the dashboard state exists,
-            // and the poll timer is not re-armed once a loop drains — so this
-            // is the last chance the title gets, and it composes without it.
+            // The finished screen returns before the dashboard state exists, so
+            // the title is composed without it. The poll timer goes on running
+            // underneath this screen: file a ticket and the next tick replaces
+            // it with the dashboard.
             let title = ticker::finished(&ticker::project_label(&self.project_root));
             self.set_pane_ticker(title);
-            println!("All tickets done. Lisa loop complete. Press [q] to quit.");
+            println!(
+                "All tickets done. Lisa is still watching for new tickets. Press [q] to quit."
+            );
             return;
         }
 
@@ -11664,6 +11797,7 @@ mod tests {
         ));
     }
 
+    mod a_drained_board_goes_on_ticking;
     mod hostile_order_regression;
     mod operator_recovery_matrix;
     mod rejected_has_an_exit;
