@@ -879,6 +879,10 @@ fn status_payload(data: &StatusData) -> serde_json::Value {
             "stamped_at": record.stamped_at,
             "stop_command": record.stop_command(),
         })).collect::<Vec<_>>(),
+        // Beside the summary of what a run did, where the run is. A consumer
+        // that had to inspect panes, or guess a session name, or `lsof` across
+        // a whole desk, was going around the envelope for a fact Lisa held.
+        "run_location": data.run.location(),
         "token_usage": token_usage_view(&data.ledger),
         "run_summary": data.run_summary,
         "config": ConfigView {
@@ -1331,6 +1335,7 @@ mod tests {
             liveness: crate::seats::RunLiveness::Ended,
             evidence: "the run stopped 18h ago.".to_string(),
             schedulers: Vec::new(),
+            stamped: false,
         }
     }
 
@@ -1373,6 +1378,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            stamped: true,
         }
     }
 

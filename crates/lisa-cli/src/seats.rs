@@ -128,22 +128,41 @@ pub(crate) struct RunReport {
     /// registry has nothing live in it — including every board whose scheduler
     /// predates the registry, where the shared stamp is all there is.
     pub(crate) schedulers: Vec<lisa_core::schedulers::SchedulerRecord>,
+    /// Whether the shared [`SCHEDULER_ALIVE_FILE`] stamp is fresh.
+    ///
+    /// The registry above answers *which* schedulers, and answers nothing at
+    /// all on a board whose scheduler predates it. This bool is the other half
+    /// of "is one here", and it is kept separately because [`RunLiveness`]
+    /// folds the two together: `Working` is decided by the signal directory
+    /// moving, which a freshly created `.lisa/signals/` does on a board nobody
+    /// has ever run.
+    pub(crate) stamped: bool,
 }
 
 impl RunReport {
-    fn working(evidence: String, schedulers: Vec<lisa_core::schedulers::SchedulerRecord>) -> Self {
+    fn working(
+        evidence: String,
+        schedulers: Vec<lisa_core::schedulers::SchedulerRecord>,
+        stamped: bool,
+    ) -> Self {
         Self {
             liveness: RunLiveness::Working,
             evidence,
             schedulers,
+            stamped,
         }
     }
 
-    fn stamping(evidence: String, schedulers: Vec<lisa_core::schedulers::SchedulerRecord>) -> Self {
+    fn stamping(
+        evidence: String,
+        schedulers: Vec<lisa_core::schedulers::SchedulerRecord>,
+        stamped: bool,
+    ) -> Self {
         Self {
             liveness: RunLiveness::Stamping,
             evidence,
             schedulers,
+            stamped,
         }
     }
 
@@ -152,6 +171,7 @@ impl RunReport {
             liveness: RunLiveness::Unclear,
             evidence,
             schedulers: Vec::new(),
+            stamped: false,
         }
     }
 
@@ -164,6 +184,77 @@ impl RunReport {
     /// only stamping.
     pub(crate) fn holds_the_board(&self) -> bool {
         matches!(self.liveness, RunLiveness::Working | RunLiveness::Stamping)
+    }
+
+    /// Whether Lisa has evidence of a *scheduler* on this board, as opposed to
+    /// evidence that something once touched the signal directory.
+    ///
+    /// Two independent sources, because either alone has a board it cannot
+    /// speak for: the registry names schedulers and says nothing about a build
+    /// that predates it, and the shared stamp survives that build but cannot
+    /// count past one.
+    fn a_scheduler_is_here(&self) -> bool {
+        !self.schedulers.is_empty() || self.stamped
+    }
+
+    /// Where this run is, for a program that has to decide something.
+    ///
+    /// The prose above tells an operator; this tells `rail up` whether a loop
+    /// already has a strip beside it, and a phone over SSH which session to
+    /// attach to. Both had to infer it from panes, or guess, because the
+    /// envelope carried the board and not the run.
+    ///
+    /// Three states rather than a bool, because "no run" and "a run Lisa cannot
+    /// place" are different answers and silence was both:
+    ///
+    /// - **`working`** — a scheduler is here and something moved in
+    ///   `.lisa/signals/` inside the window.
+    /// - **`idle`** — a scheduler is here and nothing is moving. A run that has
+    ///   finished every ticket is exactly this: still resident, still holding
+    ///   the board, not working. Reporting it as absent is what started a second
+    ///   scheduler here on 2026-08-12.
+    /// - **`none`** — Lisa has no evidence of a scheduler. Signals moving with
+    ///   nobody stamping is *not* a run: a `.lisa/signals/` that `lisa init`
+    ///   created a moment ago moves exactly that way.
+    /// - **`unknown`** — Lisa could not look. A clock before the epoch, a signal
+    ///   directory it cannot read.
+    ///
+    /// The session name is the whole point of the payload: it is what
+    /// `zellij attach` takes, and it means the same thing on the other end of
+    /// `gh codespace ssh`. Nothing here is a pid or a socket path.
+    pub(crate) fn location(&self) -> crate::json_output::RunLocationView {
+        let mut sessions: Vec<String> = self
+            .schedulers
+            .iter()
+            .filter_map(|record| record.session_name.clone())
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+
+        let state = match self.liveness {
+            RunLiveness::Unclear => "unknown",
+            _ if !self.a_scheduler_is_here() => "none",
+            RunLiveness::Working => "working",
+            RunLiveness::Stamping | RunLiveness::Ended => "idle",
+        };
+
+        // One session is a place to go; two is a contested board, where naming
+        // either one as *the* run would send a caller to an arbitrary half of
+        // the problem. `sessions` still lists both, and `schedulers` has the
+        // rest of each one.
+        let session = match sessions.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
+
+        crate::json_output::RunLocationView {
+            state,
+            attach_command: session
+                .as_ref()
+                .map(|session| format!("zellij attach {session}")),
+            session,
+            sessions,
+        }
     }
 
     /// One sentence naming the schedulers on this board and how to stop them,
@@ -305,6 +396,15 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
         }
     };
 
+    // Whether the shared stamp is fresh, decided once and carried on the
+    // report. Every branch below that returns early does so before reaching the
+    // stamp, and a caller asking "is a scheduler here" needs the answer on all
+    // of them.
+    let stamped = stamp
+        .as_ref()
+        .and_then(|stamp| stamp.age_secs(now))
+        .is_some_and(|age| age <= window);
+
     // Work first, because work is the fact that matters and the only one a
     // second scheduler cannot forge on another's behalf: whoever consumed it,
     // something was written into that directory by a live pane or plugin.
@@ -317,6 +417,7 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
                 humanize(quiet)
             ),
             live,
+            stamped,
         );
     }
 
@@ -342,7 +443,7 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
                 ),
             }
         );
-        return RunReport::stamping(evidence, live);
+        return RunReport::stamping(evidence, live, stamped);
     }
 
     let stamp_age = match &stamp {
@@ -357,6 +458,7 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
                         humanize(age)
                     ),
                     Vec::new(),
+                    stamped,
                 )
             }
             Some(age) => Some(age),
@@ -392,6 +494,7 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
             waited = humanize(window),
         ),
         schedulers: Vec::new(),
+        stamped,
     }
 }
 

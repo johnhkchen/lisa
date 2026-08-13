@@ -85,6 +85,35 @@ pub struct ConfigView {
     pub model: Option<String>,
 }
 
+/// Where the run on this board is, when there is one.
+///
+/// `run_summary` is about what a run *did*; this is about what a run *is* and
+/// how to reach it. They are separate keys for that reason: a board with no run
+/// still has a summary of the last one, and a board whose run has finished
+/// every ticket still has a session an operator can attach to.
+///
+/// Everything here is portable. A session name means the same thing to a phone
+/// on the other end of `gh codespace ssh` as it does on the machine that wrote
+/// it; a pid or a socket path does not, and neither is here. `schedulers[]`
+/// carries the machine-local identity for a reader that is on the machine.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunLocationView {
+    /// `working`, `idle`, `none`, or `unknown`. See
+    /// [`crate::seats::RunReport::location`] for what decides each one.
+    pub state: &'static str,
+    /// The session holding this board, when exactly one does. `null` on a board
+    /// with no run, on a contested board with two — `sessions` has both — and
+    /// on a run Lisa knows is here but cannot place.
+    pub session: Option<String>,
+    /// Every session named by a scheduler on this board, sorted. Empty is not
+    /// the same as no run: read `state` for that.
+    pub sessions: Vec<String>,
+    /// The exact command that opens `session`, or `null` when there is no one
+    /// session to open. Lisa names commands it can stand behind rather than
+    /// leaving a caller to assemble one.
+    pub attach_command: Option<String>,
+}
+
 /// What one command has to say, and the exit status that goes with it.
 ///
 /// `Answer` is "Lisa computed the answer" — including an answer of "no". A
