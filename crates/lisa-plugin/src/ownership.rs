@@ -132,6 +132,7 @@ mod tests {
                 attempt_id,
             },
             outcome: RunOutcome::Done,
+            reason: None,
             authoritative: true,
             fenced: false,
             requested: route.clone(),

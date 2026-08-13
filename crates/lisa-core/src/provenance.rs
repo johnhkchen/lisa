@@ -41,8 +41,10 @@ use crate::types::AttemptLease;
 /// `requested` from `actual`). Version 9 adds the usage-correction row that late-
 /// joins a capture onto an already-completed ticket (T-051-03-01). Version 10
 /// adds the check-override row that records an operator letting a parked ticket
-/// run again over its own check (T-056-01-01).
-pub const SCHEMA_VERSION: u32 = 10;
+/// run again over its own check (T-056-01-01). Version 11 adds the attempt-launch
+/// row and the `seat-lost` outcome, so an attempt that was launched leaves a row
+/// whatever became of it (T-067-01-02).
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// The `(method, provider, model)` a run resolved to. `model` is `None` until
 /// model selection lands (S-026); `provider` is derived from the client. Today
@@ -85,6 +87,19 @@ pub enum RunOutcome {
     Failed,
     /// Reclaimed for exceeding a session/per-phase timeout.
     TimedOut,
+    /// The scheduler took the seat away from an attempt that was still
+    /// running: recovery gave up on the pane and fenced it.
+    ///
+    /// Deliberately its own word rather than `failed` or `timed-out`, because
+    /// what happened is not either of those and an operator reading the ledger
+    /// has to be able to tell them apart. `failed` is *the work reported an
+    /// error*; `timed-out` is *the attempt outran its budget*. `seat-lost` is
+    /// *the scheduler ended an attempt that had not said anything wrong* —
+    /// the pane is gone, the agent inside it was possibly mid-sentence, and
+    /// nothing about the ticket itself has been decided. It is never
+    /// authoritative, and its [`ProvenanceRecord::reason`] carries the
+    /// scheduler's own sentence for why the seat went.
+    SeatLost,
 }
 
 /// Explicit JSON-level kind for a pre-ownership provenance row.
@@ -92,6 +107,13 @@ pub enum RunOutcome {
 #[serde(rename_all = "kebab-case")]
 pub enum ProvenanceRecordType {
     AssignmentTransition,
+}
+
+/// Explicit JSON-level kind for the row an attempt leaves when it is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttemptLaunchType {
+    AttemptLaunch,
 }
 
 /// Explicit JSON-level kind for bounded blocked-work recovery and parking.
@@ -171,6 +193,13 @@ pub struct ProvenanceRecord {
     /// Exact execution attempt that produced this terminal record.
     pub attempt_lease: AttemptLease,
     pub outcome: RunOutcome,
+    /// The scheduler's own sentence for a non-`done` outcome, when it has one.
+    ///
+    /// Absent on rows whose outcome speaks for itself, and on every row written
+    /// before schema 11. [`RunOutcome::SeatLost`] always carries it: a seat that
+    /// vanished with no reason recorded is the thing this field exists to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Whether this is the ticket-level successful outcome. Schema-v2 writers
     /// set this only for a current-lease [`RunOutcome::Done`] publication.
     pub authoritative: bool,
@@ -197,6 +226,49 @@ pub struct ProvenanceRecord {
     /// Count of threads already running when this run was spawned.
     pub concurrency_at_spawn: usize,
     pub pane_id: u32,
+}
+
+/// One attempt that was launched, written before the agent can start.
+///
+/// Every other row in this ledger is *write-after*: it describes an attempt
+/// that already ended. That ordering is what made the field failure this row
+/// exists for invisible — two attempts on `screen-design` were assigned, worked
+/// for twelve minutes, lost their seats, and left the ledger empty, so the
+/// desk's own accounting said the day contained neither.
+///
+/// The assignment file is the moment an attempt becomes real: it is published
+/// atomically, before any provider lifecycle input, and it is the exact bytes
+/// the agent is told to read. This row is appended immediately after that
+/// publication and before the launch line is typed, so the ledger cannot
+/// disagree with the existence of that file. Everything terminal about the
+/// attempt still arrives later, in its own row.
+///
+/// The row is not authority — it grants nothing and fences nothing. It is the
+/// receipt for a launch, and a launch row with no later terminal row naming the
+/// same `attempt_lease` is itself a readable fact: an attempt that started and
+/// whose end nobody recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptLaunchRecord {
+    pub schema_version: u32,
+    /// Completion durability tier in effect for this attempt.
+    #[serde(default)]
+    pub seal: CompletionSeal,
+    pub record_type: AttemptLaunchType,
+    pub ticket_id: String,
+    pub attempt_lease: AttemptLease,
+    pub pane_id: u32,
+    /// Vendor the attempt was dispatched to (`"anthropic"` or `"openai"`).
+    pub provider: String,
+    /// The published assignment file's name, e.g. `assignment-2-8675309.md`.
+    ///
+    /// The name rather than a path on purpose: the plugin runs in WASM and sees
+    /// the project through a `/host/` prefix, so an absolute path here would
+    /// name a directory no reader of the committed ledger has. The name carries
+    /// the attempt id and the publication nonce, which is exactly enough to
+    /// find the file under the attempt's own work directory.
+    pub assignment: String,
+    /// Launch time, UTC epoch seconds.
+    pub occurred_at: u64,
 }
 
 /// One attempt-scoped transition that ended before provider ownership.
@@ -542,6 +614,7 @@ fn is_false(value: &bool) -> bool {
 #[serde(untagged)]
 pub enum ProvenanceLedgerRecord {
     NoteAcknowledgment(NoteAcknowledgmentRecord),
+    AttemptLaunch(AttemptLaunchRecord),
     AssignmentTransition(AssignmentTransitionRecord),
     ParkingTransition(ParkingTransitionRecord),
     TriageTransition(TriageTransitionRecord),
@@ -682,6 +755,43 @@ pub fn usage_gap<'a>(
         .collect()
 }
 
+/// Ticket ids whose seat was taken away and whose tokens never joined. Sorted.
+///
+/// **Whether that usage is recoverable at all.** `lisa capture-usage` runs from
+/// the provider's Stop hook, so the capture exists only if the session reached
+/// a stop. A seat lost to a pane that was fenced mid-turn never produces one,
+/// and those tokens are gone for good — no transcript path was ever recorded,
+/// and the scheduler has no other reader of the provider's accounting. A seat
+/// lost *after* the session stopped is different: its capture is already on
+/// disk, and because a [`RunOutcome::SeatLost`] row is a durable execution row
+/// like any other, the capture sweep's pane-reign attribution joins it onto the
+/// ticket exactly as it does for a completed one.
+///
+/// So this is the honest split, and the point of it. A ticket that leaves this
+/// list gained its tokens; a ticket that stays on it spent tokens nobody can
+/// count, and the loss is *recorded and countable* rather than silent. Zero is
+/// never substituted for unknown.
+pub fn lost_seat_usage_gap<'a>(
+    records: impl IntoIterator<Item = &'a ProvenanceLedgerRecord> + Clone,
+) -> Vec<String> {
+    let mut lost: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for record in records.clone() {
+        if let ProvenanceLedgerRecord::Execution(exec) = record {
+            if exec.outcome == RunOutcome::SeatLost {
+                lost.insert(exec.ticket_id.clone());
+            }
+        }
+    }
+    let view = correct_usage(records);
+    lost.into_iter()
+        .filter(|ticket_id| {
+            view.get(ticket_id)
+                .map(|usage| usage.tokens_in.is_none())
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
 /// Convert a `SystemTime` to UTC epoch seconds, saturating pre-epoch times to 0.
 pub fn system_time_to_epoch(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
@@ -716,6 +826,14 @@ pub fn extract_usage(usage: &Value) -> (Option<u64>, Option<u64>, Option<f64>) {
 /// parent directory if absent. True append — existing lines are never rewritten,
 /// so retries/resets of the same ticket accumulate additional records.
 pub fn append_record(path: &Path, record: &ProvenanceRecord) -> std::io::Result<()> {
+    append_serialized(path, record)
+}
+
+/// Append one attempt-launch receipt as a single JSONL row.
+pub fn append_attempt_launch_record(
+    path: &Path,
+    record: &AttemptLaunchRecord,
+) -> std::io::Result<()> {
     append_serialized(path, record)
 }
 
@@ -817,6 +935,7 @@ mod tests {
             ticket_id: "T-027-01".to_string(),
             attempt_lease: AttemptLease::mint("T-027-01", None).unwrap(),
             outcome: RunOutcome::Done,
+            reason: None,
             authoritative: true,
             fenced: false,
             requested: Route::from_client(AgentClient::Codex),
@@ -899,13 +1018,154 @@ mod tests {
             serde_json::to_string(&RunOutcome::Failed).unwrap(),
             "\"failed\""
         );
+        assert_eq!(
+            serde_json::to_string(&RunOutcome::SeatLost).unwrap(),
+            "\"seat-lost\""
+        );
+    }
+
+    /// A lost seat has to be legible as its own thing, not as a shade of the
+    /// two outcomes that already existed.
+    #[test]
+    fn a_lost_seat_is_spelled_apart_from_done_and_timed_out() {
+        let mut record = sample();
+        record.outcome = RunOutcome::SeatLost;
+        record.authoritative = false;
+        record.fenced = true;
+        record.reason = Some("positive shell readiness was never proven".to_string());
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"outcome\":\"seat-lost\""));
+        assert!(!json.contains("\"outcome\":\"done\""));
+        assert!(!json.contains("\"outcome\":\"timed-out\""));
+        assert!(!json.contains("\"outcome\":\"failed\""));
+        assert!(json.contains("\"reason\":\"positive shell readiness was never proven\""));
+        assert_eq!(
+            serde_json::from_str::<ProvenanceRecord>(&json).unwrap(),
+            record
+        );
+
+        // The field is additive: every row written before schema 11 reads back
+        // with no reason rather than failing to parse.
+        let legacy: ProvenanceRecord = serde_json::from_str(SCHEMA_V2_EXECUTION_JSON).unwrap();
+        assert_eq!(legacy.reason, None);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("reason"));
+    }
+
+    fn sample_attempt_launch() -> AttemptLaunchRecord {
+        AttemptLaunchRecord {
+            schema_version: SCHEMA_VERSION,
+            seal: CompletionSeal::Commit,
+            record_type: AttemptLaunchType::AttemptLaunch,
+            ticket_id: "T-019-01".to_string(),
+            attempt_lease: AttemptLease {
+                ticket_id: "T-019-01".to_string(),
+                attempt_id: 2,
+            },
+            pane_id: 1,
+            provider: "anthropic".to_string(),
+            assignment: "assignment-2-8675309.md".to_string(),
+            occurred_at: 1_786_650_742,
+        }
+    }
+
+    #[test]
+    fn attempt_launch_serializes_to_one_compact_line_and_round_trips() {
+        let record = sample_attempt_launch();
+        let json = serde_json::to_string(&record).unwrap();
+
+        assert!(!json.contains('\n'), "record must be single-line: {json}");
+        assert!(json.contains("\"schema_version\":11"));
+        assert!(json.contains("\"record_type\":\"attempt-launch\""));
+        assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-019-01\",\"attempt_id\":2}"));
+        assert!(json.contains("\"assignment\":\"assignment-2-8675309.md\""));
+        assert!(json.contains("\"provider\":\"anthropic\""));
+        assert_eq!(
+            serde_json::from_str::<AttemptLaunchRecord>(&json).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn attempt_launch_appends_as_exactly_one_jsonl_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/provenance.jsonl");
+
+        append_attempt_launch_record(&path, &sample_attempt_launch()).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert!(bytes.ends_with(b"\n"));
+        let back: AttemptLaunchRecord = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(back, sample_attempt_launch());
+    }
+
+    /// The mixed ledger has to keep a launch row a launch row. An untagged enum
+    /// that let one deserialize as an execution would put a fabricated outcome
+    /// on a row that reports none.
+    #[test]
+    fn attempt_launch_row_does_not_absorb_or_get_absorbed() {
+        let launch = serde_json::to_string(&sample_attempt_launch()).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ProvenanceLedgerRecord>(&launch).unwrap(),
+            ProvenanceLedgerRecord::AttemptLaunch(_)
+        ));
+
+        for other in [
+            serde_json::to_string(&sample()).unwrap(),
+            serde_json::to_string(&sample_assignment_transition()).unwrap(),
+        ] {
+            assert!(
+                !matches!(
+                    serde_json::from_str::<ProvenanceLedgerRecord>(&other).unwrap(),
+                    ProvenanceLedgerRecord::AttemptLaunch(_)
+                ),
+                "not a launch row: {other}"
+            );
+        }
+    }
+
+    /// The countable half of the token question: a seat lost before its Stop
+    /// hook fired spent tokens nobody can join, and that has to read as a
+    /// recorded loss rather than as nothing having happened.
+    #[test]
+    fn lost_seat_usage_is_counted_as_lost_until_a_capture_joins_it() {
+        let mut lost = sample();
+        lost.ticket_id = "T-019-01".to_string();
+        lost.attempt_lease = AttemptLease {
+            ticket_id: "T-019-01".to_string(),
+            attempt_id: 1,
+        };
+        lost.outcome = RunOutcome::SeatLost;
+        lost.authoritative = false;
+        lost.tokens_in = None;
+        lost.tokens_out = None;
+
+        let mut rows = vec![
+            ProvenanceLedgerRecord::AttemptLaunch(sample_attempt_launch()),
+            ProvenanceLedgerRecord::Execution(lost),
+        ];
+        assert_eq!(lost_seat_usage_gap(&rows), vec!["T-019-01".to_string()]);
+        // A completed ticket's gap is a different question and stays separate.
+        assert!(usage_gap(&rows).is_empty());
+
+        // A seat lost *after* its session stopped has a capture on disk, and the
+        // sweep joins it exactly as it does for a completed ticket.
+        rows.push(ProvenanceLedgerRecord::UsageCorrection(sample_correction(
+            "T-019-01", 400, 50,
+        )));
+        assert!(lost_seat_usage_gap(&rows).is_empty());
+        assert_eq!(
+            correct_usage(&rows).get("T-019-01").unwrap().tokens_in,
+            Some(400)
+        );
     }
 
     #[test]
     fn record_serializes_to_one_compact_line() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":10"));
+        assert!(json.contains("\"schema_version\":11"));
         assert!(json.contains("\"seal\":\"commit\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-027-01\",\"attempt_id\":1}"));
         assert!(json.contains("\"outcome\":\"done\""));
@@ -946,7 +1206,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":10"));
+        assert!(json.contains("\"schema_version\":11"));
         assert!(json.contains("\"seal\":\"journal\""));
         assert!(json.contains("\"record_type\":\"assignment-transition\""));
         assert!(json.contains("\"attempt_lease\":{\"ticket_id\":\"T-040-02-01\",\"attempt_id\":7}"));
@@ -986,7 +1246,7 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
 
             assert!(!json.contains('\n'), "record must be single-line: {json}");
-            assert!(json.contains("\"schema_version\":10"));
+            assert!(json.contains("\"schema_version\":11"));
             assert!(json.contains("\"seal\":\"journal\""));
             assert!(json.contains(&format!(
                 "\"record_type\":{}",
@@ -1327,6 +1587,7 @@ mod tests {
                 attempt_id: 1,
             },
             outcome: RunOutcome::Done,
+            reason: None,
             authoritative: true,
             fenced: false,
             requested: route.clone(),
@@ -1347,7 +1608,7 @@ mod tests {
         let record = sample_correction("T-051-03-01", 1200, 340);
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains('\n'), "record must be single-line: {json}");
-        assert!(json.contains("\"schema_version\":10"));
+        assert!(json.contains("\"schema_version\":11"));
         assert!(json.contains("\"record_type\":\"usage-correction\""));
         assert!(json.contains("\"method\":\"claude\""));
         assert!(json.contains("\"source_line\":7"));

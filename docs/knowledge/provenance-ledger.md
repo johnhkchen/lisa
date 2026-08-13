@@ -1,14 +1,15 @@
 # Provenance Ledger
 
 The **provenance ledger** is an append-only JSONL file at
-`.lisa/provenance.jsonl`. It contains terminal execution attempts,
-pre-ownership assignment failures, and ticket parking transitions. Terminal
-execution rows are appended after the attempt reaches its terminal state and
-never race agent-owned ticket fields. `.lisa/` gitignores only `signals/`, so
-the ledger is **committable learning data** that can be queried across runs.
+`.lisa/provenance.jsonl`. It contains launched attempts, terminal execution
+attempts, pre-ownership assignment failures, and ticket parking transitions.
+Terminal execution rows are appended after the attempt reaches its terminal
+state and never race agent-owned ticket fields. `.lisa/` gitignores only
+`signals/`, so the ledger is **committable learning data** that can be queried
+across runs.
 
 Schema owner: `crates/lisa-core/src/provenance.rs`. Current
-`schema_version`: **9**.
+`schema_version`: **11**.
 
 ## Execution record shape
 
@@ -26,7 +27,8 @@ One JSON object per line. Example:
 | `seal` | enum | no | `commit` or `journal`, identifying the completion durability tier in effect. Missing on pre-ladder rows means `commit`. |
 | `ticket_id` | string | no | The ticket this run worked on. Retries reuse the id → multiple records. |
 | `attempt_lease` | object | no | Exact `{ticket_id, attempt_id}` lease stamped on this execution attempt. |
-| `outcome` | enum | no | `done` \| `failed` \| `timed-out`. |
+| `outcome` | enum | no | `done` \| `failed` \| `timed-out` \| `seat-lost`. |
+| `reason` | string | **absent** | The scheduler's own sentence for a non-`done` outcome. Absent when the outcome speaks for itself, and on every row written before schema 11. Always present on `seat-lost`. |
 | `authoritative` | bool | no | True only for the current lease's accepted ticket-level `done` publication. |
 | `fenced` | bool | no | True when scheduler teardown confirmed this attempt's pane was fenced. |
 | `requested` | Route | no | The `(method, provider, model)` requested for the run. |
@@ -50,10 +52,42 @@ Schema-v2 records use the same complete `AttemptLease` value as scheduler
 admission. A timed-out predecessor and its replacement therefore have the same
 top-level `ticket_id` but different `attempt_lease.attempt_id` values.
 
-`failed` and `timed-out` records are retained attempt history. They have
-`authoritative: false`; this does not make their history untrustworthy, only
-states that they are not the ticket's successful terminal publication. A
+`failed`, `timed-out` and `seat-lost` records are retained attempt history. They
+have `authoritative: false`; this does not make their history untrustworthy,
+only states that they are not the ticket's successful terminal publication. A
 confirmed timeout/hard-silence pane closure also carries `fenced: true`.
+
+### `seat-lost` is its own word
+
+Schema 11 added a fourth outcome, and the distinction it draws is the point of
+it. `failed` means *the work reported an error*. `timed-out` means *the attempt
+outran its budget*. `seat-lost` means **the scheduler ended an attempt that had
+not said anything wrong** — recovery gave up on the pane and fenced it, the
+agent inside was possibly mid-sentence, and nothing about the ticket itself has
+been decided. Collapsing it into `failed` would blame the work; leaving it out
+was worse, and is what this row exists to stop:
+
+```
+grep 'T-019-01' .lisa/provenance.jsonl         → nothing
+grep 'T-019-01' .lisa/completion-journal.jsonl → nothing
+```
+
+Two attempts, twelve minutes of agent time each, two dead panes, and two tickets
+left at `phase: review` with no seat — and by the record, no attempt on either
+ticket ever happened. Every `seat-lost` row carries `fenced: true`, `reason`,
+and the exact `attempt_lease`, and it is written **before** the fence, because
+the lease, the pane and the thread it is built from are exactly what the fence
+clears.
+
+**Its tokens.** `seat-lost` rows carry `null` tokens like every other terminal
+row, and whether they ever gain any depends on one thing: `lisa capture-usage`
+runs from the provider's Stop hook, so a capture exists only if the session
+reached a stop. A seat lost *after* the session stopped has its capture on disk,
+and the sweep joins it by pane reign exactly as it does for a completed ticket.
+A seat lost mid-turn produced no capture and never will — that spend is
+unrecoverable. `lost_seat_usage_gap` enumerates the second case and `lisa
+status` prints it as *lost with the seat*, so the loss is counted rather than
+silent. Zero is never substituted for unknown.
 
 Only the current lease can publish a `done` record, and that record carries
 `authoritative: true`. Completion request admission, asynchronous result
@@ -95,6 +129,58 @@ segments by provider rather than treating a token as a universal unit.
 Missing values are always `null`, never guessed. A run that produced no
 observable usage (no artifact, empty/unreadable transcript) records `null`
 tokens — not a fabricated `0`.
+
+## Attempt-launch record shape
+
+Schema 11 added the one row in this file that is **not** write-after. Every
+other shape describes an attempt that already ended, and that ordering is what
+made a lost attempt invisible: nothing was written until the end, and these
+attempts had no recorded end.
+
+The assignment file is the moment an attempt becomes real. It is published
+atomically, before any provider lifecycle input, and it is the exact bytes the
+agent is told to read. This row is appended immediately after that publication
+and before the launch line is typed, so **the ledger cannot disagree with the
+existence of that file**. It is emitted from the publication path itself rather
+than from each of the three dispatch sites, so a fourth launch path cannot
+quietly skip it.
+
+The row is not authority — it grants nothing and fences nothing. A launch row
+with no later terminal row naming the same `attempt_lease` is itself a readable
+fact: an attempt that started and whose end nobody recorded. `lisa status`
+reports exactly that under *Tickets nobody is working*.
+
+Example:
+
+```json
+{"schema_version":11,"seal":"commit","record_type":"attempt-launch","ticket_id":"T-019-01","attempt_lease":{"ticket_id":"T-019-01","attempt_id":2},"pane_id":1,"provider":"anthropic","assignment":"assignment-2-8675309.md","occurred_at":1786650742}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema_version` | int | `11` for the generation that introduced this shape. |
+| `seal` | enum | Completion tier in effect for this attempt. |
+| `record_type` | enum | Always `attempt-launch`. |
+| `ticket_id` | string | Ticket the attempt was dispatched for. |
+| `attempt_lease` | object | Exact `{ticket_id, attempt_id}` lease this launch carries. |
+| `pane_id` | int | Zellij pane the attempt was placed in. |
+| `provider` | string | Vendor the attempt was dispatched to. |
+| `assignment` | string | The published assignment file's **name**, e.g. `assignment-2-8675309.md`. A name and not a path: the plugin runs in WASM and sees the project through a `/host/` prefix, so an absolute path would name a directory no reader of the committed ledger has. The name carries the attempt id and the publication nonce, which locates the file under that attempt's own work directory. |
+| `occurred_at` | int | Launch time, UTC epoch seconds. |
+
+Like every ledger write in the plugin, this one is best-effort: a failure logs
+loudly and the launch proceeds. A ledger that can refuse a dispatch is a ledger
+that can stop the board.
+
+**jq** — attempts that were launched and whose end nobody recorded:
+
+```sh
+jq -s '
+  (map(select(.outcome != null)) | map(.attempt_lease)) as $ended
+  | map(select(.record_type=="attempt-launch") | select(.attempt_lease as $l | $ended | index($l) | not))
+  | map({ticket_id, attempt: .attempt_lease.attempt_id, assignment})
+' .lisa/provenance.jsonl
+```
 
 ## Assignment-transition record shape
 
@@ -217,10 +303,10 @@ jq -s '
 
 ## Mixed-ledger reading
 
-Historical execution rows have no `record_type`. Assignment, parking, triage,
-proposal, and usage-correction rows have distinct required discriminators and
-fields. Core exposes the untagged `ProvenanceLedgerRecord` enum to replay every
-shape without rewriting old lines.
+Historical execution rows have no `record_type`. Attempt-launch, assignment,
+parking, triage, proposal, and usage-correction rows have distinct required
+discriminators and fields. Core exposes the untagged `ProvenanceLedgerRecord`
+enum to replay every shape without rewriting old lines.
 
 All three row shapes deserialize an absent `seal` as `commit`. Such rows are
 pre-ladder history produced when commit sealing was the only completion path.
@@ -268,9 +354,16 @@ ORDER BY 1, 2;
   current-lease Done row is marked authoritative.
 - **Non-fatal.** A failed ledger write is logged and swallowed — it never
   interrupts the scheduling loop.
-- **Write-after.** The record is appended at run teardown, after the ticket's
-  phase/status are already updated. The ledger is downstream of the run, never a
-  participant in it.
+- **Write-after, with one deliberate exception.** Terminal records are appended
+  at run teardown, after the ticket's phase/status are already updated. The
+  ledger is downstream of the run, never a participant in it. The
+  `attempt-launch` row is the exception and is *write-before*, because an
+  attempt with no recorded end is exactly the case write-after cannot describe.
+- **Durable before the teardown that erases its inputs.** A `seat-lost` row is
+  written before the pane is fenced, its lease revoked and its signals cleared.
+  `on-stop.sh` states the same rule at the other end of an attempt's life —
+  *"the capture must already be durable when the signal appears … a session
+  ended mid-capture lost 8 of 9 usage records"*.
 
 ## Versioning
 
@@ -280,7 +373,9 @@ Version 3 added assignment-transition rows. Version 4 added park/unpark rows
 and the shared remedy-owner classification. Version 5 added bounded blocked
 retry fields. Version 6 added the completion `seal`; its default keeps rows
 from versions 1–5 classified as commit-sealed pre-ladder history. Version 9 added
-the usage-correction row (the late token-usage join). Version-1 rows remain valid
+the usage-correction row (the late token-usage join). Version 11 added the
+attempt-launch row, the `seat-lost` outcome, and the optional execution `reason`,
+so an attempt that was launched leaves a row whatever became of it. Version-1 rows remain valid
 append-only history but predate attempt attribution; readers of a mixed ledger
 must branch on version and shape rather than inventing leases.
 
