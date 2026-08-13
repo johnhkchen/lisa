@@ -120,6 +120,19 @@ pub(crate) fn compose(ticker: Ticker<'_>) -> String {
         segments.push("paused".to_string());
     }
 
+    // A board short of the panes its layout made is running at less than the
+    // concurrency it was asked for, and every other surface reads as healthy.
+    // Ahead of the working count because it qualifies it: `1/2 working` on a
+    // board with two panes left is not the same run as `1/2 working` on four.
+    if let Some(short) = state.short_panes {
+        segments.push(format!(
+            "{}/{} panes{}",
+            short.present,
+            short.declared,
+            if short.gave_up { " (gave up)" } else { "" }
+        ));
+    }
+
     if working > 0 {
         // `seats.max(working)` rather than `seats`: before the first PaneUpdate
         // no slots are discovered yet, and `1/0 working` is worse than `1/1`.
@@ -399,6 +412,40 @@ mod tests {
             compose_for(&state, None),
             "steer · paused · idle · 2/4 done"
         );
+    }
+
+    /// The fact `screen-design` ran on for hours with nothing anywhere saying
+    /// it: half the panes gone, and a title that read healthy.
+    #[test]
+    fn a_board_short_of_its_panes_says_so_before_the_work_it_qualifies() {
+        let mut state = board();
+        state.active_threads = vec![thread("T-019-01", 12)];
+        state.short_panes = Some(crate::ui::ShortPanes {
+            present: 2,
+            declared: 4,
+            gave_up: false,
+        });
+
+        assert_eq!(
+            compose_for(&state, None),
+            "steer · 2/4 panes · 1/4 working · T-019-01 <1m"
+        );
+
+        // And a run that has stopped trying says which kind of short it is,
+        // because the two need different things from the operator.
+        state.short_panes = Some(crate::ui::ShortPanes {
+            present: 2,
+            declared: 4,
+            gave_up: true,
+        });
+        assert!(compose_for(&state, None).contains("2/4 panes (gave up)"));
+    }
+
+    #[test]
+    fn a_whole_board_says_nothing_about_its_panes() {
+        let state = board();
+        assert_eq!(state.short_panes, None);
+        assert!(!compose_for(&state, None).contains("panes"));
     }
 
     #[test]

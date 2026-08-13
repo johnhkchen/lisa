@@ -10,6 +10,7 @@ pub mod disposition;
 pub mod liveness;
 pub mod notes;
 pub mod operator_override;
+pub mod pane_heal;
 pub mod parking;
 pub mod provenance;
 pub mod route;

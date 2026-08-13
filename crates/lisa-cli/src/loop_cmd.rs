@@ -697,6 +697,14 @@ fn generate_layout(
         agent_panes.push_str("            pane\n");
     }
 
+    // The same number, told to the plugin, so a run that loses a pane can put it
+    // back. The layout is the only thing that knows what *this* run asked for,
+    // and this line is written from the loop above rather than recomputed from
+    // `max_threads` — a scheduler and its layout that each derive the count
+    // separately are two numbers that can disagree, and the whole point of
+    // healing is that the layout wins.
+    let agent_pane_count_line = format!("                agent_panes \"{pane_count}\"\n");
+
     // The absolute `lisa` path (current_exe), exported by native adapters for
     // lifecycle-hook usage capture. An absent key falls back to PATH.
     let lisa_bin_line = match lisa_bin {
@@ -765,12 +773,13 @@ fn generate_layout(
                 triage_enabled "{triage_enabled}"
                 triage_timeout_secs "{triage_timeout_secs}"
                 client "{client}"
-{model_line}{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
+{agent_pane_count_line}{model_line}{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
         }}
     }}
 }}
 "#,
         agent_panes = agent_panes,
+        agent_pane_count_line = agent_pane_count_line,
         wasm_path = wasm_path.display(),
         git_root = git_root.display(),
         completion_seal = completion_seal,
@@ -1168,6 +1177,33 @@ mod tests {
         // max_threads=3 should produce 6 pane lines (2x)
         let pane_count = layout.matches("            pane").count();
         assert_eq!(pane_count, 6, "Expected 6 panes (2 * max_threads=3)");
+    }
+
+    /// The count the plugin heals towards is the count the layout made.
+    ///
+    /// Not an equality between two derivations of `max_threads * 2`: the whole
+    /// point of `agent_panes` is that a run which has *lost* panes can tell what
+    /// it started with, so the number is read off the pane lines this very
+    /// layout emitted. Any future change that makes the stack a different size
+    /// — a spare fewer, a swap layout, a per-provider pane — has to keep these
+    /// two agreeing or this fails.
+    #[test]
+    fn the_layout_declares_exactly_as_many_panes_as_it_creates() {
+        for max_threads in [1, 2, 3, 8] {
+            let mut config = default_config();
+            config.max_threads = max_threads;
+            let layout = test_layout(Path::new("/tmp/lisa-plugin.wasm"), None, &config);
+
+            let created = layout
+                .lines()
+                .filter(|line| line.trim_end() == "            pane")
+                .count();
+            assert!(created > 0, "max_threads={max_threads} created no panes");
+            assert!(
+                layout.contains(&format!("agent_panes \"{created}\"")),
+                "max_threads={max_threads} created {created} panes but declared something else:\n{layout}"
+            );
+        }
     }
 
     #[test]

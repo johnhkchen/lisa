@@ -649,6 +649,20 @@ pub struct PluginConfig {
     /// Maximum number of concurrent threads (default: 4)
     pub max_threads: usize,
 
+    /// How many coding panes this run's layout declared and created.
+    ///
+    /// Written by `lisa loop` from the same loop that emits the `pane` lines, so
+    /// the number the scheduler holds *is* the number the layout made. `None` —
+    /// a layout from before this key, or a directly constructed test — means the
+    /// run does not know how many panes it should have, and a scheduler that
+    /// does not know that never regenerates one.
+    ///
+    /// Deliberately not `max_threads * 2`: recomputing it here would be a second
+    /// derivation of a number that already exists, and the pane loss this
+    /// answers is exactly the case where the two would disagree.
+    #[serde(default)]
+    pub agent_panes: Option<usize>,
+
     /// Seconds of total inactivity (no heartbeats, signals, or phase changes)
     /// before a thread is flagged Stuck (default: 1200 = 20 minutes). The hard
     /// reclaim bar is 2x this value, so the default tolerates a single silent
@@ -784,6 +798,7 @@ impl PluginConfig {
             story_dir: PathBuf::from(Self::DEFAULT_STORY_DIR),
             work_dir: PathBuf::from(Self::DEFAULT_WORK_DIR),
             max_threads: Self::DEFAULT_MAX_THREADS,
+            agent_panes: None,
             stuck_threshold_secs: Self::DEFAULT_STUCK_THRESHOLD_SECS,
             review_timeout_secs: Self::DEFAULT_REVIEW_TIMEOUT_SECS,
             session_timeout_secs: Self::DEFAULT_SESSION_TIMEOUT_SECS,
@@ -829,6 +844,16 @@ impl PluginConfig {
         if let Some(max_threads) = config.get("max_threads") {
             if let Ok(n) = max_threads.parse() {
                 result.max_threads = n;
+            }
+        }
+
+        if let Some(agent_panes) = config.get("agent_panes") {
+            // A zero or unreadable value stays absent rather than becoming a
+            // declaration of "no panes", which nothing could heal towards.
+            if let Ok(n) = agent_panes.parse::<usize>() {
+                if n > 0 {
+                    result.agent_panes = Some(n);
+                }
             }
         }
 

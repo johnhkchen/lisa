@@ -555,6 +555,26 @@ pub struct PluginState {
     pub paused: bool,
     /// Which preset view is currently active.
     pub active_view: ViewPreset,
+    /// A board that is short of the coding panes its layout made, and whether
+    /// the loop has stopped trying to put them back. `None` while the board is
+    /// whole — which is nearly always, and says nothing worth a row.
+    pub short_panes: Option<ShortPanes>,
+}
+
+/// A board running on fewer coding panes than its layout declared.
+///
+/// The operator on `screen-design` had no way to see this at all: the run was
+/// down to half its panes for hours and every surface said it was healthy. It
+/// goes in the title because the title is the one row visible from a pane the
+/// operator is not looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortPanes {
+    /// Coding panes present now.
+    pub present: usize,
+    /// Coding panes the layout declared.
+    pub declared: usize,
+    /// Whether this run has spent its regeneration budget and stopped asking.
+    pub gave_up: bool,
 }
 
 impl Default for PluginState {
@@ -572,6 +592,7 @@ impl Default for PluginState {
             modal: ModalState::default(),
             paused: false,
             active_view: ViewPreset::default(),
+            short_panes: None,
         }
     }
 }
@@ -2401,6 +2422,7 @@ mod tests {
             modal: ModalState::default(),
             paused: false,
             active_view: ViewPreset::default(),
+            short_panes: None,
         }
     }
 
@@ -4943,6 +4965,7 @@ mod tests {
             modal: ModalState::default(),
             paused: false,
             active_view: ViewPreset::default(),
+            short_panes: None,
         };
 
         // Test DAG view: done tickets filtered, active tickets shown

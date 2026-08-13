@@ -9,6 +9,7 @@ mod assignment;
 mod codex_ack;
 mod completion_journal;
 mod deadline;
+mod heal;
 mod ownership;
 mod pane_name;
 mod publication;
@@ -57,6 +58,7 @@ use lisa_core::disposition::{
 use lisa_core::operator_override::{
     build_operator_override, OperatorOverride, OverriddenAsk, OverrideReason,
 };
+use lisa_core::pane_heal::{PaneHealAnswer, PaneHealReceipt};
 use lisa_core::provenance::{
     self, AssignmentState, AssignmentTransitionRecord, OperatorOverrideRecord,
     OperatorOverrideType, ParkingTransitionRecord, ParkingTransitionType, ProposalAction,
@@ -363,6 +365,18 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
         }
     }
     Ok(normalized)
+}
+
+/// One request healing made of Zellij, as native tests read it back.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HealCall {
+    /// A replacement terminal pane was asked for.
+    OpenedPane,
+    /// The agent stack was restated with these members, in layout order.
+    Restacked(Vec<u32>),
+    /// Focus was handed back to this pane.
+    Refocused(u32),
 }
 
 /// Terminate a hard-silent attempt at the Zellij pane boundary. Native unit
@@ -1114,6 +1128,41 @@ pub struct State {
     /// not had a chance to answer; a new `PaneUpdate` retires the guard, so a
     /// resize that drifts the expansion back is promoted again.
     stack_promoted: Option<(u32, Option<u32>)>,
+
+    /// How many replacement panes this run has asked Zellij for, and whether it
+    /// has stopped asking. See [`heal`].
+    heal_budget: heal::Budget,
+
+    /// A replacement pane that has been asked for and has not appeared yet.
+    /// Holds the next ask off, and remembers whose focus to hand back.
+    heal_outstanding: Option<heal::Outstanding>,
+
+    /// The last census the plugin took: what the layout declared against what
+    /// the manifest showed. Read by the dashboard and by the `rail` ask, so both
+    /// answer from the same observation the scheduler acted on.
+    heal_census: heal::Census,
+
+    /// A `lisa heal-panes` ask this scheduler took and has not answered yet.
+    ///
+    /// An ask that finds the board short is answered when the pane arrives, not
+    /// when the request is read: *asked and healed* is a claim about a pane that
+    /// exists.
+    heal_request: Option<lisa_core::pane_heal::PaneHealRequest>,
+
+    /// Whether the give-up sentence has already been said. The budget is sticky,
+    /// so without this the feed would repeat it on every `PaneUpdate`.
+    heal_give_up_reported: bool,
+
+    /// Where `lisa heal-panes` leaves its ask and reads its answer — the project
+    /// root, as `/host` inside the sandbox. Empty disables the channel, which is
+    /// the state of every directly constructed test that does not want it.
+    heal_root: PathBuf,
+
+    /// What healing asked Zellij to do, in order. Native tests observe the
+    /// requests instead of invoking plugin host calls, the same way
+    /// [`close_fenced_pane`] is observed through its state transition.
+    #[cfg(test)]
+    heal_calls: Vec<HealCall>,
 
     /// Panes whose agent did not release them after `/exit`, keyed by pane.
     ///
@@ -4557,6 +4606,441 @@ impl State {
         }
         self.stack_promoted = Some((target, self.stack_view.expanded));
         show_pane_with_id(PaneId::Terminal(target), false);
+    }
+
+    /// Ask Zellij for a terminal pane at the project root.
+    ///
+    /// The plugin already holds every permission this needs — it asks for
+    /// `ChangeApplicationState` at load, and has been renaming panes with it
+    /// since the first version. It has simply never made one.
+    fn open_regenerated_pane(&mut self) {
+        #[cfg(not(test))]
+        open_terminal(&self.project_root);
+        #[cfg(test)]
+        self.heal_calls.push(HealCall::OpenedPane);
+    }
+
+    /// Restate the agent stack, in layout order, with `members` in it.
+    ///
+    /// `stack_panes` is how a pane created *anywhere* becomes a member of the
+    /// stack at the size the layout gave it. Measured against Zellij 0.44.3: a
+    /// pane opened beside the stack and then restacked lands back inside the
+    /// 70% region with the dashboard still holding its 30%, which is the
+    /// arrangement `lisa loop` starts with.
+    fn restack_agent_panes(&mut self, members: &[u32]) {
+        #[cfg(not(test))]
+        stack_panes(members.iter().map(|id| PaneId::Terminal(*id)).collect());
+        #[cfg(test)]
+        self.heal_calls.push(HealCall::Restacked(members.to_vec()));
+    }
+
+    /// Hand focus back to the pane that had it before Lisa opened one.
+    fn refocus_pane(&mut self, pane_id: u32) {
+        #[cfg(not(test))]
+        focus_pane_with_id(PaneId::Terminal(pane_id), false);
+        #[cfg(test)]
+        self.heal_calls.push(HealCall::Refocused(pane_id));
+    }
+
+    /// The coding panes this manifest shows in the loop's own tab, in layout
+    /// order.
+    ///
+    /// Scoped to the tab the plugin is drawn in, which is the tab `lisa loop`'s
+    /// layout puts the stack and the dashboard in together. A second tab an
+    /// operator opened is theirs: its shells must not be counted as Lisa's
+    /// panes, and must never be conscripted into a seat.
+    ///
+    /// `None` when the plugin cannot find its own pane in the manifest — a
+    /// manifest caught mid-relayout, or one that arrived before the plugin knew
+    /// its id. Nothing is counted or retired from a shape we do not recognise.
+    fn agent_panes_in_tab<'a>(&self, manifest: &'a PaneManifest) -> Option<Vec<&'a PaneInfo>> {
+        let plugin_pane_id = self.plugin_pane_id?;
+        let tab = manifest.panes.values().find(|panes| {
+            panes
+                .iter()
+                .any(|pane| pane.is_plugin && pane.id == plugin_pane_id)
+        })?;
+        let mut coding: Vec<&PaneInfo> = tab
+            .iter()
+            .filter(|pane| !pane.is_plugin && !pane.is_floating && !pane.is_suppressed)
+            .collect();
+        // Layout order: the stack runs top to bottom, and `stack_panes` is given
+        // the members in the order they should appear.
+        coding.sort_by_key(|pane| (pane.pane_y, pane.pane_x, pane.id));
+        Some(coding)
+    }
+
+    /// Count the coding panes against what the layout declared, and act on the
+    /// difference.
+    ///
+    /// Called from `PaneUpdate` and nowhere else. Zellij delivers that event
+    /// when the pane set changes, which is exactly when this answer can change,
+    /// so a lost pane is noticed for the cost of one comparison on an event the
+    /// plugin already handles. A pane is lost far too rarely to earn a poll.
+    fn census_panes(&mut self, manifest: &PaneManifest) {
+        let Some(panes) = self.agent_panes_in_tab(manifest) else {
+            return;
+        };
+        if panes.is_empty() && !self.agent_slots.is_empty() {
+            // Every coding pane gone at once is not four deaths; it is a
+            // manifest that does not describe the tab we know. Same discipline
+            // as `stack::observe`: an unrecognised shape decides nothing.
+            return;
+        }
+
+        // The census describes the manifest, so it is taken before any slot
+        // bookkeeping: an adoption that answers a `rail` ask must report the
+        // board this manifest shows, not the one the slots had caught up to.
+        self.heal_census = heal::Census {
+            declared: self.config.agent_panes,
+            present: panes.len(),
+        };
+        let live: HashSet<u32> = panes.iter().map(|pane| pane.id).collect();
+        self.adopt_regenerated_pane(&live, &panes);
+        self.retire_vanished_slots(&live);
+
+        let Some(now) = unix_secs(std::time::SystemTime::now()) else {
+            return;
+        };
+        // A stale ask is charged and cleared here, so the decision below sees
+        // the budget it really has.
+        if self
+            .heal_outstanding
+            .is_some_and(|ask| ask.is_stale(now) && !live.is_empty())
+        {
+            self.heal_outstanding = None;
+        }
+
+        match heal::decide(
+            self.heal_census,
+            self.heal_outstanding,
+            &self.heal_budget,
+            now,
+        ) {
+            heal::Decision::Whole => self.answer_pane_heal_request(PaneHealAnswer::AlreadyFine),
+            heal::Decision::Undeclared => {
+                self.answer_pane_heal_request(PaneHealAnswer::Refused);
+            }
+            heal::Decision::Waiting => {}
+            heal::Decision::Regenerate { missing } => {
+                let focus_before = panes
+                    .iter()
+                    .find(|pane| pane.is_focused)
+                    .map(|pane| pane.id);
+                self.request_replacement_pane(missing, focus_before, now);
+            }
+            heal::Decision::GaveUp { missing } => self.report_pane_heal_give_up(missing),
+        }
+    }
+
+    /// Ask Zellij for one replacement pane.
+    ///
+    /// One at a time: each arrival is its own `PaneUpdate`, and the next
+    /// decision is made from the manifest that event carries rather than from a
+    /// plan made before it. The pane is created wherever Zellij puts it and
+    /// moved into the stack on adoption — see [`Self::adopt_regenerated_pane`],
+    /// which is also where the operator gets their focus back.
+    fn request_replacement_pane(&mut self, missing: usize, focus_before: Option<u32>, now: u64) {
+        let exhausted = self.heal_budget.spend(now);
+        self.heal_outstanding = Some(heal::Outstanding {
+            asked_at: now,
+            focus_before,
+        });
+        let declared = self.config.agent_panes.unwrap_or_default();
+        self.log_activity(ActivityEvent::Warning {
+            message: format!(
+                "The board has {} of the {} coding panes its layout made; asking Zellij for one back \
+                 (attempt {} of {} in {} minutes)",
+                declared.saturating_sub(missing),
+                declared,
+                self.heal_budget.recent(now),
+                heal::MAX_REGENERATIONS,
+                heal::REGENERATION_WINDOW_SECS / 60,
+            ),
+        });
+        self.open_regenerated_pane();
+        if exhausted {
+            // Said now rather than on the next tick: the ask that spent the
+            // budget is the one an operator will be reading about.
+            self.report_pane_heal_give_up(missing.saturating_sub(1));
+        }
+    }
+
+    /// Take in the pane the last ask produced, as a fresh seat.
+    ///
+    /// A regenerated pane is never the dead pane's seat resumed. The attempt
+    /// that died with the old pane ended when the pane did — `T-067-01-02`
+    /// requires that end to be recorded, and [`Self::retire_vanished_slots`]
+    /// records it — so this pane arrives idle, unleased and unnamed, and takes
+    /// its first ticket through ordinary scheduling like any other spare.
+    fn adopt_regenerated_pane(&mut self, live: &HashSet<u32>, panes: &[&PaneInfo]) {
+        let Some(ask) = self.heal_outstanding else {
+            return;
+        };
+        let known: HashSet<u32> = self.agent_slots.iter().map(|slot| slot.pane_id).collect();
+        let Some(adopted) = live.iter().copied().find(|id| !known.contains(id)) else {
+            return;
+        };
+
+        self.heal_outstanding = None;
+        self.agent_slots.push(AgentSlot {
+            pane_id: adopted,
+            ticket_id: None,
+            attempt_lease: None,
+            has_session: false,
+            transition_state: TransitionState::Idle,
+            transition_started_at: None,
+            cooldown_until: None,
+            last_activity_at: None,
+            last_client: None,
+        });
+        if self.permissions_granted {
+            self.rename_slot(
+                adopted,
+                format_pane_name(PaneName::Idle {
+                    resident_agent: None,
+                }),
+            );
+        }
+
+        // Back into the stack, at the size the layout gave it. A replacement
+        // pane sitting beside the stack is a new bug wearing the fix's clothes,
+        // so the arrangement is restated explicitly rather than hoped for from
+        // wherever Zellij happened to open it.
+        let members: Vec<u32> = panes.iter().map(|pane| pane.id).collect();
+        self.restack_agent_panes(&members);
+
+        // And the operator gets their focus back. Opening a pane focuses it,
+        // which is Zellij being helpful to a person who asked for one; nobody
+        // asked for this one.
+        if let Some(focus) = ask.focus_before {
+            if live.contains(&focus) && focus != adopted {
+                self.refocus_pane(focus);
+            }
+        }
+
+        self.log_activity(ActivityEvent::Info {
+            message: format!(
+                "Put pane {} back into the agent stack as a fresh idle seat; \
+                 the board is running on {} panes again",
+                adopted,
+                self.agent_slots.len()
+            ),
+        });
+        self.answer_pane_heal_request(PaneHealAnswer::Healed);
+        if self.permissions_granted {
+            self.schedule_ready_tickets();
+        }
+    }
+
+    /// Forget the slots whose panes are gone, recording any attempt that died
+    /// with one.
+    ///
+    /// Until now a slot outlived its pane forever: `discover_slots` latches, so
+    /// nothing has ever removed one, and an idle slot pointing at a pane that no
+    /// longer exists is a seat the scheduler will happily launch a session into.
+    fn retire_vanished_slots(&mut self, live: &HashSet<u32>) {
+        let vanished: Vec<u32> = self
+            .agent_slots
+            .iter()
+            .map(|slot| slot.pane_id)
+            .filter(|pane_id| !live.contains(pane_id))
+            .collect();
+        for pane_id in vanished {
+            self.retire_vanished_slot(pane_id);
+        }
+    }
+
+    /// Forget one slot whose pane is gone.
+    fn retire_vanished_slot(&mut self, pane_id: u32) {
+        let Some(index) = self
+            .agent_slots
+            .iter()
+            .position(|slot| slot.pane_id == pane_id)
+        else {
+            return;
+        };
+        let held = self.agent_slots[index].ticket_id.clone();
+        let lease = self.agent_slots[index].attempt_lease.clone();
+        let fenced = self.agent_slots[index].transition_state == TransitionState::Fenced;
+
+        // Only an attempt that is still authoritative is lost here. Every
+        // terminal path — a fence, a startup-recovery failure, an ordinary
+        // release — revokes the lease before it closes the pane and has already
+        // written whatever row it owed, so matching against `current_leases` is
+        // what keeps this from filing a second row for an ending Lisa recorded.
+        if let (Some(ticket_id), Some(lease)) = (held.clone(), lease) {
+            if self.current_leases.get(&ticket_id) == Some(&lease) {
+                self.emit_seat_loss(
+                    &ticket_id,
+                    &format!("pane {pane_id} closed while the attempt was running"),
+                );
+                if let Some(thread) = self.threads.get_mut(&ticket_id) {
+                    thread.fail();
+                }
+                self.revoke_current_lease(&ticket_id);
+                if !self
+                    .error_alerts
+                    .iter()
+                    .any(|(existing, pane)| existing == &ticket_id && *pane == pane_id)
+                {
+                    self.error_alerts.push((ticket_id.clone(), pane_id));
+                }
+                self.log_activity(ActivityEvent::Error {
+                    message: format!(
+                        "Pane {} closed with {} still running in it; the attempt is over and recorded \
+                         as a lost seat",
+                        pane_id, ticket_id
+                    ),
+                });
+            }
+        }
+
+        self.clear_pane_lifecycle_signals(pane_id);
+        self.forget_provider_residency(pane_id);
+        self.seat_assignments.remove(&pane_id);
+        self.awaiting_human.remove(&pane_id);
+        self.notified_attention.remove(&pane_id);
+        self.wedged_seats.remove(&pane_id);
+        self.pane_heartbeats.remove(&pane_id);
+        self.last_pane_names.remove(&pane_id);
+        self.seat_readiness.remove(&pane_id);
+        self.pending_enters
+            .retain(|pending| pending.pane_id != PaneId::Terminal(pane_id));
+        self.agent_slots.remove(index);
+        if held.is_none() && !fenced {
+            self.log_activity(ActivityEvent::Warning {
+                message: format!("Pane {pane_id} is gone; its idle seat has been retired"),
+            });
+        }
+    }
+
+    /// Say once that this run has stopped asking for panes.
+    fn report_pane_heal_give_up(&mut self, missing: usize) {
+        self.answer_pane_heal_request(PaneHealAnswer::Refused);
+        if self.heal_give_up_reported {
+            return;
+        }
+        self.heal_give_up_reported = true;
+        let declared = self.config.agent_panes.unwrap_or_default();
+        self.log_activity(ActivityEvent::Error {
+            message: format!(
+                "Asked Zellij for a replacement pane {} times in {} minutes and the board is still \
+                 short {}; not asking again. The run carries on with {} of {} panes — restart the \
+                 loop when the work in flight has finished to get them back.",
+                heal::MAX_REGENERATIONS,
+                heal::REGENERATION_WINDOW_SECS / 60,
+                missing,
+                declared.saturating_sub(missing),
+                declared,
+            ),
+        });
+    }
+
+    /// Take an outstanding `lisa heal-panes` ask, if one has been left.
+    ///
+    /// Read on the poll tick — a request file is one `read` on a path that is
+    /// almost never there, and an ask that is about to be answered by a pane
+    /// arriving does not need answering any faster than that. An ask that finds
+    /// the board short is *held* rather than answered: *asked and healed* is a
+    /// claim about a pane that exists, so the receipt waits for the arrival.
+    fn check_pane_heal_requests(&mut self) {
+        if self.heal_root.as_os_str().is_empty() {
+            return;
+        }
+        let Some(request) = lisa_core::pane_heal::take_request(&self.heal_root) else {
+            return;
+        };
+        self.log_activity(ActivityEvent::Info {
+            message: format!(
+                "{} asked for the board's missing panes back ({} of {} coding panes present)",
+                request.asked_by,
+                self.heal_census.present,
+                self.heal_census
+                    .declared
+                    .map(|declared| declared.to_string())
+                    .unwrap_or_else(|| "an unknown number of".to_string()),
+            ),
+        });
+        // A previous ask this scheduler never got to answer is superseded rather
+        // than left hanging: only one receipt file exists, and it belongs to the
+        // newest nonce.
+        self.heal_request = Some(request);
+
+        let Some(now) = unix_secs(std::time::SystemTime::now()) else {
+            return;
+        };
+        match heal::decide(
+            self.heal_census,
+            self.heal_outstanding,
+            &self.heal_budget,
+            now,
+        ) {
+            heal::Decision::Whole => self.answer_pane_heal_request(PaneHealAnswer::AlreadyFine),
+            heal::Decision::Undeclared => self.answer_pane_heal_request(PaneHealAnswer::Refused),
+            // Already asked, and the pane has not arrived yet: the receipt is
+            // owed when it does.
+            heal::Decision::Waiting => {}
+            heal::Decision::Regenerate { missing } => {
+                self.request_replacement_pane(missing, self.stack_view.expanded, now)
+            }
+            heal::Decision::GaveUp { missing } => self.report_pane_heal_give_up(missing),
+        }
+    }
+
+    /// Leave the receipt for the ask this scheduler is holding, if it is holding
+    /// one. A no-op otherwise, so every outcome can report itself without
+    /// knowing whether anybody asked.
+    fn answer_pane_heal_request(&mut self, answer: PaneHealAnswer) {
+        let Some(request) = self.heal_request.take() else {
+            return;
+        };
+        let detail = match answer {
+            PaneHealAnswer::Healed => format!(
+                "Put a pane back; the board has all {} of its coding panes again.",
+                self.heal_census
+                    .declared
+                    .unwrap_or(self.heal_census.present),
+            ),
+            PaneHealAnswer::AlreadyFine => format!(
+                "Nothing to do — all {} coding panes are already there.",
+                self.heal_census.present
+            ),
+            PaneHealAnswer::Refused => {
+                if self.config.agent_panes.is_none() {
+                    "This run was started from a layout that does not say how many coding panes it \
+                     made, so Lisa will not invent one. Restart the loop with this version of lisa \
+                     and the ask will work."
+                        .to_string()
+                } else {
+                    format!(
+                        "Lisa already asked Zellij for a pane {} times in {} minutes and each one \
+                         went away again; it has stopped asking. Restart the loop when the work in \
+                         flight has finished.",
+                        heal::MAX_REGENERATIONS,
+                        heal::REGENERATION_WINDOW_SECS / 60,
+                    )
+                }
+            }
+        };
+        let answered_at = unix_secs(std::time::SystemTime::now()).unwrap_or_default();
+        let receipt = PaneHealReceipt::new(
+            request.nonce,
+            answer,
+            detail,
+            self.heal_census.declared,
+            self.heal_census.present,
+            (!self.scheduler_id.is_empty()).then(|| self.scheduler_id.clone()),
+            answered_at,
+        );
+        if self.heal_root.as_os_str().is_empty() {
+            return;
+        }
+        if let Err(error) = lisa_core::pane_heal::publish_receipt(&self.heal_root, &receipt) {
+            self.log_activity(ActivityEvent::Error {
+                message: format!("could not answer the pane-heal ask: {error}"),
+            });
+        }
     }
 
     /// Return the explicit assignment state for a physical seat.
@@ -9695,6 +10179,11 @@ impl State {
             }
         }
 
+        // Whoever noticed the board was short before Lisa did. Read early, so
+        // an ask that finds a missing pane starts the same regeneration this
+        // tick that a `PaneUpdate` would have started on its own.
+        self.check_pane_heal_requests();
+
         // Presence first: the exit policy asks only whether a process is in the
         // pane, and the answer must be current before any timeout decision —
         // including for a process that cannot name itself.
@@ -11027,6 +11516,8 @@ impl ZellijPlugin for State {
         // Signal directory for idle signal detection
         self.signal_dir = host.join(".lisa/signals");
         self.attempt_dir = host.join(".lisa/attempts");
+        // Where a `lisa heal-panes` ask lands and its receipt goes back.
+        self.heal_root = host.clone();
         self.scheduler_dir = host.join(lisa_core::schedulers::SCHEDULER_DIR);
 
         // Provenance ledger + per-provider usage-artifact directories.
@@ -11185,6 +11676,11 @@ impl ZellijPlugin for State {
                 // expansion back to the last pane, and this is what puts it
                 // right without waiting for the poll.
                 self.observe_stack(&pane_manifest);
+                // And the count. This is the only place a pane's disappearance
+                // is visible at all, and the event fires exactly when the pane
+                // set changes, so noticing costs one comparison rather than a
+                // poll. See [`heal`].
+                self.census_panes(&pane_manifest);
                 // Try scheduling in case slots just appeared
                 if self.permissions_granted {
                     self.schedule_ready_tickets();
@@ -11765,6 +12261,11 @@ impl State {
             activity_log,
             alerts,
             slots,
+            short_panes: (!self.heal_census.is_whole()).then(|| ui::ShortPanes {
+                present: self.heal_census.present,
+                declared: self.heal_census.declared.unwrap_or_default(),
+                gave_up: self.heal_budget.has_given_up(),
+            }),
             seat_assignment_statuses,
             current_time: Duration::from_secs(
                 std::time::SystemTime::now()
@@ -12015,6 +12516,7 @@ mod tests {
     }
 
     mod a_drained_board_goes_on_ticking;
+    mod a_loop_regenerates_a_pane_it_lost;
     mod an_attempt_that_happened_leaves_a_record;
     mod hostile_order_regression;
     mod operator_recovery_matrix;
