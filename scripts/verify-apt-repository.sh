@@ -4,6 +4,9 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 artifacts_dir=${1:-"$repo_root/target/distrib"}
 old_version=0.0.0-1
+# Newer than any real Lisa version and shaped like a candidate. It exists only
+# in canary, so a box on stable or nightly must never be offered it.
+rc_version=9.9.9~rc1-1
 
 fail() {
     echo "Signed apt repository verification failed: $*" >&2
@@ -76,36 +79,68 @@ fingerprint=$(docker exec -e GNUPGHOME=/fixture/gnupg "$tool_container" sh -eu -
 docker exec -e GNUPGHOME=/fixture/gnupg "$tool_container" sh -eu -c \
     "gpg --batch --armor --export '$fingerprint' > /fixture/lisa-archive-keyring.asc"
 
-docker exec -e OLD_VERSION="$old_version" "$tool_container" sh -eu -c '
-    mkdir -p /fixture/old /fixture/all /fixture/unpacked
+# Three package generations: an old release every suite carries, the real
+# current release, and a candidate that only canary is allowed to see.
+docker exec -e OLD_VERSION="$old_version" -e RC_VERSION="$rc_version" \
+    "$tool_container" sh -eu -c '
+    mkdir -p /fixture/pkgs/old /fixture/pkgs/current /fixture/pkgs/rc /fixture/unpacked
     for architecture in amd64 arm64; do
         for name in lisa lisa-runtime-zellij; do
             source="/packages/$name-$architecture.deb"
-            root="/fixture/unpacked/$name-$architecture"
-            dpkg-deb --raw-extract "$source" "$root"
-            sed -i "s/^Version:.*/Version: $OLD_VERSION/" "$root/DEBIAN/control"
-            dpkg-deb --build "$root" "/fixture/old/$name-$architecture.deb" >/dev/null
-            cp "$source" "/fixture/all/$name-$architecture.deb"
-            cp "/fixture/old/$name-$architecture.deb" \
-                "/fixture/all/$name-$architecture-old.deb"
+            cp "$source" "/fixture/pkgs/current/$name-$architecture.deb"
+            for generation in old rc; do
+                case "$generation" in
+                    old) version=$OLD_VERSION ;;
+                    rc) version=$RC_VERSION ;;
+                esac
+                root="/fixture/unpacked/$generation-$name-$architecture"
+                dpkg-deb --raw-extract "$source" "$root"
+                sed -i "s/^Version:.*/Version: $version/" "$root/DEBIAN/control"
+                dpkg-deb --build "$root" \
+                    "/fixture/pkgs/$generation/$name-$architecture.deb" >/dev/null
+            done
         done
     done
     dpkg-deb --field /packages/lisa-amd64.deb Version > /fixture/current-lisa-version
     dpkg-deb --field /packages/lisa-runtime-zellij-amd64.deb Version \
         > /fixture/current-runtime-version
+
+    # Bootstrap: every suite carries only the old release.
+    for suite in stable nightly canary; do
+        mkdir -p "/fixture/bootstrap/$suite"
+        cp -r /fixture/pkgs/old "/fixture/bootstrap/$suite/old"
+    done
+
+    # Steady state: stable and nightly stop at the current release; the
+    # candidate reaches canary and no further.
+    for suite in stable nightly canary; do
+        mkdir -p "/fixture/full/$suite"
+        cp -r /fixture/pkgs/old "/fixture/full/$suite/old"
+        cp -r /fixture/pkgs/current "/fixture/full/$suite/current"
+    done
+    cp -r /fixture/pkgs/rc /fixture/full/canary/rc
 '
 
 docker exec -e GNUPGHOME=/fixture/gnupg "$tool_container" \
     bash /source/scripts/build-apt-repository.sh \
-    /fixture/old /fixture/site "$fingerprint" /fixture/lisa-archive-keyring.asc
+    /fixture/bootstrap /fixture/site "$fingerprint" /fixture/lisa-archive-keyring.asc
 
 docker exec "$tool_container" sh -eu -c '
     export GNUPGHOME=/fixture/public-only
     mkdir -m 0700 "$GNUPGHOME"
     gpg --batch --quiet --import /fixture/lisa-archive-keyring.asc
-    gpg --batch --verify /fixture/site/dists/stable/InRelease >/dev/null 2>&1
-    gpg --batch --verify /fixture/site/dists/stable/Release.gpg \
-        /fixture/site/dists/stable/Release >/dev/null 2>&1
+    suites=$(ls /fixture/site/dists | sort | tr "\n" " ")
+    if [ "$suites" != "canary nightly stable " ]; then
+        echo "published suites are \"$suites\", expected canary nightly stable" >&2
+        exit 1
+    fi
+    # One key, one keyring, three suites: a channel change must never mean
+    # trusting a second key, so every suite verifies against this one import.
+    for suite in stable nightly canary; do
+        gpg --batch --verify "/fixture/site/dists/$suite/InRelease" >/dev/null 2>&1
+        gpg --batch --verify "/fixture/site/dists/$suite/Release.gpg" \
+            "/fixture/site/dists/$suite/Release" >/dev/null 2>&1
+    done
     if grep -R -q "BEGIN PGP PRIVATE KEY" /fixture/site; then
         echo "generated site contains private key material" >&2
         exit 1
@@ -134,20 +169,95 @@ docker exec -e DEBIAN_FRONTEND=noninteractive -e OLD_VERSION="$old_version" \
 
 docker exec -e GNUPGHOME=/fixture/gnupg "$tool_container" \
     bash /source/scripts/build-apt-repository.sh \
-    /fixture/all /fixture/site "$fingerprint" /fixture/lisa-archive-keyring.asc
+    /fixture/full /fixture/site "$fingerprint" /fixture/lisa-archive-keyring.asc
 
-docker exec -e DEBIAN_FRONTEND=noninteractive "$client_container" sh -eu -c '
+# The candidate's bytes are in the shared pool. That is what makes one signing
+# key and one pool possible; the suite index is what keeps it out of stable.
+docker exec -e RC_VERSION="$rc_version" "$tool_container" sh -eu -c '
+    test -f "/fixture/site/pool/main/l/lisa/lisa_${RC_VERSION}_amd64.deb"
+    if grep -q "$RC_VERSION" /fixture/site/dists/stable/main/binary-amd64/Packages; then
+        echo "the stable index lists candidate $RC_VERSION" >&2
+        exit 1
+    fi
+    if grep -q "$RC_VERSION" /fixture/site/dists/nightly/main/binary-amd64/Packages; then
+        echo "the nightly index lists candidate $RC_VERSION" >&2
+        exit 1
+    fi
+    grep -q "$RC_VERSION" /fixture/site/dists/canary/main/binary-amd64/Packages
+'
+
+# A box on stable upgrades to the current release and cannot see the candidate,
+# while every version this channel has ever carried stays installable.
+docker exec -e DEBIAN_FRONTEND=noninteractive -e OLD_VERSION="$old_version" \
+    -e RC_VERSION="$rc_version" "$client_container" sh -eu -c '
     apt-get -qq update
     apt-get upgrade -y -qq
-    lisa_version=$(dpkg-query -W -f="\${Version}" lisa)
-    runtime_version=$(dpkg-query -W -f="\${Version}" lisa-runtime-zellij)
     expected_lisa=$(cat /fixture/current-lisa-version)
     expected_runtime=$(cat /fixture/current-runtime-version)
-    test "$lisa_version" = "$expected_lisa"
-    test "$runtime_version" = "$expected_runtime"
+    test "$(dpkg-query -W -f="\${Version}" lisa)" = "$expected_lisa"
+    test "$(dpkg-query -W -f="\${Version}" lisa-runtime-zellij)" = "$expected_runtime"
     test "$(apt-cache policy lisa | awk "/Candidate:/ { print \$2 }")" = "$expected_lisa"
     test "$(apt-cache policy lisa-runtime-zellij | awk "/Candidate:/ { print \$2 }")" \
         = "$expected_runtime"
+    if apt-cache madison lisa | grep -q "$RC_VERSION"; then
+        echo "a box on stable can see candidate $RC_VERSION" >&2
+        exit 1
+    fi
+    if apt-get install -s -y "lisa=$RC_VERSION" >/dev/null 2>&1; then
+        echo "a box on stable can install candidate $RC_VERSION" >&2
+        exit 1
+    fi
+    # Rollback with no extra machinery: the pool still holds the old release.
+    apt-cache madison lisa | grep -q "$OLD_VERSION"
+    apt-get install -y -qq --allow-downgrades \
+        "lisa=$OLD_VERSION" "lisa-runtime-zellij=$OLD_VERSION"
+    test "$(dpkg-query -W -f="\${Version}" lisa)" = "$OLD_VERSION"
+    apt-get install -y -qq "lisa=$expected_lisa" "lisa-runtime-zellij=$expected_runtime"
+    test "$(dpkg-query -W -f="\${Version}" lisa)" = "$expected_lisa"
+'
+
+# Changing channel is editing one word in one file.
+docker exec -e DEBIAN_FRONTEND=noninteractive -e RC_VERSION="$rc_version" \
+    "$client_container" sh -eu -c '
+    sed -i "s#/fixture/site [a-z]* main#/fixture/site canary main#" \
+        /etc/apt/sources.list.d/lisa.list
+    apt-get -qq update
+    test "$(apt-cache policy lisa | awk "/Candidate:/ { print \$2 }")" = "$RC_VERSION"
+    apt-get upgrade -y -qq
+    test "$(dpkg-query -W -f="\${Version}" lisa)" = "$RC_VERSION"
+    test "$(dpkg-query -W -f="\${Version}" lisa-runtime-zellij)" = "$RC_VERSION"
+'
+
+# Coming back down a channel is a downgrade, and apt will not perform one until
+# it is told to. This is the operator note in docs/knowledge/mac-mini-nightly.md.
+docker exec -e DEBIAN_FRONTEND=noninteractive -e RC_VERSION="$rc_version" \
+    "$client_container" sh -eu -c '
+    sed -i "s#/fixture/site [a-z]* main#/fixture/site nightly main#" \
+        /etc/apt/sources.list.d/lisa.list
+    apt-get -qq update
+    expected_lisa=$(cat /fixture/current-lisa-version)
+    expected_runtime=$(cat /fixture/current-runtime-version)
+    test "$(apt-cache policy lisa | awk "/Candidate:/ { print \$2 }")" = "$expected_lisa"
+    if apt-cache madison lisa | grep -q "$RC_VERSION"; then
+        echo "a box on nightly can see candidate $RC_VERSION" >&2
+        exit 1
+    fi
+    apt-get upgrade -y -qq
+    test "$(dpkg-query -W -f="\${Version}" lisa)" = "$RC_VERSION"
+    if apt-get install -y -qq "lisa=$expected_lisa" >/dev/null 2>&1; then
+        echo "apt downgraded lisa without --allow-downgrades" >&2
+        exit 1
+    fi
+    apt-get install -y -qq --allow-downgrades \
+        "lisa=$expected_lisa" "lisa-runtime-zellij=$expected_runtime"
+    test "$(dpkg-query -W -f="\${Version}" lisa)" = "$expected_lisa"
+    test "$(dpkg-query -W -f="\${Version}" lisa-runtime-zellij)" = "$expected_runtime"
+'
+
+docker exec -e DEBIAN_FRONTEND=noninteractive "$client_container" sh -eu -c '
+    sed -i "s#/fixture/site [a-z]* main#/fixture/site stable main#" \
+        /etc/apt/sources.list.d/lisa.list
+    apt-get -qq update
     printf "%s\n" "#!/bin/sh" "echo claude 1.0.0" > /usr/local/bin/claude
     chmod 0755 /usr/local/bin/claude
     mkdir -p /tmp/lisa-doctor-project
@@ -181,4 +291,7 @@ grep -Fq 'path /usr/libexec/lisa/zellij' <<<"$doctor_output" ||
 grep -Fq 'All dependencies satisfied.' <<<"$doctor_output" ||
     fail "doctor did not report satisfied dependencies"
 
-echo "Verified signed apt install and upgrade from $old_version to $(tr -d '\n' < "$work_dir/current-lisa-version")"
+echo "Verified stable, nightly and canary against one archive key:" \
+    "install and upgrade from $old_version to $(tr -d '\n' < "$work_dir/current-lisa-version")," \
+    "rollback by exact version, a channel change by one word, and stable never" \
+    "seeing the $rc_version candidate that sits in canary"

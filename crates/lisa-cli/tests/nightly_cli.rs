@@ -21,20 +21,41 @@ use tempfile::TempDir;
 /// The version this build is: what every cycle starts from.
 const INSTALLED: &str = env!("CARGO_PKG_VERSION");
 
+/// The newest tag in the fixtures below, as a tag string.
+///
+/// Derived from [`INSTALLED`] rather than written out. A literal newest tag
+/// stops being the version under test the moment the workspace version is
+/// bumped, and then a level machine reads as one release behind — so the suite
+/// fails on exactly the operation it exists to protect. It did: `0.5.0-rc.2`
+/// was hardcoded here and three tests broke on the `0.5.0-rc.3` bump.
+fn newest_tag() -> String {
+    format!("v{INSTALLED}")
+}
+
 /// A release list whose newest tag is the version under test, soaked long ago.
 /// A machine on nightly is level with this list and has nothing to do.
-const LEVEL_LIST: &str = r#"[
-  {"tag_name": "v0.5.0-rc.2", "published_at": "2026-08-09T00:00:00Z", "draft": false},
-  {"tag_name": "v0.4.4", "published_at": "2026-07-19T00:00:00Z", "draft": false}
-]"#;
+fn level_list() -> String {
+    format!(
+        r#"[
+  {{"tag_name": "{}", "published_at": "2026-08-09T00:00:00Z", "draft": false}},
+  {{"tag_name": "v0.4.4", "published_at": "2026-07-19T00:00:00Z", "draft": false}}
+]"#,
+        newest_tag()
+    )
+}
 
 /// The same list with a tag published far enough ahead that it can never have
 /// soaked, whatever day the suite runs on. `nightly` must see it and refuse it.
-const UNSOAKED_LIST: &str = r#"[
-  {"tag_name": "v0.9.0-rc.1", "published_at": "2099-01-01T00:00:00Z", "draft": false},
-  {"tag_name": "v0.5.0-rc.2", "published_at": "2026-08-09T00:00:00Z", "draft": false},
-  {"tag_name": "v0.4.4", "published_at": "2026-07-19T00:00:00Z", "draft": false}
-]"#;
+fn unsoaked_list() -> String {
+    format!(
+        r#"[
+  {{"tag_name": "v0.9.0-rc.1", "published_at": "2099-01-01T00:00:00Z", "draft": false}},
+  {{"tag_name": "{}", "published_at": "2026-08-09T00:00:00Z", "draft": false}},
+  {{"tag_name": "v0.4.4", "published_at": "2026-07-19T00:00:00Z", "draft": false}}
+]"#,
+        newest_tag()
+    )
+}
 
 /// A local stand-in for the GitHub releases API, serving one fixed body.
 struct ReleaseServer {
@@ -42,7 +63,10 @@ struct ReleaseServer {
 }
 
 impl ReleaseServer {
-    fn start(body: &'static str) -> Self {
+    fn start(body: String) -> Self {
+        // The serving thread outlives this call, and the fixtures are now built
+        // at runtime from INSTALLED rather than being literals.
+        let body: &'static str = Box::leak(body.into_boxed_str());
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
         let port = listener.local_addr().unwrap().port();
 
@@ -161,7 +185,7 @@ fn stderr_of(output: &Output) -> String {
 
 #[test]
 fn a_machine_level_with_its_channel_records_that_and_stays_quiet() {
-    let server = ReleaseServer::start(LEVEL_LIST);
+    let server = ReleaseServer::start(level_list());
     let config = TempDir::new().unwrap();
     write_config(config.path(), "channel = \"nightly\"\n");
 
@@ -178,13 +202,13 @@ fn a_machine_level_with_its_channel_records_that_and_stays_quiet() {
     assert_eq!(record["ok"], true);
     assert_eq!(record["channel"], "nightly");
     assert_eq!(record["installed_before"], INSTALLED);
-    assert_eq!(record["tag"], "v0.5.0-rc.2");
+    assert_eq!(record["tag"], newest_tag());
     assert!(record["at_utc"].as_str().unwrap().ends_with('Z'));
 }
 
 #[test]
 fn a_tag_that_has_not_soaked_is_seen_and_not_taken() {
-    let server = ReleaseServer::start(UNSOAKED_LIST);
+    let server = ReleaseServer::start(unsoaked_list());
     let config = TempDir::new().unwrap();
     write_config(config.path(), "channel = \"nightly\"\n");
 
@@ -313,7 +337,7 @@ fn a_cycle_that_cannot_read_the_release_list_fails_loudly_and_moves_nothing() {
 
 #[test]
 fn every_cycle_leaves_a_line_behind_so_the_arrangement_can_be_judged_later() {
-    let server = ReleaseServer::start(LEVEL_LIST);
+    let server = ReleaseServer::start(level_list());
     let config = TempDir::new().unwrap();
     write_config(config.path(), "channel = \"nightly\"\n");
     let zellij = FakeZellij::idle();
@@ -348,7 +372,7 @@ fn a_box_nobody_has_set_up_says_so_rather_than_reading_as_healthy() {
 
 #[test]
 fn the_json_a_fleet_reads_says_what_the_prose_says() {
-    let server = ReleaseServer::start(LEVEL_LIST);
+    let server = ReleaseServer::start(level_list());
     let config = TempDir::new().unwrap();
     write_config(config.path(), "channel = \"nightly\"\n");
     let zellij = FakeZellij::idle();
