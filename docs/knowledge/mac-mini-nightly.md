@@ -171,6 +171,19 @@ lisa nightly uninstall   # removes the job; keeps the channel and the record
 
 ---
 
+## Recording that it works
+
+The mini's own answer is the evidence, so keep it where the rest of us can read
+it. From the mini, after the first cycle has run:
+
+```bash
+lisa nightly status --json > docs/knowledge/mac-mini-nightly-record.json   # in this repo
+```
+
+That file is what says the arrangement is real rather than described: it carries
+the channel the machine is on, the last cycle it ran, and when. Refresh it after
+anything interesting — the first move, the first failure, the first rollback.
+
 ## What to write down as this runs
 
 The point of the mini is evidence, so the two things worth keeping are:
