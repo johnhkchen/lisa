@@ -500,7 +500,7 @@ fn an_unpark_past_the_bound_does_not_re_arm_the_completion() {
     // blocked becomes open, the phase is left alone.
     let unpark = |state: &mut State| {
         lisa_core::ticket::update_ticket_status(
-            &state.config.ticket_dir.join(format!("{TICKET}.md")),
+            state.config.ticket_dir.join(format!("{TICKET}.md")),
             TicketStatus::Open,
         )
         .unwrap();

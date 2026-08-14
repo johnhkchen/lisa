@@ -1336,7 +1336,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("completion-journal.jsonl");
 
-        let mut fail_one_generation = |generation: u64, retryability| {
+        let fail_one_generation = |generation: u64, retryability| {
             let generation_key = key("T-BOUND", "operator", generation);
             let command = correlation(&format!("command-{generation}"));
             append(

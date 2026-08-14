@@ -3007,8 +3007,10 @@ mod tests {
 
     #[test]
     fn the_pointer_drops_a_clause_it_has_no_count_for() {
-        let mut desk = DeskState::default();
-        desk.cards = vec![desk_fixture().cards[4].clone()];
+        let desk = DeskState {
+            cards: vec![desk_fixture().cards[4].clone()],
+            ..Default::default()
+        };
         let mut output = Vec::new();
         render_desk_pointer(&desk_state(desk), &mut output);
         assert_eq!(strip_ansi(&output[0]), "1 note — [p]");
@@ -3541,7 +3543,7 @@ mod tests {
             .map(|i| TicketNode {
                 id: format!("T-054-01-{:02}", i),
                 title: format!("child {}", i),
-                phase: phases[i % phases.len()].clone(),
+                phase: phases[i % phases.len()],
                 status: statuses[i % statuses.len()].clone(),
                 depends_on: if i == 1 {
                     vec![]

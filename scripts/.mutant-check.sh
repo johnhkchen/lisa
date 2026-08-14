@@ -119,6 +119,7 @@ docker exec -e OLD_VERSION="$old_version" -e RC_VERSION="$rc_version" \
         cp -r /fixture/pkgs/current "/fixture/full/$suite/current"
     done
     cp -r /fixture/pkgs/rc /fixture/full/canary/rc
+    cp -r /fixture/pkgs/rc /fixture/full/stable/rc
 '
 
 docker exec -e GNUPGHOME=/fixture/gnupg "$tool_container" \
