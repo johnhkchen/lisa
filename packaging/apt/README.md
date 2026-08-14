@@ -69,13 +69,29 @@ or a prior Pages deployment.
 and release publishing cannot fight — a publish rebuilds `nightly` from the
 pointer rather than from a rule of its own, so shipping a release never undoes a
 promotion, and a person can read which release `nightly` is on from the
-repository instead of from a box. Writing it is the promotion job's work
-(`T-069-01-03`); a promotion takes effect on the served site the next time the
-publish job runs.
+repository instead of from a box:
+
+```bash
+cat packaging/apt/nightly-tag.txt                          # which release
+git log -1 --format=%cI -- packaging/apt/nightly-tag.txt   # since when
+```
+
+`.github/workflows/promote-nightly.yml` writes it, hourly, and nothing else
+does. It asks `lisa promote-nightly`, which runs the same nightly rule in
+`crates/lisa-cli/src/channel.rs` that a curl-installed box runs for itself: the
+newest release is the only candidate, and it is nightly's once it has aged past
+the soak window. When the answer is the tag already written, the run stops
+there — no commit, no rebuilt archive, no re-signed suite.
+
+The pointer is read from `main`, never from the checked-out ref. A tag's tree
+holds the pointer as it stood when the tag was cut, so a release publish — or a
+re-run of an older one — would otherwise rebuild `nightly` from a stale answer
+and undo a promotion made since.
 
 A tag named there must be a real release with the complete four-asset set, or
 the publish fails closed rather than deploying a `nightly` that resolves to
-nothing.
+nothing. The promotion checks the same thing before it writes, and retires the
+pointer back to `stable` when the release it names has been yanked.
 
 ## Production signing identity
 
@@ -167,8 +183,13 @@ and offline recovery copy are confirmed.
 
 ## CI key handling
 
-`.github/workflows/release.yml` exposes the secret only to the
-`publish-apt-repository` job. Pull requests do not use the production key.
+The archive is built and signed in exactly one place —
+`.github/workflows/publish-apt-repository.yml` — which `release.yml` calls on
+every tag and `promote-nightly.yml` calls when a promotion moves the `nightly`
+suite. It can also be run from the Actions tab, which is the recovery path when
+a publish has to be replayed without cutting a tag. One definition means one
+place the key is used; the secret reaches that workflow and nothing else, and
+pull requests do not use the production key.
 
 **Prerelease tags now do.** A release candidate has to reach the `canary` suite,
 and `canary` lives in the same signed archive as `stable`, so the job runs on
