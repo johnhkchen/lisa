@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Rehearse a soak promotion against a throwaway tap (T-069-01-03).
+# Rehearse a soak promotion, and a stale stable formula being corrected, against
+# a throwaway tap (T-069-01-03, T-069-01-05).
 #
 # The decision -- which release has soaked, which has been superseded, which was
 # yanked -- is Rust, and `cargo test` covers it. What this covers is the half
@@ -81,19 +82,23 @@ version_of() {
 }
 
 commits_in() {
-    git -C "$tap" rev-list --count HEAD 2>/dev/null || echo 0
+    local where=${1:-$tap}
+    git -C "$where" rev-list --count HEAD 2>/dev/null || echo 0
 }
 
 expect_version() {
-    local formula=$1 want=$2 got
-    got=$(version_of "$tap/Formula/$formula.rb" 2>/dev/null || true)
+    local formula=$1 want=$2 where=${3:-$tap} got
+    got=$(version_of "$where/Formula/$formula.rb" 2>/dev/null || true)
     [[ $got == "$want" ]] ||
-        fail "$formula should be $want, is ${got:-absent}"
+        fail "$formula in $(basename "$where") should be $want, is ${got:-absent}"
 }
 
 # 1. A release publish: canary takes the candidate, stable refuses it, and
-#    nightly carries whatever the promotion pointer named.
-bash "$publisher" "$tap" "$work/release.rb" true "$work/soaked.rb" >/dev/null
+#    nightly carries whatever the promotion pointer named. Stable is handed
+#    nothing here, which is the one case that leaves Formula/lisa.rb alone:
+#    nothing but prereleases has been published, so there is no release stable
+#    could name.
+bash "$publisher" "$tap" "$work/release.rb" true "$work/soaked.rb" "" >/dev/null
 expect_version lisa-canary "$released"
 expect_version lisa-nightly "$soaked"
 [[ ! -e "$tap/Formula/lisa.rb" ]] ||
@@ -106,7 +111,7 @@ first=$(commits_in)
 # 2. The same publish again. Nothing moved, so nothing is committed: this is the
 #    no-op criterion, and it has to hold for the release path as well as the
 #    promotion one.
-bash "$publisher" "$tap" "$work/release.rb" true "$work/soaked.rb" >/dev/null
+bash "$publisher" "$tap" "$work/release.rb" true "$work/soaked.rb" "" >/dev/null
 bash "$committer" "$tap" >/dev/null
 [[ $(commits_in) -eq $first ]] ||
     fail "a publish with nothing to say left $(($(commits_in) - first)) commit(s) in the tap"
@@ -115,7 +120,7 @@ bash "$committer" "$tap" >/dev/null
 #    the run is unchanged. Only lisa-nightly may move.
 canary_before=$(git -C "$tap" log -1 --format=%H -- Formula/lisa-canary.rb)
 note="promoted after a 24h soak; superseded nothing"
-bash "$publisher" "$tap" "$work/release.rb" true "$work/release.rb" >/dev/null
+bash "$publisher" "$tap" "$work/release.rb" true "$work/release.rb" "" >/dev/null
 bash "$committer" "$tap" "$note" >/dev/null
 
 expect_version lisa-nightly "$released"
@@ -136,10 +141,50 @@ git -C "$tap" log -1 --format=%b | grep -Fq "$note" ||
 # 5. And a stable release afterwards writes lisa, leaves nightly where the
 #    promotion put it, and needs no second promotion to do it.
 formula_for 9.9.10 "$work/stable.rb"
-bash "$publisher" "$tap" "$work/stable.rb" false "$work/release.rb" >/dev/null
+bash "$publisher" "$tap" "$work/stable.rb" false "$work/release.rb" "$work/stable.rb" >/dev/null
 bash "$committer" "$tap" >/dev/null
 expect_version lisa 9.9.10
 expect_version lisa-canary 9.9.10
 expect_version lisa-nightly "$released"
+
+# 6. The correction (T-069-01-05). A tap seeded with a release candidate under
+#    the stable name -- what the single-formula era left in the live tap -- and
+#    one publish from a prerelease tag. Skipping the file, which is what this
+#    used to do, leaves the candidate there: refusing to write a candidate into
+#    stable and leaving the candidate that is already there are not the same
+#    thing.
+stale="$work/stale-tap"
+mkdir -p "$stale/Formula"
+git -C "$stale" init --quiet
+git -C "$stale" config user.email "verify@example.invalid"
+git -C "$stale" config user.name "tap verification"
+cp "$work/release.rb" "$stale/Formula/lisa.rb"
+
+correction=$(bash "$publisher" "$stale" "$work/release.rb" true "$work/release.rb" "$work/soaked.rb")
+expect_version lisa "$soaked" "$stale"
+expect_version lisa-canary "$released" "$stale"
+grep -Fq "wrote Formula/lisa.rb ($soaked)" <<<"$correction" ||
+    fail "the correction did not say it moved lisa.rb: $correction"
+
+# The correction costs the no-op behaviour nothing: run the same publish again
+# and the tap gains no second commit for a formula that is already right.
+bash "$committer" "$stale" >/dev/null
+corrected=$(commits_in "$stale")
+[[ $corrected -gt 0 ]] || fail "the correction committed nothing"
+bash "$publisher" "$stale" "$work/release.rb" true "$work/release.rb" "$work/soaked.rb" >/dev/null
+bash "$committer" "$stale" >/dev/null
+[[ $(commits_in "$stale") -eq $corrected ]] ||
+    fail "a second publish over a corrected tap left $(($(commits_in "$stale") - corrected)) commit(s)"
+
+# 7. And the refusal the correction must not have cost: a caller that hands a
+#    release candidate as the newest stable is refused outright, whatever it
+#    claims about the release it is publishing.
+if bash "$publisher" "$stale" "$work/release.rb" true "$work/release.rb" "$work/release.rb" \
+    >/dev/null 2>"$work/refusal.log"; then
+    fail "the publisher wrote a release candidate into the stable formula"
+fi
+grep -Fq "stable never takes a prerelease" "$work/refusal.log" ||
+    fail "the publisher refused a prerelease stable source without saying why: $(cat "$work/refusal.log")"
+expect_version lisa "$soaked" "$stale"
 
 echo "nightly promotion verification passed"

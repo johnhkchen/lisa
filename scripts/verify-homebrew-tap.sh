@@ -9,7 +9,9 @@ set -euo pipefail
 #
 #   routing   which formula files a release writes. A prerelease reaches
 #             lisa-canary and never lisa; a release never rewrites lisa-nightly,
-#             which belongs to the soak promotion.
+#             which belongs to the soak promotion; and a prerelease left under
+#             the stable name by an older publisher is corrected rather than
+#             skipped over (T-069-01-05).
 #   install   a real Homebrew, in a throwaway prefix, installing each formula
 #             from a local copy of this build's archive: the version it lands
 #             on, the lisa binary it puts on PATH, and brew refusing the second
@@ -83,8 +85,8 @@ sed "s/^  version \".*\"\$/  version \"$rehearsal_prerelease_version\"/" \
 
 : >"$work_dir/routing.log"
 route() {
-    local tap=$1 release_formula=$2 prerelease=$3 nightly_formula=$4
-    "$publisher" "$tap" "$release_formula" "$prerelease" "$nightly_formula" |
+    local tap=$1 release_formula=$2 prerelease=$3 nightly_formula=$4 stable_formula=$5
+    "$publisher" "$tap" "$release_formula" "$prerelease" "$nightly_formula" "$stable_formula" |
         tee -a "$work_dir/routing.log"
 }
 
@@ -93,7 +95,7 @@ route() {
 # anything has been promoted.
 release_tap="$work_dir/tap"
 mkdir -p "$release_tap"
-route "$release_tap" "$dist_formula" false "$dist_formula" >/dev/null
+route "$release_tap" "$dist_formula" false "$dist_formula" "$dist_formula" >/dev/null
 
 for name in lisa lisa-nightly lisa-canary; do
     [[ -s $release_tap/Formula/$name.rb ]] || fail "a stable release did not write Formula/$name.rb"
@@ -102,13 +104,13 @@ for name in lisa lisa-nightly lisa-canary; do
 done
 
 # The behaviour change this ticket is about: with a stable tap already in place,
-# the next release candidate moves canary and touches nothing else. Nightly is
-# handed the same source as before, standing in for a promotion that has not
-# happened.
+# the next release candidate moves canary and touches nothing else. Nightly and
+# stable are handed the same sources as before, standing in for a promotion that
+# has not happened and a stable release that has not been superseded.
 rc_tap="$work_dir/tap-after-rc"
 mkdir -p "$rc_tap/Formula"
 cp "$release_tap"/Formula/*.rb "$rc_tap/Formula/"
-rc_log=$(route "$rc_tap" "$prerelease_formula" true "$dist_formula")
+rc_log=$(route "$rc_tap" "$prerelease_formula" true "$dist_formula" "$dist_formula")
 
 [[ $(formula_version "$rc_tap/Formula/lisa-canary.rb") == "$rehearsal_prerelease_version" ]] ||
     fail "a release candidate did not reach lisa-canary"
@@ -116,14 +118,40 @@ rc_log=$(route "$rc_tap" "$prerelease_formula" true "$dist_formula")
     fail "a release candidate moved lisa; stable must stay on $release_version"
 [[ $(formula_version "$rc_tap/Formula/lisa-nightly.rb") == "$release_version" ]] ||
     fail "a release candidate moved lisa-nightly; only the soak promotion may move it"
-grep -Fq "unchanged Formula/lisa-nightly.rb" <<<"$rc_log" ||
-    fail "a promotion with nothing to do rewrote lisa-nightly.rb; the tap's history must stay readable"
+for name in lisa lisa-nightly; do
+    grep -Fq "unchanged Formula/$name.rb" <<<"$rc_log" ||
+        fail "a publish with nothing to say rewrote $name.rb; the tap's history must stay readable"
+done
 
-# And a prerelease into an empty tap leaves no stable formula at all, rather
-# than seeding one from a release candidate.
+# The correction (T-069-01-05): a tap carrying a release candidate under the
+# stable name, and one publish from a prerelease tag. Stable is written from the
+# newest release that is not a prerelease, so the run that may not write a
+# candidate into stable is the same run that takes one back out.
+stale_tap="$work_dir/tap-with-stale-stable"
+mkdir -p "$stale_tap/Formula"
+cp "$release_tap"/Formula/*.rb "$stale_tap/Formula/"
+cp "$prerelease_formula" "$stale_tap/Formula/lisa.rb"
+stale_log=$(route "$stale_tap" "$prerelease_formula" true "$dist_formula" "$dist_formula")
+
+[[ $(formula_version "$stale_tap/Formula/lisa.rb") == "$release_version" ]] ||
+    fail "a release candidate left under Formula/lisa.rb survived a publish; stable must be corrected to $release_version"
+grep -Fq "wrote Formula/lisa.rb ($release_version)" <<<"$stale_log" ||
+    fail "the publish did not say it corrected Formula/lisa.rb"
+
+# And the refusal that correction must not have cost: a candidate handed in as
+# the newest stable is refused, whatever the caller says about the release.
+if "$publisher" "$stale_tap" "$prerelease_formula" true "$dist_formula" "$prerelease_formula" \
+    >/dev/null 2>"$work_dir/refusal.log"; then
+    fail "the publisher wrote a release candidate into Formula/lisa.rb"
+fi
+grep -Fq "stable never takes a prerelease" "$work_dir/refusal.log" ||
+    fail "the publisher refused a prerelease stable source without saying why"
+
+# And a prerelease into an empty tap, with no stable release published at all,
+# leaves no stable formula rather than seeding one from a release candidate.
 fresh_tap="$work_dir/tap-from-prerelease"
 mkdir -p "$fresh_tap"
-route "$fresh_tap" "$prerelease_formula" true "$prerelease_formula" >/dev/null
+route "$fresh_tap" "$prerelease_formula" true "$prerelease_formula" "" >/dev/null
 [[ ! -e $fresh_tap/Formula/lisa.rb ]] ||
     fail "a prerelease wrote Formula/lisa.rb; stable must never take a release candidate"
 for name in lisa-canary lisa-nightly; do
@@ -139,7 +167,7 @@ for name in lisa lisa-nightly lisa-canary; do
         fail "Formula/$name.rb is not marked as generated"
 done
 
-echo "routing verified: a prerelease reaches lisa-canary only, and never lisa or lisa-nightly"
+echo "routing verified: a prerelease reaches lisa-canary only, never lisa or lisa-nightly, and leaves lisa naming the newest release that is not a prerelease"
 
 # ---------------------------------------------------------------------------
 # Install: a real Homebrew in a throwaway prefix, serving this build's archive.

@@ -6,6 +6,12 @@
 # Each run renders all three and commits only the files whose contents changed,
 # so the caller that has nothing to say leaves no commit in the tap.
 #
+# Every run resolves all three channels from scratch -- the newest release for
+# canary, the newest release that is not a prerelease for stable, the promotion
+# pointer for nightly -- so one run leaves the whole tap correct whatever kind
+# of release triggered it. A prerelease cut used to skip Formula/lisa.rb, which
+# left whatever was under the stable name there to go stale (T-069-01-05).
+#
 # The formulae are read from release assets rather than from a workflow's
 # artifact store, so the promotion -- which has no build of its own -- can use
 # the same path a release does.
@@ -19,7 +25,7 @@ on:
         required: true
         type: string
       release-tag:
-        description: The release lisa-canary carries, and lisa when it is not a prerelease
+        description: The release lisa-canary carries; name the newest release, whatever kind it is
         required: true
         type: string
       note:
@@ -35,7 +41,7 @@ on:
         default: main
         type: string
       release-tag:
-        description: The release lisa-canary carries, and lisa when it is not a prerelease
+        description: The release lisa-canary carries; name the newest release, whatever kind it is
         required: true
         type: string
       note:
@@ -99,10 +105,12 @@ jobs:
             echo "packaging/apt/nightly-tag.txt is empty on main" >&2
             exit 1
           fi
+          newest_stable_tag=$(gh release list --repo "$SOURCE_REPO" \
+            --exclude-drafts --exclude-pre-releases --limit 1 \
+            --json tagName --jq '.[0].tagName')
+
           if [[ $pointer == stable ]]; then
-            nightly_tag=$(gh release list --repo "$SOURCE_REPO" \
-              --exclude-drafts --exclude-pre-releases --limit 1 \
-              --json tagName --jq '.[0].tagName')
+            nightly_tag=$newest_stable_tag
             if [[ -z $nightly_tag ]]; then
               echo "no published stable release for lisa-nightly to carry" >&2
               exit 1
@@ -110,13 +118,23 @@ jobs:
           else
             nightly_tag=$pointer
           fi
-          echo "lisa-canary carries $RELEASE_TAG; lisa-nightly carries $nightly_tag" \
-            "(promotion pointer: $pointer)"
 
           is_prerelease=$(gh release view "$RELEASE_TAG" --repo "$SOURCE_REPO" \
             --json isPrerelease --jq '.isPrerelease')
           [[ $is_prerelease == true || $is_prerelease == false ]] ||
             { echo "cannot tell whether $RELEASE_TAG is a prerelease" >&2; exit 1; }
+
+          # lisa follows the newest release that is not a prerelease -- on every
+          # run, not only the runs that cut one. A release that is not a
+          # prerelease is that release at the moment it publishes, so it is
+          # named directly rather than waited for in the release list.
+          if [[ $is_prerelease == false ]]; then
+            stable_tag=$RELEASE_TAG
+          else
+            stable_tag=$newest_stable_tag
+          fi
+          echo "lisa-canary carries $RELEASE_TAG; lisa carries ${stable_tag:-nothing yet};" \
+            "lisa-nightly carries $nightly_tag (promotion pointer: $pointer)"
 
           # The formula each of the two releases published. One release, one
           # .rb: more than one would mean the tap has to be told which is which.
@@ -143,21 +161,44 @@ jobs:
             nightly_formula=$(download_formula "$nightly_tag" "$RUNNER_TEMP/nightly-formula")
           fi
 
+          # Empty only when nothing but prereleases has ever been published, and
+          # then the tap has no stable formula for this run to leave stale.
+          stable_formula=""
+          if [[ -n $stable_tag ]]; then
+            case $stable_tag in
+              "$RELEASE_TAG") stable_formula=$release_formula ;;
+              "$nightly_tag") stable_formula=$nightly_formula ;;
+              *) stable_formula=$(download_formula "$stable_tag" "$RUNNER_TEMP/stable-formula") ;;
+            esac
+          fi
+
           bash lisa/scripts/publish-tap-formulae.sh \
-            tap "$release_formula" "$is_prerelease" "$nightly_formula"
+            tap "$release_formula" "$is_prerelease" "$nightly_formula" "$stable_formula"
           bash lisa/scripts/commit-tap-formulae.sh tap "$TAP_NOTE"
 
           git -C tap push
 
-          # What the tap now says, where a person reading the run can see it.
+          # What the tap now says against what each channel resolved to, where a
+          # person reading the run can see both. A row whose two columns differ
+          # is a tap this run failed to converge.
+          declare -A should_be=(
+            [lisa]="${stable_tag:-}"
+            [lisa-nightly]="$nightly_tag"
+            [lisa-canary]="$RELEASE_TAG"
+          )
           {
             echo "### Homebrew tap"
             echo
-            echo "| formula | version |"
-            echo "| --- | --- |"
+            echo "| formula | version | channel resolved to |"
+            echo "| --- | --- | --- |"
             for formula in lisa lisa-nightly lisa-canary; do
               version=$(awk -F'"' '/^  version "/ { print $2; exit }' \
                 "tap/Formula/$formula.rb" 2>/dev/null || true)
-              echo "| $formula | ${version:-absent} |"
+              expected=${should_be[$formula]}
+              if [[ -n $expected ]]; then
+                echo "| $formula | ${version:-absent} | ${expected#v} |"
+              else
+                echo "| $formula | ${version:-absent} | nothing yet |"
+              fi
             done
           } >> "$GITHUB_STEP_SUMMARY"

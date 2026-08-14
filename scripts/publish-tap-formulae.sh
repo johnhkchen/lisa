@@ -18,20 +18,33 @@ set -euo pipefail
 # rehearse it:
 #
 #   canary   <- this release, every time
-#   stable   <- this release, only when it is not a prerelease
+#   stable   <- the newest release that is not a prerelease, which the caller
+#               resolves and hands in; never this release when this release is a
+#               prerelease
 #   nightly  <- the release the promotion pointer names, which the caller resolves
 #               and hands in; a release publish never chooses it
 #
+# Stable is written on every run, including the runs that publish a release
+# candidate. Refusing to write a candidate into stable is right; leaving the
+# candidate that is already there is not, and until T-069-01-05 this script did
+# both -- it skipped the file on a prerelease cut, so the 0.5.0-rc.2 that the
+# single-formula era had put under the stable name simply stayed there. The two
+# are the same fact stated once: stable's source is the newest stable, so a
+# prerelease cut can only ever leave stable correct.
+#
 # Nothing is rewritten when the contents would not change, so a tap's history
-# stays readable during an incident.
+# stays readable during an incident -- a correction that has already happened
+# costs no second commit.
 #
 # Usage:
-#   publish-tap-formulae.sh <tap-checkout> <release-formula.rb> <is-prerelease> <nightly-formula.rb>
+#   publish-tap-formulae.sh <tap-checkout> <release-formula.rb> <is-prerelease> <nightly-formula.rb> <stable-formula.rb>
 #
 #   <tap-checkout>       a checkout of johnhkchen/homebrew-lisa (writes Formula/*.rb)
 #   <release-formula.rb> the .rb cargo-dist built for the release being published
 #   <is-prerelease>      true | false, from dist's announcement_is_prerelease
 #   <nightly-formula.rb> the .rb of the release nightly should carry
+#   <stable-formula.rb>  the .rb of the newest release that is not a prerelease,
+#                        or "" when no such release exists yet
 
 stable_formula=lisa
 nightly_formula=lisa-nightly
@@ -42,17 +55,20 @@ fail() {
     exit 1
 }
 
-[[ $# -eq 4 ]] ||
-    fail "usage: $(basename "$0") <tap-checkout> <release-formula.rb> <is-prerelease> <nightly-formula.rb>"
+[[ $# -eq 5 ]] ||
+    fail "usage: $(basename "$0") <tap-checkout> <release-formula.rb> <is-prerelease> <nightly-formula.rb> <stable-formula.rb>"
 
 tap_checkout=$1
 release_source=$2
 is_prerelease=$3
 nightly_source=$4
+stable_source=$5
 
 [[ -d $tap_checkout ]] || fail "tap checkout does not exist: $tap_checkout"
 [[ -s $release_source ]] || fail "missing cargo-dist formula for this release: $release_source"
 [[ -s $nightly_source ]] || fail "missing the formula nightly should carry: $nightly_source"
+[[ -z $stable_source || -s $stable_source ]] ||
+    fail "missing the formula stable should carry: $stable_source"
 case $is_prerelease in
 true | false) ;;
 *) fail "is-prerelease must be true or false, got: $is_prerelease" ;;
@@ -159,11 +175,33 @@ render() {
 render "$canary_formula" canary "$release_source" "$formula_dir/$canary_formula.rb" \
     "canary takes every release"
 
-if [[ $is_prerelease == false ]]; then
-    render "$stable_formula" stable "$release_source" "$formula_dir/$stable_formula.rb" \
-        "stable takes releases that are not prereleases"
+if [[ -z $stable_source ]]; then
+    # Nothing but prereleases have ever been published, so there is no release
+    # stable could name. This is the only case that leaves Formula/lisa.rb
+    # alone, and a tap in it has no stable formula to be stale.
+    [[ $is_prerelease == true ]] ||
+        fail "$(formula_version "$release_source") is not a prerelease, so it is what stable should carry; pass it as <stable-formula.rb>"
+    echo "skipped Formula/$stable_formula.rb -- no release that is not a prerelease exists yet"
 else
-    echo "skipped Formula/$stable_formula.rb -- $(formula_version "$release_source") is a prerelease and stable never takes one"
+    stable_version=$(formula_version "$stable_source")
+    [[ -n $stable_version ]] || fail "no version line in $stable_source"
+
+    # The refusal, stated where it cannot be argued out of by a caller that has
+    # the prerelease flag wrong: a version with a prerelease component is not
+    # something stable may carry, whoever handed it over and for whatever reason.
+    case $stable_version in
+    *-*) fail "stable never takes a prerelease, and $stable_version is one: $stable_source" ;;
+    esac
+
+    # A release that is not a prerelease is, at the moment it publishes, the
+    # newest one that is not a prerelease. A caller that says otherwise has
+    # resolved a stale tag, and would move stable backwards off this release.
+    if [[ $is_prerelease == false && $stable_version != "$(formula_version "$release_source")" ]]; then
+        fail "$(formula_version "$release_source") is not a prerelease, so stable must be written from it, not from $stable_version"
+    fi
+
+    render "$stable_formula" stable "$stable_source" "$formula_dir/$stable_formula.rb" \
+        "stable takes the newest release that is not a prerelease"
 fi
 
 render "$nightly_formula" nightly "$nightly_source" "$formula_dir/$nightly_formula.rb" \
