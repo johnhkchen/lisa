@@ -244,6 +244,32 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+
+  # Rehearse the three-channel tap before any of it reaches johnhkchen/homebrew-lisa.
+  # This runs on macOS because that is where the tap's readers are, and because a
+  # real Homebrew is the only thing that can say whether the channels conflict.
+  # The same rehearsal on a Linux runner drags in Homebrew's own glibc and gcc
+  # bottles -- several hundred megabytes of the wrong thing to test.
+  verify-homebrew-tap:
+    needs:
+      - plan
+      - build-global-artifacts
+    runs-on: "macos-15"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - name: Verify the three-channel Homebrew tap
+        shell: bash
+        run: scripts/verify-homebrew-tap.sh
+
   # Determines if we should publish/announce
   host:
     needs:
@@ -478,47 +504,108 @@ jobs:
     needs:
       - plan
       - host
+      - verify-homebrew-tap
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      IS_PRERELEASE: ${{ fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+      SOURCE_REPO: ${{ github.repository }}
       GITHUB_USER: "axo bot"
       GITHUB_EMAIL: "admin+bot@axo.dev"
+    # Every tag reaches the tap, prerelease or not: a release candidate has to
+    # reach lisa-canary, and lisa is kept clean by what is written into each
+    # formula rather than by skipping the publish.
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out the tap
+        uses: actions/checkout@v6
         with:
           persist-credentials: true
           repository: "johnhkchen/homebrew-lisa"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      # The generator that derives the three channel formulae, and the promotion
+      # pointer that says which release nightly carries, both live in this repo.
+      - name: Check out Lisa
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+          path: lisa
       # So we have access to the formula
       - name: Fetch homebrew formulae
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: Formula/
+          path: dist-artifacts/
           merge-multiple: true
       # This is extra complex because you can make your Formula name not match your app name
       # so we need to find releases with a *.rb file, and publish with that filename.
       - name: Commit formula files
+        shell: bash
         run: |
+          set -euo pipefail
           git config --global user.name "${GITHUB_USER}"
           git config --global user.email "${GITHUB_EMAIL}"
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew update
+
+          # lisa-nightly follows one promotion pointer for the whole fleet -- the
+          # same file the apt suites read -- so a release publish can never undo a
+          # promotion, and the two package managers cannot disagree about which
+          # release has soaked. `stable` means nothing has been promoted yet.
+          pointer=$(tr -d '[:space:]' < lisa/packaging/apt/nightly-tag.txt)
+          if [[ -z $pointer ]]; then
+            echo "packaging/apt/nightly-tag.txt is empty" >&2
+            exit 1
+          fi
+          if [[ $pointer == stable ]]; then
+            nightly_tag=$(gh release list --repo "$SOURCE_REPO" \
+              --exclude-drafts --exclude-pre-releases --limit 1 \
+              --json tagName --jq '.[0].tagName')
+            if [[ -z $nightly_tag ]]; then
+              echo "no published stable release for lisa-nightly to carry" >&2
+              exit 1
+            fi
+          else
+            nightly_tag=$pointer
+          fi
+          echo "lisa-nightly carries $nightly_tag (promotion pointer: $pointer)"
 
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
             filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
-            name=$(echo "$filename" | sed "s/\.rb$//")
-            version=$(echo "$release" | jq .app_version --raw-output)
+            release_formula="$PWD/dist-artifacts/$filename"
 
-            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-            brew update
-            # We avoid reformatting user-provided data such as the app description and homepage.
-            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
+            if [[ $nightly_tag == "$RELEASE_TAG" ]]; then
+              nightly_formula="$release_formula"
+            else
+              rm -rf nightly-formula
+              mkdir -p nightly-formula
+              gh release download "$nightly_tag" --repo "$SOURCE_REPO" \
+                --dir nightly-formula --pattern "$filename"
+              nightly_formula="$PWD/nightly-formula/$filename"
+            fi
 
-            git add "Formula/${filename}"
-            git commit -m "${name} ${version}"
+            bash lisa/scripts/publish-tap-formulae.sh \
+              tap "$release_formula" "$IS_PRERELEASE" "$nightly_formula"
+
+            for formula in lisa lisa-nightly lisa-canary; do
+              path="Formula/$formula.rb"
+              [[ -e tap/$path ]] || continue
+              if [[ -z $(git -C tap status --porcelain -- "$path") ]]; then
+                continue
+              fi
+              version=$(awk -F'"' '/^  version "/ { print $2; exit }' "tap/$path")
+              # We avoid reformatting user-provided data such as the app description and homepage.
+              brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "tap/$path" || true
+
+              git -C tap add "$path"
+              git -C tap commit -m "${formula} ${version}"
+            done
           done
-          git push
+          git -C tap push
 
   announce:
     needs:
