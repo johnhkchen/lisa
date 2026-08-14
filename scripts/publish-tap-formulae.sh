@@ -7,23 +7,32 @@ set -euo pipefail
 # formula name -- python@3.11, postgresql@16 -- so Lisa says it the same way:
 #
 #   brew install lisa           stable   the newest release that is not a prerelease
-#   brew install lisa-nightly   nightly  a release that has soaked (written by the promotion job)
+#   brew install lisa-nightly   nightly  the release the soak promotion has raised
 #   brew install lisa-canary    canary   every release, prerelease or not
 #
 # cargo-dist emits exactly one formula, so the other two are derived here rather
 # than maintained by hand. A formula that drifts because somebody forgot to bump
 # it is the failure this exists to prevent.
 #
-# Usage:
-#   publish-tap-formulae.sh <dist-formula.rb> <tap-checkout> <version> <is-prerelease>
+# The rule, and it lives here rather than in the release workflow so a script can
+# rehearse it:
 #
-#   <dist-formula.rb>  the .rb cargo-dist built for this release
-#   <tap-checkout>     a checkout of johnhkchen/homebrew-lisa (writes Formula/*.rb)
-#   <version>          the release version, e.g. 0.5.0-rc.2 (used in messages only)
-#   <is-prerelease>    true | false, from dist's announcement_is_prerelease
+#   canary   <- this release, every time
+#   stable   <- this release, only when it is not a prerelease
+#   nightly  <- the release the promotion pointer names, which the caller resolves
+#               and hands in; a release publish never chooses it
+#
+# Nothing is rewritten when the contents would not change, so a tap's history
+# stays readable during an incident.
+#
+# Usage:
+#   publish-tap-formulae.sh <tap-checkout> <release-formula.rb> <is-prerelease> <nightly-formula.rb>
+#
+#   <tap-checkout>       a checkout of johnhkchen/homebrew-lisa (writes Formula/*.rb)
+#   <release-formula.rb> the .rb cargo-dist built for the release being published
+#   <is-prerelease>      true | false, from dist's announcement_is_prerelease
+#   <nightly-formula.rb> the .rb of the release nightly should carry
 
-tap_owner=johnhkchen
-tap_name=lisa
 stable_formula=lisa
 nightly_formula=lisa-nightly
 canary_formula=lisa-canary
@@ -33,15 +42,17 @@ fail() {
     exit 1
 }
 
-[[ $# -eq 4 ]] || fail "usage: $(basename "$0") <dist-formula.rb> <tap-checkout> <version> <is-prerelease>"
+[[ $# -eq 4 ]] ||
+    fail "usage: $(basename "$0") <tap-checkout> <release-formula.rb> <is-prerelease> <nightly-formula.rb>"
 
-source_formula=$1
-tap_checkout=$2
-version=$3
-is_prerelease=$4
+tap_checkout=$1
+release_source=$2
+is_prerelease=$3
+nightly_source=$4
 
-[[ -s $source_formula ]] || fail "missing cargo-dist formula: $source_formula"
 [[ -d $tap_checkout ]] || fail "tap checkout does not exist: $tap_checkout"
+[[ -s $release_source ]] || fail "missing cargo-dist formula for this release: $release_source"
+[[ -s $nightly_source ]] || fail "missing the formula nightly should carry: $nightly_source"
 case $is_prerelease in
 true | false) ;;
 *) fail "is-prerelease must be true or false, got: $is_prerelease" ;;
@@ -49,6 +60,10 @@ esac
 
 formula_dir="$tap_checkout/Formula"
 mkdir -p "$formula_dir"
+
+formula_version() {
+    awk -F'"' '/^  version "/ { print $2; exit }' "$1"
+}
 
 # lisa-nightly -> LisaNightly, the class name Homebrew derives from a file name.
 formula_class() {
@@ -78,11 +93,16 @@ siblings_of() {
 }
 
 render() {
-    local name=$1 channel=$2 destination=$3
-    local class conflicts
+    local name=$1 channel=$2 source=$3 destination=$4 reason=$5
+    local class conflicts version
     class=$(formula_class "$name")
+    version=$(formula_version "$source")
+    [[ -n $version ]] || fail "no version line in $source"
+
     # One Lisa and one channel per machine. Without this all three link a bin/lisa
     # and PATH order decides which one runs; with it brew refuses and says why.
+    # Homebrew loads the named siblings to check, which is why installing from
+    # this tap needs `brew trust johnhkchen/lisa` first.
     conflicts="  conflicts_with $(siblings_of "$name"), because: \"they install lisa from different release channels\""
 
     awk \
@@ -124,34 +144,27 @@ render() {
                 exit 1
             }
         }
-    ' "$source_formula" >"$destination.tmp"
+    ' "$source" >"$destination.tmp" || fail "could not render $name from $source"
+
+    if [[ -e $destination ]] && cmp -s "$destination.tmp" "$destination"; then
+        rm -f "$destination.tmp"
+        echo "unchanged Formula/$name.rb ($version)"
+        return
+    fi
 
     mv "$destination.tmp" "$destination"
+    echo "wrote Formula/$name.rb ($version) -- $reason"
 }
 
-# The routing. Canary means every release; stable means only a release that is
-# not a prerelease; nightly is written by the promotion job (T-069-01-03) and is
-# only seeded here so there is a formula for it to promote into.
-wrote=0
-
-render "$canary_formula" canary "$formula_dir/$canary_formula.rb"
-echo "wrote Formula/$canary_formula.rb ($version) -- canary takes every release"
-wrote=$((wrote + 1))
+render "$canary_formula" canary "$release_source" "$formula_dir/$canary_formula.rb" \
+    "canary takes every release"
 
 if [[ $is_prerelease == false ]]; then
-    render "$stable_formula" stable "$formula_dir/$stable_formula.rb"
-    echo "wrote Formula/$stable_formula.rb ($version) -- stable takes non-prerelease releases"
-    wrote=$((wrote + 1))
+    render "$stable_formula" stable "$release_source" "$formula_dir/$stable_formula.rb" \
+        "stable takes releases that are not prereleases"
 else
-    echo "skipped Formula/$stable_formula.rb -- $version is a prerelease and stable never takes one"
+    echo "skipped Formula/$stable_formula.rb -- $(formula_version "$release_source") is a prerelease and stable never takes one"
 fi
 
-if [[ -e $formula_dir/$nightly_formula.rb ]]; then
-    echo "skipped Formula/$nightly_formula.rb -- nightly is written by the soak promotion, not by a release"
-else
-    render "$nightly_formula" nightly "$formula_dir/$nightly_formula.rb"
-    echo "wrote Formula/$nightly_formula.rb ($version) -- seeded once so nightly exists to be promoted into"
-    wrote=$((wrote + 1))
-fi
-
-echo "tap $tap_owner/$tap_name: $wrote formula file(s) generated from $(basename "$source_formula")"
+render "$nightly_formula" nightly "$nightly_source" "$formula_dir/$nightly_formula.rb" \
+    "nightly carries the release the soak promotion points at"

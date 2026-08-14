@@ -81,23 +81,19 @@ sed "s/^  version \".*\"\$/  version \"$rehearsal_prerelease_version\"/" \
 [[ $(formula_version "$prerelease_formula") == "$rehearsal_prerelease_version" ]] ||
     fail "could not build the prerelease rehearsal formula"
 
-fresh_tap="$work_dir/tap-from-prerelease"
-mkdir -p "$fresh_tap"
-"$publisher" "$prerelease_formula" "$fresh_tap" "$rehearsal_prerelease_version" true \
-    >"$work_dir/routing-prerelease.log"
-cat "$work_dir/routing-prerelease.log"
+: >"$work_dir/routing.log"
+route() {
+    local tap=$1 release_formula=$2 prerelease=$3 nightly_formula=$4
+    "$publisher" "$tap" "$release_formula" "$prerelease" "$nightly_formula" |
+        tee -a "$work_dir/routing.log"
+}
 
-[[ ! -e $fresh_tap/Formula/lisa.rb ]] ||
-    fail "a prerelease wrote Formula/lisa.rb; stable must never take a release candidate"
-for name in lisa-canary lisa-nightly; do
-    [[ -s $fresh_tap/Formula/$name.rb ]] || fail "a prerelease did not write Formula/$name.rb"
-done
-
+# A release that is not a prerelease, with nothing promoted yet: nightly carries
+# what stable carries, which is what the promotion pointer resolves to before
+# anything has been promoted.
 release_tap="$work_dir/tap"
 mkdir -p "$release_tap"
-"$publisher" "$dist_formula" "$release_tap" "$release_version" false \
-    >"$work_dir/routing-stable.log"
-cat "$work_dir/routing-stable.log"
+route "$release_tap" "$dist_formula" false "$dist_formula" >/dev/null
 
 for name in lisa lisa-nightly lisa-canary; do
     [[ -s $release_tap/Formula/$name.rb ]] || fail "a stable release did not write Formula/$name.rb"
@@ -106,22 +102,35 @@ for name in lisa lisa-nightly lisa-canary; do
 done
 
 # The behaviour change this ticket is about: with a stable tap already in place,
-# the next release candidate moves canary and touches nothing else.
-"$publisher" "$prerelease_formula" "$release_tap" "$rehearsal_prerelease_version" true \
-    >"$work_dir/routing-rc-over-stable.log"
-cat "$work_dir/routing-rc-over-stable.log"
+# the next release candidate moves canary and touches nothing else. Nightly is
+# handed the same source as before, standing in for a promotion that has not
+# happened.
+rc_tap="$work_dir/tap-after-rc"
+mkdir -p "$rc_tap/Formula"
+cp "$release_tap"/Formula/*.rb "$rc_tap/Formula/"
+rc_log=$(route "$rc_tap" "$prerelease_formula" true "$dist_formula")
 
-[[ $(formula_version "$release_tap/Formula/lisa-canary.rb") == "$rehearsal_prerelease_version" ]] ||
+[[ $(formula_version "$rc_tap/Formula/lisa-canary.rb") == "$rehearsal_prerelease_version" ]] ||
     fail "a release candidate did not reach lisa-canary"
-[[ $(formula_version "$release_tap/Formula/lisa.rb") == "$release_version" ]] ||
+[[ $(formula_version "$rc_tap/Formula/lisa.rb") == "$release_version" ]] ||
     fail "a release candidate moved lisa; stable must stay on $release_version"
-[[ $(formula_version "$release_tap/Formula/lisa-nightly.rb") == "$release_version" ]] ||
-    fail "a release published into lisa-nightly; only the soak promotion may write it"
+[[ $(formula_version "$rc_tap/Formula/lisa-nightly.rb") == "$release_version" ]] ||
+    fail "a release candidate moved lisa-nightly; only the soak promotion may move it"
+grep -Fq "unchanged Formula/lisa-nightly.rb" <<<"$rc_log" ||
+    fail "a promotion with nothing to do rewrote lisa-nightly.rb; the tap's history must stay readable"
 
-# Put canary back on this build so the install rehearsal below can assert one
-# version for all three formulae.
-rm -f "$release_tap/Formula/lisa-canary.rb"
-"$publisher" "$dist_formula" "$release_tap" "$release_version" false >/dev/null
+# And a prerelease into an empty tap leaves no stable formula at all, rather
+# than seeding one from a release candidate.
+fresh_tap="$work_dir/tap-from-prerelease"
+mkdir -p "$fresh_tap"
+route "$fresh_tap" "$prerelease_formula" true "$prerelease_formula" >/dev/null
+[[ ! -e $fresh_tap/Formula/lisa.rb ]] ||
+    fail "a prerelease wrote Formula/lisa.rb; stable must never take a release candidate"
+for name in lisa-canary lisa-nightly; do
+    [[ -s $fresh_tap/Formula/$name.rb ]] || fail "a prerelease did not write Formula/$name.rb"
+done
+
+cat "$work_dir/routing.log"
 
 for name in lisa lisa-nightly lisa-canary; do
     grep -Fq 'conflicts_with' "$release_tap/Formula/$name.rb" ||
@@ -185,15 +194,48 @@ export HOMEBREW_NO_ANALYTICS=1
 export HOMEBREW_NO_AUTO_UPDATE=1
 export HOMEBREW_NO_ENV_HINTS=1
 export HOMEBREW_NO_EMOJI=1
+export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
 export HOMEBREW_CACHE="$work_dir/cache"
 export HOMEBREW_LOGS="$work_dir/logs"
 # Homebrew refuses a prefix that sits inside its own temporary directory, and on
 # macOS that directory defaults to /private/tmp -- where mktemp -d puts us.
 export HOMEBREW_TEMP="$work_dir/temp"
-mkdir -p "$HOMEBREW_TEMP"
+# Tap trust is recorded per user, in $HOME/.homebrew/trust.json, not per prefix.
+# Without this the rehearsal reads -- and writes -- the trust list of whoever is
+# running it, and passes on a machine that already trusts the tap.
+export HOME="$work_dir/home"
+mkdir -p "$HOMEBREW_TEMP" "$HOME"
 unset HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY HOMEBREW_LIBRARY
 brew="$prefix/bin/brew"
 [[ -x $brew ]] || fail "the throwaway Homebrew has no bin/brew"
+
+# Homebrew requires a non-official tap to be trusted before it will load a
+# formula that was not named on the command line, and conflicts_with loads the
+# two sibling channels. So `brew trust johnhkchen/lisa` is part of installing
+# Lisa from the tap, and the README says so. Prove it is really needed rather
+# than repeating it as folklore -- but if Homebrew stops needing it, say so
+# instead of failing a release over an instruction that became unnecessary.
+set +e
+untrusted_output=$("$brew" install johnhkchen/lisa/lisa 2>&1)
+untrusted_status=$?
+set -e
+if [[ $untrusted_status -eq 0 ]]; then
+    echo "notice: brew installed from the untrusted tap; the README's 'brew trust' step may no longer be required" >&2
+    "$brew" uninstall johnhkchen/lisa/lisa >/dev/null 2>&1 || true
+else
+    grep -Fq 'untrusted tap johnhkchen/lisa' <<<"$untrusted_output" ||
+        {
+            printf '%s\n' "$untrusted_output" >&2
+            fail "brew refused the untrusted tap for some reason other than trust"
+        }
+    echo "untrusted tap refused, as the README's 'brew trust johnhkchen/lisa' step says it is"
+fi
+
+"$brew" trust johnhkchen/lisa >"$work_dir/trust.log" 2>&1 ||
+    {
+        cat "$work_dir/trust.log" >&2
+        fail "brew trust johnhkchen/lisa failed; the README's install instructions cannot work"
+    }
 
 for channel in lisa lisa-nightly lisa-canary; do
     "$brew" install "johnhkchen/lisa/$channel" >"$work_dir/install-$channel.log" 2>&1 ||
