@@ -45,7 +45,9 @@ formula names the other two, which is what keeps two channels off one box.
 Homebrew versions without a `brew trust` command do not need the line.
 
 After that, plain `brew upgrade` keeps the machine on whatever its formula says.
-No Lisa command is in that path.
+No Lisa command is in that path. `lisa upgrade` runs the same two commands for
+you — and unlike `brew` on its own, it refuses while a run is live on the
+machine.
 
 **The three cannot be installed together.** They all provide the same `lisa`, so
 each conflicts with the other two and `brew` says so rather than leaving PATH
@@ -56,6 +58,9 @@ brew uninstall lisa
 brew install johnhkchen/lisa/lisa-nightly
 ```
 
+`lisa upgrade --channel nightly` runs exactly those two, after fetching the new
+bottle first so the moment with no `lisa` on the box is as short as a local copy.
+
 **Going back to an older version is the one thing Homebrew cannot do.** `brew
 switch` is gone, and a formula carries one version, so there is no `lisa=0.4.4`
 here the way there is on apt. The way back on a Mac is Lisa's own installer,
@@ -65,6 +70,11 @@ naming the release:
 lisa upgrade --tag v0.4.4
 ```
 
+That writes into `~/.local/bin`, which means the machine then has two lisas and
+PATH order decides which one runs — Homebrew's upgrades will not move the pinned
+one. `lisa doctor` reports the pair for as long as it lasts; `rm ~/.local/bin/lisa`
+puts the box back on its formula.
+
 **If this machine already has `lisa` from this tap**, two things change. Run
 `brew trust johnhkchen/lisa` once — without it, the next `brew upgrade` stops
 and says the tap is untrusted. And `lisa` stops taking release candidates: it
@@ -73,8 +83,13 @@ sit still until the next real release instead of moving every few days. Nothing
 is uninstalled and no version is taken away. To keep following candidates, swap
 to `lisa-canary` with the two commands above.
 
-Until releases are promoted into nightly on their own, `lisa-nightly` carries
-the same release as `lisa`.
+`lisa-nightly` is moved by a scheduled promotion rather than by a release: a
+release reaches `lisa-canary` the moment it is published, and reaches
+`lisa-nightly` a day later if nothing has replaced it in the meantime. Which
+release that is right now is one line in this repository —
+[`packaging/apt/nightly-tag.txt`](packaging/apt/nightly-tag.txt) — and `stable`
+there means nothing has been promoted yet, so `lisa-nightly` carries the same
+release as `lisa`.
 
 ### Debian and Ubuntu
 
@@ -117,6 +132,9 @@ Normal `apt-get update` and `apt-get upgrade` keep both packages on whatever the
 channel says. `lisa-runtime-zellij` provides Lisa's pinned runtime at
 `/usr/libexec/lisa/zellij`, so apt installs do not need a first-run Zellij
 download; it ships in all three channels next to the `lisa` it was built with.
+
+`lisa upgrade` runs that pair of commands for you, and refuses while a run is
+live on the machine.
 
 **Changing channel** is that one word and an update. All three suites are signed
 by the same key, so nothing new has to be trusted:
@@ -180,6 +198,20 @@ one above it has soaked yet. So a release candidate that a hotfix replaces twent
 minutes later is never installed anywhere. If the newest release has not aged out
 yet, `lisa upgrade` says how much longer and leaves the machine where it is.
 
+**Which source says what channel this box is on depends on how Lisa got here.**
+One question, one answer, per machine:
+
+| how Lisa got onto the box | the channel is | the per-user config file |
+| --- | --- | --- |
+| `brew install johnhkchen/lisa/lisa-nightly` | the formula name | not read |
+| an apt sources line | the suite word in it | not read |
+| the one-command install, or a source build | the `channel` field below | the only answer |
+
+On a package-managed box the package is the channel, so a `channel` line in the
+config file changes nothing — `lisa doctor` reports it as a disagreement to go
+and clear rather than letting it look load-bearing. On every other box the file
+below is the whole of it.
+
 The channel is a property of the machine, not of a project, so it lives in a
 per-user file:
 
@@ -198,9 +230,9 @@ to edit when 24 hours is the wrong wait. (A project's `.lisa.toml` also has a
 to do with channels.)
 
 **To find out where a machine stands, run `lisa doctor`.** It reports Lisa itself
-as one row — the channel this box is on, the version installed, and the version
-that channel resolves to right now — and when the two differ it names the command
-that settles the gap. A machine that is level says so once and stays quiet, a
+as one row — the channel this box is on, *where that channel was read from*, the
+version installed, and the version that channel resolves to right now — and when
+the two differ it names the command that settles the gap. A machine that is level says so once and stays quiet, a
 machine that has never picked a channel is reported as *unset* rather than
 silently counted as stable, and a machine that cannot reach the release list says
 that instead of claiming to be current. Being behind is something to know, not a
@@ -211,17 +243,32 @@ lisa doctor          # read it here
 lisa doctor --json   # collect it from every box: data.lisa.state is level, behind, ahead, waiting or unresolved
 ```
 
+**On a package-managed box, `lisa upgrade` hands the move to the package
+manager.** It reads the channel off the formula or the suite, says what it is
+about to run, refuses while a run is live, then runs `brew update && brew upgrade
+<formula>` or `apt-get update && apt-get install --only-upgrade lisa
+lisa-runtime-zellij` and reports what moved. `lisa upgrade --channel <name>`
+switches packages: an uninstall and an install on Homebrew (the bottle is fetched
+first, so the gap with no `lisa` on the box is as short as a local copy), and the
+suite word plus `apt-get update` on apt. Plain `brew upgrade` and `apt-get
+upgrade` keep working exactly as before — nothing here has to be in the path.
+
 Two things `upgrade` deliberately does not do. With no network it stops, says it
 could not read the release list, and leaves the installed Lisa in place — it
-never guesses. And on a machine where Homebrew or apt owns `lisa`, it refuses to
-write over their file and prints the command that does move them
-(`brew upgrade lisa`, `apt-get install --only-upgrade lisa`). On those machines
-the channel is the package that is installed — the formula name or the suite in
-the sources line — and `brew upgrade` or `apt-get upgrade` is the whole of
-keeping it current. See [macOS](#macos) and
-[Debian and Ubuntu](#debian-and-ubuntu). The per-user channel file below is for
-machines with no package to ask: the one-command install above, and source
-builds.
+never guesses. And it never half-does a channel switch: coming back *down* a
+channel on apt asks for an older version than the box has, which apt calls a
+downgrade, so Lisa prints that command with `--allow-downgrades` rather than
+running it.
+
+**Going back to an exact release is not the same command on the two package
+managers, and it is worth knowing before you need it.** On apt the pool keeps
+every version any suite has carried, so `lisa upgrade --tag v0.4.4` runs
+`apt-get install --allow-downgrades lisa=0.4.4-1 lisa-runtime-zellij=0.4.4-1` and
+that is a real rollback. **Homebrew has none** — `brew switch` was removed and a
+formula carries one version — so on a Mac `lisa upgrade --tag` falls back to
+Lisa's own installer writing into `~/.local/bin`. That leaves two lisas on the
+box with PATH order deciding which one runs, which Lisa says out loud when it
+does it and `lisa doctor` reports until you remove one.
 
 **An upgrade never lands under a run.** If any Zellij session is up on the
 machine, `lisa upgrade` stops rather than swap the binary a live loop is calling,
