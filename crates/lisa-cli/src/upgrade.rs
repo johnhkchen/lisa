@@ -16,12 +16,17 @@
 //! leaves the installed Lisa exactly where it was. An upgrader that guesses
 //! when it cannot see is worse than one that stops.
 //!
-//! **What happens on a brew- or apt-managed box.** It refuses, and names both
-//! ways forward. One Homebrew formula and one apt suite cannot carry three
-//! channels, and writing over a file a package manager owns produces a machine
-//! whose next `brew upgrade` silently undoes the channel. Brew and apt stay the
-//! hands-off stable door; the shell installer's `~/.local/bin` is the
-//! channel-aware path.
+//! **What happens on a brew- or apt-managed box.** It delegates. The tap
+//! carries a formula per channel and the apt archive a suite per channel
+//! (`S-069-01`), so the installed package already answers "which line of Lisa
+//! is this box on" — and the package manager already knows how to fetch, verify
+//! and swap. Lisa keeps the parts no package manager has: reading the channel
+//! off the package, refusing to move under a live Zellij session, and saying
+//! what moved. See [`crate::install_channel`] for which source wins where.
+//!
+//! The download-and-swap path below is still the whole story on a curl-installed
+//! or source-built box — and on Homebrew it is the only rollback there is, since
+//! `brew switch` is gone.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -32,6 +37,11 @@ use std::time::Duration;
 use semver::Version;
 
 use crate::channel::{self, Channel, Release};
+use install_channel::{Derived, Plan, Privilege, Source};
+
+/// Which channel the installed package names, and who moves it. Upgrade's own
+/// business, so it lives inside this module rather than beside it.
+pub(crate) mod install_channel;
 
 /// The release list Lisa resolves channels against.
 const RELEASES_API: &str = "https://api.github.com/repos/johnhkchen/lisa/releases?per_page=100";
@@ -47,11 +57,6 @@ const DOWNLOAD_BASE_ENV: &str = "LISA_DOWNLOAD_BASE";
 
 /// The shell installer cargo-dist publishes with every release.
 const INSTALLER_NAME: &str = "lisa-cli-installer.sh";
-
-/// The one-command install line, quoted verbatim in the package-manager
-/// refusal because that is the command that moves a box onto the channel path.
-const INSTALL_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -LsSf \
-    https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh";
 
 /// What `lisa upgrade` was asked to do.
 pub(crate) struct UpgradeArgs {
@@ -99,30 +104,27 @@ pub(crate) fn classify_install(exe: &Path, home: Option<&Path>) -> InstallMethod
     InstallMethod::Elsewhere
 }
 
-/// The refusal a package-managed Lisa gets, naming both ways forward.
-fn package_managed_refusal(method: &InstallMethod, exe: &Path) -> String {
-    let (manager, upgrade_command, remove_command) = match method {
-        InstallMethod::Homebrew => (
-            "Homebrew",
-            "brew update && brew upgrade lisa",
-            "brew uninstall lisa",
-        ),
-        InstallMethod::Apt => (
-            "apt",
-            "sudo apt-get update && sudo apt-get install --only-upgrade lisa",
-            "sudo apt-get remove lisa",
-        ),
-        _ => unreachable!("only package-managed installs are refused"),
-    };
+/// Whether a package manager owns this Lisa, and therefore whether the move is
+/// its job rather than Lisa's.
+pub(crate) fn is_package_managed(method: &InstallMethod) -> bool {
+    matches!(method, InstallMethod::Homebrew | InstallMethod::Apt)
+}
 
+/// The refusal a package-managed Lisa gets when its own package cannot be read.
+///
+/// Not a refusal to move — that is delegated now — but a refusal to *guess*.
+/// A box whose channel cannot be derived is exactly the box that must not fall
+/// back to a config field nobody can see being used.
+fn unreadable_package_refusal(manager: &str, reason: &str, exe: &Path) -> String {
     format!(
-        "this lisa is managed by {manager} ({}), and lisa upgrade will not write over a file \
-         {manager} owns.\n\
-         {manager} carries one current version, so it cannot carry three channels. Either:\n  \
-         - stay with {manager}, which tracks stable, and upgrade with:\n      {upgrade_command}\n  \
-         - or move this machine onto channels, which live in ~/.local/bin:\n      \
-         {remove_command}\n      {INSTALL_COMMAND}\n    then run: lisa upgrade --channel <name>",
+        "this lisa is managed by {manager} ({}), so {manager} is what says which channel it is \
+         on — and that could not be read: {reason}.\n\
+         Nothing was moved. Either put the install back in a shape {manager} recognises, or \
+         reinstall on the channel you meant:\n  \
+         - Homebrew: brew install {tap}/lisa-nightly   (or lisa-canary, or lisa)\n  \
+         - apt: put the channel in the suite word of /etc/apt/sources.list.d/lisa.list",
         exe.display(),
+        tap = install_channel::TAP,
     )
 }
 
@@ -309,6 +311,25 @@ pub(crate) fn installer_owned_path(home: &Path) -> PathBuf {
     home.join(".local").join("bin").join("lisa")
 }
 
+/// Ask a lisa on this machine which version it is.
+///
+/// Asking beats assuming everywhere it is used: after a package manager has
+/// moved the box, the version on disk is the only honest source of what moved,
+/// and the process asking is still the old binary.
+pub(crate) fn version_of(lisa: &Path) -> Option<Version> {
+    Command::new(lisa)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .nth(1)
+                .and_then(|version| Version::parse(version).ok())
+        })
+}
+
 /// Work out which lisa this machine has, and how old it is.
 pub(crate) fn installed_lisa(exe: &Path, home: Option<&Path>) -> Result<Installed, String> {
     let own = Version::parse(env!("CARGO_PKG_VERSION"))
@@ -333,16 +354,7 @@ pub(crate) fn installed_lisa(exe: &Path, home: Option<&Path>) -> Result<Installe
     // Ask it rather than assume: an installed lisa is the one an upgrade
     // replaces, and its version is a fact about the machine, not about this
     // build.
-    let reported = Command::new(&installed).arg("--version").output();
-    let version = reported
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .split_whitespace()
-                .nth(1)
-                .and_then(|version| Version::parse(version).ok())
-        });
+    let version = version_of(&installed);
 
     Ok(match version {
         Some(version) => Installed {
@@ -354,6 +366,359 @@ pub(crate) fn installed_lisa(exe: &Path, home: Option<&Path>) -> Result<Installe
     })
 }
 
+/// Put an apt box's sources line on another suite.
+///
+/// The file is rewritten whole from a value Lisa computed, rather than edited
+/// in place by a regular expression: the file being changed is the one that
+/// decides what this machine installs, and a half-applied edit to it is not a
+/// state worth risking. Everything that is not Lisa's own line survives byte for
+/// byte.
+fn put_apt_on(file: &Path, to: Channel, privilege: Privilege) -> Result<(), String> {
+    let contents = std::fs::read_to_string(file)
+        .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    let rewritten = install_channel::rewrite_suite(&contents, to)
+        .map_err(|error| format!("{}: {error}", file.display()))?;
+    if rewritten == contents {
+        return Ok(());
+    }
+
+    match privilege {
+        Privilege::Root => std::fs::write(file, rewritten)
+            .map_err(|error| format!("cannot write {}: {error}", file.display())),
+        Privilege::Sudo => {
+            use std::process::Stdio;
+            let mut tee = Command::new("sudo")
+                .arg("tee")
+                .arg(file)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("cannot run sudo tee {}: {error}", file.display()))?;
+            tee.stdin
+                .as_mut()
+                .ok_or_else(|| "cannot write to sudo tee".to_string())?
+                .write_all(rewritten.as_bytes())
+                .map_err(|error| format!("cannot write {}: {error}", file.display()))?;
+            let status = tee
+                .wait()
+                .map_err(|error| format!("cannot write {}: {error}", file.display()))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "sudo tee {} exited {status}, so the channel was not changed",
+                    file.display()
+                ))
+            }
+        }
+        Privilege::Neither => Err(format!(
+            "{} is root-owned, this process is not root, and there is no sudo on this machine",
+            file.display()
+        )),
+    }
+}
+
+/// What the delegated `upgrade` is about to hand the package manager.
+#[derive(Debug)]
+struct Delegation {
+    plan: Plan,
+    /// The suite file to put on another channel first, when this is a switch.
+    sources: Option<(PathBuf, Channel)>,
+}
+
+/// Work out what moves a package-managed box, given what was asked for.
+fn plan_for(
+    method: &InstallMethod,
+    derived: &Derived,
+    requested: Option<Channel>,
+    privilege: Privilege,
+) -> Result<Delegation, String> {
+    let on = derived.channel;
+    match (&derived.source, requested) {
+        (Source::Formula(formula), Some(channel)) if Some(channel) != on => Ok(Delegation {
+            plan: install_channel::brew_switch(formula, channel),
+            sources: None,
+        }),
+        (Source::Formula(formula), _) => Ok(Delegation {
+            plan: install_channel::brew_upgrade(formula),
+            sources: None,
+        }),
+        (Source::Suite { file, .. }, Some(channel)) if Some(channel) != on => Ok(Delegation {
+            plan: install_channel::apt_switch(privilege, file, channel),
+            sources: Some((file.clone(), channel)),
+        }),
+        (Source::Suite { .. }, _) => Ok(Delegation {
+            plan: install_channel::apt_upgrade(privilege),
+            sources: None,
+        }),
+        (Source::Unreadable { manager, reason }, _) => Err(unreadable_package_refusal(
+            manager,
+            reason,
+            Path::new("this lisa"),
+        )),
+        (Source::Config, _) => Err(format!(
+            "{method:?} is not a package-managed install, so there is nothing to delegate to"
+        )),
+    }
+}
+
+/// Run `lisa upgrade` on a box a package manager owns.
+///
+/// The shape is the one `upgrade` already had — say where the channel comes
+/// from, say what is about to happen, refuse under a live run, then report what
+/// moved — with `brew` or `apt-get` doing the fetch, verify and swap in the
+/// middle.
+fn run_package_upgrade(
+    args: &UpgradeArgs,
+    method: InstallMethod,
+    exe: &Path,
+    derived: Derived,
+) -> Result<(), String> {
+    let lisa =
+        install_channel::package_lisa_path(&method, exe).unwrap_or_else(|| exe.to_path_buf());
+    let installed = version_of(&lisa)
+        .or_else(|| Version::parse(env!("CARGO_PKG_VERSION")).ok())
+        .ok_or_else(|| "this build's own version is unreadable".to_string())?;
+
+    if let Source::Unreadable { manager, reason } = &derived.source {
+        return Err(unreadable_package_refusal(manager, reason, exe));
+    }
+
+    match derived.channel {
+        Some(channel) => println!(
+            "Channel {channel} — {}, from {}.",
+            channel.rule(),
+            derived.source.describe()
+        ),
+        None => println!(
+            "This machine is on {}, which is not one of Lisa's three channels.",
+            derived.source.describe()
+        ),
+    }
+
+    let privilege = Privilege::look();
+
+    // A pin is the rollback, and rollback is the one thing the two package
+    // managers do not agree on: apt keeps every version it has carried, and
+    // Homebrew keeps none.
+    if let Some(tag) = &args.tag {
+        return pin_package_box(args, &method, exe, &lisa, &installed, tag, privilege);
+    }
+
+    let requested = match &args.channel {
+        Some(name) => Some(Channel::parse(name)?),
+        None => None,
+    };
+    if let (Some(requested), Some(on)) = (requested, derived.channel) {
+        if requested == on {
+            println!("This machine is already on {requested}; nothing to switch.");
+        }
+    }
+    if requested.is_some() {
+        println!(
+            "The channel is the package, so nothing was written to Lisa's config file — \
+             the install is what says which channel this box is on."
+        );
+    }
+
+    let delegation = plan_for(&method, &derived, requested, privilege)?;
+    println!("{}", delegation.plan.describe());
+    let _ = io::stdout().flush();
+
+    // Last thing before anything moves: a run on this machine is calling the
+    // binary the package manager is about to replace. Delegating the swap does
+    // not delegate this — a `brew upgrade` under a live Zellij breaks the run
+    // exactly as Lisa's own installer would.
+    let busy = crate::busy::look();
+
+    if args.dry_run {
+        if busy.is_busy() {
+            println!(
+                "This machine is working — {} — so a real run would stop here rather than let \
+                 a package manager swap the binary underneath it.",
+                busy.describe()
+            );
+        }
+        println!("--dry-run: nothing was run and nothing was installed.");
+        return Ok(());
+    }
+
+    if busy.is_busy() && !args.anyway {
+        return Err(format!(
+            "{}\nlisa {installed} at {} is unchanged.",
+            live_run_refusal(&busy),
+            lisa.display()
+        ));
+    }
+    if busy.is_busy() {
+        println!("--anyway: moving with {}.", busy.describe());
+    }
+
+    if !privilege.can_run() {
+        return Err(format!(
+            "this box needs root to move an apt package and this process has no way to become \
+             it. Nothing was changed; run this yourself:\n{}",
+            delegation.plan.describe()
+        ));
+    }
+
+    if let Some((file, channel)) = &delegation.sources {
+        put_apt_on(file, *channel, privilege)?;
+        println!("{} now says {channel}.", file.display());
+    }
+
+    for step in &delegation.plan.steps {
+        step.run().map_err(|error| {
+            format!(
+                "{error}\nlisa {installed} at {} is what this machine has.{}",
+                lisa.display(),
+                by_hand_suffix(&delegation.plan)
+            )
+        })?;
+    }
+
+    report_move(&lisa, &installed);
+    Ok(())
+}
+
+/// Whatever the plan said Lisa would not do for you, appended to an error so the
+/// operator standing at a failure has it in front of them.
+fn by_hand_suffix(plan: &Plan) -> String {
+    if plan.by_hand.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", plan.by_hand.join("\n"))
+    }
+}
+
+/// Say what the package manager actually did, in the before-and-after shape
+/// `upgrade` already uses.
+fn report_move(lisa: &Path, before: &Version) {
+    match version_of(lisa) {
+        Some(after) if &after == before => {
+            println!("lisa {before} is what this channel carries. Nothing moved.");
+        }
+        Some(after) => {
+            println!(
+                "lisa {before} → {after} at {}. Open a new shell, then check it with: \
+                 lisa --version",
+                lisa.display()
+            );
+        }
+        None => println!(
+            "The mover finished, and {} did not answer --version. Check it with: \
+             command -v lisa && lisa --version",
+            lisa.display()
+        ),
+    }
+}
+
+/// `lisa upgrade --tag` on a package-managed box.
+///
+/// **On apt this is a real rollback.** The pool keeps every version any suite
+/// has carried, so `apt-get install lisa=<version>` fetches it back.
+///
+/// **On Homebrew there is no such thing.** `brew switch` was removed and a
+/// formula carries one version, so the escape hatch is Lisa's own installer
+/// writing into `~/.local/bin` — which leaves two lisas on the box and PATH
+/// order deciding which one runs. That is a real state, so it is said out loud
+/// here and reported by `doctor` afterwards rather than discovered later.
+fn pin_package_box(
+    args: &UpgradeArgs,
+    method: &InstallMethod,
+    exe: &Path,
+    lisa: &Path,
+    installed: &Version,
+    tag: &str,
+    privilege: Privilege,
+) -> Result<(), String> {
+    let busy = crate::busy::look();
+    let guard = |dry_run: bool| -> Result<(), String> {
+        if dry_run || !busy.is_busy() || args.anyway {
+            Ok(())
+        } else {
+            Err(format!(
+                "{}\nlisa {installed} at {} is unchanged.",
+                live_run_refusal(&busy),
+                lisa.display()
+            ))
+        }
+    };
+
+    match method {
+        InstallMethod::Apt => {
+            let version = Version::parse(tag.strip_prefix('v').unwrap_or(tag))
+                .map_err(|error| format!("{tag} is not a release version: {error}"))?;
+            let plan = install_channel::apt_pin(privilege, &version);
+            println!("Pinning to {tag}, ignoring the channel.");
+            println!("{}", plan.describe());
+            if args.dry_run {
+                println!("--dry-run: nothing was run and nothing was installed.");
+                return Ok(());
+            }
+            guard(false)?;
+            if !privilege.can_run() {
+                return Err(format!(
+                    "this box needs root to move an apt package and this process has no way to \
+                     become it. Nothing was changed; run this yourself:\n{}",
+                    plan.describe()
+                ));
+            }
+            for step in &plan.steps {
+                step.run().map_err(|error| {
+                    format!(
+                        "{error}\nlisa {installed} at {} is what this machine has.{}",
+                        lisa.display(),
+                        by_hand_suffix(&plan)
+                    )
+                })?;
+            }
+            report_move(lisa, installed);
+            Ok(())
+        }
+        InstallMethod::Homebrew => {
+            println!(
+                "Pinning to {tag}, ignoring the channel. Homebrew cannot do this — `brew switch` \
+                 is gone and a formula carries one version — so Lisa's own installer writes \
+                 {tag} into ~/.local/bin instead."
+            );
+            println!(
+                "That leaves two lisas on this machine: the Homebrew one at {} and the pinned \
+                 one. PATH order decides which runs, and `lisa doctor` reports the pair until \
+                 you take one away.",
+                exe.display()
+            );
+            let releases = fetch_releases()
+                .map_err(|error| format!("{error}\nlisa {installed} is unchanged."))?;
+            let target = find_tag(&releases, tag)?.clone();
+            if args.dry_run {
+                println!("--dry-run: nothing was downloaded and nothing was installed.");
+                return Ok(());
+            }
+            guard(false)?;
+            install(&target).map_err(|error| {
+                format!(
+                    "{error}\nlisa {installed} at {} is still in place.",
+                    lisa.display()
+                )
+            })?;
+            println!(
+                "lisa {} is installed in ~/.local/bin. Check which one your shell finds with: \
+                 command -v lisa",
+                target.version
+            );
+            println!(
+                "To go back to the Homebrew one: rm ~/.local/bin/lisa   (or `brew upgrade {}`)",
+                install_channel::formula_from_exe(exe).unwrap_or_else(|| "lisa".to_string())
+            );
+            Ok(())
+        }
+        InstallMethod::ShellInstaller | InstallMethod::Elsewhere => {
+            unreachable!("only package-managed installs are pinned here")
+        }
+    }
+}
+
 /// Run `lisa upgrade`.
 pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
     let exe = std::env::current_exe()
@@ -361,15 +726,17 @@ pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
     let exe = exe.canonicalize().unwrap_or(exe);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let method = classify_install(&exe, home.as_deref());
+
+    // A package-managed box does not read a channel out of a config file and
+    // does not need Lisa to fetch anything: the package it has is the channel,
+    // and the package manager is the mover.
+    if is_package_managed(&method) {
+        let derived = install_channel::derive(&method, &exe);
+        return run_package_upgrade(&args, method, &exe, derived);
+    }
+
     let target_of_the_move = installed_lisa(&exe, home.as_deref())?;
     let installed = target_of_the_move.version.clone();
-
-    // Refuse before touching config or the network: on these boxes there is
-    // nothing `upgrade` can do, and recording a channel it cannot honour would
-    // only make the machine lie about itself.
-    if matches!(method, InstallMethod::Homebrew | InstallMethod::Apt) {
-        return Err(package_managed_refusal(&method, &exe));
-    }
 
     let config_path = channel::config_path()?;
     let mut config = channel::load_from(&config_path)?;
@@ -546,21 +913,95 @@ mod tests {
         );
     }
 
+    /// A Homebrew box on `lisa-nightly` asked to upgrade hands the whole move
+    /// to `brew`, which is the change this ticket is: the old code printed
+    /// `brew upgrade lisa` and refused.
     #[test]
-    fn the_refusal_names_both_ways_forward() {
-        let refusal = package_managed_refusal(
+    fn a_brew_box_delegates_the_move_to_the_formula_it_is_on() {
+        let derived = install_channel::derive(
             &InstallMethod::Homebrew,
-            Path::new("/opt/homebrew/Cellar/lisa/0.5.0-rc.2/bin/lisa"),
+            Path::new("/opt/homebrew/Cellar/lisa-nightly/0.5.0-rc.2/bin/lisa"),
         );
-        assert!(refusal.contains("brew upgrade lisa"), "{refusal}");
-        assert!(refusal.contains("brew uninstall lisa"), "{refusal}");
-        assert!(refusal.contains("lisa upgrade --channel"), "{refusal}");
+        assert_eq!(derived.channel, Some(Channel::Nightly));
 
-        let refusal = package_managed_refusal(&InstallMethod::Apt, Path::new("/usr/bin/lisa"));
-        assert!(
-            refusal.contains("apt-get install --only-upgrade lisa"),
-            "{refusal}"
+        let delegation =
+            plan_for(&InstallMethod::Homebrew, &derived, None, Privilege::Root).unwrap();
+        let block = delegation.plan.describe();
+        assert!(block.contains("brew upgrade lisa-nightly"), "{block}");
+        assert!(delegation.sources.is_none());
+    }
+
+    #[test]
+    fn asking_a_brew_box_for_another_channel_switches_packages() {
+        let derived = install_channel::derive(
+            &InstallMethod::Homebrew,
+            Path::new("/opt/homebrew/Cellar/lisa/0.4.4/bin/lisa"),
         );
+        let block = plan_for(
+            &InstallMethod::Homebrew,
+            &derived,
+            Some(Channel::Canary),
+            Privilege::Root,
+        )
+        .unwrap()
+        .plan
+        .describe();
+
+        assert!(block.contains("brew uninstall lisa"), "{block}");
+        assert!(
+            block.contains("brew install johnhkchen/lisa/lisa-canary"),
+            "{block}"
+        );
+    }
+
+    /// The channel an apt box is on is the suite word, and switching it is the
+    /// sources-line change before the install rather than a config edit.
+    #[test]
+    fn asking_an_apt_box_for_another_channel_rewrites_the_sources_line_first() {
+        let derived = Derived {
+            channel: Some(Channel::Stable),
+            source: Source::Suite {
+                suite: "stable".to_string(),
+                file: PathBuf::from("/etc/apt/sources.list.d/lisa.list"),
+            },
+        };
+        let delegation = plan_for(
+            &InstallMethod::Apt,
+            &derived,
+            Some(Channel::Nightly),
+            Privilege::Root,
+        )
+        .unwrap();
+
+        assert_eq!(
+            delegation.sources,
+            Some((
+                PathBuf::from("/etc/apt/sources.list.d/lisa.list"),
+                Channel::Nightly
+            ))
+        );
+        let block = delegation.plan.describe();
+        assert!(block.contains("apt-get update"), "{block}");
+        assert!(
+            block.contains("apt-get install --only-upgrade -y lisa lisa-runtime-zellij"),
+            "{block}"
+        );
+    }
+
+    /// A package-managed box whose package cannot be read must not quietly fall
+    /// back to the config file — that is the second source of truth this ticket
+    /// exists to remove.
+    #[test]
+    fn a_package_that_cannot_be_read_is_a_refusal_that_names_the_fix() {
+        let derived = install_channel::derive(
+            &InstallMethod::Homebrew,
+            Path::new("/home/linuxbrew/bin/lisa"),
+        );
+        let error =
+            plan_for(&InstallMethod::Homebrew, &derived, None, Privilege::Root).unwrap_err();
+        assert!(error.contains("Homebrew"), "{error}");
+        assert!(error.contains("Nothing was moved"), "{error}");
+        assert!(error.contains("brew install johnhkchen/lisa/"), "{error}");
     }
 
     #[test]
