@@ -124,7 +124,9 @@ jobs:
             local tag=$1 dir=$2
             rm -rf "$dir"
             mkdir -p "$dir"
-            gh release download "$tag" --repo "$SOURCE_REPO" --dir "$dir" --pattern '*.rb'
+            # Anything the download says goes to stderr: this function's stdout
+            # is the formula path its caller captures.
+            gh release download "$tag" --repo "$SOURCE_REPO" --dir "$dir" --pattern '*.rb' >&2
             local count
             count=$(find "$dir" -maxdepth 1 -name '*.rb' | wc -l | tr -d ' ')
             if [[ $count -ne 1 ]]; then
