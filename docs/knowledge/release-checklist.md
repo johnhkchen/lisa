@@ -463,7 +463,9 @@ test "$("$LISA_UNDER_TEST" --version)" = "lisa $VERSION"
 Wait for `publish-homebrew-formula` to finish, then read all three formulae. The
 cut always moves `lisa-canary`; it moves `lisa` only when `$VERSION` is not a
 prerelease, and it never moves `lisa-nightly`, which follows the promotion
-pointer:
+pointer — the hourly `promote-nightly.yml` moves that one, roughly a day after
+this cut, and [nightly-promotion.md](nightly-promotion.md) is where to look when
+it has not:
 
 ```bash
 for formula in lisa lisa-nightly lisa-canary; do

@@ -92,6 +92,11 @@ Required values are explicit protocol inputs, not questions on the everyday path
 
 | ID | Surface | Bar | Default / justification | Fixture | Category |
 | --- | --- | --- | --- | --- | --- |
+| `flag:lisa/promote-nightly:--releases` | Name the release list to judge | working default | Default is `-`, standard input, so the caller pipes the list it already fetched. | `the_release_list_can_arrive_on_standard_input` | — |
+| `flag:lisa/promote-nightly:--pointer` | Name the promotion pointer to read and write | working default | Default is `packaging/apt/nightly-tag.txt`, the one the tap and the apt suites are built from. | `a_soaked_release_is_promoted_and_the_pointer_says_so` | — |
+| `flag:lisa/promote-nightly:--write` | Write the decision to the pointer file | working default | Default is off, so asking what nightly should carry never moves a fleet by itself. | `a_decision_without_write_changes_nothing` | — |
+| `flag:lisa/promote-nightly:--json` | Print one JSON document for another program | working default | Default is off, so a person reads the same decision in sentences. | `the_human_report_names_the_release_and_the_reason` | — |
+| `flag:lisa/promote-nightly:--now` | Judge against a given instant instead of the clock | working default | Default is the clock; naming an instant is how a test and a rehearsal pin a soak boundary. | `two_releases_inside_one_window_promote_neither` | — |
 | `flag:lisa/recheck-world:--path` | Choose the project folder for world-owned wait checks | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
 | `flag:lisa/triage-agent:--agent-bin` | Override the first responder's executable | working default | Without the flag, Lisa uses the executable for the selected client. | `flag_audit_covers_live_cli_config_and_prompts` | — |
 | `flag:lisa/triage-agent:--client` | Name the first responder's client | justified ask | The internal caller must bind the read-only pass to the client chosen for this attempt. | — | expert override |
