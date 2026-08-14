@@ -83,9 +83,12 @@ Expected skew before this cut:
 
 - `releases/latest`: `$PRIOR_STABLE` (stable);
 - newest release of any kind: `v0.5.0-rc.2`, the prerelease this cut supersedes;
-- Homebrew tap: `0.5.0-rc.2` (deliberate: `publish-prereleases = true` means the
-  tap tracks whichever came last, so it carries the prerelease rather than
-  `$PRIOR_STABLE`);
+- Homebrew tap: three formulae, one per channel — `Formula/lisa.rb` on the newest
+  release that is not a prerelease, `Formula/lisa-canary.rb` on the newest release
+  of any kind, and `Formula/lisa-nightly.rb` on whatever
+  `packaging/apt/nightly-tag.txt` names, the same promotion pointer the apt
+  suites read. `publish-prereleases = true` is still set and now means a
+  candidate reaches `lisa-canary` instead of `lisa`;
 - apt repository: `dists/stable` on `$PRIOR_STABLE` and older stables;
   `dists/nightly` on whatever `packaging/apt/nightly-tag.txt` names;
   `dists/canary` on the newest release of any kind.
@@ -99,8 +102,12 @@ gh api "repos/$REPO/releases/latest" \
 gh api "repos/$REPO/releases?per_page=1" \
   --jq '.[0] | {tag_name,prerelease,published_at,target_commitish}'
 
-gh api repos/johnhkchen/homebrew-lisa/contents/Formula/lisa.rb \
-  --jq .content | tr -d '\n' | base64 --decode | sed -n '1,45p'
+for formula in lisa lisa-nightly lisa-canary; do
+  printf '%s: ' "$formula"
+  gh api "repos/johnhkchen/homebrew-lisa/contents/Formula/$formula.rb" \
+    --jq .content | tr -d '\n' | base64 --decode |
+    awk -F'"' '/^  version "/ { print $2; exit }' || echo 'ABSENT'
+done
 
 curl -fsSL https://johnhkchen.github.io/lisa/dists/stable/main/binary-amd64/Packages \
   | awk '/^Package: lisa$/{p=1; next} /^Package: /{p=0} p&&/^Version:/{print}'
@@ -263,15 +270,16 @@ Finally, parse both workflow files and inspect the release-specific gates:
 ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/auto-release.yml")'
 ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/release.yml")'
 
-rg -n 'github.event.inputs.tag|Build WASM plugin|Verify static musl artifact|publish-homebrew-formula|publish-apt-repository' \
+rg -n 'github.event.inputs.tag|Build WASM plugin|Verify static musl artifact|verify-homebrew-tap|publish-homebrew-formula|publish-apt-repository' \
   .github/workflows/release.yml
 ```
 
 The tagged checkout expression must prefer `github.event.inputs.tag`; the WASM
 build must precede cargo-dist; the musl verifier must run after `dist build` and
-before artifact upload; Homebrew must depend on a successful host job; and
-`publish-apt-repository` must be present, ungated by prerelease status, and
-required by `announce`.
+before artifact upload; Homebrew must depend on a successful host job and on
+`verify-homebrew-tap`, which rehearses the three formulae on macOS before any of
+them reaches the tap; and `publish-apt-repository` must be present, ungated by
+prerelease status, and required by `announce`.
 
 ## 4. Publication authorization and cut
 
@@ -452,16 +460,29 @@ test "$("$LISA_UNDER_TEST" --version)" = "lisa $VERSION"
 
 ## 9. Verify Homebrew convergence
 
-Wait for `publish-homebrew-formula` to finish before reading the tap:
+Wait for `publish-homebrew-formula` to finish, then read all three formulae. The
+cut always moves `lisa-canary`; it moves `lisa` only when `$VERSION` is not a
+prerelease, and it never moves `lisa-nightly`, which follows the promotion
+pointer:
 
 ```bash
-gh api repos/johnhkchen/homebrew-lisa/contents/Formula/lisa.rb \
-  --jq .content | tr -d '\n' | base64 --decode \
-  > "$EVIDENCE/lisa.rb"
+for formula in lisa lisa-nightly lisa-canary; do
+  gh api "repos/johnhkchen/homebrew-lisa/contents/Formula/$formula.rb" \
+    --jq .content | tr -d '\n' | base64 --decode > "$EVIDENCE/$formula.rb"
+done
 
+grep -F "version \"$VERSION\"" "$EVIDENCE/lisa-canary.rb"
+grep -F 'lisa-cli-aarch64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa-canary.rb"
+grep -F 'lisa-cli-x86_64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa-canary.rb"
+
+# Each formula refuses the other two, so a machine has one Lisa and one channel.
+for formula in lisa lisa-nightly lisa-canary; do
+  grep -F 'conflicts_with' "$EVIDENCE/$formula.rb"
+done
+
+# A stable cut only. On a release candidate, assert instead that lisa.rb still
+# carries $PRIOR_STABLE.
 grep -F "version \"$VERSION\"" "$EVIDENCE/lisa.rb"
-grep -F 'lisa-cli-aarch64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa.rb"
-grep -F 'lisa-cli-x86_64-unknown-linux-musl.tar.gz' "$EVIDENCE/lisa.rb"
 ```
 
 ## 10. Verify apt convergence — fresh install and upgrade
@@ -550,15 +571,22 @@ Compare all stable-facing versions in one record:
   jq -r .tag_name "$EVIDENCE/latest-release.json"
   printf 'shell_version='
   "$LISA_UNDER_TEST" --version
-  printf 'brew_version='
-  sed -n 's/^  version "\([^"]*\)"/\1/p' "$EVIDENCE/lisa.rb"
+  for formula in lisa lisa-nightly lisa-canary; do
+    printf 'brew_%s=' "$formula"
+    sed -n 's/^  version "\([^"]*\)"/\1/p' "$EVIDENCE/$formula.rb"
+  done
   printf 'apt_version='
   sed -n 's/^lisa \(.*\)/\1/p' "$EVIDENCE/apt-fresh-install.txt" | head -1
 } | tee "$EVIDENCE/channel-versions.txt"
 ```
 
-All four values must agree on `$VERSION`. The intended disposition is
-`eliminated`; a mismatch is not a passing release.
+The stable-facing values — `latest_tag`, `shell_version`, `brew_lisa` and
+`apt_version` — must agree on `$VERSION` on a stable cut. On a prerelease cut
+`brew_lisa_canary` is `$VERSION` while `brew_lisa` stays on `$PRIOR_STABLE`,
+exactly as apt's `canary` and `stable` suites do, and that is the design rather
+than skew. `brew_lisa_nightly` follows the promotion pointer either way. The
+intended disposition is `eliminated`; an unexplained mismatch is not a passing
+release.
 
 ## 11. Record the cut
 
@@ -579,7 +607,9 @@ aarch64_musl_bullseye_step: PENDING
 x86_64_musl_bullseye_step: PENDING
 readme_installer_path: PENDING
 installed_version: PENDING
-homebrew_version: PENDING
+homebrew_lisa_version: PENDING
+homebrew_lisa_nightly_version: PENDING
+homebrew_lisa_canary_version: PENDING
 apt_fresh_version: PENDING
 apt_upgrade_from_prior: PENDING    # before/after line, or "equal-to-fresh (single-version repo)"
 channel_skew: pending

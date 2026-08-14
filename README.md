@@ -19,11 +19,62 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/release
 On Linux that's everything: Lisa brings its own Zellij, downloaded
 automatically on first run. Do not install Zellij separately.
 
-On macOS, you can also use Homebrew:
+### macOS
+
+One tap, three formulae. The formula name is the channel, and installing one is
+the whole choice:
+
+| formula | takes |
+| --- | --- |
+| `lisa` | the newest release that is not a release candidate |
+| `lisa-nightly` | the newest release that has soaked for a day |
+| `lisa-canary` | the newest release, candidate or not |
+
+Trust the tap once, then install the one you want:
 
 ```bash
+brew trust johnhkchen/lisa
 brew install johnhkchen/lisa/lisa
+
+lisa doctor
 ```
+
+`brew trust` is Homebrew asking whether you mean to run code from a tap that is
+not its own. It is a one-time answer per machine. Lisa needs it because each
+formula names the other two, which is what keeps two channels off one box.
+Homebrew versions without a `brew trust` command do not need the line.
+
+After that, plain `brew upgrade` keeps the machine on whatever its formula says.
+No Lisa command is in that path.
+
+**The three cannot be installed together.** They all provide the same `lisa`, so
+each conflicts with the other two and `brew` says so rather than leaving PATH
+order to decide which one runs. Changing channel is an uninstall and an install:
+
+```bash
+brew uninstall lisa
+brew install johnhkchen/lisa/lisa-nightly
+```
+
+**Going back to an older version is the one thing Homebrew cannot do.** `brew
+switch` is gone, and a formula carries one version, so there is no `lisa=0.4.4`
+here the way there is on apt. The way back on a Mac is Lisa's own installer,
+naming the release:
+
+```bash
+lisa upgrade --tag v0.4.4
+```
+
+**If this machine already has `lisa` from this tap**, two things change. Run
+`brew trust johnhkchen/lisa` once — without it, the next `brew upgrade` stops
+and says the tap is untrusted. And `lisa` stops taking release candidates: it
+used to carry whatever shipped last, candidate included, so the machine will now
+sit still until the next real release instead of moving every few days. Nothing
+is uninstalled and no version is taken away. To keep following candidates, swap
+to `lisa-canary` with the two commands above.
+
+Until releases are promoted into nightly on their own, `lisa-nightly` carries
+the same release as `lisa`.
 
 ### Debian and Ubuntu
 
@@ -164,9 +215,13 @@ Two things `upgrade` deliberately does not do. With no network it stops, says it
 could not read the release list, and leaves the installed Lisa in place — it
 never guesses. And on a machine where Homebrew or apt owns `lisa`, it refuses to
 write over their file and prints the command that does move them
-(`brew upgrade lisa`, `apt-get install --only-upgrade lisa`); those carry one
-version each, which is the stable channel by another name. Channels need the
-one-command install above, which puts `lisa` in `~/.local/bin`.
+(`brew upgrade lisa`, `apt-get install --only-upgrade lisa`). On those machines
+the channel is the package that is installed — the formula name or the suite in
+the sources line — and `brew upgrade` or `apt-get upgrade` is the whole of
+keeping it current. See [macOS](#macos) and
+[Debian and Ubuntu](#debian-and-ubuntu). The per-user channel file below is for
+machines with no package to ask: the one-command install above, and source
+builds.
 
 **An upgrade never lands under a run.** If any Zellij session is up on the
 machine, `lisa upgrade` stops rather than swap the binary a live loop is calling,
