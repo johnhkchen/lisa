@@ -316,7 +316,9 @@ jobs:
     needs:
       - plan
       - host
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+    # Every tag rebuilds the site, prerelease or not: a release candidate has to
+    # reach the canary suite, and stable is kept clean by what goes into each
+    # suite's input rather than by skipping the publish.
     runs-on: "ubuntu-22.04"
     permissions:
       contents: read
@@ -336,41 +338,88 @@ jobs:
           ref: ${{ needs.plan.outputs.tag }}
           persist-credentials: false
 
-      - name: Collect Debian packages from stable releases
+      - name: Collect Debian packages into the three suite inputs
         shell: bash
         run: |
           set -euo pipefail
+          store="$RUNNER_TEMP/apt-store"
           input="$RUNNER_TEMP/apt-input"
-          mkdir -p "$input"
+          releases="$RUNNER_TEMP/releases.json"
+          mkdir -p "$store" "$input/stable" "$input/nightly" "$input/canary"
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" > "$releases"
+
+          # A release contributes packages only when it carries the complete
+          # four-asset set, so a partially uploaded tag never lands in a suite.
           # shellcheck disable=SC2016 # $assets belongs to jq, not the shell.
-          mapfile -t tags < <(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '
-              .[]
-              | select(.draft == false and .prerelease == false)
-              | ([.assets[].name]) as $assets
-              | select(
-                  ($assets | index("lisa-amd64.deb")) != null and
-                  ($assets | index("lisa-arm64.deb")) != null and
-                  ($assets | index("lisa-runtime-zellij-amd64.deb")) != null and
-                  ($assets | index("lisa-runtime-zellij-arm64.deb")) != null
-                )
-              | .tag_name
-            '
-          )
-          if [[ ${#tags[@]} -eq 0 ]]; then
+          complete='([.assets[].name]) as $assets
+            | select(
+                ($assets | index("lisa-amd64.deb")) != null and
+                ($assets | index("lisa-arm64.deb")) != null and
+                ($assets | index("lisa-runtime-zellij-amd64.deb")) != null and
+                ($assets | index("lisa-runtime-zellij-arm64.deb")) != null
+              )
+            | .tag_name'
+
+          # stable keeps meaning non-prerelease; canary takes every release.
+          mapfile -t stable_tags < <(
+            jq -r ".[] | select(.draft == false and .prerelease == false) | $complete" "$releases")
+          mapfile -t canary_tags < <(
+            jq -r ".[] | select(.draft == false) | $complete" "$releases")
+          if [[ ${#stable_tags[@]} -eq 0 ]]; then
             echo "No stable release contains the complete Debian package set" >&2
             exit 1
           fi
-          for tag in "${tags[@]}"; do
-            destination="$input/$tag"
-            mkdir -p "$destination"
-            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-              --dir "$destination" \
-              --pattern lisa-amd64.deb \
-              --pattern lisa-arm64.deb \
-              --pattern lisa-runtime-zellij-amd64.deb \
-              --pattern lisa-runtime-zellij-arm64.deb
-          done
+
+          # nightly is everything stable has, plus whichever release the soak
+          # promotion has raised into it. The pointer is a checked-in file so a
+          # release publish cannot silently undo a promotion, and so a person
+          # can read which release nightly is on without ssh. T-069-01-03 owns
+          # writing it; `stable` means nothing has been promoted yet.
+          nightly_tags=("${stable_tags[@]}")
+          nightly_pointer=$(tr -d '[:space:]' < packaging/apt/nightly-tag.txt)
+          if [[ -z $nightly_pointer ]]; then
+            echo "packaging/apt/nightly-tag.txt is empty" >&2
+            exit 1
+          fi
+          if [[ $nightly_pointer != stable ]]; then
+            if ! printf '%s\n' "${canary_tags[@]}" | grep -Fxq "$nightly_pointer"; then
+              echo "packaging/apt/nightly-tag.txt names $nightly_pointer, which is not a" \
+                "release carrying the complete Debian package set" >&2
+              exit 1
+            fi
+            if ! printf '%s\n' "${stable_tags[@]}" | grep -Fxq "$nightly_pointer"; then
+              nightly_tags+=("$nightly_pointer")
+            fi
+          fi
+
+          fetch_tag() {
+            local tag=$1
+            if [[ ! -d "$store/$tag" ]]; then
+              mkdir -p "$store/$tag"
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                --dir "$store/$tag" \
+                --pattern lisa-amd64.deb \
+                --pattern lisa-arm64.deb \
+                --pattern lisa-runtime-zellij-amd64.deb \
+                --pattern lisa-runtime-zellij-arm64.deb
+            fi
+          }
+
+          # Hardlinks, so a tag in three suites is downloaded and stored once.
+          fill_suite() {
+            local suite=$1
+            shift
+            local tag
+            for tag in "$@"; do
+              fetch_tag "$tag"
+              cp -al "$store/$tag" "$input/$suite/$tag"
+            done
+          }
+
+          fill_suite stable "${stable_tags[@]}"
+          fill_suite nightly "${nightly_tags[@]}"
+          fill_suite canary "${canary_tags[@]}"
           echo "LISA_APT_INPUT=$input" >> "$GITHUB_ENV"
 
       - name: Install apt repository tools
