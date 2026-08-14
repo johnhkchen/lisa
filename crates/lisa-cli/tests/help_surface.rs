@@ -1,7 +1,7 @@
 //! Regression lock for the legible `--help` surface (S-036-01, S-044-01).
 //!
 //! Pins five properties so they cannot silently regress:
-//!   (a) all 21 of Lisa's own subcommands still resolve,
+//!   (a) all 22 of Lisa's own subcommands still resolve,
 //!   (b) top-level help matches the operator-oriented snapshot,
 //!   (c) each operator command keeps its purpose and concrete example,
 //!   (d) the five machinery-invoked plumbing commands stay outside the
@@ -15,7 +15,7 @@
 use std::process::{Command, Output};
 
 /// The commands an operator runs, foregrounded in `--help`.
-const OPERATOR_COMMANDS: [&str; 11] = [
+const OPERATOR_COMMANDS: [&str; 12] = [
     "init",
     "validate",
     "status",
@@ -27,6 +27,7 @@ const OPERATOR_COMMANDS: [&str; 11] = [
     "proposal",
     "loop",
     "file-ticket",
+    "upgrade",
 ];
 
 /// The five machinery-invoked commands: omitted from Clap's generated list but
@@ -72,6 +73,7 @@ Commands:
   heal-panes     Ask a running loop to put back a coding pane it lost
   schedulers     Show every run holding this board, and stop one that outlived its pane
   file-ticket    Put a new ticket on the board, from a draft you pipe in
+  upgrade        Move this machine to the Lisa its channel asks for
   help           Print this message or the help of the given subcommand(s)
 
 Options:
@@ -91,7 +93,7 @@ struct OperatorHelpSnapshot {
     expected: &'static str,
 }
 
-const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 11] = [
+const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 12] = [
     OperatorHelpSnapshot {
         command: "init",
         expected: r#"Set up a project to run with Lisa
@@ -277,10 +279,32 @@ Example: lisa file-ticket --story S-065-01 < draft.md
 For another program to read: lisa file-ticket --json. What the fields mean and which ones you can rely on: lisa json-guide
 "#,
     },
+    OperatorHelpSnapshot {
+        command: "upgrade",
+        expected: r#"Move this machine to the Lisa its channel asks for
+
+Usage: lisa upgrade [OPTIONS]
+
+Options:
+      --channel <CHANNEL>  Put this machine on a channel (canary | nightly | stable), then upgrade
+      --tag <TAG>          Move to this exact release instead, which is how you go back
+      --dry-run            Say what would happen and change nothing
+  -h, --help               Print help
+
+A machine picks one of three channels and keeps it in a per-user config file, not in the project: canary takes the newest release, nightly takes the newest release once it has aged past the soak window, and stable takes the newest release that is not a prerelease. A machine that has never chosen is treated as stable.
+
+A brew- or apt-managed lisa is left alone: those carry one version, so upgrade says which command moves them instead.
+
+Examples:
+  lisa upgrade
+  lisa upgrade --channel nightly
+  lisa upgrade --tag v0.4.4
+"#,
+    },
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 21] = [
+const OWN_COMMANDS: [&str; 22] = [
     "init",
     "validate",
     "status",
@@ -292,6 +316,7 @@ const OWN_COMMANDS: [&str; 21] = [
     "proposal",
     "loop",
     "file-ticket",
+    "upgrade",
     "agent-exec",
     "capture-usage",
     "claim",
@@ -386,14 +411,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 21 own subcommands resolves — including the hidden
+/// (a) Every one of the 22 own subcommands resolves — including the hidden
 /// five, which `--help` reaches even though they are absent from the listing.
 #[test]
 fn all_pinned_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        21,
-        "the pinned command set must be exactly 21"
+        22,
+        "the pinned command set must be exactly 22"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);

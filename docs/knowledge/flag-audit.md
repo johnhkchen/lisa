@@ -75,6 +75,9 @@ rows with the live command tree and config catalog.
 | `flag:lisa/loop:--headless` | Run where there is no terminal | working default | Default is off: every machine with a terminal keeps the pane-per-agent run with a dashboard beside it, and a caller with no terminal is told this word by name rather than left to guess it. | `headless_is_asked_for_and_a_terminal_is_used_wherever_there_is_one` | — |
 | `flag:lisa/loop:--max-threads` | Override the concurrent-agent limit | working default | Without the flag, Lisa uses `.lisa.toml` and then the default of `2`. | `test_resolve_cli_overrides_default` | — |
 | `flag:lisa/loop:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
+| `flag:lisa/upgrade:--channel` | Put this machine on a channel and move in one command | working default | Without the flag, the channel this machine already recorded decides, and a machine that has never recorded one is treated as stable. | `a_machine_that_has_never_chosen_is_treated_as_stable_and_says_so` | — |
+| `flag:lisa/upgrade:--dry-run` | Say what would happen and change nothing | working default | Default is off, so Lisa carries the upgrade out unless a preview is requested. | `setting_a_channel_and_upgrading_is_one_command` | — |
+| `flag:lisa/upgrade:--tag` | Move to one exact release, which is how you go back | working default | Without the flag, the channel picks the release; naming a tag is the rollback. | `a_tag_pins_to_an_exact_release_and_an_unknown_one_is_refused` | — |
 
 ### Hidden and machine-facing commands
 
