@@ -27,9 +27,17 @@ brew install johnhkchen/lisa/lisa
 
 ### Debian and Ubuntu
 
-Lisa's stable apt channel is signed by a dedicated archive key. Install that key
-in its own keyring, pin the Lisa source to it, then install both the CLI and its
-pinned Zellij runtime:
+One repository, one signing key, three channels. The channel is the word in the
+sources line, and that word is the whole choice:
+
+| channel | takes |
+| --- | --- |
+| `stable` | the newest release that is not a release candidate |
+| `nightly` | the newest release that has soaked for a day |
+| `canary` | the newest release, candidate or not |
+
+Install the archive key in its own keyring, point at the channel you want, then
+install the CLI and its pinned Zellij runtime:
 
 ```bash
 sudo apt-get update
@@ -45,7 +53,8 @@ sudo install -D -m 0644 /tmp/lisa-archive-keyring.gpg \
   /usr/share/keyrings/lisa-archive-keyring.gpg
 rm -f /tmp/lisa-archive-keyring.asc /tmp/lisa-archive-keyring.gpg
 
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lisa-archive-keyring.gpg] https://johnhkchen.github.io/lisa stable main" \
+channel=stable   # or nightly, or canary
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lisa-archive-keyring.gpg] https://johnhkchen.github.io/lisa $channel main" \
   | sudo tee /etc/apt/sources.list.d/lisa.list >/dev/null
 sudo apt-get update
 sudo apt-get install -y lisa lisa-runtime-zellij
@@ -53,10 +62,33 @@ sudo apt-get install -y lisa lisa-runtime-zellij
 lisa doctor
 ```
 
-Normal `apt-get update` and `apt-get upgrade` commands move both packages to
-later stable Lisa releases. `lisa-runtime-zellij` provides Lisa's pinned runtime
-at `/usr/libexec/lisa/zellij`, so apt installs do not need a first-run Zellij
-download.
+Normal `apt-get update` and `apt-get upgrade` keep both packages on whatever the
+channel says. `lisa-runtime-zellij` provides Lisa's pinned runtime at
+`/usr/libexec/lisa/zellij`, so apt installs do not need a first-run Zellij
+download; it ships in all three channels next to the `lisa` it was built with.
+
+**Changing channel** is that one word and an update. All three suites are signed
+by the same key, so nothing new has to be trusted:
+
+```bash
+sudo sed -i 's/ stable main/ nightly main/' /etc/apt/sources.list.d/lisa.list
+sudo apt-get update
+sudo apt-get install --only-upgrade lisa lisa-runtime-zellij
+```
+
+**Going back down** a channel — canary or nightly to stable — asks for an older
+version than the one on the box. apt calls that a downgrade and will not do it
+until you say so:
+
+```bash
+apt-cache madison lisa                    # every version this channel offers
+sudo apt-get install --allow-downgrades \
+  lisa=0.4.4-1 lisa-runtime-zellij=0.4.4-1
+```
+
+Old versions stay in the pool, so that same command is also how you go back to a
+release that worked. `apt-cache madison lisa` is where the exact version strings
+come from.
 
 This is a vendor repository, not the Debian archive: bundling the private Zellij
 runtime is deliberate. It is hosted on GitHub Pages, whose documented limits

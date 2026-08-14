@@ -62,10 +62,12 @@ same walk with three deliberate differences, all of them consequences of
 - **`releases/latest` stays at `$PRIOR_STABLE`.** GitHub does not resolve latest
   to a prerelease. Section 6 reads `repos/$REPO/releases/tags/$TAG` instead, and
   asserts `.prerelease == true`.
-- **`publish-apt-repository` is skipped, and a skip is correct.** For a stable
-  cut a skip is a failed release; for a prerelease it is the design. Section 10
-  does not apply, and the apt repository legitimately keeps serving the prior
-  stable.
+- **`publish-apt-repository` runs, and it must.** Since `T-069-01-02` the
+  archive carries three suites, and a prerelease publish is how a candidate
+  reaches `canary`. A skip is a failed cut on any tag. What a prerelease does
+  *not* change is `dists/stable`: Section 10's stable checks should find the
+  same `$PRIOR_STABLE` there afterwards, with the candidate visible only under
+  `dists/canary`.
 - **Section 8's README installer path does not carry the prerelease** — it
   downloads through `releases/latest`, which is `$PRIOR_STABLE`. Install through
   the tagged asset instead:
@@ -84,8 +86,9 @@ Expected skew before this cut:
 - Homebrew tap: `0.5.0-rc.2` (deliberate: `publish-prereleases = true` means the
   tap tracks whichever came last, so it carries the prerelease rather than
   `$PRIOR_STABLE`);
-- apt repository: `$PRIOR_STABLE` and older stables (apt publishing skips
-  prereleases).
+- apt repository: `dists/stable` on `$PRIOR_STABLE` and older stables;
+  `dists/nightly` on whatever `packaging/apt/nightly-tag.txt` names;
+  `dists/canary` on the newest release of any kind.
 
 Capture the live values instead of assuming that baseline is still current:
 
@@ -267,8 +270,8 @@ rg -n 'github.event.inputs.tag|Build WASM plugin|Verify static musl artifact|pub
 The tagged checkout expression must prefer `github.event.inputs.tag`; the WASM
 build must precede cargo-dist; the musl verifier must run after `dist build` and
 before artifact upload; Homebrew must depend on a successful host job; and
-`publish-apt-repository` must be present, gated to stable (non-prerelease) tags,
-and required by `announce`.
+`publish-apt-repository` must be present, ungated by prerelease status, and
+required by `announce`.
 
 ## 4. Publication authorization and cut
 
@@ -337,7 +340,8 @@ Required successful jobs for a stable cut are:
 - `build-global-artifacts`;
 - `host`;
 - `publish-homebrew-formula`;
-- `publish-apt-repository` (stable tags only — skipped is a FAILED stable cut);
+- `publish-apt-repository` (every tag — skipped is a FAILED cut, prerelease
+  included, because that is how a candidate reaches `canary`);
 - `announce`.
 
 Both musl jobs must show `Verify static musl artifact on Debian bullseye` as
@@ -512,6 +516,31 @@ grep -F "after=lisa $VERSION" "$EVIDENCE/apt-upgrade.txt"
 If the repository no longer serves the prior stable version (single-version
 repo), the fallback install makes the upgrade leg equal the fresh leg — record
 that explicitly in the cut record rather than skipping the check.
+
+Channels stay separate. All three suites are signed by the same key, so one
+keyring reads all of them; what must differ is what each one offers. On a
+prerelease cut this is the check that matters — the candidate must be in
+`canary` and in neither of the others:
+
+```bash
+docker run --rm debian:bookworm bash -ec '
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl gnupg >/dev/null
+  curl --proto "=https" --tlsv1.2 -fsSL \
+    https://johnhkchen.github.io/lisa/lisa-archive-keyring.asc \
+    | gpg --batch --dearmor -o /usr/share/keyrings/lisa-archive-keyring.gpg
+  for channel in stable nightly canary; do
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/lisa-archive-keyring.gpg] https://johnhkchen.github.io/lisa $channel main" \
+      > /etc/apt/sources.list.d/lisa.list
+    apt-get update -qq
+    echo "$channel=$(apt-cache policy lisa | awk "/Candidate:/ { print \$2 }")"
+  done
+' | tee "$EVIDENCE/apt-channels.txt"
+```
+
+`stable` must never name a candidate version. On a stable cut all three
+normally agree on `$VERSION`; on a prerelease cut `canary` is ahead and that is
+the design. Record the three values either way.
 
 Compare all stable-facing versions in one record:
 

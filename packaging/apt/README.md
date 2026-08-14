@@ -1,8 +1,8 @@
 # Lisa apt archive operations
 
 This directory owns the public trust root for Lisa's Debian and Ubuntu package
-channel. The repository is published at <https://johnhkchen.github.io/lisa> by
-the stable release workflow.
+channels. The repository is published at <https://johnhkchen.github.io/lisa> by
+the release workflow, and carries all three channels under one signing key.
 
 ## Hosting decision
 
@@ -26,24 +26,56 @@ target; the four `.deb` release assets are provider-independent inputs.
 
 ## Repository shape
 
-The public source is:
+The public source names the channel in its suite field:
 
 ```text
 deb [signed-by=/usr/share/keyrings/lisa-archive-keyring.gpg] https://johnhkchen.github.io/lisa stable main
 ```
 
-The single `stable` suite contains `amd64` and `arm64` indexes. Prerelease tags
-are not published to it. Package payloads live under `pool/main/l/lisa/`, while
-indexes and signed Release metadata live under `dists/stable/`.
+There are three suites — `stable`, `nightly` and `canary` — each with `amd64`
+and `arm64` indexes under `dists/<suite>/`. All three are signed by the one
+archive key below, so changing channel never means trusting a second key.
 
-`scripts/build-apt-repository.sh` derives package filenames from Debian control
-metadata, rejects incomplete architecture/package pairs and conflicting bytes,
-generates both Packages indexes, and creates `InRelease` plus `Release.gpg`.
+Package payloads live in a single shared pool at `pool/main/l/lisa/`. A suite is
+an index over a subset of that pool, not a copy of it, and nothing is ever
+pruned from it: every version any channel has carried stays fetchable, which is
+what makes `apt-get install lisa=<version>` a rollback with no extra machinery.
+The pool holding a release candidate does not put that candidate on `stable` —
+only the suite index decides what a box can see.
 
-Every stable publish queries all non-draft, non-prerelease GitHub Releases. A
-release contributes packages only when it has the complete four-asset set. That
+`lisa-runtime-zellij` is published to all three suites, in lockstep with `lisa`.
+It carries the same version and pins the Zellij that release was built against,
+and `lisa` only *recommends* it, without a version — a single stable runtime
+shared by all three would let apt pair a canary `lisa` with a stale runtime.
+
+`scripts/build-apt-repository.sh` takes an input root holding one directory per
+suite. It derives package filenames from Debian control metadata, rejects
+incomplete architecture/package pairs and conflicting bytes, pools every input
+once, cuts each suite's indexes out of one pool-wide index, checks that each
+index lists exactly its own suite's packages, and creates `InRelease` plus
+`Release.gpg` per suite.
+
+Every publish queries all non-draft GitHub Releases. A release contributes
+packages only when it has the complete four-asset set. `stable` takes the
+non-prerelease ones, `canary` takes all of them, and `nightly` takes everything
+`stable` has plus whichever release `packaging/apt/nightly-tag.txt` names. That
 means the complete Pages site can be recovered without a mutable hosting branch
 or a prior Pages deployment.
+
+### The nightly pointer
+
+`packaging/apt/nightly-tag.txt` holds one line: a release tag, or the literal
+`stable` meaning nothing has been promoted yet. It exists so that soak promotion
+and release publishing cannot fight — a publish rebuilds `nightly` from the
+pointer rather than from a rule of its own, so shipping a release never undoes a
+promotion, and a person can read which release `nightly` is on from the
+repository instead of from a box. Writing it is the promotion job's work
+(`T-069-01-03`); a promotion takes effect on the served site the next time the
+publish job runs.
+
+A tag named there must be a real release with the complete four-asset set, or
+the publish fails closed rather than deploying a `nightly` that resolves to
+nothing.
 
 ## Production signing identity
 
@@ -135,9 +167,13 @@ and offline recovery copy are confirmed.
 
 ## CI key handling
 
-`.github/workflows/release.yml` exposes the secret only to the stable
-`publish-apt-repository` job. Pull requests and prerelease publishing do not use
-the production key.
+`.github/workflows/release.yml` exposes the secret only to the
+`publish-apt-repository` job. Pull requests do not use the production key.
+
+**Prerelease tags now do.** A release candidate has to reach the `canary` suite,
+and `canary` lives in the same signed archive as `stable`, so the job runs on
+every tag rather than only on non-prerelease ones. What keeps `stable` clean is
+which releases go into which suite's input, not whether the publish ran.
 
 The job:
 
@@ -168,13 +204,20 @@ The release package directory can be checked end to end with:
 scripts/verify-apt-repository.sh target/distrib
 ```
 
-The verifier creates a fresh ephemeral key, repacks the real four packages at a
-lower test version, and builds the initial signed repository. A clean bookworm
-container installs `lisa` and `lisa-runtime-zellij` through a `signed-by`
-file-based source. The verifier then adds the current package pair, runs apt
-update and upgrade, checks both installed and candidate versions, disconnects
-the network, and requires `lisa doctor` to report the packaged runtime and exit
-zero.
+The verifier creates a fresh ephemeral key and repacks the real four packages
+into three generations: an old version, the current version, and a candidate
+version that only `canary` is given. It builds the signed repository, checks
+that one public-key import verifies all three suites, and that the candidate is
+in the shared pool but in no index except `canary`'s.
+
+A clean bookworm container then installs `lisa` and `lisa-runtime-zellij`
+through a `signed-by` file-based source and walks the channels: it upgrades on
+`stable` and confirms the candidate is neither visible nor installable there,
+rolls back to the old version by exact version and forward again, moves to
+`nightly` and then `canary` by editing the suite word alone, and comes back down
+to `stable` — where it confirms `apt-get upgrade` does not downgrade and that
+`--allow-downgrades` is what completes the move. Finally it disconnects the
+network and requires `lisa doctor` to report the packaged runtime and exit zero.
 
 This test never reads `APT_SIGNING_KEY` and is safe for pull requests.
 
@@ -208,6 +251,6 @@ or cannot verify generated signatures. The prior Pages deployment remains the
 served site when a new deployment fails before activation.
 
 Because Pages is reconstructed from GitHub Releases, recovery does not require a
-hosting branch. Correct the key or workflow issue and rerun the stable release
-workflow for the same tag. Do not republish different package bytes under an
+hosting branch. Correct the key or workflow issue and rerun the release workflow
+for the same tag. Do not republish different package bytes under an
 existing Debian package name, version, and architecture.

@@ -163,6 +163,28 @@ lisa doctor --path ~/path/to/a/board
 lisa status --path ~/path/to/a/board
 ```
 
+### On a Linux box, apt does this instead
+
+The apt repository keeps every version it has ever carried in the pool, so
+rolling back is naming one:
+
+```bash
+apt-cache madison lisa                    # every version this channel offers
+sudo apt-get install --allow-downgrades \
+  lisa=0.4.4-1 lisa-runtime-zellij=0.4.4-1
+```
+
+`--allow-downgrades` is not optional and it is not only about rollback. **A box
+that has been on `nightly` or `canary` and moves back to `stable` is asking for
+an older version than the one it is running**, so `apt-get upgrade` will leave
+it where it is and say nothing useful. Changing the suite in
+`/etc/apt/sources.list.d/lisa.list` is only half the move; the other half is the
+line above, naming the version the new channel offers.
+
+This is the one thing apt does better than Homebrew. `brew switch` was removed,
+so a Mac has no equivalent — on the mini, `lisa upgrade --tag` above *is* the
+rollback path, and that is why it survives on brew boxes.
+
 To stop the machine upgrading itself without forgetting anything it knows:
 
 ```bash
