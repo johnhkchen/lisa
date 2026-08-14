@@ -181,9 +181,10 @@ filled in — the version the machine was on before it moved.
 **On a Homebrew mini, that pin is the shell installer, and it leaves two lisas
 on the box.** Nothing else can do it: the pinned release lands in
 `~/.local/bin/lisa`, Homebrew's stays where it was, and PATH order decides which
-one your shell — and the nightly job — finds. `lisa doctor` reports the pair as
-its own row for as long as it lasts. When the release that broke has been
-replaced, put the box back on its formula:
+one your shell — and the nightly job — finds. `lisa doctor`'s `lisa install` row
+counts every lisa on the box and says which one answered `lisa`, for as long as
+the state lasts. When the release that broke has been replaced, put the box back
+on its formula:
 
 ```bash
 rm ~/.local/bin/lisa
@@ -196,6 +197,37 @@ After a rollback, confirm the work runs again:
 lisa --version
 lisa doctor --path ~/path/to/a/board
 lisa status --path ~/path/to/a/board
+```
+
+### Which lisa is this box actually running
+
+**A machine can carry more than one, and the one your channel is about is not
+always the one that answers.** The measured case on a MacBook, 2026-08-14: a
+Homebrew keg at `/opt/homebrew/opt/lisa/bin/lisa` with the formula *unlinked*
+(so `/opt/homebrew/bin/lisa` is absent), a `~/.local/bin/lisa` from a pin, and a
+`~/.cargo/bin/lisa` from a source build. `brew upgrade lisa` moves the first one
+and the shell keeps running a different file — the box's channel then describes
+a binary nobody executes.
+
+`lisa doctor` counts them, whichever one you ran it from:
+
+```
+  lisa install unsupported
+    this machine has 3 lisas:
+      /opt/homebrew/opt/lisa/bin/lisa  (Homebrew's lisa, unlinked, 0.4.4)
+      /Users/you/.local/bin/lisa  (the shell installer, 0.5.0-rc.2)  <- `lisa` runs this one
+      /Users/you/.cargo/bin/lisa  (cargo install, 0.4.4)
+      `lisa` runs /Users/you/.local/bin/lisa, and PATH order is what decides that
+```
+
+`lisa doctor --json` carries the same list under `data.lisa_installs`, one entry
+per file with `origin`, `formula`, `version`, `running` and `first_on_path`, so a
+fleet asked by script sees what a person sees. Two ways out, and which one is
+right depends on what you meant:
+
+```bash
+brew link lisa          # put the keg back on PATH, if the package is what you want running
+rm ~/.local/bin/lisa    # drop the pin, if the pin was temporary
 ```
 
 ### On a Linux box, apt does this instead
@@ -215,6 +247,13 @@ an older version than the one it is running**, so `apt-get upgrade` will leave
 it where it is and say nothing useful. Changing the suite in
 `/etc/apt/sources.list.d/lisa.list` is only half the move; the other half is the
 line above, naming the version the new channel offers.
+
+**Homebrew says "stable" and does not mean this document's "stable".** `brew
+info` prints lines like `lisa: 0.4.4 → stable 0.5.0-rc.2`. Homebrew's *stable*
+means the formula's non-HEAD version, so it will call a release candidate stable
+in those exact words. Read `brew` output during a channel incident with that in
+mind; the channel a box is on is the formula it installed, not a word in
+`brew info`.
 
 This is the one thing apt does better than Homebrew. `brew switch` was removed,
 so a Mac has no equivalent — on the mini, `lisa upgrade --tag` above *is* the
