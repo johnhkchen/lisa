@@ -12,6 +12,8 @@ use crate::config;
 use crate::runtime::{ResolvedZellijRuntime, ZellijRuntimeRequest};
 use crate::templates::PLUGIN_WASM;
 
+pub(crate) mod installs;
+
 pub(crate) const LISA_SHELL_INSTALL_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh";
 
 #[cfg(test)]
@@ -801,58 +803,23 @@ fn installed_channel() -> Option<crate::upgrade::install_channel::Derived> {
 /// one a nightly job upgrades. `lisa upgrade --tag` on a Homebrew box creates it
 /// deliberately, because it is the only rollback Homebrew has. Reporting it is
 /// the fix: nothing here removes anything.
-fn shadowed_install_report() -> CheckReport {
+///
+/// The census behind it is [`installs::census`], which asks the box rather than
+/// the process — see that module for why the running binary is an answer here
+/// and never the question.
+fn install_report(found: &[installs::Install]) -> CheckReport {
     let name = "lisa install";
-    let Ok(exe) = std::env::current_exe() else {
-        return CheckReport {
-            name,
-            required: false,
-            result: CheckResult::Skipped {
-                reason: "cannot find the running lisa".to_string(),
-            },
-        };
-    };
-    let exe = exe.canonicalize().unwrap_or(exe);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let method = crate::upgrade::classify_install(&exe, home.as_deref());
-
-    let installer_copy = home
-        .as_deref()
-        .map(crate::upgrade::installer_owned_path)
-        .filter(|path| path.exists())
-        .filter(|path| path.canonicalize().map(|it| it != exe).unwrap_or(true));
-
-    let packaged = crate::upgrade::install_channel::package_lisa_path(&method, &exe);
-
-    match (packaged, installer_copy) {
-        (Some(packaged), Some(installer_copy)) => {
-            let manager = if matches!(method, crate::upgrade::InstallMethod::Homebrew) {
-                "Homebrew"
-            } else {
-                "apt"
-            };
-            let first = first_lisa_on_path();
-            CheckResult::Unsupported {
-                description: format!(
-                    "this machine has two lisas: {manager}'s at {} and the shell installer's at \
-                     {}. PATH order decides which one runs{}, and only the {manager} one \
-                     follows this box's channel",
-                    packaged.display(),
-                    installer_copy.display(),
-                    match &first {
-                        Some(found) => format!(" — right now that is {}", found.display()),
-                        None => String::new(),
-                    }
-                ),
-                remedy: format!(
-                    "Keep one. To go back to the packaged lisa:\n    rm {}\nTo keep the pinned \
-                     one instead, leave it and remember that {manager} upgrades will not move it.",
-                    installer_copy.display()
-                ),
-            }
-        }
-        _ => CheckResult::Found {
-            version: format!("one lisa, at {}", exe.display()),
+    match installs::read(found) {
+        None => CheckResult::Skipped {
+            reason: "cannot find any lisa on this machine, not even the one asking".to_string(),
+        },
+        Some(installs::Verdict::Settled(said)) => CheckResult::Found { version: said },
+        Some(installs::Verdict::Muddled {
+            description,
+            remedy,
+        }) => CheckResult::Unsupported {
+            description,
+            remedy,
         },
     }
     .into_report(name)
@@ -923,6 +890,9 @@ struct Findings {
     announcement: &'static str,
     completion: Result<crate::completion_seal::RunCompletionSeal, String>,
     lisa: Result<crate::freshness::Freshness, String>,
+    /// Every lisa this box carries, which the `lisa install` row summarises and
+    /// the JSON document lists in full.
+    installs: Vec<installs::Install>,
     /// The machine's rows: `lisa`, `zellij`, then the dependency checks.
     reports: Vec<CheckReport>,
     project: CheckReport,
@@ -945,9 +915,12 @@ fn gather(root: &Path) -> Result<Findings, String> {
     // Lisa itself comes first: the one version this report used to leave out is
     // the one that decides what every row below it even means.
     let lisa = look_at_lisa();
+    // Taken once: the row a person reads and the list a script collects are the
+    // same census, so the two cannot disagree about what is on the box.
+    let found = installs::census(&installs::Machine::look());
     let mut reports = vec![
         lisa_report(&lisa),
-        shadowed_install_report(),
+        install_report(&found),
         CheckReport {
             name: "zellij",
             required: true,
@@ -964,6 +937,7 @@ fn gather(root: &Path) -> Result<Findings, String> {
         announcement: resolved_config.client_announcement(),
         completion,
         lisa,
+        installs: found,
         reports,
         project,
         has_project,
@@ -1045,6 +1019,10 @@ fn doctor_document(root: &Path) -> Result<(serde_json::Value, i32), String> {
             Err(error) => Some(error.clone()),
         },
         "checks": reports.iter().map(check_to_json).collect::<Vec<_>>(),
+        // The `lisa install` row's own list, in full: a fleet asked by script
+        // sees every lisa a person reading the row sees, not a sentence about
+        // them.
+        "lisa_installs": installs::to_json(&findings.installs),
     });
 
     Ok((data, i32::from(failed)))

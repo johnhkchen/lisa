@@ -58,6 +58,10 @@ const APT_ROOT: &str = "/etc/apt";
 /// The file an apt-installed Lisa lives in.
 const APT_LISA: &str = "/usr/bin/lisa";
 
+/// Where that file is, overridable so a test can hand Lisa a box instead of
+/// looking at `/usr/bin`, which cannot be faked in a temporary directory.
+const APT_LISA_ENV: &str = "LISA_APT_LISA";
+
 /// The formula a channel is published as.
 pub(crate) const fn formula_for(channel: Channel) -> &'static str {
     match channel {
@@ -663,13 +667,20 @@ pub(crate) fn deb_version(version: &Version) -> String {
     deb
 }
 
+/// The file an apt box's `lisa` is, wherever this machine keeps it.
+pub(crate) fn apt_lisa_path() -> PathBuf {
+    std::env::var_os(APT_LISA_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(APT_LISA))
+}
+
 /// The file the package manager keeps its `lisa` in, which is what to ask for a
 /// version once the mover has run. Homebrew relinks `<prefix>/bin/lisa` on
 /// every upgrade, so the path outlives the Cellar directory the old version was
 /// in.
 pub(crate) fn package_lisa_path(method: &InstallMethod, exe: &Path) -> Option<PathBuf> {
     match method {
-        InstallMethod::Apt => Some(PathBuf::from(APT_LISA)),
+        InstallMethod::Apt => Some(apt_lisa_path()),
         InstallMethod::Homebrew => {
             let cellar = exe.to_string_lossy();
             let prefix = cellar.split("/Cellar/").next()?;

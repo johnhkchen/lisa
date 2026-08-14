@@ -34,8 +34,21 @@ struct BrewBox {
 
 fn brew_box(formula: &str) -> BrewBox {
     let prefix = TempDir::new().unwrap();
+    let lisa = install_keg(prefix.path(), formula);
+    link_keg(prefix.path(), formula);
+
+    BrewBox {
+        _prefix: prefix,
+        lisa,
+    }
+}
+
+/// Put a keg in a Homebrew prefix, in Homebrew's own layout: the versioned
+/// directory under `Cellar`, and `opt/<formula>` pointed at it. The `opt` link
+/// is there whether or not the formula is linked onto `PATH`, which is why it
+/// is what the census reads.
+fn install_keg(prefix: &Path, formula: &str) -> PathBuf {
     let cellar = prefix
-        .path()
         .join("Cellar")
         .join(formula)
         .join(INSTALLED)
@@ -44,16 +57,26 @@ fn brew_box(formula: &str) -> BrewBox {
     let lisa = cellar.join("lisa");
     std::fs::copy(env!("CARGO_BIN_EXE_lisa"), &lisa).expect("copy this build into a Cellar");
 
-    // The linked copy Homebrew keeps current on every upgrade, which is what
-    // `upgrade` asks for a version after the move.
-    let linked = prefix.path().join("bin");
-    std::fs::create_dir_all(&linked).unwrap();
-    std::fs::copy(&lisa, linked.join("lisa")).unwrap();
+    std::fs::create_dir_all(prefix.join("opt")).unwrap();
+    let _ = std::fs::remove_file(prefix.join("opt").join(formula));
+    std::os::unix::fs::symlink(
+        prefix.join("Cellar").join(formula).join(INSTALLED),
+        prefix.join("opt").join(formula),
+    )
+    .unwrap();
 
-    BrewBox {
-        _prefix: prefix,
-        lisa,
-    }
+    lisa
+}
+
+/// `brew link`: the name on `PATH` is a symlink into the keg, which is why one
+/// linked formula is one lisa under two names rather than two lisas.
+fn link_keg(prefix: &Path, formula: &str) {
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::os::unix::fs::symlink(
+        prefix.join("opt").join(formula).join("bin").join("lisa"),
+        prefix.join("bin").join("lisa"),
+    )
+    .unwrap();
 }
 
 /// A project Lisa will answer about.
@@ -97,6 +120,102 @@ fn said(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+/// A machine with nothing on it but what a case puts there (T-069-01-06).
+///
+/// `doctor`'s install census asks the box, not the process — so every place it
+/// looks has to be a place this suite owns, or the cases read the laptop
+/// running them. That laptop is not hypothetical: the box this ticket was
+/// measured on carries three lisas, and a case that counted those would be
+/// measuring the wrong machine.
+struct Machine {
+    root: TempDir,
+    home: TempDir,
+    config: TempDir,
+    project: TempDir,
+}
+
+impl Machine {
+    fn new() -> Self {
+        let machine = Machine {
+            root: TempDir::new().unwrap(),
+            home: TempDir::new().unwrap(),
+            config: TempDir::new().unwrap(),
+            project: project(),
+        };
+        std::fs::create_dir_all(machine.home.path().join(".local/bin")).unwrap();
+        std::fs::create_dir_all(machine.brew().join("bin")).unwrap();
+        machine
+    }
+
+    /// The one Homebrew prefix this box has.
+    fn brew(&self) -> PathBuf {
+        self.root.path().join("brew")
+    }
+
+    /// What the shell installer wrote, if a case says it did. Executable,
+    /// because `PATH` order only decides between things a shell will run.
+    fn installer_copy(&self) -> PathBuf {
+        let lisa = self.home.path().join(".local/bin/lisa");
+        std::fs::copy(env!("CARGO_BIN_EXE_lisa"), &lisa)
+            .expect("copy this build into ~/.local/bin");
+        lisa
+    }
+
+    /// A channel named in the machine config, which a package-managed box does
+    /// not read.
+    fn config_channel(&self, channel: &str) -> &Self {
+        std::fs::write(
+            self.config.path().join("config.toml"),
+            format!("channel = \"{channel}\"\n"),
+        )
+        .unwrap();
+        self
+    }
+
+    /// `lisa doctor --json`, run from whichever lisa a case is asking.
+    ///
+    /// `PATH` is the two directories a real box would have plus `/bin` for
+    /// `sh`, in the order a real box has them: `~/.local/bin` before Homebrew
+    /// is why a pinned copy shadows a keg. Nothing else is on it — the suite
+    /// has to run the same way on a Debian box that really does carry
+    /// `/usr/bin/lisa`.
+    fn doctor(&self, lisa: &Path) -> serde_json::Value {
+        let output = Command::new(lisa)
+            .arg("doctor")
+            .arg("--path")
+            .arg(self.project.path())
+            .arg("--json")
+            .env("HOME", self.home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}/.local/bin:{}/bin:/bin",
+                    self.home.path().display(),
+                    self.brew().display()
+                ),
+            )
+            .env("LISA_HOMEBREW_PREFIXES", self.brew())
+            .env("LISA_APT_LISA", self.root.path().join("no-apt-here/lisa"))
+            .env("LISA_CONFIG_DIR", self.config.path())
+            .env("LISA_RELEASES_URL", "http://127.0.0.1:1/releases")
+            .output()
+            .expect("run lisa doctor");
+
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON document")
+    }
+}
+
+/// The `lisa install` row: which lisas this box has.
+fn install_row(document: &serde_json::Value) -> serde_json::Value {
+    document["data"]["checks"]
+        .as_array()
+        .expect("doctor lists its checks")
+        .iter()
+        .find(|check| check["name"] == "lisa install")
+        .expect("the row is always there")
+        .clone()
 }
 
 /// The change this ticket is: `lisa upgrade` on a brew box used to refuse and
@@ -202,22 +321,12 @@ fn a_pin_on_a_brew_box_says_it_is_the_installer_and_names_the_state_it_leaves() 
 /// formula, and names the config line that is not being read.
 #[test]
 fn doctor_reports_the_channel_it_derived_and_the_config_it_ignored() {
-    let machine = machine_on("canary");
-    let brew = brew_box("lisa-nightly");
-    let project = project();
+    let machine = Machine::new();
+    machine.config_channel("canary");
+    let keg = install_keg(&machine.brew(), "lisa-nightly");
+    link_keg(&machine.brew(), "lisa-nightly");
 
-    let output = Command::new(&brew.lisa)
-        .arg("doctor")
-        .arg("--path")
-        .arg(project.path())
-        .arg("--json")
-        .env("LISA_CONFIG_DIR", machine.path())
-        .env("LISA_RELEASES_URL", "http://127.0.0.1:1/releases")
-        .output()
-        .expect("run lisa doctor");
-
-    let document: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON document");
+    let document = machine.doctor(&keg);
     let lisa = &document["data"]["lisa"];
 
     assert_eq!(lisa["channel"], "nightly");
@@ -239,76 +348,121 @@ fn doctor_reports_the_channel_it_derived_and_the_config_it_ignored() {
 /// before. `doctor` reports it; nothing removes anything.
 #[test]
 fn doctor_reports_a_box_carrying_both_a_packaged_lisa_and_an_installed_one() {
-    let machine = TempDir::new().unwrap();
-    let brew = brew_box("lisa");
-    let project = project();
-    let home = TempDir::new().unwrap();
-    std::fs::create_dir_all(home.path().join(".local/bin")).unwrap();
-    std::fs::write(home.path().join(".local/bin/lisa"), "#!/bin/sh\n").unwrap();
+    let machine = Machine::new();
+    let keg = install_keg(&machine.brew(), "lisa");
+    link_keg(&machine.brew(), "lisa");
+    let pinned = machine.installer_copy();
 
-    let output = Command::new(&brew.lisa)
-        .arg("doctor")
-        .arg("--path")
-        .arg(project.path())
-        .arg("--json")
-        .env("HOME", home.path())
-        .env("LISA_CONFIG_DIR", machine.path())
-        .env("LISA_RELEASES_URL", "http://127.0.0.1:1/releases")
-        .output()
-        .expect("run lisa doctor");
-
-    let document: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON document");
-    let row = document["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|check| check["name"] == "lisa install")
-        .expect("doctor has a row for which lisa this machine runs")
-        .clone();
+    let document = machine.doctor(&keg);
+    let row = install_row(&document);
 
     assert_eq!(row["status"], "unsupported");
     let detail = row["detail"].as_str().unwrap();
-    assert!(detail.contains("two lisas"), "{detail}");
+    assert!(detail.contains("2 lisas"), "{detail}");
     assert!(detail.contains(".local/bin/lisa"), "{detail}");
     assert!(row["remedy"].as_str().unwrap().contains("rm "), "{row}");
     assert_eq!(
         row["required"], false,
         "two lisas is a finding to report, not a reason to stop the machine working"
     );
+
+    let listed = document["data"]["lisa_installs"].as_array().unwrap();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert_eq!(listed[0]["origin"], "homebrew");
+    assert_eq!(listed[0]["formula"], "lisa");
+    assert_eq!(
+        listed[1]["path"],
+        pinned.display().to_string(),
+        "the script sees the same two files the person sees"
+    );
+    assert_eq!(
+        listed[1]["first_on_path"], true,
+        "~/.local/bin comes before Homebrew on this PATH, which is the point"
+    );
 }
 
-/// A box with one lisa says so and moves on.
+/// A box with one lisa says so, names it, and moves on.
 #[test]
 fn doctor_is_quiet_when_there_is_only_one_lisa() {
-    let machine = TempDir::new().unwrap();
-    let brew = brew_box("lisa");
-    let project = project();
-    let home = TempDir::new().unwrap();
+    let machine = Machine::new();
+    let keg = install_keg(&machine.brew(), "lisa");
+    link_keg(&machine.brew(), "lisa");
 
-    let output = Command::new(&brew.lisa)
-        .arg("doctor")
-        .arg("--path")
-        .arg(project.path())
-        .arg("--json")
-        .env("HOME", home.path())
-        .env("LISA_CONFIG_DIR", machine.path())
-        .env("LISA_RELEASES_URL", "http://127.0.0.1:1/releases")
-        .output()
-        .expect("run lisa doctor");
-
-    let document: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("one JSON document");
-    let row = document["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|check| check["name"] == "lisa install")
-        .expect("the row is always there")
-        .clone();
+    let document = machine.doctor(&keg);
+    let row = install_row(&document);
 
     assert_eq!(row["status"], "ok");
-    assert!(row["detail"].as_str().unwrap().contains("one lisa"));
+    let detail = row["detail"].as_str().unwrap();
+    assert!(detail.contains("one lisa"), "{detail}");
+    assert!(
+        detail.contains(&machine.brew().join("bin/lisa").display().to_string()),
+        "one lisa still says which one answered `lisa`: {detail}"
+    );
+    assert!(detail.contains("Homebrew's lisa"), "{detail}");
+    assert_eq!(
+        document["data"]["lisa_installs"].as_array().unwrap().len(),
+        1,
+        "the linked name and the keg it points at are one file, not two lisas"
+    );
+}
+
+/// The bug this ticket is (T-069-01-06). Measured on a MacBook on 2026-08-14: a
+/// Homebrew keg that is not what answers `lisa`, and `doctor` said *one lisa*
+/// and `OK` — because it derived the packaged copy from the running process,
+/// which is the one case where the packaged copy is safe.
+///
+/// This is the dangerous shape: `brew upgrade lisa` moves the keg, the shell
+/// keeps running `~/.local/bin/lisa`, and the channel the box reports describes
+/// a binary nobody executes.
+#[test]
+fn doctor_finds_a_packaged_lisa_that_is_not_the_one_lisa_runs() {
+    let machine = Machine::new();
+    // Installed but unlinked, which is the measured state: `<prefix>/bin/lisa`
+    // is absent while `<prefix>/opt/lisa/bin/lisa` runs.
+    install_keg(&machine.brew(), "lisa");
+    let pinned = machine.installer_copy();
+
+    // Asked of the pinned copy, which is what the shell finds — the case the
+    // old check could not see.
+    let document = machine.doctor(&pinned);
+    let row = install_row(&document);
+
+    assert_ne!(
+        row["status"], "ok",
+        "a keg `brew upgrade` moves and nothing runs is not an OK machine: {row}"
+    );
+    let detail = row["detail"].as_str().unwrap();
+    assert!(detail.contains("2 lisas"), "{detail}");
+    assert!(
+        detail.contains(
+            &machine
+                .brew()
+                .join("opt/lisa/bin/lisa")
+                .display()
+                .to_string()
+        ),
+        "the unlinked keg is named, not just counted: {detail}"
+    );
+    assert!(
+        detail.contains(&pinned.display().to_string()),
+        "and so is the one that answered: {detail}"
+    );
+
+    let remedy = row["remedy"].as_str().unwrap();
+    assert!(
+        remedy.contains("Homebrew upgrades move"),
+        "the remedy says what a channel move would and would not touch: {remedy}"
+    );
+    assert!(remedy.contains("brew link lisa"), "{remedy}");
+
+    let listed = document["data"]["lisa_installs"].as_array().unwrap();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert_eq!(listed[0]["package_managed"], true);
+    assert_eq!(
+        listed[0]["first_on_path"], false,
+        "the packaged lisa is not what runs, which is the whole finding"
+    );
+    assert_eq!(listed[1]["first_on_path"], true);
 }
 
 /// A nightly schedule on a package box follows the package, so it refuses to be
