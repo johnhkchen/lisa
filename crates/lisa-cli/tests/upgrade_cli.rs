@@ -72,10 +72,15 @@ fn serve(mut stream: TcpStream, body: &str) {
 }
 
 /// Run `lisa upgrade` with a throwaway machine config and a given release list.
+///
+/// `HOME` is thrown away too: `upgrade` asks the lisa in `~/.local/bin` what
+/// version this machine has, and a test must not read the version the machine
+/// running the suite happens to have installed.
 fn upgrade(config_dir: &Path, releases_url: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lisa"))
         .arg("upgrade")
         .args(args)
+        .env("HOME", config_dir)
         .env("LISA_CONFIG_DIR", config_dir)
         .env("LISA_RELEASES_URL", releases_url)
         .output()
@@ -290,6 +295,7 @@ fn an_upgrade_does_not_land_under_a_live_run() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
         .args(["upgrade", "--channel", "stable"])
+        .env("HOME", config.path())
         .env("LISA_CONFIG_DIR", config.path())
         .env("LISA_RELEASES_URL", &server.url)
         .env("PATH", format!("{}:/usr/bin:/bin", zellij.path().display()))

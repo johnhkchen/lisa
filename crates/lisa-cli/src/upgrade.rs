@@ -286,16 +286,83 @@ fn find_tag<'a>(releases: &'a [Release], requested: &str) -> Result<&'a Release,
         })
 }
 
-/// Run `lisa upgrade`.
-pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
-    let installed = Version::parse(env!("CARGO_PKG_VERSION"))
+/// The lisa an upgrade is about: the one the shell installer maintains.
+///
+/// Usually that is the process asking, and then this is just its own version.
+/// It is not the same thing on a box where the running `lisa` came from
+/// somewhere else — a `cargo build`, another prefix — and there the difference
+/// matters most in the case you least want to get wrong: `--tag` is the
+/// rollback, and a rollback that reads the *runner's* version decides the
+/// machine is already where it needs to be and moves nothing.
+#[derive(Debug, Clone)]
+pub(crate) struct Installed {
+    /// The version this machine has on the channel-aware path.
+    pub(crate) version: Version,
+    /// The file that version lives in.
+    pub(crate) path: PathBuf,
+    /// Whether that file is the one running right now.
+    pub(crate) is_running: bool,
+}
+
+/// The path the shell installer writes, whether or not anything is there.
+pub(crate) fn installer_owned_path(home: &Path) -> PathBuf {
+    home.join(".local").join("bin").join("lisa")
+}
+
+/// Work out which lisa this machine has, and how old it is.
+pub(crate) fn installed_lisa(exe: &Path, home: Option<&Path>) -> Result<Installed, String> {
+    let own = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("this build's own version is unreadable: {error}"))?;
 
+    let mine = Installed {
+        version: own.clone(),
+        path: exe.to_path_buf(),
+        is_running: true,
+    };
+
+    let Some(home) = home else { return Ok(mine) };
+    let installed = installer_owned_path(home);
+    if !installed.exists()
+        || installed
+            .canonicalize()
+            .is_ok_and(|resolved| resolved == exe)
+    {
+        return Ok(mine);
+    }
+
+    // Ask it rather than assume: an installed lisa is the one an upgrade
+    // replaces, and its version is a fact about the machine, not about this
+    // build.
+    let reported = Command::new(&installed).arg("--version").output();
+    let version = reported
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .nth(1)
+                .and_then(|version| Version::parse(version).ok())
+        });
+
+    Ok(match version {
+        Some(version) => Installed {
+            version,
+            path: installed,
+            is_running: false,
+        },
+        None => mine,
+    })
+}
+
+/// Run `lisa upgrade`.
+pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot find the running lisa: {error}"))?;
     let exe = exe.canonicalize().unwrap_or(exe);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let method = classify_install(&exe, home.as_deref());
+    let target_of_the_move = installed_lisa(&exe, home.as_deref())?;
+    let installed = target_of_the_move.version.clone();
 
     // Refuse before touching config or the network: on these boxes there is
     // nothing `upgrade` can do, and recording a channel it cannot honour would
@@ -339,7 +406,7 @@ pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
     let releases = fetch_releases().map_err(|error| {
         format!(
             "{error}\nlisa {installed} at {} is unchanged.",
-            exe.display()
+            target_of_the_move.path.display()
         )
     })?;
 
@@ -379,11 +446,21 @@ pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
         target.version, target.tag
     );
     if matches!(method, InstallMethod::Elsewhere) {
-        println!(
-            "Note: this lisa runs from {}, and the installer writes to ~/.local/bin. \
-             Check which one your shell finds afterwards with: command -v lisa",
-            exe.display()
-        );
+        if target_of_the_move.is_running {
+            println!(
+                "Note: this lisa runs from {}, and the installer writes to ~/.local/bin. \
+                 Check which one your shell finds afterwards with: command -v lisa",
+                exe.display()
+            );
+        } else {
+            println!(
+                "Note: this command is running from {}, and the lisa it moves is the \
+                 installed one at {} ({installed}). Check which one your shell finds \
+                 afterwards with: command -v lisa",
+                exe.display(),
+                target_of_the_move.path.display()
+            );
+        }
     }
     let _ = io::stdout().flush();
 
@@ -407,7 +484,7 @@ pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
         return Err(format!(
             "{}\nlisa {installed} at {} is unchanged.",
             live_run_refusal(&busy),
-            exe.display()
+            target_of_the_move.path.display()
         ));
     }
     if busy.is_busy() {
@@ -417,7 +494,7 @@ pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
     install(&target).map_err(|error| {
         format!(
             "{error}\nlisa {installed} at {} is still in place.",
-            exe.display()
+            target_of_the_move.path.display()
         )
     })?;
 

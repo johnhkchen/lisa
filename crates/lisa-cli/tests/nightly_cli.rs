@@ -126,6 +126,10 @@ fn nightly(config: &Path, zellij: &FakeZellij, releases_url: &str, args: &[&str]
     Command::new(env!("CARGO_BIN_EXE_lisa"))
         .arg("nightly")
         .args(args)
+        // A thrown-away HOME too: a cycle reads the version of the lisa in
+        // `~/.local/bin`, and that must not be the one this machine happens to
+        // have installed.
+        .env("HOME", config)
         .env("LISA_CONFIG_DIR", config)
         .env("LISA_RELEASES_URL", releases_url)
         .env("PATH", zellij.path_env())
@@ -373,6 +377,7 @@ fn install_dry_run_prints_the_job_and_touches_nothing() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
         .args(["nightly", "install", "--dry-run"])
+        .env("HOME", config.path())
         .env("LISA_CONFIG_DIR", config.path())
         .env("LISA_LAUNCH_AGENTS_DIR", agents.path())
         .output()
@@ -408,6 +413,7 @@ fn install_puts_the_machine_on_nightly_and_uninstall_leaves_what_it_knows() {
         .args(["nightly", "install", "--project"])
         .arg(board.path())
         .args(["--alert", "cat > /dev/null"])
+        .env("HOME", config.path())
         .env("LISA_CONFIG_DIR", config.path())
         .env("LISA_LAUNCH_AGENTS_DIR", agents.path())
         .output()
@@ -430,6 +436,7 @@ fn install_puts_the_machine_on_nightly_and_uninstall_leaves_what_it_knows() {
 
     let uninstall = Command::new(env!("CARGO_BIN_EXE_lisa"))
         .args(["nightly", "uninstall"])
+        .env("HOME", config.path())
         .env("LISA_CONFIG_DIR", config.path())
         .env("LISA_LAUNCH_AGENTS_DIR", agents.path())
         .output()

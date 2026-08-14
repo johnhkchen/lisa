@@ -192,16 +192,13 @@ fn record(state: &Path, cycle: &Cycle) -> Result<(), String> {
         .map_err(|error| format!("cannot write {}: {error}", history_path(state).display()))
 }
 
-/// The lisa the shell installer maintains, which is the one an upgrade moves.
-fn installer_owned_lisa(home: &Path) -> PathBuf {
-    home.join(".local").join("bin").join("lisa")
-}
-
 /// The binary a cycle checks after it moves: the installer's, when it is there,
 /// and otherwise whatever is running now.
 fn lisa_to_check(home: Option<&Path>, running: &Path) -> PathBuf {
     match home {
-        Some(home) if installer_owned_lisa(home).exists() => installer_owned_lisa(home),
+        Some(home) if upgrade::installer_owned_path(home).exists() => {
+            upgrade::installer_owned_path(home)
+        }
         _ => running.to_path_buf(),
     }
 }
@@ -256,9 +253,6 @@ fn cycle(
 /// failed.
 pub(crate) fn run_cycle() -> Result<i32, String> {
     let started = channel::now_unix();
-    let installed = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|error| format!("this build's own version is unreadable: {error}"))?;
-
     let state = state_dir()?;
     let config_path = channel::config_path()?;
     let config = channel::load_from(&config_path)?;
@@ -274,6 +268,9 @@ pub(crate) fn run_cycle() -> Result<i32, String> {
     let exe = exe.canonicalize().unwrap_or(exe);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let method = upgrade::classify_install(&exe, home.as_deref());
+    // The version this machine *has*, which on a box where the running lisa
+    // came from somewhere else is not the version of the process asking.
+    let installed = upgrade::installed_lisa(&exe, home.as_deref())?.version;
 
     println!(
         "lisa nightly, {} — channel {}, installed {installed}.",
@@ -1243,7 +1240,7 @@ mod tests {
         // Nothing in ~/.local/bin yet: the running build is all there is.
         assert_eq!(lisa_to_check(Some(home), &running), running);
 
-        let installed = installer_owned_lisa(home);
+        let installed = upgrade::installer_owned_path(home);
         std::fs::create_dir_all(installed.parent().unwrap()).expect("bin dir");
         std::fs::write(&installed, "#!/bin/sh\n").expect("write lisa");
         assert_eq!(lisa_to_check(Some(home), &running), installed);
