@@ -371,6 +371,24 @@ fn the_json_a_fleet_reads_says_what_the_prose_says() {
 }
 
 #[test]
+fn the_guide_names_the_fields_a_script_would_read() {
+    let guide = Command::new(env!("CARGO_BIN_EXE_lisa"))
+        .arg("json-guide")
+        .output()
+        .expect("run lisa json-guide");
+    let guide = stdout_of(&guide);
+
+    assert!(guide.contains("lisa nightly status --json"), "{guide}");
+    assert!(guide.contains("nightly-status"), "{guide}");
+    for field in ["last_cycle", "consecutive_skips", "installed_before"] {
+        assert!(guide.contains(field), "the guide never names {field}");
+    }
+    for outcome in ["moved", "level", "waiting", "skipped", "failed"] {
+        assert!(guide.contains(outcome), "the guide never names {outcome}");
+    }
+}
+
+#[test]
 fn install_dry_run_prints_the_job_and_touches_nothing() {
     let config = TempDir::new().unwrap();
     let agents = TempDir::new().unwrap();

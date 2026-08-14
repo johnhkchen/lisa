@@ -9,6 +9,7 @@ write it as prose. Add `--json` and they hand you the answer itself instead.
     lisa status --json
     lisa validate --json
     lisa doctor --json
+    lisa nightly status --json
     lisa file-ticket --story S-065-01 --json < draft.md
 
 Everything else is unchanged. Without `--json` all four print exactly the prose they always did,
@@ -35,7 +36,7 @@ Every document has the same envelope:
 
 - `schema` and `schema_version` — the contract this document was written to.
 - `lisa_version` — which build answered.
-- `command` — `status`, `validate`, `doctor`, or `file-ticket`.
+- `command` — `status`, `validate`, `doctor`, `nightly-status`, or `file-ticket`.
 - `ok` — whether Lisa could work out an answer at all. **Not** whether the answer was good news.
 - `error` — `null` when `ok` is true; otherwise `{"message": "…"}` carrying the same sentence the
   prose would have printed.
@@ -54,6 +55,7 @@ contract; it never replaces it.
 | `lisa validate --json` | every check passed | problems were found, **or** Lisa could not answer |
 | `lisa status --json` | the board was reported | Lisa could not answer |
 | `lisa doctor --json` | every required tool is there and supported | one is missing or unsupported, **or** Lisa could not answer |
+| `lisa nightly status --json` | the unattended arrangement is working | it is not, **or** Lisa could not answer |
 | `lisa file-ticket --json` | the ticket is on the board | nothing was filed |
 
 `lisa validate --json` finding problems is an *answer*: `ok` is `true`, `error` is `null`,
@@ -313,6 +315,43 @@ are behind without reading a terminal on each one in turn.
 `lisa doctor --json` reports and does nothing else. The prose run tidies Zellij's plugin cache and
 prepares Codex's directory trust on its way past; the document does neither, so collecting it from
 every machine changes none of them.
+
+## `lisa nightly status --json`
+
+The other machine-level document: where a box that upgrades itself stands. `lisa doctor --json`
+says whether a machine is level with its channel; this says whether the arrangement that keeps it
+level is still running.
+
+`data` carries:
+
+| Field | What it is |
+| --- | --- |
+| `state` | `ok` or `finding`. `finding` is exit status 1. |
+| `channel` | The channel this machine recorded, or `null`. |
+| `effective_channel` | The channel actually applied. |
+| `detail` | The sentence the prose prints. |
+| `remedy` | What to do about it, or `null`. |
+| `record` | Path to `health.json` on that machine. |
+| `last_cycle` | The whole last cycle, or `null` when none has run. See below. |
+
+`last_cycle` carries `{at, at_utc, outcome, ok, detail, channel, effective_channel,
+installed_before, installed_after, tag, remedy, consecutive_skips, alerts[]}`.
+
+`outcome` is one of:
+
+- `moved` — a new release was installed and checked against this machine's own board.
+- `level` — already on what the channel resolves to.
+- `waiting` — the channel names no release this cycle; `nightly` mid-soak looks like this.
+- `skipped` — a run was live on the machine, so nothing was touched. `consecutive_skips` counts how
+  many nights in a row that has been true.
+- `failed` — the one to alert on. `remedy` carries the rollback, naming the tag that was working.
+
+`state` is `finding` for more than a failed cycle: a record older than 36 hours means the schedule
+itself has stopped, three skipped cycles in a row means the machine never gets a chance to move,
+and a machine that has never run one has not been set up. A silence is a finding here, not a pass.
+
+`alerts[]` records what was told and how it went — `alert_command ran`, `alert_command exited 3`,
+or `nothing left this machine: no alert_command is set in the machine config`.
 
 ## `lisa file-ticket --json`
 

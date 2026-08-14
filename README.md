@@ -136,6 +136,45 @@ write over their file and prints the command that does move them
 version each, which is the stable channel by another name. Channels need the
 one-command install above, which puts `lisa` in `~/.local/bin`.
 
+**An upgrade never lands under a run.** If any Zellij session is up on the
+machine, `lisa upgrade` stops rather than swap the binary a live loop is calling,
+names the sessions holding it, and offers `--anyway` for when you know better.
+
+### A machine that upgrades itself
+
+A machine that waits to be upgraded by hand drifts. On a box that runs background
+work — real work, with nothing in front of anyone — put the upgrade on a schedule
+and let it meet each release before you do:
+
+```bash
+lisa nightly install --project ~/work/some-board   # channel nightly + a nightly job
+lisa nightly status                                # where does this box stand?
+lisa nightly status --json                         # the same answer for a script
+lisa nightly uninstall                             # off the schedule, channel kept
+```
+
+On macOS that writes a launchd job at
+`~/Library/LaunchAgents/io.johnhkchen.lisa.nightly.plist`, which runs one cycle at
+04:30 and again at 05:30 and 06:30 in case the machine was busy. A cycle skips
+entirely while the machine is working, moves only when the nightly channel has a
+release that has soaked, and then checks the new release against a board you name
+— `lisa doctor` under the version that just landed, which is what catches a
+Homebrew Zellij that has drifted out of the supported range. Anything that fails
+is written down, exits non-zero, goes to the system log and a notification, and is
+handed to `alert_command` if you set one. Every alarm carries the way back:
+
+```bash
+lisa upgrade --tag v0.4.4    # one command, back to a release that worked
+```
+
+Each cycle is recorded next to the channel — `nightly/health.json` for the last
+one and `nightly/history.jsonl` for all of them — and `lisa nightly status` reads
+it: it fails when the last cycle failed, when the record has gone stale because
+nothing is running the job, and when the box has been too busy to move for three
+nights. Silence is a finding, not a pass. The full arrangement, and what to check
+after a release lands, is in
+[docs/knowledge/mac-mini-nightly.md](docs/knowledge/mac-mini-nightly.md).
+
 ## What It Does
 
 When you have a set of interdependent tasks — a feature broken into tickets, a refactor with sequencing constraints, a sprint with parallel workstreams — Lisa schedules and runs them concurrently as Claude Code sessions. You define the work as markdown tickets with dependency metadata. Lisa figures out what can run in parallel, what has to wait, and launches sessions accordingly.
