@@ -1,0 +1,161 @@
+# Write johnhkchen/homebrew-lisa's three channel formulae.
+#
+# One definition with two callers, the same arrangement the apt publish has
+# (T-069-01-03): a release calls it to move `lisa` and `lisa-canary`, and the
+# soak promotion calls it to move `lisa-nightly` onto a release that has aged.
+# Each run renders all three and commits only the files whose contents changed,
+# so the caller that has nothing to say leaves no commit in the tap.
+#
+# The formulae are read from release assets rather than from a workflow's
+# artifact store, so the promotion -- which has no build of its own -- can use
+# the same path a release does.
+name: Publish Homebrew tap
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The Lisa tree to take the formula generator from
+        required: true
+        type: string
+      release-tag:
+        description: The release lisa-canary carries, and lisa when it is not a prerelease
+        required: true
+        type: string
+      note:
+        description: One line added to each tap commit saying why the formula moved
+        required: false
+        default: ""
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The Lisa tree to take the formula generator from
+        required: false
+        default: main
+        type: string
+      release-tag:
+        description: The release lisa-canary carries, and lisa when it is not a prerelease
+        required: true
+        type: string
+      note:
+        description: One line added to each tap commit saying why the formula moved
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  publish:
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+    concurrency:
+      group: publish-lisa-homebrew-tap
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SOURCE_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release-tag }}
+      TAP_NOTE: ${{ inputs.note }}
+      GITHUB_USER: "axo bot"
+      GITHUB_EMAIL: "admin+bot@axo.dev"
+    steps:
+      - name: Check out the tap
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          repository: "johnhkchen/homebrew-lisa"
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      # The generator that derives the three channel formulae lives in this repo.
+      - name: Check out Lisa
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          persist-credentials: false
+          path: lisa
+
+      - name: Render and commit the three channel formulae
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.name "$GITHUB_USER"
+          git config --global user.email "$GITHUB_EMAIL"
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew update
+
+          # lisa-nightly follows one promotion pointer for the whole fleet --
+          # the same file the apt suites read -- so a release publish can never
+          # undo a promotion, and the two package managers cannot disagree about
+          # which release has soaked. It is read from the default branch, never
+          # from the checked-out ref: a tag's tree holds the pointer as it stood
+          # when the tag was cut. `stable` means nothing has been promoted yet.
+          pointer=$(gh api \
+            -H "Accept: application/vnd.github.raw" \
+            "repos/$SOURCE_REPO/contents/packaging/apt/nightly-tag.txt?ref=main" |
+            tr -d '[:space:]')
+          if [[ -z $pointer ]]; then
+            echo "packaging/apt/nightly-tag.txt is empty on main" >&2
+            exit 1
+          fi
+          if [[ $pointer == stable ]]; then
+            nightly_tag=$(gh release list --repo "$SOURCE_REPO" \
+              --exclude-drafts --exclude-pre-releases --limit 1 \
+              --json tagName --jq '.[0].tagName')
+            if [[ -z $nightly_tag ]]; then
+              echo "no published stable release for lisa-nightly to carry" >&2
+              exit 1
+            fi
+          else
+            nightly_tag=$pointer
+          fi
+          echo "lisa-canary carries $RELEASE_TAG; lisa-nightly carries $nightly_tag" \
+            "(promotion pointer: $pointer)"
+
+          is_prerelease=$(gh release view "$RELEASE_TAG" --repo "$SOURCE_REPO" \
+            --json isPrerelease --jq '.isPrerelease')
+          [[ $is_prerelease == true || $is_prerelease == false ]] ||
+            { echo "cannot tell whether $RELEASE_TAG is a prerelease" >&2; exit 1; }
+
+          # The formula each of the two releases published. One release, one
+          # .rb: more than one would mean the tap has to be told which is which.
+          download_formula() {
+            local tag=$1 dir=$2
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            gh release download "$tag" --repo "$SOURCE_REPO" --dir "$dir" --pattern '*.rb'
+            local count
+            count=$(find "$dir" -maxdepth 1 -name '*.rb' | wc -l | tr -d ' ')
+            if [[ $count -ne 1 ]]; then
+              echo "$tag publishes $count Homebrew formulae; expected exactly one" >&2
+              exit 1
+            fi
+            find "$dir" -maxdepth 1 -name '*.rb'
+          }
+
+          release_formula=$(download_formula "$RELEASE_TAG" "$RUNNER_TEMP/release-formula")
+          if [[ $nightly_tag == "$RELEASE_TAG" ]]; then
+            nightly_formula=$release_formula
+          else
+            nightly_formula=$(download_formula "$nightly_tag" "$RUNNER_TEMP/nightly-formula")
+          fi
+
+          bash lisa/scripts/publish-tap-formulae.sh \
+            tap "$release_formula" "$is_prerelease" "$nightly_formula"
+          bash lisa/scripts/commit-tap-formulae.sh tap "$TAP_NOTE"
+
+          git -C tap push
+
+          # What the tap now says, where a person reading the run can see it.
+          {
+            echo "### Homebrew tap"
+            echo
+            echo "| formula | version |"
+            echo "| --- | --- |"
+            for formula in lisa lisa-nightly lisa-canary; do
+              version=$(awk -F'"' '/^  version "/ { print $2; exit }' \
+                "tap/Formula/$formula.rb" 2>/dev/null || true)
+              echo "| $formula | ${version:-absent} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

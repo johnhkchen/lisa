@@ -345,270 +345,38 @@ jobs:
     # Every tag rebuilds the site, prerelease or not: a release candidate has to
     # reach the canary suite, and stable is kept clean by what goes into each
     # suite's input rather than by skipping the publish.
-    runs-on: "ubuntu-22.04"
+    #
+    # The steps live in their own workflow because the soak promotion
+    # (T-069-01-03) runs exactly the same ones on its own schedule. Two copies
+    # would be two places the archive is signed and two answers to which release
+    # each suite carries.
     permissions:
       contents: read
       pages: write
       id-token: write
-    concurrency:
-      group: publish-lisa-apt-repository
-      cancel-in-progress: false
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.plan.outputs.tag }}
-          persist-credentials: false
-
-      - name: Collect Debian packages into the three suite inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          store="$RUNNER_TEMP/apt-store"
-          input="$RUNNER_TEMP/apt-input"
-          releases="$RUNNER_TEMP/releases.json"
-          mkdir -p "$store" "$input/stable" "$input/nightly" "$input/canary"
-
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" > "$releases"
-
-          # A release contributes packages only when it carries the complete
-          # four-asset set, so a partially uploaded tag never lands in a suite.
-          # shellcheck disable=SC2016 # $assets belongs to jq, not the shell.
-          complete='([.assets[].name]) as $assets
-            | select(
-                ($assets | index("lisa-amd64.deb")) != null and
-                ($assets | index("lisa-arm64.deb")) != null and
-                ($assets | index("lisa-runtime-zellij-amd64.deb")) != null and
-                ($assets | index("lisa-runtime-zellij-arm64.deb")) != null
-              )
-            | .tag_name'
-
-          # stable keeps meaning non-prerelease; canary takes every release.
-          mapfile -t stable_tags < <(
-            jq -r ".[] | select(.draft == false and .prerelease == false) | $complete" "$releases")
-          mapfile -t canary_tags < <(
-            jq -r ".[] | select(.draft == false) | $complete" "$releases")
-          if [[ ${#stable_tags[@]} -eq 0 ]]; then
-            echo "No stable release contains the complete Debian package set" >&2
-            exit 1
-          fi
-
-          # nightly is everything stable has, plus whichever release the soak
-          # promotion has raised into it. The pointer is a checked-in file so a
-          # release publish cannot silently undo a promotion, and so a person
-          # can read which release nightly is on without ssh. T-069-01-03 owns
-          # writing it; `stable` means nothing has been promoted yet.
-          nightly_tags=("${stable_tags[@]}")
-          nightly_pointer=$(tr -d '[:space:]' < packaging/apt/nightly-tag.txt)
-          if [[ -z $nightly_pointer ]]; then
-            echo "packaging/apt/nightly-tag.txt is empty" >&2
-            exit 1
-          fi
-          if [[ $nightly_pointer != stable ]]; then
-            if ! printf '%s\n' "${canary_tags[@]}" | grep -Fxq "$nightly_pointer"; then
-              echo "packaging/apt/nightly-tag.txt names $nightly_pointer, which is not a" \
-                "release carrying the complete Debian package set" >&2
-              exit 1
-            fi
-            if ! printf '%s\n' "${stable_tags[@]}" | grep -Fxq "$nightly_pointer"; then
-              nightly_tags+=("$nightly_pointer")
-            fi
-          fi
-
-          fetch_tag() {
-            local tag=$1
-            if [[ ! -d "$store/$tag" ]]; then
-              mkdir -p "$store/$tag"
-              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-                --dir "$store/$tag" \
-                --pattern lisa-amd64.deb \
-                --pattern lisa-arm64.deb \
-                --pattern lisa-runtime-zellij-amd64.deb \
-                --pattern lisa-runtime-zellij-arm64.deb
-            fi
-          }
-
-          # Hardlinks, so a tag in three suites is downloaded and stored once.
-          fill_suite() {
-            local suite=$1
-            shift
-            local tag
-            for tag in "$@"; do
-              fetch_tag "$tag"
-              cp -al "$store/$tag" "$input/$suite/$tag"
-            done
-          }
-
-          fill_suite stable "${stable_tags[@]}"
-          fill_suite nightly "${nightly_tags[@]}"
-          fill_suite canary "${canary_tags[@]}"
-          echo "LISA_APT_INPUT=$input" >> "$GITHUB_ENV"
-
-      - name: Install apt repository tools
-        run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y -qq apt-utils gnupg
-
-      - name: Build signed apt repository
-        shell: bash
-        env:
-          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          if [[ -z $APT_SIGNING_KEY ]]; then
-            echo "APT_SIGNING_KEY is not configured" >&2
-            exit 1
-          fi
-          export GNUPGHOME
-          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/lisa-apt-gnupg.XXXXXX")
-          chmod 0700 "$GNUPGHOME"
-          trap 'rm -rf "$GNUPGHOME"' EXIT
-          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --quiet --import
-          secret_count=$(gpg --batch --with-colons --list-secret-keys |
-            awk -F: '$1 == "sec" { count++ } END { print count + 0 }')
-          if [[ $secret_count -ne 1 ]]; then
-            echo "APT_SIGNING_KEY must contain exactly one primary secret key" >&2
-            exit 1
-          fi
-          fingerprint=$(gpg --batch --with-colons --list-secret-keys |
-            awk -F: '$1 == "fpr" { print toupper($10); exit }')
-          public_fingerprint=$(gpg --batch --with-colons --show-keys \
-            packaging/apt/lisa-archive-keyring.asc |
-            awk -F: '$1 == "fpr" { print toupper($10); exit }')
-          if [[ $fingerprint != "$public_fingerprint" ]]; then
-            echo "APT_SIGNING_KEY does not match the checked-in public key" >&2
-            exit 1
-          fi
-          scripts/build-apt-repository.sh \
-            "$LISA_APT_INPUT" "$RUNNER_TEMP/apt-site" "$fingerprint" \
-            packaging/apt/lisa-archive-keyring.asc
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v6
-
-      - name: Upload apt repository Pages artifact
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: ${{ runner.temp }}/apt-site
-          include-hidden-files: true
-
-      - name: Deploy apt repository to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
+    uses: ./.github/workflows/publish-apt-repository.yml
+    with:
+      ref: ${{ needs.plan.outputs.tag }}
+    secrets: inherit
 
   publish-homebrew-formula:
     needs:
       - plan
       - host
       - verify-homebrew-tap
-    runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      PLAN: ${{ needs.plan.outputs.val }}
-      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
-      IS_PRERELEASE: ${{ fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
-      SOURCE_REPO: ${{ github.repository }}
-      GITHUB_USER: "axo bot"
-      GITHUB_EMAIL: "admin+bot@axo.dev"
     # Every tag reaches the tap, prerelease or not: a release candidate has to
     # reach lisa-canary, and lisa is kept clean by what is written into each
-    # formula rather than by skipping the publish.
+    # formula rather than by skipping the publish. lisa-nightly is not this
+    # job's to move -- it follows the promotion pointer, and the same workflow
+    # run by promote-nightly.yml is what moves it.
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
-    steps:
-      - name: Check out the tap
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: true
-          repository: "johnhkchen/homebrew-lisa"
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: tap
-      # The generator that derives the three channel formulae, and the promotion
-      # pointer that says which release nightly carries, both live in this repo.
-      - name: Check out Lisa
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-          persist-credentials: false
-          path: lisa
-      # So we have access to the formula
-      - name: Fetch homebrew formulae
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-*
-          path: dist-artifacts/
-          merge-multiple: true
-      # This is extra complex because you can make your Formula name not match your app name
-      # so we need to find releases with a *.rb file, and publish with that filename.
-      - name: Commit formula files
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config --global user.name "${GITHUB_USER}"
-          git config --global user.email "${GITHUB_EMAIL}"
-          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-          brew update
-
-          # lisa-nightly follows one promotion pointer for the whole fleet -- the
-          # same file the apt suites read -- so a release publish can never undo a
-          # promotion, and the two package managers cannot disagree about which
-          # release has soaked. `stable` means nothing has been promoted yet.
-          pointer=$(tr -d '[:space:]' < lisa/packaging/apt/nightly-tag.txt)
-          if [[ -z $pointer ]]; then
-            echo "packaging/apt/nightly-tag.txt is empty" >&2
-            exit 1
-          fi
-          if [[ $pointer == stable ]]; then
-            nightly_tag=$(gh release list --repo "$SOURCE_REPO" \
-              --exclude-drafts --exclude-pre-releases --limit 1 \
-              --json tagName --jq '.[0].tagName')
-            if [[ -z $nightly_tag ]]; then
-              echo "no published stable release for lisa-nightly to carry" >&2
-              exit 1
-            fi
-          else
-            nightly_tag=$pointer
-          fi
-          echo "lisa-nightly carries $nightly_tag (promotion pointer: $pointer)"
-
-          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
-            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
-            release_formula="$PWD/dist-artifacts/$filename"
-
-            if [[ $nightly_tag == "$RELEASE_TAG" ]]; then
-              nightly_formula="$release_formula"
-            else
-              rm -rf nightly-formula
-              mkdir -p nightly-formula
-              gh release download "$nightly_tag" --repo "$SOURCE_REPO" \
-                --dir nightly-formula --pattern "$filename"
-              nightly_formula="$PWD/nightly-formula/$filename"
-            fi
-
-            bash lisa/scripts/publish-tap-formulae.sh \
-              tap "$release_formula" "$IS_PRERELEASE" "$nightly_formula"
-
-            for formula in lisa lisa-nightly lisa-canary; do
-              path="Formula/$formula.rb"
-              [[ -e tap/$path ]] || continue
-              # Style first and ask git after, because `brew style --fix` rewrites
-              # the file: what is committed is the styled version, so a release
-              # that changes nothing really leaves no commit behind.
-              # We avoid reformatting user-provided data such as the app description and homepage.
-              brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "tap/$path" || true
-              if [[ -z $(git -C tap status --porcelain -- "$path") ]]; then
-                continue
-              fi
-              version=$(awk -F'"' '/^  version "/ { print $2; exit }' "tap/$path")
-
-              git -C tap add "$path"
-              git -C tap commit -m "${formula} ${version}"
-            done
-          done
-          git -C tap push
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-homebrew-tap.yml
+    with:
+      ref: ${{ needs.plan.outputs.tag }}
+      release-tag: ${{ needs.plan.outputs.tag }}
+    secrets: inherit
 
   announce:
     needs:

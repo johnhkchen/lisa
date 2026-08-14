@@ -1,0 +1,218 @@
+# Build and deploy the signed apt repository, all three suites, from the
+# current release list.
+#
+# This is one definition with two callers, and that is the point (T-069-01-03).
+# A release calls it to put a new version into `stable` and `canary`; the soak
+# promotion calls it to move `nightly` onto a release that has aged. A second
+# copy of these steps would be a second place the archive can be signed and a
+# second answer to which release each suite carries.
+#
+# It can also be run by hand from the Actions tab, which is the recovery path
+# when a promotion or a release publish needs to be replayed without cutting a
+# tag.
+name: Publish apt repository
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The Lisa tree to take scripts and the archive key from
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The Lisa tree to take scripts and the archive key from
+        required: false
+        default: main
+        type: string
+
+jobs:
+  publish:
+    runs-on: "ubuntu-22.04"
+    # Declared here so a manual run has them too; a caller job grants the same
+    # set, and a called workflow can only ever hold less than its caller.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: publish-lisa-apt-repository
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          persist-credentials: false
+
+      # The promotion pointer is read from the default branch, never from the
+      # checked-out ref. A tag's tree holds the pointer as it stood when the tag
+      # was cut, so building `nightly` from it would quietly undo any promotion
+      # made since -- including on a re-run of an old release.
+      - name: Read the promotion pointer from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          pointer=$(gh api \
+            -H "Accept: application/vnd.github.raw" \
+            "repos/$GITHUB_REPOSITORY/contents/packaging/apt/nightly-tag.txt?ref=main" |
+            tr -d '[:space:]')
+          if [[ -z $pointer ]]; then
+            echo "packaging/apt/nightly-tag.txt is empty on main" >&2
+            exit 1
+          fi
+          echo "nightly promotion pointer: $pointer"
+          echo "LISA_NIGHTLY_POINTER=$pointer" >> "$GITHUB_ENV"
+
+      - name: Collect Debian packages into the three suite inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          store="$RUNNER_TEMP/apt-store"
+          input="$RUNNER_TEMP/apt-input"
+          releases="$RUNNER_TEMP/releases.json"
+          mkdir -p "$store" "$input/stable" "$input/nightly" "$input/canary"
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" > "$releases"
+
+          # A release contributes packages only when it carries the complete
+          # four-asset set, so a partially uploaded tag never lands in a suite.
+          # shellcheck disable=SC2016 # $assets belongs to jq, not the shell.
+          complete='([.assets[].name]) as $assets
+            | select(
+                ($assets | index("lisa-amd64.deb")) != null and
+                ($assets | index("lisa-arm64.deb")) != null and
+                ($assets | index("lisa-runtime-zellij-amd64.deb")) != null and
+                ($assets | index("lisa-runtime-zellij-arm64.deb")) != null
+              )
+            | .tag_name'
+
+          # stable keeps meaning non-prerelease; canary takes every release.
+          mapfile -t stable_tags < <(
+            jq -r ".[] | select(.draft == false and .prerelease == false) | $complete" "$releases")
+          mapfile -t canary_tags < <(
+            jq -r ".[] | select(.draft == false) | $complete" "$releases")
+          if [[ ${#stable_tags[@]} -eq 0 ]]; then
+            echo "No stable release contains the complete Debian package set" >&2
+            exit 1
+          fi
+
+          # nightly is everything stable has, plus whichever release the soak
+          # promotion has raised into it. The pointer is a checked-in file so a
+          # release publish cannot silently undo a promotion, and so a person
+          # can read which release nightly is on without ssh. `lisa
+          # promote-nightly` writes it; `stable` means nothing is promoted yet.
+          nightly_tags=("${stable_tags[@]}")
+          nightly_pointer=$LISA_NIGHTLY_POINTER
+          if [[ $nightly_pointer != stable ]]; then
+            if ! printf '%s\n' "${canary_tags[@]}" | grep -Fxq "$nightly_pointer"; then
+              echo "packaging/apt/nightly-tag.txt names $nightly_pointer, which is not a" \
+                "release carrying the complete Debian package set" >&2
+              exit 1
+            fi
+            if ! printf '%s\n' "${stable_tags[@]}" | grep -Fxq "$nightly_pointer"; then
+              nightly_tags+=("$nightly_pointer")
+            fi
+          fi
+
+          fetch_tag() {
+            local tag=$1
+            if [[ ! -d "$store/$tag" ]]; then
+              mkdir -p "$store/$tag"
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                --dir "$store/$tag" \
+                --pattern lisa-amd64.deb \
+                --pattern lisa-arm64.deb \
+                --pattern lisa-runtime-zellij-amd64.deb \
+                --pattern lisa-runtime-zellij-arm64.deb
+            fi
+          }
+
+          # Hardlinks, so a tag in three suites is downloaded and stored once.
+          fill_suite() {
+            local suite=$1
+            shift
+            local tag
+            for tag in "$@"; do
+              fetch_tag "$tag"
+              cp -al "$store/$tag" "$input/$suite/$tag"
+            done
+          }
+
+          fill_suite stable "${stable_tags[@]}"
+          fill_suite nightly "${nightly_tags[@]}"
+          fill_suite canary "${canary_tags[@]}"
+          echo "LISA_APT_INPUT=$input" >> "$GITHUB_ENV"
+
+          # What each suite carries, where a person reading the run can see it.
+          if [[ $nightly_pointer == stable ]]; then
+            nightly_shown="${stable_tags[0]} (nothing promoted)"
+          else
+            nightly_shown=$nightly_pointer
+          fi
+          {
+            echo "### apt suites"
+            echo
+            echo "| suite | newest release |"
+            echo "| --- | --- |"
+            echo "| stable | ${stable_tags[0]} |"
+            echo "| nightly | $nightly_shown |"
+            echo "| canary | ${canary_tags[0]} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install apt repository tools
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y -qq apt-utils gnupg
+
+      - name: Build signed apt repository
+        shell: bash
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z $APT_SIGNING_KEY ]]; then
+            echo "APT_SIGNING_KEY is not configured" >&2
+            exit 1
+          fi
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/lisa-apt-gnupg.XXXXXX")
+          chmod 0700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --quiet --import
+          secret_count=$(gpg --batch --with-colons --list-secret-keys |
+            awk -F: '$1 == "sec" { count++ } END { print count + 0 }')
+          if [[ $secret_count -ne 1 ]]; then
+            echo "APT_SIGNING_KEY must contain exactly one primary secret key" >&2
+            exit 1
+          fi
+          fingerprint=$(gpg --batch --with-colons --list-secret-keys |
+            awk -F: '$1 == "fpr" { print toupper($10); exit }')
+          public_fingerprint=$(gpg --batch --with-colons --show-keys \
+            packaging/apt/lisa-archive-keyring.asc |
+            awk -F: '$1 == "fpr" { print toupper($10); exit }')
+          if [[ $fingerprint != "$public_fingerprint" ]]; then
+            echo "APT_SIGNING_KEY does not match the checked-in public key" >&2
+            exit 1
+          fi
+          scripts/build-apt-repository.sh \
+            "$LISA_APT_INPUT" "$RUNNER_TEMP/apt-site" "$fingerprint" \
+            packaging/apt/lisa-archive-keyring.asc
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload apt repository Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/apt-site
+          include-hidden-files: true
+
+      - name: Deploy apt repository to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
