@@ -461,8 +461,9 @@ test "$("$LISA_UNDER_TEST" --version)" = "lisa $VERSION"
 ## 9. Verify Homebrew convergence
 
 Wait for `publish-homebrew-formula` to finish, then read all three formulae. The
-cut always moves `lisa-canary`; it moves `lisa` only when `$VERSION` is not a
-prerelease, and it never moves `lisa-nightly`, which follows the promotion
+cut always moves `lisa-canary`; it writes `lisa` from the newest release that is
+not a prerelease, which is `$VERSION` on a stable cut and `$PRIOR_STABLE` on a
+candidate; and it never moves `lisa-nightly`, which follows the promotion
 pointer — the hourly `promote-nightly.yml` moves that one, roughly a day after
 this cut, and [nightly-promotion.md](nightly-promotion.md) is where to look when
 it has not:
@@ -482,10 +483,16 @@ for formula in lisa lisa-nightly lisa-canary; do
   grep -F 'conflicts_with' "$EVIDENCE/$formula.rb"
 done
 
-# A stable cut only. On a release candidate, assert instead that lisa.rb still
-# carries $PRIOR_STABLE.
+# A stable cut only. On a release candidate, assert instead that lisa.rb carries
+# $PRIOR_STABLE -- the publish writes it from that release rather than skipping
+# the file, so this is a convergence check on a candidate cut too, not an
+# assumption that nothing touched it.
 grep -F "version \"$VERSION\"" "$EVIDENCE/lisa.rb"
 ```
+
+A formula that does not match after the run has converged is a tap to repair,
+not a release to re-cut: [nightly-promotion.md](nightly-promotion.md#when-the-tap-is-already-wrong)
+has the one-dispatch republish and the two-dispatch fallback.
 
 ## 10. Verify apt convergence — fresh install and upgrade
 

@@ -99,15 +99,99 @@ gh workflow run promote-nightly.yml --repo johnhkchen/lisa --field dry-run=true
 archive does not match it, say after a failed deploy:
 
 ```bash
+newest=$(gh release list --repo johnhkchen/lisa --exclude-drafts --limit 1 \
+  --json tagName --jq '.[0].tagName')
+
 gh workflow run publish-apt-repository.yml --repo johnhkchen/lisa
 gh workflow run publish-homebrew-tap.yml --repo johnhkchen/lisa \
-  --field release-tag=v0.5.0-rc.2
+  --field release-tag="$newest"
 ```
+
+`release-tag` is what `lisa-canary` will carry, so it has to be the newest
+release **at the moment you run this**, prerelease or not. Resolve it rather than
+copying a tag out of a plan: a literal that was newest when the plan was written
+moves `lisa-canary` backwards when the plan is finally run.
 
 **Yank a release from nightly by hand.** Deleting or un-publishing the release is
 the real act — the next promotion run reads the list, sees it gone, and retires
 the pointer. Editing `packaging/apt/nightly-tag.txt` on `main` works too and
 takes effect on the next publish.
+
+## When the tap is already wrong
+
+A formula naming a release its channel does not mean — `lisa` on a release
+candidate, say. One dispatch fixes it: the *Republish without a promotion* one
+above, naming the newest release of any kind. Every publish resolves all
+three channels from scratch: the newest release for `lisa-canary`, the newest
+release that is *not* a prerelease for `lisa`, the promotion pointer for
+`lisa-nightly`. Whatever kind of release is newest, the run leaves the whole tap
+correct, and a formula that was already right is not rewritten or recommitted.
+
+Read the result, which is the same loop the release checklist uses:
+
+```bash
+for formula in lisa lisa-nightly lisa-canary; do
+  printf '%s: ' "$formula"
+  gh api "repos/johnhkchen/homebrew-lisa/contents/Formula/$formula.rb" \
+    --jq .content | tr -d '\n' | base64 --decode |
+    awk -F'"' '/^  version "/ { print $2; exit }'
+done
+```
+
+**Stable is allowed to move backwards, and this is what that looks like.** The
+correction on 2026-08-14 took `lisa` from `0.5.0-rc.2` down to `0.4.4`, because
+`0.4.4` is the newest release that is not a prerelease and has been since
+2026-07-19. `lisa` means *the newest stable*, not *the highest version anyone has
+seen*; a tap that refuses to come down from a candidate is a tap that lies about
+which line it is on. Two consequences worth saying out loud:
+
+- A machine already holding `0.5.0-rc.2` does not come back on `brew upgrade`.
+  Homebrew never downgrades, so it needs `brew reinstall lisa`. Anyone who ran
+  `brew upgrade lisa` during the single-formula era is in this position.
+- A machine on `0.4.4` was right all along and stops being told otherwise:
+  `brew outdated` no longer reports `0.4.4 < 0.5.0-rc.2`. A `brew pin lisa` held
+  only to stop an absent-minded upgrade from taking the box onto a candidate can
+  come off.
+
+### The two-dispatch repair, for a tap the fixed publisher cannot reach
+
+Before `T-069-01-05` a prerelease cut skipped `Formula/lisa.rb` entirely, so a
+stale stable formula stayed stale until somebody cut a release that was not a
+prerelease. If you are working against a publisher from before that fix — an old
+`ref`, or a tap being repaired from a tagged tree — the repair is two dispatches
+in this order, and the order is the whole trick:
+
+```bash
+newest_stable=$(gh release list --repo johnhkchen/lisa \
+  --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
+newest=$(gh release list --repo johnhkchen/lisa \
+  --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
+
+# 1. Publish the newest stable as if it were the release: this is the only way
+#    the old publisher writes Formula/lisa.rb. It moves lisa-canary too.
+gh workflow run publish-homebrew-tap.yml --repo johnhkchen/lisa \
+  --field release-tag="$newest_stable"
+
+# 2. Wait for that run to finish, then put lisa-canary back on the newest
+#    release of any kind.
+gh workflow run publish-homebrew-tap.yml --repo johnhkchen/lisa \
+  --field release-tag="$newest"
+```
+
+Three things this gets wrong if it is run carelessly:
+
+- **Step 2 must name the newest release at the time you run it**, resolved, not a
+  literal. A rehearsal of this repair written before `v0.5.0-rc.3` existed named
+  `v0.5.0-rc.2` in step 2, and would have moved `lisa-canary` backwards a release.
+- **Between the two runs `lisa-canary` reads the older version.** A
+  `brew upgrade lisa-canary` inside that window is a downgrade for whoever runs
+  it. Keep the gap short, and prefer the one-run dispatch above whenever the
+  publisher on `main` is available to it.
+- **Step 1 is not optional and cannot be reordered.** Run in the other order,
+  the stable write lands last and leaves `lisa-canary` on the stable release.
+
+`lisa-nightly` is untouched by either dispatch: it follows
+`packaging/apt/nightly-tag.txt` on `main`, not the tag you name.
 
 ## The failure mode to watch for
 
