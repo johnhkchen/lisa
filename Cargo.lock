@@ -1609,6 +1609,7 @@ dependencies = [
  "fs2",
  "libc",
  "lisa-core",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

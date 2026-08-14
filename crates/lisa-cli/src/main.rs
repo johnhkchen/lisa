@@ -1,6 +1,7 @@
 mod agent_exec;
 mod already_done;
 mod capture_usage;
+mod channel;
 mod check_disposition;
 mod check_run;
 mod claim;
@@ -34,6 +35,7 @@ mod status;
 mod templates;
 mod triage_agent;
 mod unblock;
+mod upgrade;
 
 use clap::{Parser, Subcommand};
 use lisa_cli::commit_transaction;
@@ -302,6 +304,31 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Move this machine to the Lisa its channel asks for.
+    #[command(
+        display_order = 15,
+        after_help = "A machine picks one of three channels and keeps it in a per-user config \
+                      file, not in the project: canary takes the newest release, nightly takes \
+                      the newest release once it has aged past the soak window, and stable takes \
+                      the newest release that is not a prerelease. A machine that has never \
+                      chosen is treated as stable.\n\nA brew- or apt-managed lisa is left alone: \
+                      those carry one version, so upgrade says which command moves them \
+                      instead.\n\nExamples:\n  lisa upgrade\n  lisa upgrade --channel nightly\n  \
+                      lisa upgrade --tag v0.4.4"
+    )]
+    Upgrade {
+        /// Put this machine on a channel (canary | nightly | stable), then upgrade
+        #[arg(long, conflicts_with = "tag")]
+        channel: Option<String>,
+
+        /// Move to this exact release instead, which is how you go back
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Say what would happen and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Settle a first-responder proposal for a waiting ticket.
     #[command(display_order = 8)]
     Proposal {
@@ -562,6 +589,21 @@ fn main() {
             let path = resolve_path(&path);
             require_lisa_project(&path);
             if let Err(e) = doctor::run_doctor(&path) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Upgrade {
+            channel,
+            tag,
+            dry_run,
+        } => {
+            let args = upgrade::UpgradeArgs {
+                channel,
+                tag,
+                dry_run,
+            };
+            if let Err(e) = upgrade::run_upgrade(args) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
