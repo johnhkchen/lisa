@@ -294,8 +294,11 @@ are behind without reading a terminal on each one in turn.
 | Field | What it is |
 | --- | --- |
 | `installed` | The version of Lisa answering, without the `v`. |
-| `channel` | The channel this machine recorded, or `null` when it has never chosen one. |
+| `channel` | The channel this machine is on, or `null` when nothing has said. |
 | `effective_channel` | The channel actually applied — `stable` when nothing was chosen. |
+| `channel_source` | Where that channel was read from: `homebrew-formula`, `apt-suite`, or `config`. |
+| `channel_source_detail` | The formula or the suite and its sources file, or `null` on a box the config governs. |
+| `channel_conflict` | Set when a machine config names a channel a package-managed box does not read, or `null`. |
 | `channel_error` | Why the machine's config could not be read, or `null`. |
 | `state` | `level`, `behind`, `ahead`, `waiting`, or `unresolved`. |
 | `resolved_tag` / `resolved_version` | The release the channel resolves to, or `null` when it resolves to none. |
@@ -312,6 +315,12 @@ are behind without reading a terminal on each one in turn.
 - `unresolved` — the release list could not be read at all. **Not** the same as `level`: nothing was
   checked, so nothing is being claimed. Treat a box stuck on `unresolved` as a box you cannot see.
 
+**Which source answers is decided by how Lisa got onto the box, not by precedence.** A Homebrew or
+apt box reads its channel off the package it has — `lisa-nightly`, or the suite word in
+`/etc/apt/sources.list.d/lisa.list` — and its machine config is not consulted at all; every other
+box reads the `channel` field in that config. `channel_conflict` is how a fleet finds the machines
+whose config still claims something the package does not.
+
 `lisa doctor --json` reports and does nothing else. The prose run tidies Zellij's plugin cache and
 prepares Codex's directory trust on its way past; the document does neither, so collecting it from
 every machine changes none of them.
@@ -327,7 +336,8 @@ level is still running.
 | Field | What it is |
 | --- | --- |
 | `state` | `ok` or `finding`. `finding` is exit status 1. |
-| `channel` | The channel this machine recorded, or `null`. |
+| `channel` | The channel this machine is on, or `null`. |
+| `channel_source` | Where that came from: `homebrew-formula`, `apt-suite`, or `config`. |
 | `effective_channel` | The channel actually applied. |
 | `detail` | The sentence the prose prints. |
 | `remedy` | What to do about it, or `null`. |

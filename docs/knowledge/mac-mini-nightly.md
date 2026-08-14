@@ -25,7 +25,9 @@ lisa nightly status
 
 `install` does four things and prints all of them:
 
-1. records `channel = "nightly"` in the machine config,
+1. records `channel = "nightly"` in the machine config — **unless a package
+   manager owns this Lisa**, in which case the package already says it and the
+   config field is not read at all,
 2. records the board a new release is checked against (`nightly_project`) and
    the alarm that leaves the machine (`alert_command`),
 3. writes the launchd job, and
@@ -34,10 +36,17 @@ lisa nightly status
 `lisa nightly install --dry-run` prints the job and changes nothing, which is
 the way to read it before it exists.
 
-**The mini must be on the shell-installer Lisa** (`~/.local/bin/lisa`, from the
-one-command install in the README). `install` refuses on a Homebrew- or
-apt-managed box, because one formula and one apt suite carry one version each
-and cannot follow a channel.
+**Either Lisa works here, and which one you have decides what "nightly" means:**
+
+| how the mini has Lisa | what puts it on nightly | what the 04:30 job runs |
+| --- | --- | --- |
+| `brew install johnhkchen/lisa/lisa-nightly` | the formula name | `brew update && brew upgrade lisa-nightly` |
+| the one-command install (`~/.local/bin/lisa`) | `channel = "nightly"` in the machine config | the release's own installer |
+
+On a package-managed box `install` checks the package really is the nightly one
+and refuses if it is not — a job that quietly followed `stable` while calling
+itself nightly is the failure this catches. `lisa upgrade --channel nightly`
+moves it, by swapping formulae.
 
 ---
 
@@ -54,6 +63,11 @@ EnvironmentVariables    PATH=~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/
 StandardOutPath         <machine config dir>/nightly/launchd.out
 StandardErrorPath       <machine config dir>/nightly/launchd.err
 ```
+
+`ProgramArguments` names whichever lisa the mover keeps current — Homebrew's
+`<brew prefix>/bin/lisa` on a formula box, `~/.local/bin/lisa` on a
+curl-installed one — so the job always runs the binary that is actually being
+upgraded.
 
 Three times, not one, because this machine's job is running work: a cycle that
 finds a live run skips, and the two later tries give a busy box another chance
@@ -144,6 +158,15 @@ lisa nightly status --json   # data.state is "ok" or "finding"
 
 ## Rolling back
 
+**Rollback is the one thing the two package managers do not agree on, and this
+is the paragraph to have read before an incident rather than during one.**
+
+| the box | the way back | why |
+| --- | --- | --- |
+| Homebrew (the mini) | `lisa upgrade --tag v0.4.4` | `brew switch` was removed and a formula carries one version, so there is no `lisa=0.4.4` to ask brew for |
+| apt | `sudo apt-get install --allow-downgrades lisa=0.4.4-1 lisa-runtime-zellij=0.4.4-1` | the pool keeps every version any suite has carried |
+| the one-command install | `lisa upgrade --tag v0.4.4` | the installer writes whichever release you name |
+
 One command, from the mini:
 
 ```bash
@@ -154,6 +177,18 @@ It names both versions before it moves, refuses while a run is live (`--anyway`
 overrides), and leaves the current binary in place if anything fails. Every
 failing cycle's record and alarm already carry this line with the right tag
 filled in — the version the machine was on before it moved.
+
+**On a Homebrew mini, that pin is the shell installer, and it leaves two lisas
+on the box.** Nothing else can do it: the pinned release lands in
+`~/.local/bin/lisa`, Homebrew's stays where it was, and PATH order decides which
+one your shell — and the nightly job — finds. `lisa doctor` reports the pair as
+its own row for as long as it lasts. When the release that broke has been
+replaced, put the box back on its formula:
+
+```bash
+rm ~/.local/bin/lisa
+brew upgrade lisa-nightly
+```
 
 After a rollback, confirm the work runs again:
 
@@ -184,6 +219,12 @@ line above, naming the version the new channel offers.
 This is the one thing apt does better than Homebrew. `brew switch` was removed,
 so a Mac has no equivalent — on the mini, `lisa upgrade --tag` above *is* the
 rollback path, and that is why it survives on brew boxes.
+
+`lisa upgrade --tag v0.4.4` on an apt box runs exactly the command above, with
+the version derived from the tag. `lisa upgrade --channel stable` changes the
+suite word and runs the update, then prints the `--allow-downgrades` line rather
+than running it: coming back down a channel is a downgrade, and Lisa does not
+half-do one on a machine's behalf.
 
 To stop the machine upgrading itself without forgetting anything it knows:
 

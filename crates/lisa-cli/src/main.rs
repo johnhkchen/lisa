@@ -311,14 +311,18 @@ enum Commands {
     /// Move this machine to the Lisa its channel asks for.
     #[command(
         display_order = 15,
-        after_help = "A machine picks one of three channels and keeps it in a per-user config \
-                      file, not in the project: canary takes the newest release, nightly takes \
-                      the newest release once it has aged past the soak window, and stable takes \
-                      the newest release that is not a prerelease. A machine that has never \
-                      chosen is treated as stable.\n\nA brew- or apt-managed lisa is left alone: \
-                      those carry one version, so upgrade says which command moves them \
-                      instead.\n\nExamples:\n  lisa upgrade\n  lisa upgrade --channel nightly\n  \
-                      lisa upgrade --tag v0.4.4"
+        after_help = "A machine is on one of three channels: canary takes the newest release, \
+                      nightly takes the newest release once it has aged past the soak window, \
+                      and stable takes the newest release that is not a prerelease.\n\nWhere \
+                      that channel is written depends on how lisa got onto the box. A Homebrew \
+                      or apt box reads it off the package — the formula name, or the suite word \
+                      in the sources line — and upgrade hands the move to brew or apt-get; \
+                      --channel there switches packages. Every other box keeps it in a per-user \
+                      config file, and one that has never chosen is treated as stable.\n\n\
+                      --tag is the way back, and it is not the same everywhere: on apt it is a \
+                      real rollback from the pool, and on Homebrew it is lisa's own installer \
+                      writing into ~/.local/bin, because brew switch is gone.\n\nExamples:\n  \
+                      lisa upgrade\n  lisa upgrade --channel nightly\n  lisa upgrade --tag v0.4.4"
     )]
     Upgrade {
         /// Put this machine on a channel (canary | nightly | stable), then upgrade
