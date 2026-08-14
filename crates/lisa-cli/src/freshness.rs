@@ -28,10 +28,32 @@
 use semver::Version;
 
 use crate::channel::{self, Channel, MachineConfig, Release};
+use crate::upgrade::install_channel::{Derived, Source};
 
-/// What the machine config says about this box's channel.
+/// Where this box's channel comes from.
+///
+/// Two sources, and which one applies is decided by how Lisa got onto the
+/// machine rather than by precedence between them: a package-managed box reads
+/// the channel off its package, and every other box reads it out of the machine
+/// config. An operator reading a channel they did not expect needs to know
+/// which of the two to go and fix, so the row says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Setting {
+    /// The installed package names this channel — a Homebrew formula or an apt
+    /// suite. The config file is not read on these boxes; `config_says` is what
+    /// it would have claimed, kept so a disagreement can be reported as inert
+    /// rather than silently ignored.
+    Package {
+        channel: Channel,
+        /// Where it was read from, in the words the row prints.
+        source: String,
+        /// The one word a script sorts on: `homebrew-formula` or `apt-suite`.
+        kind: &'static str,
+        /// What the machine config claims, when it claims something else.
+        config_says: Option<Channel>,
+        /// The command the package manager settles a gap with.
+        native: String,
+    },
     /// The machine chose this channel.
     Chosen(Channel),
     /// Nothing has chosen. The state every machine in the fleet is in today,
@@ -42,10 +64,11 @@ pub(crate) enum Setting {
 }
 
 impl Setting {
-    /// The channel to resolve against: the chosen one, or [`Channel::DEFAULT`].
+    /// The channel to resolve against: the derived one, the chosen one, or
+    /// [`Channel::DEFAULT`].
     pub(crate) fn effective(&self) -> Channel {
         match self {
-            Setting::Chosen(channel) => *channel,
+            Setting::Package { channel, .. } | Setting::Chosen(channel) => *channel,
             Setting::Unset | Setting::Unreadable(_) => Channel::DEFAULT,
         }
     }
@@ -53,15 +76,44 @@ impl Setting {
     /// The channel name for a machine reader, or `None` when none is set.
     pub(crate) fn name(&self) -> Option<&'static str> {
         match self {
-            Setting::Chosen(channel) => Some(channel.as_str()),
+            Setting::Package { channel, .. } | Setting::Chosen(channel) => Some(channel.as_str()),
             Setting::Unset | Setting::Unreadable(_) => None,
+        }
+    }
+
+    /// Which of the three answers a surprising channel came from.
+    pub(crate) fn source_name(&self) -> &'static str {
+        match self {
+            Setting::Package { kind, .. } => kind,
+            Setting::Chosen(_) | Setting::Unset | Setting::Unreadable(_) => "config",
+        }
+    }
+
+    /// The sentence about a config field that is not being read, when there is
+    /// one to say.
+    pub(crate) fn conflict(&self) -> Option<String> {
+        match self {
+            Setting::Package {
+                channel,
+                source,
+                config_says: Some(claimed),
+                ..
+            } if claimed != channel => Some(format!(
+                "the machine config says channel {claimed}, and on a package-managed box that \
+                 field is not read — {source} is what this machine is on. Change the package, \
+                 or clear the config line so it stops disagreeing"
+            )),
+            _ => None,
         }
     }
 
     /// How the row names the channel.
     fn label(&self) -> String {
         match self {
-            Setting::Chosen(channel) => format!("channel {channel}"),
+            Setting::Package {
+                channel, source, ..
+            } => format!("channel {channel} (from {source})"),
+            Setting::Chosen(channel) => format!("channel {channel} (from the machine config)"),
             Setting::Unset => format!("channel unset (treated as {})", Channel::DEFAULT),
             Setting::Unreadable(reason) => format!("channel unreadable ({reason})"),
         }
@@ -172,11 +224,51 @@ pub(crate) fn machine_setting(config: &Result<MachineConfig, String>) -> Setting
     }
 }
 
+/// Read this machine's channel off the package that installed it, when a
+/// package installed it.
+///
+/// `None` means there is no package to ask — a curl-installed or source-built
+/// box — and the caller falls back to [`machine_setting`]. A package-managed
+/// box whose package could not be read also lands here as `None` on purpose:
+/// `doctor` reports that as its own row, and quietly reading the config instead
+/// would be exactly the second answer this design removes.
+pub(crate) fn package_setting(
+    derived: &Derived,
+    config: &Result<MachineConfig, String>,
+) -> Option<Setting> {
+    let channel = derived.channel?;
+    let native = match &derived.source {
+        Source::Formula(formula) => format!("brew upgrade {formula}"),
+        Source::Suite { .. } => {
+            "sudo apt-get update && sudo apt-get install --only-upgrade lisa lisa-runtime-zellij"
+                .to_string()
+        }
+        Source::Config | Source::Unreadable { .. } => return None,
+    };
+
+    Some(Setting::Package {
+        channel,
+        source: derived.source.describe(),
+        kind: derived.source.name(),
+        config_says: config.as_ref().ok().and_then(|config| config.channel),
+        native,
+    })
+}
+
 impl Freshness {
     /// The row's detail: the channel, the version installed, and the version
     /// that channel currently resolves to — the Zellij row's shape, asked of
     /// Lisa itself.
     pub(crate) fn summary(&self) -> String {
+        let mut summary = self.state_summary();
+        if let Some(conflict) = self.setting.conflict() {
+            summary.push_str(&format!(". Also: {conflict}"));
+        }
+        summary
+    }
+
+    /// The row without the config-disagreement sentence.
+    fn state_summary(&self) -> String {
         let head = format!("{}, installed {}", self.setting.label(), self.installed);
         let selected = self.setting.effective();
         match &self.state {
@@ -211,7 +303,14 @@ impl Freshness {
         let State::Behind { release } = &self.state else {
             return None;
         };
-        Some(match self.setting {
+        Some(match &self.setting {
+            // `lisa upgrade` is still the one command, on every box. On a
+            // package-managed one it hands the move to the package manager, and
+            // naming what it will run is what lets an operator do it by hand.
+            Setting::Package { native, .. } => format!(
+                "Move this machine to {}:\n    lisa upgrade\n    (which runs: {native})",
+                release.tag
+            ),
             Setting::Chosen(_) => {
                 format!("Move this machine to {}:\n    lisa upgrade", release.tag)
             }
@@ -234,6 +333,14 @@ impl Freshness {
             "installed": self.installed.to_string(),
             "channel": self.setting.name(),
             "effective_channel": self.setting.effective().as_str(),
+            // Which of the three answers this channel came from, so a fleet
+            // asked by script can tell a formula from a suite from a file.
+            "channel_source": self.setting.source_name(),
+            "channel_source_detail": match &self.setting {
+                Setting::Package { source, .. } => Some(source.clone()),
+                _ => None,
+            },
+            "channel_conflict": self.setting.conflict(),
             "channel_error": match &self.setting {
                 Setting::Unreadable(reason) => Some(reason.clone()),
                 _ => None,
@@ -411,6 +518,114 @@ mod tests {
         assert!(summary.contains("channel unreadable"), "{summary}");
         assert!(summary.contains("beta"), "{summary}");
         assert_eq!(check.to_json()["channel_error"], "unknown channel \"beta\"");
+    }
+
+    /// The formula name is the channel, and the row says so — an operator who
+    /// reads a surprising channel has to know whether to go and change a
+    /// formula, a suite, or a file.
+    #[test]
+    fn a_brew_box_reports_the_formula_it_derived_its_channel_from() {
+        let derived = Derived {
+            channel: Some(Channel::Nightly),
+            source: Source::Formula("lisa-nightly".to_string()),
+        };
+        let setting = package_setting(&derived, &Ok(MachineConfig::default()))
+            .expect("a formula names a channel");
+
+        let releases = fleet();
+        let check = assess_at("0.4.3", setting, Ok(&releases));
+
+        let summary = check.summary();
+        assert!(summary.contains("channel nightly"), "{summary}");
+        assert!(
+            summary.contains("from the Homebrew formula lisa-nightly"),
+            "{summary}"
+        );
+
+        let remedy = check.remedy().unwrap();
+        assert!(remedy.contains("lisa upgrade"), "{remedy}");
+        assert!(remedy.contains("brew upgrade lisa-nightly"), "{remedy}");
+
+        let json = check.to_json();
+        assert_eq!(json["channel"], "nightly");
+        assert_eq!(json["channel_source"], "homebrew-formula");
+        assert!(json["channel_conflict"].is_null());
+    }
+
+    #[test]
+    fn an_apt_box_reports_the_suite_and_the_file_it_is_written_in() {
+        let derived = Derived {
+            channel: Some(Channel::Canary),
+            source: Source::Suite {
+                suite: "canary".to_string(),
+                file: std::path::PathBuf::from("/etc/apt/sources.list.d/lisa.list"),
+            },
+        };
+        let setting = package_setting(&derived, &Ok(MachineConfig::default())).unwrap();
+        let json = assess_at("0.4.3", setting, Ok(&fleet())).to_json();
+
+        assert_eq!(json["channel_source"], "apt-suite");
+        assert!(json["channel_source_detail"]
+            .as_str()
+            .unwrap()
+            .contains("/etc/apt/sources.list.d/lisa.list"));
+        assert!(json["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("apt-get install --only-upgrade lisa lisa-runtime-zellij"));
+    }
+
+    /// The disagreement this whole design exists to prevent: a config field
+    /// claiming one channel while the installed package is another. The package
+    /// wins, and the row says the field is not being read rather than leaving it
+    /// to look load-bearing.
+    #[test]
+    fn a_config_field_that_disagrees_with_the_package_is_named_as_inert() {
+        let derived = Derived {
+            channel: Some(Channel::Stable),
+            source: Source::Formula("lisa".to_string()),
+        };
+        let config = Ok(MachineConfig {
+            channel: Some(Channel::Canary),
+            ..MachineConfig::default()
+        });
+        let setting = package_setting(&derived, &config).unwrap();
+        assert_eq!(setting.effective(), Channel::Stable);
+
+        let check = assess_at("0.4.4", setting, Ok(&fleet()));
+        let summary = check.summary();
+        assert!(summary.contains("channel canary"), "{summary}");
+        assert!(summary.contains("is not read"), "{summary}");
+        assert_eq!(check.state.name(), "level");
+        assert!(check.to_json()["channel_conflict"]
+            .as_str()
+            .unwrap()
+            .contains("the machine config says channel canary"));
+    }
+
+    #[test]
+    fn a_config_field_that_agrees_with_the_package_says_nothing() {
+        let derived = Derived {
+            channel: Some(Channel::Stable),
+            source: Source::Formula("lisa".to_string()),
+        };
+        let config = Ok(MachineConfig {
+            channel: Some(Channel::Stable),
+            ..MachineConfig::default()
+        });
+        let setting = package_setting(&derived, &config).unwrap();
+        assert_eq!(setting.conflict(), None);
+    }
+
+    /// A box with no package to ask keeps the config field as its only answer.
+    #[test]
+    fn a_source_built_box_has_no_package_setting_at_all() {
+        let derived = Derived {
+            channel: None,
+            source: Source::Config,
+        };
+        assert!(package_setting(&derived, &Ok(MachineConfig::default())).is_none());
+        assert_eq!(Setting::Chosen(Channel::Nightly).source_name(), "config");
     }
 
     #[test]

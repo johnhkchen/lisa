@@ -764,7 +764,13 @@ fn look_at_lisa() -> Result<crate::freshness::Freshness, String> {
     let installed = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("this build's own version is unreadable: {error}"))?;
     let machine = crate::channel::config_path().and_then(|path| crate::channel::load_from(&path));
-    let setting = crate::freshness::machine_setting(&machine);
+
+    // Which of the three sources answers here is decided by how Lisa got onto
+    // the machine: a package-managed box reads its channel off the package it
+    // has, and every other box reads it out of the config file.
+    let setting = installed_channel()
+        .and_then(|derived| crate::freshness::package_setting(&derived, &machine))
+        .unwrap_or_else(|| crate::freshness::machine_setting(&machine));
     let releases = crate::upgrade::fetch_releases_within(crate::upgrade::DOCTOR_LIST_TIMEOUT);
 
     Ok(crate::freshness::assess(
@@ -774,6 +780,103 @@ fn look_at_lisa() -> Result<crate::freshness::Freshness, String> {
         releases.as_deref().map_err(|error| error.clone()),
         crate::channel::now_unix(),
     ))
+}
+
+/// What the package that installed this Lisa says about its channel, when a
+/// package installed it. `None` on a box where `current_exe` cannot be read at
+/// all, which is a state the rest of the report survives.
+fn installed_channel() -> Option<crate::upgrade::install_channel::Derived> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let method = crate::upgrade::classify_install(&exe, home.as_deref());
+    Some(crate::upgrade::install_channel::derive(&method, &exe))
+}
+
+/// How many lisas this machine could run, and which one it finds first.
+///
+/// A real state, and the one that made `installed_lisa()`'s bug: a box can
+/// carry a package-manager Lisa *and* one the shell installer wrote into
+/// `~/.local/bin`, and then PATH order decides which one runs — including which
+/// one a nightly job upgrades. `lisa upgrade --tag` on a Homebrew box creates it
+/// deliberately, because it is the only rollback Homebrew has. Reporting it is
+/// the fix: nothing here removes anything.
+fn shadowed_install_report() -> CheckReport {
+    let name = "lisa install";
+    let Ok(exe) = std::env::current_exe() else {
+        return CheckReport {
+            name,
+            required: false,
+            result: CheckResult::Skipped {
+                reason: "cannot find the running lisa".to_string(),
+            },
+        };
+    };
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let method = crate::upgrade::classify_install(&exe, home.as_deref());
+
+    let installer_copy = home
+        .as_deref()
+        .map(crate::upgrade::installer_owned_path)
+        .filter(|path| path.exists())
+        .filter(|path| path.canonicalize().map(|it| it != exe).unwrap_or(true));
+
+    let packaged = crate::upgrade::install_channel::package_lisa_path(&method, &exe);
+
+    match (packaged, installer_copy) {
+        (Some(packaged), Some(installer_copy)) => {
+            let manager = if matches!(method, crate::upgrade::InstallMethod::Homebrew) {
+                "Homebrew"
+            } else {
+                "apt"
+            };
+            let first = first_lisa_on_path();
+            CheckResult::Unsupported {
+                description: format!(
+                    "this machine has two lisas: {manager}'s at {} and the shell installer's at \
+                     {}. PATH order decides which one runs{}, and only the {manager} one \
+                     follows this box's channel",
+                    packaged.display(),
+                    installer_copy.display(),
+                    match &first {
+                        Some(found) => format!(" — right now that is {}", found.display()),
+                        None => String::new(),
+                    }
+                ),
+                remedy: format!(
+                    "Keep one. To go back to the packaged lisa:\n    rm {}\nTo keep the pinned \
+                     one instead, leave it and remember that {manager} upgrades will not move it.",
+                    installer_copy.display()
+                ),
+            }
+        }
+        _ => CheckResult::Found {
+            version: format!("one lisa, at {}", exe.display()),
+        },
+    }
+    .into_report(name)
+}
+
+/// The `lisa` the operator's shell actually finds.
+fn first_lisa_on_path() -> Option<PathBuf> {
+    let found = get_command_version("sh", &["-c", "command -v lisa"])?;
+    if found.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(found))
+    }
+}
+
+impl CheckResult {
+    /// Name a result, which is all a report is.
+    fn into_report(self, name: &'static str) -> CheckReport {
+        CheckReport {
+            name,
+            required: false,
+            result: self,
+        }
+    }
 }
 
 /// The `lisa` row itself, in the shape every other row uses.
@@ -844,6 +947,7 @@ fn gather(root: &Path) -> Result<Findings, String> {
     let lisa = look_at_lisa();
     let mut reports = vec![
         lisa_report(&lisa),
+        shadowed_install_report(),
         CheckReport {
             name: "zellij",
             required: true,
