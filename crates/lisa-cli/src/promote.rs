@@ -475,15 +475,20 @@ fn render_human(decision: &Decision, pointer_path: &Path, wrote: bool) -> String
     ];
     if decision.overdue_hours > 0 {
         lines.push(format!(
-            "late:    {} was promotable {}h before this run took it",
+            "late:    {} became promotable {}h ago",
             decision.target, decision.overdue_hours
         ));
     }
     lines.push(if wrote {
         format!("wrote:   {}", pointer_path.display())
+    } else if decision.action.changes_the_pointer() {
+        format!(
+            "wrote:   nothing; --write is what moves {}",
+            pointer_path.display()
+        )
     } else {
         format!(
-            "wrote:   nothing ({} is already right)",
+            "wrote:   nothing ({} already says this)",
             pointer_path.display()
         )
     });
