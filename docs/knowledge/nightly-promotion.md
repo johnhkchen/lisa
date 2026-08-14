@@ -127,7 +127,15 @@ release that is *not* a prerelease for `lisa`, the promotion pointer for
 `lisa-nightly`. Whatever kind of release is newest, the run leaves the whole tap
 correct, and a formula that was already right is not rewritten or recommitted.
 
-Read the result, which is the same loop the release checklist uses:
+Read the result. From a Lisa checkout, `scripts/verify-live-tap.sh` asks the
+live tap and the live release list and says which formula is wrong — it only
+looks, so it is safe against the real tap:
+
+```bash
+scripts/verify-live-tap.sh
+```
+
+Or by hand, the same loop the release checklist uses:
 
 ```bash
 for formula in lisa lisa-nightly lisa-canary; do
