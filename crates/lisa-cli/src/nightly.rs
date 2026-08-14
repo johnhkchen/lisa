@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::busy;
 use crate::channel::{self, Channel, MachineConfig};
+use crate::upgrade::install_channel;
 use crate::upgrade::{self, InstallMethod};
 
 /// The launchd job's name. Reverse-DNS, the same identity
@@ -272,37 +273,19 @@ pub(crate) fn run_cycle() -> Result<i32, String> {
     // came from somewhere else is not the version of the process asking.
     let installed = upgrade::installed_lisa(&exe, home.as_deref())?.version;
 
+    // A package-managed box follows the channel its package names, and the
+    // package manager is the mover. Everything around the move — the schedule,
+    // the live-run refusal, the check against this machine's own work, the
+    // alarm — is the same on both paths.
+    if upgrade::is_package_managed(&method) {
+        return packaged_cycle(&state, &config, &exe, &method, &installed, skips_before);
+    }
+
     println!(
         "lisa nightly, {} — channel {}, installed {installed}.",
         channel::format_rfc3339_utc(started),
         config.effective_channel(),
     );
-
-    // A package-managed box cannot honour a channel at all, and a schedule
-    // pointed at one will fail every night until someone says why.
-    if matches!(method, InstallMethod::Homebrew | InstallMethod::Apt) {
-        let detail = format!(
-            "this machine's lisa is managed by a package manager ({}), which carries one \
-             version and cannot follow a channel",
-            exe.display()
-        );
-        return finish(
-            &state,
-            &config,
-            cycle(
-                channel::now_unix(),
-                outcome::FAILED,
-                false,
-                detail,
-                &config,
-                &installed,
-                None,
-                None,
-                Some("Move this machine onto the channel-aware install: lisa upgrade".to_string()),
-                0,
-            ),
-        );
-    }
 
     // Nothing lands under a live run.
     let busy = busy::look();
@@ -468,6 +451,235 @@ pub(crate) fn run_cycle() -> Result<i32, String> {
                 0,
             ),
         ),
+    }
+}
+
+/// One cycle on a box a package manager owns.
+///
+/// The same five steps as the cycle above — refuse mid-run, move, verify,
+/// record, shout — with `brew` or `apt-get` doing the fetch, verify and swap.
+/// The channel is not read from the config here: on these boxes the installed
+/// package *is* the channel, so the record says which formula or suite it came
+/// from.
+fn packaged_cycle(
+    state: &Path,
+    config: &MachineConfig,
+    exe: &Path,
+    method: &InstallMethod,
+    installed: &Version,
+    skips_before: u64,
+) -> Result<i32, String> {
+    let derived = install_channel::derive(method, exe);
+    let lisa = install_channel::package_lisa_path(method, exe).unwrap_or_else(|| exe.to_path_buf());
+    let started = channel::now_unix();
+
+    // The version the package manager has, which after an upgrade is not the
+    // version of the process asking.
+    let installed = upgrade::version_of(&lisa).unwrap_or_else(|| installed.clone());
+
+    let record = |outcome: &str,
+                  ok: bool,
+                  detail: String,
+                  after: Option<String>,
+                  remedy: Option<String>,
+                  skips: u64| {
+        let mut record = cycle(
+            channel::now_unix(),
+            outcome,
+            ok,
+            detail,
+            config,
+            &installed,
+            after,
+            None,
+            remedy,
+            skips,
+        );
+        // The package is the channel, so the record says what the package says
+        // rather than what a config field this box does not read claims.
+        record.channel = derived.channel.map(|channel| channel.as_str().to_string());
+        record.effective_channel = derived
+            .channel
+            .map(|channel| channel.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        record
+    };
+
+    println!(
+        "lisa nightly, {} — {}, installed {installed}.",
+        channel::format_rfc3339_utc(started),
+        match derived.channel {
+            Some(channel) => format!("channel {channel} from {}", derived.source.describe()),
+            None => derived.source.describe(),
+        },
+    );
+
+    let Some(_channel) = derived.channel else {
+        return finish(
+            state,
+            config,
+            record(
+                outcome::FAILED,
+                false,
+                format!(
+                    "this machine's channel could not be read off the package that installed \
+                     it: {}",
+                    derived.source.describe()
+                ),
+                None,
+                Some(
+                    "Reinstall on the channel this box is for, then this job has something to \
+                     follow: brew install johnhkchen/lisa/lisa-nightly, or the suite word in \
+                     /etc/apt/sources.list.d/lisa.list"
+                        .to_string(),
+                ),
+                0,
+            ),
+        );
+    };
+
+    // Nothing lands under a live run — including when the mover is brew.
+    let busy = busy::look();
+    if busy.is_busy() {
+        let skips = skips_before + 1;
+        return finish(
+            state,
+            config,
+            record(
+                outcome::SKIPPED,
+                true,
+                format!("nothing was touched: {}", busy.describe()),
+                None,
+                None,
+                skips,
+            ),
+        );
+    }
+
+    let privilege = install_channel::Privilege::look();
+    let plan = match &derived.source {
+        install_channel::Source::Formula(formula) => install_channel::brew_upgrade(formula),
+        _ => install_channel::apt_upgrade(privilege),
+    };
+
+    if !privilege.can_run() {
+        return finish(
+            state,
+            config,
+            record(
+                outcome::FAILED,
+                false,
+                "this box needs root to move an apt package and this job has no way to become \
+                 it, so nothing was run"
+                    .to_string(),
+                None,
+                Some(plan.describe()),
+                0,
+            ),
+        );
+    }
+
+    println!("{}", plan.describe());
+    for step in &plan.steps {
+        if let Err(error) = step.run() {
+            return finish(
+                state,
+                config,
+                record(
+                    outcome::FAILED,
+                    false,
+                    format!("{error}. lisa {installed} is still what this machine has"),
+                    None,
+                    Some(
+                        "Nothing was replaced, so there is nothing to undo. The next cycle tries \
+                         again; to look now: lisa upgrade --dry-run"
+                            .to_string(),
+                    ),
+                    0,
+                ),
+            );
+        }
+    }
+
+    let Some(after) = upgrade::version_of(&lisa) else {
+        return finish(
+            state,
+            config,
+            record(
+                outcome::FAILED,
+                false,
+                format!("{} did not answer --version after the move", lisa.display()),
+                None,
+                Some(format!(
+                    "Ask this machine what it has, and which lisa it finds first:\n    \
+                     command -v lisa && lisa --version\n    {}",
+                    lisa.display()
+                )),
+                0,
+            ),
+        );
+    };
+
+    if after == installed {
+        return finish(
+            state,
+            config,
+            record(
+                outcome::LEVEL,
+                true,
+                format!("lisa {installed} is what this channel carries, so nothing moved"),
+                None,
+                None,
+                0,
+            ),
+        );
+    }
+
+    match verify(&lisa, &after, config.nightly_project.as_deref()) {
+        Ok(detail) => finish(
+            state,
+            config,
+            record(
+                outcome::MOVED,
+                true,
+                format!("moved {installed} → {after}. {detail}"),
+                Some(after.to_string()),
+                None,
+                0,
+            ),
+        ),
+        Err(error) => finish(
+            state,
+            config,
+            record(
+                outcome::FAILED,
+                false,
+                format!("lisa {after} installed, and this machine is not working with it: {error}"),
+                Some(after.to_string()),
+                Some(format!(
+                    "Put this machine back on the release that worked:\n    {}",
+                    rollback_to(method, &installed)
+                )),
+                0,
+            ),
+        ),
+    }
+}
+
+/// The way back to a known-good release, which is not the same command on the
+/// two package managers.
+///
+/// **apt keeps every version it has carried** in one shared pool, so an exact
+/// version is a real rollback. **Homebrew keeps none** — `brew switch` was
+/// removed and a formula carries one version — so the way back there is Lisa's
+/// own installer, and `lisa upgrade --tag` is what runs it.
+fn rollback_to(method: &InstallMethod, version: &Version) -> String {
+    match method {
+        InstallMethod::Apt => format!(
+            "sudo apt-get install --allow-downgrades lisa={deb} lisa-runtime-zellij={deb}",
+            deb = install_channel::deb_version(version)
+        ),
+        _ => format!("lisa upgrade --tag v{version}"),
     }
 }
 
@@ -786,11 +998,30 @@ pub(crate) fn run_status(json: bool) -> Result<i32, String> {
     let standing = standing(last_cycle(&state)?, channel::now_unix());
     let exit_code = i32::from(!standing.ok);
 
+    // The channel a box asked from a distance has to be the one it is really
+    // on, so a package-managed machine answers with its package rather than
+    // with a config field it does not read.
+    let derived = std::env::current_exe().ok().map(|exe| {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let method = upgrade::classify_install(&exe, home.as_deref());
+        install_channel::derive(&method, &exe)
+    });
+    let from_package = derived.as_ref().and_then(|derived| derived.channel);
+
     if json {
         let data = serde_json::json!({
             "state": if standing.ok { "ok" } else { "finding" },
-            "channel": config.channel.map(|channel| channel.as_str()),
-            "effective_channel": config.effective_channel().as_str(),
+            "channel": from_package
+                .or(config.channel)
+                .map(|channel| channel.as_str()),
+            "channel_source": derived
+                .as_ref()
+                .map(|derived| derived.source.name())
+                .unwrap_or("config"),
+            "effective_channel": from_package
+                .unwrap_or_else(|| config.effective_channel())
+                .as_str(),
             "detail": standing.headline,
             "remedy": standing.remedy,
             "last_cycle": standing.last,
@@ -903,17 +1134,37 @@ pub(crate) fn run_install(args: InstallArgs) -> Result<(), String> {
         .map(PathBuf::from)
         .ok_or_else(|| "cannot find this machine's home directory: HOME is not set".to_string())?;
     let method = upgrade::classify_install(&exe, Some(&home));
+    let derived = install_channel::derive(&method, &exe);
 
-    if matches!(method, InstallMethod::Homebrew | InstallMethod::Apt) {
-        return Err(format!(
-            "this lisa is managed by a package manager ({}), which carries one version and \
-             cannot follow a channel, so an unattended nightly upgrade has nothing to do. \
-             Move onto the channel-aware install first: lisa upgrade",
-            exe.display()
-        ));
+    // On a package-managed box the channel is the package, so the one thing
+    // this command must not do is write a `channel` field the machine will not
+    // read. It checks the package says nightly and names the command that
+    // changes it if it does not.
+    if upgrade::is_package_managed(&method) {
+        match derived.channel {
+            Some(Channel::Nightly) => {}
+            Some(other) => {
+                return Err(format!(
+                    "this machine is on channel {other}, from {} — a nightly job here would \
+                     upgrade it along {other}, not nightly. Put the box on nightly first:\n    \
+                     lisa upgrade --channel nightly",
+                    derived.source.describe()
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "this lisa is package-managed and its channel could not be read: {}. \
+                     A nightly job would have nothing to follow.",
+                    derived.source.describe()
+                ))
+            }
+        }
     }
 
-    let lisa = lisa_to_check(Some(&home), &exe);
+    // The lisa the job runs is the one the mover keeps current: the package
+    // manager's on a package-managed box, the installer's everywhere else.
+    let lisa = install_channel::package_lisa_path(&method, &exe)
+        .unwrap_or_else(|| lisa_to_check(Some(&home), &exe));
     let state = state_dir()?;
     let job = launchd_job(&lisa, &home, &state, &RUN_TIMES);
 
@@ -928,10 +1179,15 @@ pub(crate) fn run_install(args: InstallArgs) -> Result<(), String> {
     }
 
     // The channel first: a nightly job on a machine that has not said it wants
-    // nightly would quietly follow stable and look like it was working.
+    // nightly would quietly follow stable and look like it was working. On a
+    // package-managed box the package already said it — checked above — and
+    // writing the field here would only create the second answer this design
+    // removes.
     let config_path = channel::config_path()?;
     let mut config = channel::load_from(&config_path)?;
-    config.channel = Some(Channel::Nightly);
+    if !upgrade::is_package_managed(&method) {
+        config.channel = Some(Channel::Nightly);
+    }
     if let Some(project) = args.project {
         let project = project
             .canonicalize()
