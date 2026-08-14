@@ -2,7 +2,8 @@
 
 This is the maintainer runbook for cutting a stable Lisa release. It is
 version-parameterized: set the block below once and every command derives from
-it. Current cut: **v0.5.0-rc.2** (published 2026-08-09; prior stable v0.4.4).
+it. Current cut: **v0.5.0-rc.3** (prior prerelease v0.5.0-rc.2, published
+2026-08-09; prior stable v0.4.4).
 
 Only John authorizes publication. Preparing or reviewing this checklist is not
 authorization to tag, dispatch, publish, or update the Homebrew tap or apt
@@ -22,7 +23,7 @@ directory.
 ```bash
 set -euo pipefail
 REPO=johnhkchen/lisa
-VERSION=0.5.0-rc.2
+VERSION=0.5.0-rc.3
 TAG="v$VERSION"
 PRIOR_STABLE=v0.4.4
 # Ancestry gates: each must be an ancestor of the release commit.
@@ -31,7 +32,14 @@ MUSL_GATE=fcdd293   # static-musl linkage + Bullseye execution checks in release
 SEAL_GATE=6fcb2f2   # completion boundary of S-049-08 (stable-0.4.4 hotfix: E-049 + E-050 line)
 WORKFLOW_GATE=e67491b # completion boundary of S-057-02 (0.5.0 line: one working phase, and the upgrade path to it)
 DELIVERY_GATE=f508031 # the pane-delivery fix (0.5.0-rc.2: wait for the provider to leave before typing into its pane)
+CHANNEL_GATE=e44dee2 # the channel arrangement (0.5.0-rc.3: lisa upgrade, doctor drift, lisa nightly)
 ```
+
+`v0.5.0-rc.3` is the release `S-068-01` is blocked on: it is the first cut
+carrying `lisa upgrade`, `doctor`'s channel-drift row, and `lisa nightly`, so it
+is the first release that can put a machine on a channel at all. Until it
+exists, no box can be *level with nightly* except by hand-copying an unreleased
+binary, which is the failure that story exists to end.
 
 `v0.5.0-rc.1` was prepared under this checklist and never published — it was
 superseded by rc.2 before anyone tagged it. See
@@ -72,10 +80,10 @@ the resolution date — the stable cut that supersedes it.
 Expected skew before this cut:
 
 - `releases/latest`: `$PRIOR_STABLE` (stable);
-- newest release of any kind: `$PRIOR_STABLE` — the 0.4.4 line was cut stable
-  and no prerelease has been published since;
-- Homebrew tap: `$PRIOR_STABLE` without its `v` (deliberate:
-  `publish-prereleases = true` means the tap tracks whichever came last);
+- newest release of any kind: `v0.5.0-rc.2`, the prerelease this cut supersedes;
+- Homebrew tap: `0.5.0-rc.2` (deliberate: `publish-prereleases = true` means the
+  tap tracks whichever came last, so it carries the prerelease rather than
+  `$PRIOR_STABLE`);
 - apt repository: `$PRIOR_STABLE` and older stables (apt publishing skips
   prereleases).
 
@@ -121,7 +129,7 @@ worktrees are not a suitable place to perform the version bump.
 Prove the chosen line contains every gate:
 
 ```bash
-for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE" "$DELIVERY_GATE"; do
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE" "$DELIVERY_GATE" "$CHANNEL_GATE"; do
   git merge-base --is-ancestor "$gate" "$RELEASE_BASE"
 done
 ```
@@ -403,7 +411,7 @@ Fetch and peel the public stable tag, then repeat the ancestry gates:
 ```bash
 git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
 PUBLIC_TAG_COMMIT=$(git rev-parse "$TAG^{commit}")
-for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE" "$DELIVERY_GATE"; do
+for gate in "$E045_GATE" "$MUSL_GATE" "$SEAL_GATE" "$WORKFLOW_GATE" "$DELIVERY_GATE" "$CHANNEL_GATE"; do
   git merge-base --is-ancestor "$gate" "$PUBLIC_TAG_COMMIT"
 done
 printf 'public_tag_commit=%s\n' "$PUBLIC_TAG_COMMIT" \
