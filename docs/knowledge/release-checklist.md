@@ -117,6 +117,22 @@ The apt index carries every published stable, in publication order, so print all
 of them. The earlier single-stanza form stopped at the first `Version:` and
 reported the *oldest* version in the repository as the baseline.
 
+**Every command above reads from the publisher on purpose.** Verify a published
+artifact against the thing that published it — the GitHub API, the release list,
+the served `Packages` index — and never against a local mirror of it. A local
+mirror answers confidently and is stale exactly when it matters:
+
+- `brew info` reads this machine's tap clone, not the tap. On 2026-08-14 it
+  reported `lisa 0.5.0-rc.2` hours after the tap had been corrected to `0.4.4`.
+  Read `gh api repos/johnhkchen/homebrew-lisa/contents/Formula/<name>.rb`.
+- A rehearsal is a mirror of the world at the moment it was staged. The same day,
+  a tap migration rehearsed correctly against a copy seeded four minutes before
+  `v0.5.0-rc.3` published, and the plan it produced would have moved
+  `lisa-canary` backwards.
+
+Both were right answers to a question about the wrong world. When a check and the
+publisher disagree, the publisher is what shipped.
+
 Stop if a stable `$TAG` already exists. Switch to the post-cut audit rather than
 creating or moving the tag.
 
