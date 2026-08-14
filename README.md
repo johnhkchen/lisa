@@ -67,6 +67,61 @@ operators can find signing-key custody and rotation details in
 Want to change Lisa itself? Read [Develop Lisa](#develop-lisa) and follow
 [CONTRIBUTING.md](CONTRIBUTING.md) for the source build.
 
+## Keep Lisa current
+
+`lisa upgrade` moves this machine to the release it asked for:
+
+```bash
+lisa upgrade                      # move to what this machine's channel says
+lisa upgrade --channel nightly    # pick a channel and move, in one command
+lisa upgrade --tag v0.4.4         # go back to an exact release
+lisa upgrade --dry-run            # say what would happen and change nothing
+```
+
+Every green `main` is tagged, so there is one train of releases and three ways to
+subscribe to it:
+
+| channel | takes | who it is for |
+| --- | --- | --- |
+| `canary` | the newest release, prerelease or not | a machine you are developing on |
+| `nightly` | the newest release, prerelease or not, once it has soaked | a machine that runs real work with nothing at stake |
+| `stable` | the newest release that is not a prerelease | everything else |
+
+A machine that has never picked is treated as `stable`, and `lisa upgrade` says
+so rather than pretending someone chose.
+
+**Soak** is why `nightly` is not just `canary` a day later. A release becomes
+eligible for `nightly` once it is **24 hours old**, and only the newest release
+is ever a candidate: anything below it has been superseded, whether or not the
+one above it has soaked yet. So a release candidate that a hotfix replaces twenty
+minutes later is never installed anywhere. If the newest release has not aged out
+yet, `lisa upgrade` says how much longer and leaves the machine where it is.
+
+The channel is a property of the machine, not of a project, so it lives in a
+per-user file:
+
+- Linux: `~/.config/lisa/config.toml`
+- macOS: `~/Library/Application Support/io.johnhkchen.lisa/config.toml`
+
+```toml
+channel = "nightly"
+# Hours a release must age before the nightly channel will take it.
+soak_hours = 24
+```
+
+`lisa upgrade --channel <name>` writes that file for you; `soak_hours` is there
+to edit when 24 hours is the wrong wait. (A project's `.lisa.toml` also has a
+`version` field. That records the Lisa that set the *project* up and has nothing
+to do with channels.)
+
+Two things `upgrade` deliberately does not do. With no network it stops, says it
+could not read the release list, and leaves the installed Lisa in place — it
+never guesses. And on a machine where Homebrew or apt owns `lisa`, it refuses to
+write over their file and prints the command that does move them
+(`brew upgrade lisa`, `apt-get install --only-upgrade lisa`); those carry one
+version each, which is the stable channel by another name. Channels need the
+one-command install above, which puts `lisa` in `~/.local/bin`.
+
 ## What It Does
 
 When you have a set of interdependent tasks — a feature broken into tickets, a refactor with sequencing constraints, a sprint with parallel workstreams — Lisa schedules and runs them concurrently as Claude Code sessions. You define the work as markdown tickets with dependency metadata. Lisa figures out what can run in parallel, what has to wait, and launches sessions accordingly.
@@ -664,6 +719,23 @@ in `lisa status` — read them there first.
 lisa proposal apply T-001-01
 lisa proposal dismiss T-001-01
 ```
+
+### `lisa upgrade`
+
+Move this machine to the release its channel names, or to an exact one. The
+channels and the soak window are described in
+[Keep Lisa current](#keep-lisa-current).
+
+```bash
+lisa upgrade                    # what this machine's channel says
+lisa upgrade --channel stable   # pick a channel and move, in one command
+lisa upgrade --tag v0.4.4       # go back to an exact release
+lisa upgrade --dry-run          # say what would happen and change nothing
+```
+
+Every run names the version it is moving from and the one it is moving to before
+it moves. It stops instead of guessing when it cannot read the release list, and
+it leaves a Homebrew- or apt-installed `lisa` to its package manager.
 
 ### `lisa setup-guide`
 
