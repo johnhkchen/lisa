@@ -936,6 +936,17 @@ pub(crate) fn run_install(args: InstallArgs) -> Result<(), String> {
         let project = project
             .canonicalize()
             .map_err(|error| format!("cannot use {}: {error}", project.display()))?;
+        // Checked here rather than every night at 04:30: a directory `doctor`
+        // will not answer about is an alarm that fires forever and means
+        // nothing.
+        if !project.join(".lisa.toml").exists() && !project.join("docs/active/tickets").is_dir() {
+            return Err(format!(
+                "{} is not a board Lisa knows — no .lisa.toml and no docs/active/tickets/ in \
+                 it, so the nightly check would have nothing to ask about. Name a project \
+                 this machine actually works.",
+                project.display()
+            ));
+        }
         config.nightly_project = Some(project);
     }
     if let Some(alert) = args.alert {

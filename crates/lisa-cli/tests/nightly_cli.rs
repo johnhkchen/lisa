@@ -417,6 +417,36 @@ fn install_dry_run_prints_the_job_and_touches_nothing() {
     );
 }
 
+/// A board the nightly check could never ask about is refused at install time,
+/// not at 04:30 every morning for the rest of the machine's life.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_project_that_is_not_a_board_is_refused_before_it_becomes_a_nightly_alarm() {
+    let config = TempDir::new().unwrap();
+    let agents = TempDir::new().unwrap();
+    let not_a_board = TempDir::new().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
+        .args(["nightly", "install", "--project"])
+        .arg(not_a_board.path())
+        .env("HOME", config.path())
+        .env("LISA_CONFIG_DIR", config.path())
+        .env("LISA_LAUNCH_AGENTS_DIR", agents.path())
+        .output()
+        .expect("run lisa nightly install");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stdout_of(&output));
+    assert!(
+        stderr_of(&output).contains("is not a board Lisa knows"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        std::fs::read_dir(agents.path()).unwrap().next().is_none(),
+        "a refused install leaves no job behind"
+    );
+}
+
 /// The schedule itself is launchd, so this is the machine it is for. The job is
 /// written and read back; `LISA_LAUNCH_AGENTS_DIR` also keeps `launchctl` out of
 /// it, so the suite never loads a job onto the machine running it.
@@ -426,6 +456,7 @@ fn install_puts_the_machine_on_nightly_and_uninstall_leaves_what_it_knows() {
     let config = TempDir::new().unwrap();
     let agents = TempDir::new().unwrap();
     let board = TempDir::new().unwrap();
+    std::fs::write(board.path().join(".lisa.toml"), "version = \"0.5.0\"\n").unwrap();
 
     let install = Command::new(env!("CARGO_BIN_EXE_lisa"))
         .args(["nightly", "install", "--project"])
