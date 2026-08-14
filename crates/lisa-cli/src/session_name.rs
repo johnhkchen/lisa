@@ -253,6 +253,19 @@ fn existing_sessions(zellij_path: &Path) -> Vec<Session> {
 /// is the safe one: a marker a future Zellij renames reads as a running
 /// session, which costs a refusal an operator can clear, rather than as a dead
 /// one, which costs a second scheduler nobody notices.
+/// The names of the sessions in a listing whose servers are still up.
+///
+/// One grammar, one reader: [`crate::busy`] asks this machine whether any run
+/// is live before an upgrade swaps the binary under it, and it has to read the
+/// `EXITED` marker exactly the way the loop does.
+pub(crate) fn running_session_names(listing: &str) -> Vec<String> {
+    parse_sessions(listing)
+        .into_iter()
+        .filter(|session| session.running)
+        .map(|session| session.name)
+        .collect()
+}
+
 fn parse_sessions(listing: &str) -> Vec<Session> {
     listing
         .lines()

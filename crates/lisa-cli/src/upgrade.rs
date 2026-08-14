@@ -61,6 +61,8 @@ pub(crate) struct UpgradeArgs {
     pub(crate) tag: Option<String>,
     /// Resolve and report, download and install nothing.
     pub(crate) dry_run: bool,
+    /// Move even though a run is live on this machine.
+    pub(crate) anyway: bool,
 }
 
 /// How the running `lisa` got onto this machine.
@@ -186,12 +188,27 @@ pub(crate) fn parse_releases(body: &str) -> Result<Vec<Release>, String> {
         .collect())
 }
 
+/// The refusal an upgrade gets while a run is live on this machine.
+///
+/// Naming both ways out, because "wait" is usually right and "move anyway" is
+/// sometimes right, and the operator standing here is the one who knows which.
+pub(crate) fn live_run_refusal(busy: &crate::busy::Busy) -> String {
+    format!(
+        "not moving lisa while this machine is working: {}.\n\
+         An upgrade swaps the binary a running loop is calling, which breaks the run \
+         it lands in — being one release behind is the cheaper mistake. Either:\n  \
+         - wait for the run to finish and run this again, or\n  \
+         - move now and accept the risk:\n      lisa upgrade --anyway",
+        busy.describe(),
+    )
+}
+
 /// Download a release's shell installer and run it.
 ///
 /// The installer writes a new binary into `~/.local/bin`; nothing here removes
 /// or truncates the running one, so a failed download or a failed installer
 /// leaves the working Lisa in place.
-fn install(release: &Release) -> Result<(), String> {
+pub(crate) fn install(release: &Release) -> Result<(), String> {
     let base = std::env::var(DOWNLOAD_BASE_ENV).unwrap_or_else(|_| DOWNLOAD_BASE.to_string());
     let url = format!("{base}/{}/{INSTALLER_NAME}", release.tag);
 
@@ -370,9 +387,31 @@ pub(crate) fn run_upgrade(args: UpgradeArgs) -> Result<(), String> {
     }
     let _ = io::stdout().flush();
 
+    // Last thing before anything is downloaded: a run on this machine is
+    // calling the binary this is about to replace.
+    let busy = crate::busy::look();
+
     if args.dry_run {
+        if busy.is_busy() {
+            println!(
+                "This machine is working — {} — so a real run would stop here \
+                 rather than swap the binary underneath it.",
+                busy.describe()
+            );
+        }
         println!("--dry-run: nothing was downloaded and nothing was installed.");
         return Ok(());
+    }
+
+    if busy.is_busy() && !args.anyway {
+        return Err(format!(
+            "{}\nlisa {installed} at {} is unchanged.",
+            live_run_refusal(&busy),
+            exe.display()
+        ));
+    }
+    if busy.is_busy() {
+        println!("--anyway: moving with {}.", busy.describe());
     }
 
     install(&target).map_err(|error| {

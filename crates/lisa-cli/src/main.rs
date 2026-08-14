@@ -1,5 +1,6 @@
 mod agent_exec;
 mod already_done;
+mod busy;
 mod capture_usage;
 mod channel;
 mod check_disposition;
@@ -22,6 +23,7 @@ mod json_guide;
 mod json_output;
 mod legacy_context;
 mod loop_cmd;
+mod nightly;
 mod notes;
 mod preownership_status;
 mod proposal;
@@ -329,6 +331,26 @@ enum Commands {
         /// Say what would happen and change nothing
         #[arg(long)]
         dry_run: bool,
+
+        /// Move even though this machine has a run on it
+        #[arg(long)]
+        anyway: bool,
+    },
+    /// Keep this machine on nightly on its own, and say how that is going.
+    #[command(
+        display_order = 16,
+        after_help = "The machine this is for runs background work and meets each release \
+                      before a person does. install puts a launchd job on it, run is one \
+                      cycle of that job — skip if the machine is working, move if the \
+                      nightly channel has a soaked release, check the new one against this \
+                      board, shout if it does not hold up — and status is the question to \
+                      ask a box you are not sitting at.\n\nExamples:\n  lisa nightly install \
+                      --project ~/work/board\n  lisa nightly status\n  lisa nightly status \
+                      --json"
+    )]
+    Nightly {
+        #[command(subcommand)]
+        action: NightlyCommands,
     },
     /// Settle a first-responder proposal for a waiting ticket.
     #[command(display_order = 8)]
@@ -574,6 +596,34 @@ enum ProposalCommands {
 }
 
 #[derive(Subcommand)]
+enum NightlyCommands {
+    /// Put this machine on nightly and let it upgrade itself.
+    Install {
+        /// Board on this machine to check a new release against
+        #[arg(long)]
+        project: Option<PathBuf>,
+
+        /// Command that carries a failure off this machine; the record arrives on its stdin
+        #[arg(long)]
+        alert: Option<String>,
+
+        /// Print the job that would be installed and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run one cycle now, the way the schedule runs it.
+    Run,
+    /// Say where this machine stands, and fail when the arrangement is not working.
+    Status {
+        /// Print one JSON document instead of prose, for another program to read
+        #[arg(long)]
+        json: bool,
+    },
+    /// Take this machine off the schedule, keeping its channel and its record.
+    Uninstall,
+}
+
+#[derive(Subcommand)]
 enum NotesCommands {
     /// Mark a ticket's oldest or selected note as read.
     Ack {
@@ -610,17 +660,56 @@ fn main() {
             channel,
             tag,
             dry_run,
+            anyway,
         } => {
             let args = upgrade::UpgradeArgs {
                 channel,
                 tag,
                 dry_run,
+                anyway,
             };
             if let Err(e) = upgrade::run_upgrade(args) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
+        Commands::Nightly { action } => match action {
+            NightlyCommands::Install {
+                project,
+                alert,
+                dry_run,
+            } => {
+                let args = nightly::InstallArgs {
+                    project,
+                    alert,
+                    dry_run,
+                };
+                if let Err(e) = nightly::run_install(args) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            NightlyCommands::Run => match nightly::run_cycle() {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            NightlyCommands::Status { json } => match nightly::run_status(json) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            NightlyCommands::Uninstall => {
+                if let Err(e) = nightly::run_uninstall() {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Commands::Version => {
             // Keep the release-pinned runtime manifest in every platform build.
             // Without this OS-neutral reference, fat LTO can remove the Linux-only

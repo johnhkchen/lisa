@@ -79,6 +79,11 @@ rows with the live command tree and config catalog.
 | `flag:lisa/upgrade:--channel` | Put this machine on a channel and move in one command | working default | Without the flag, the channel this machine already recorded decides, and a machine that has never recorded one is treated as stable. | `a_machine_that_has_never_chosen_is_treated_as_stable_and_says_so` | — |
 | `flag:lisa/upgrade:--dry-run` | Say what would happen and change nothing | working default | Default is off, so Lisa carries the upgrade out unless a preview is requested. | `setting_a_channel_and_upgrading_is_one_command` | — |
 | `flag:lisa/upgrade:--tag` | Move to one exact release, which is how you go back | working default | Without the flag, the channel picks the release; naming a tag is the rollback. | `a_tag_pins_to_an_exact_release_and_an_unknown_one_is_refused` | — |
+| `flag:lisa/upgrade:--anyway` | Move even though this machine has a run on it | working default | Default is off, so an upgrade never swaps the binary a live run is calling; the refusal names this flag for the operator who knows the run is finished with it. | `an_upgrade_does_not_land_under_a_live_run` | — |
+| `flag:lisa/nightly/install:--project` | Name the board a new release is checked against | working default | Without the flag, the cycle checks that the version landed and says plainly that nothing deeper was asked. | `a_cycle_with_no_project_checks_the_version_and_says_so` | — |
+| `flag:lisa/nightly/install:--alert` | Name the command that carries a failure off this machine | working default | Without the flag, a failing cycle still shouts on the box — stderr, the system log, a desktop notification — and the record says nothing left the machine. | `an_alarm_with_nowhere_to_go_says_so_rather_than_reading_as_sent` | — |
+| `flag:lisa/nightly/install:--dry-run` | Print the job that would be installed and change nothing | working default | Default is off, so install sets the arrangement up unless a preview is requested. | `install_dry_run_prints_the_job_and_touches_nothing` | — |
+| `flag:lisa/nightly/status:--json` | Print one JSON document for another program | working default | Default is off, so a person still reads the same sentences; the exit status means the same either way. | `the_json_a_fleet_reads_says_what_the_prose_says` | — |
 
 ### Hidden and machine-facing commands
 

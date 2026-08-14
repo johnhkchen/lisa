@@ -15,7 +15,7 @@
 use std::process::{Command, Output};
 
 /// The commands an operator runs, foregrounded in `--help`.
-const OPERATOR_COMMANDS: [&str; 12] = [
+const OPERATOR_COMMANDS: [&str; 13] = [
     "init",
     "validate",
     "status",
@@ -28,6 +28,7 @@ const OPERATOR_COMMANDS: [&str; 12] = [
     "loop",
     "file-ticket",
     "upgrade",
+    "nightly",
 ];
 
 /// The five machinery-invoked commands: omitted from Clap's generated list but
@@ -74,6 +75,7 @@ Commands:
   schedulers     Show every run holding this board, and stop one that outlived its pane
   file-ticket    Put a new ticket on the board, from a draft you pipe in
   upgrade        Move this machine to the Lisa its channel asks for
+  nightly        Keep this machine on nightly on its own, and say how that is going
   help           Print this message or the help of the given subcommand(s)
 
 Options:
@@ -93,7 +95,7 @@ struct OperatorHelpSnapshot {
     expected: &'static str,
 }
 
-const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 12] = [
+const OPERATOR_HELP_SNAPSHOTS: [OperatorHelpSnapshot; 13] = [
     OperatorHelpSnapshot {
         command: "init",
         expected: r#"Set up a project to run with Lisa
@@ -292,6 +294,7 @@ Options:
       --channel <CHANNEL>  Put this machine on a channel (canary | nightly | stable), then upgrade
       --tag <TAG>          Move to this exact release instead, which is how you go back
       --dry-run            Say what would happen and change nothing
+      --anyway             Move even though this machine has a run on it
   -h, --help               Print help
 
 A machine picks one of three channels and keeps it in a per-user config file, not in the project: canary takes the newest release, nightly takes the newest release once it has aged past the soak window, and stable takes the newest release that is not a prerelease. A machine that has never chosen is treated as stable.
@@ -304,10 +307,34 @@ Examples:
   lisa upgrade --tag v0.4.4
 "#,
     },
+    OperatorHelpSnapshot {
+        command: "nightly",
+        expected: r#"Keep this machine on nightly on its own, and say how that is going
+
+Usage: lisa nightly <COMMAND>
+
+Commands:
+  install    Put this machine on nightly and let it upgrade itself
+  run        Run one cycle now, the way the schedule runs it
+  status     Say where this machine stands, and fail when the arrangement is not working
+  uninstall  Take this machine off the schedule, keeping its channel and its record
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+The machine this is for runs background work and meets each release before a person does. install puts a launchd job on it, run is one cycle of that job — skip if the machine is working, move if the nightly channel has a soaked release, check the new one against this board, shout if it does not hold up — and status is the question to ask a box you are not sitting at.
+
+Examples:
+  lisa nightly install --project ~/work/board
+  lisa nightly status
+  lisa nightly status --json
+"#,
+    },
 ];
 
 /// Every own subcommand. Removing or renaming any one must fail this test.
-const OWN_COMMANDS: [&str; 22] = [
+const OWN_COMMANDS: [&str; 23] = [
     "init",
     "validate",
     "status",
@@ -320,6 +347,7 @@ const OWN_COMMANDS: [&str; 22] = [
     "loop",
     "file-ticket",
     "upgrade",
+    "nightly",
     "agent-exec",
     "capture-usage",
     "claim",
@@ -414,14 +442,14 @@ fn assert_purpose_precedes_mechanism(surface: &str, output: &str) {
     }
 }
 
-/// (a) Every one of the 22 own subcommands resolves — including the hidden
+/// (a) Every one of the 23 own subcommands resolves — including the hidden
 /// five, which `--help` reaches even though they are absent from the listing.
 #[test]
 fn all_pinned_subcommands_resolve() {
     assert_eq!(
         OWN_COMMANDS.len(),
-        22,
-        "the pinned command set must be exactly 22"
+        23,
+        "the pinned command set must be exactly 23"
     );
     for cmd in OWN_COMMANDS {
         let out = run(&[cmd, "--help"]);

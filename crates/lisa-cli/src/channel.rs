@@ -247,6 +247,15 @@ pub(crate) struct MachineConfig {
     pub(crate) channel: Option<Channel>,
     /// The soak window `nightly` waits out.
     pub(crate) soak_hours: u64,
+    /// A project on this machine the unattended nightly run checks itself
+    /// against after it moves — the box's own workload, so a release that
+    /// breaks the work is caught by the work.
+    pub(crate) nightly_project: Option<PathBuf>,
+    /// What to run when an unattended run fails; the health record arrives on
+    /// its stdin. This is where a machine's alarm reaches a person. Unset means
+    /// a failing run still shouts locally — stderr, the system log, a desktop
+    /// notification — but nothing leaves the box.
+    pub(crate) alert_command: Option<String>,
 }
 
 impl Default for MachineConfig {
@@ -254,6 +263,8 @@ impl Default for MachineConfig {
         Self {
             channel: None,
             soak_hours: DEFAULT_SOAK_HOURS,
+            nightly_project: None,
+            alert_command: None,
         }
     }
 }
@@ -276,6 +287,8 @@ impl MachineConfig {
 struct MachineConfigFile {
     channel: Option<String>,
     soak_hours: Option<u64>,
+    nightly_project: Option<PathBuf>,
+    alert_command: Option<String>,
 }
 
 /// The directory the machine config lives in: `$LISA_CONFIG_DIR` when set,
@@ -335,7 +348,61 @@ pub(crate) fn load_from(path: &Path) -> Result<MachineConfig, String> {
     Ok(MachineConfig {
         channel,
         soak_hours,
+        nightly_project: parsed.nightly_project,
+        alert_command: parsed.alert_command,
     })
+}
+
+/// Quote a value as a TOML basic string, so a path with a space or a command
+/// with a quote in it survives the round trip.
+fn toml_string(raw: &str) -> String {
+    let mut quoted = String::with_capacity(raw.len() + 2);
+    quoted.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            '\r' => quoted.push_str("\\r"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// The optional lines: written when this machine has set them, absent when it
+/// has not, so the file never claims a setting nobody made.
+fn render_optional(config: &MachineConfig) -> String {
+    let mut lines = String::new();
+
+    lines.push_str(
+        "\n# The project an unattended nightly run checks itself against after it moves.\n\
+         # Set it to a board this machine actually works, so a release that breaks the\n\
+         # work is caught by the work: lisa nightly install --project <path>\n",
+    );
+    match &config.nightly_project {
+        Some(path) => lines.push_str(&format!(
+            "nightly_project = {}\n",
+            toml_string(&path.to_string_lossy())
+        )),
+        None => lines.push_str("# nightly_project = \"/path/to/a/board\"\n"),
+    }
+
+    lines.push_str(
+        "\n# What to run when an unattended run fails. The health record arrives on its\n\
+         # stdin. Point it at something you actually read; without it a failure only\n\
+         # shouts on this box.\n",
+    );
+    match &config.alert_command {
+        Some(command) => lines.push_str(&format!("alert_command = {}\n", toml_string(command))),
+        None => lines.push_str(
+            "# alert_command = \"curl -sS -X POST -d @- https://example.invalid/hook\"\n",
+        ),
+    }
+
+    lines
 }
 
 /// Render the machine config as the file an operator will open and edit.
@@ -353,11 +420,12 @@ fn render(config: &MachineConfig) -> String {
          channel = \"{channel}\"\n\
          \n\
          # Hours a release must age before the nightly channel will take it.\n\
-         soak_hours = {}\n",
+         soak_hours = {}\n{}",
         Channel::Canary.rule(),
         Channel::Nightly.rule(),
         Channel::Stable.rule(),
         config.soak_hours,
+        render_optional(config),
     )
 }
 
@@ -414,6 +482,41 @@ pub(crate) fn parse_rfc3339_utc(raw: &str) -> Option<i64> {
     }
 
     Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Render epoch seconds back as the same UTC grammar
+/// [`parse_rfc3339_utc`] reads, so a record a person opens carries a time they
+/// can read rather than a number they have to convert.
+pub(crate) fn format_rfc3339_utc(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let seconds = epoch.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60,
+    )
+}
+
+/// The civil date a count of days since 1970-01-01 lands on, by Howard
+/// Hinnant's `civil_from_days` — the exact inverse of [`days_from_civil`].
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// Days between 1970-01-01 and the given civil date, by Howard Hinnant's
@@ -615,6 +718,7 @@ mod tests {
             &MachineConfig {
                 channel: Some(Channel::Stable),
                 soak_hours: 6,
+                ..MachineConfig::default()
             },
         )
         .unwrap();
@@ -628,6 +732,65 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("channel = \"nightly\""), "{raw}");
         assert!(raw.contains("soak_hours = 6"), "{raw}");
+    }
+
+    #[test]
+    fn what_the_nightly_arrangement_records_survives_the_next_channel_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+
+        save_to(
+            &path,
+            &MachineConfig {
+                channel: Some(Channel::Nightly),
+                soak_hours: DEFAULT_SOAK_HOURS,
+                nightly_project: Some(PathBuf::from("/Users/someone/a board")),
+                alert_command: Some("curl -d @- \"https://example.invalid/hook\"".to_string()),
+            },
+        )
+        .unwrap();
+
+        // Rewriting the file for a channel change must not drop the two
+        // settings the unattended run depends on.
+        set_channel_at(&path, Channel::Canary).unwrap();
+
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.channel, Some(Channel::Canary));
+        assert_eq!(
+            config.nightly_project,
+            Some(PathBuf::from("/Users/someone/a board"))
+        );
+        assert_eq!(
+            config.alert_command.as_deref(),
+            Some("curl -d @- \"https://example.invalid/hook\"")
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_nightly_settings_leaves_them_commented_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        save_to(&path, &MachineConfig::default()).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# nightly_project ="), "{raw}");
+        assert!(raw.contains("# alert_command ="), "{raw}");
+
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.nightly_project, None);
+        assert_eq!(config.alert_command, None);
+    }
+
+    #[test]
+    fn a_time_written_down_reads_back_as_the_same_instant() {
+        for stamp in [
+            "2026-08-14T09:12:33Z",
+            "1970-01-01T00:00:00Z",
+            "2000-02-29T23:59:59Z",
+        ] {
+            let epoch = parse_rfc3339_utc(stamp).expect(stamp);
+            assert_eq!(format_rfc3339_utc(epoch), stamp);
+        }
     }
 
     #[test]

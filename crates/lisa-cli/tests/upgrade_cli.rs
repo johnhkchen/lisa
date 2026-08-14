@@ -266,6 +266,53 @@ fn with_no_network_it_fails_loudly_and_changes_nothing() {
     );
 }
 
+/// The guard T-068-01-03 added: a machine with a run on it keeps the binary
+/// that run is calling. This is the one case that gets as far as being ready to
+/// download something, so it is run without `--dry-run` — and it still fetches
+/// no artifact, because the refusal comes first.
+#[test]
+fn an_upgrade_does_not_land_under_a_live_run() {
+    let server = ReleaseServer::start(RELEASE_LIST);
+    let config = TempDir::new().unwrap();
+
+    let zellij = TempDir::new().unwrap();
+    let script = zellij.path().join("zellij");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'board [Created 34m ago] (current)'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
+        .args(["upgrade", "--channel", "stable"])
+        .env("LISA_CONFIG_DIR", config.path())
+        .env("LISA_RELEASES_URL", &server.url)
+        .env("PATH", format!("{}:/usr/bin:/bin", zellij.path().display()))
+        .output()
+        .expect("run lisa upgrade");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stdout_of(&output));
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("not moving lisa while this machine is working"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("board"), "the run is named: {stderr}");
+    assert!(
+        stderr.contains("lisa upgrade --anyway"),
+        "the way past it is named too: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("lisa {INSTALLED}")) && stderr.contains("is unchanged"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn an_unknown_channel_names_the_three_that_exist() {
     let config = TempDir::new().unwrap();
