@@ -26,6 +26,7 @@ mod loop_cmd;
 mod nightly;
 mod notes;
 mod preownership_status;
+mod promote;
 mod proposal;
 mod reset_ticket;
 mod run_summary;
@@ -357,6 +358,34 @@ enum Commands {
     Proposal {
         #[command(subcommand)]
         action: ProposalCommands,
+    },
+    /// Say which release the nightly channel should carry, and write it down.
+    ///
+    /// The publisher-side half of the nightly rule: one machine runs it against
+    /// the live release list and writes the answer into the promotion pointer
+    /// the tap and the apt suites are built from, so a package-managed box gets
+    /// a soaked release without holding a clock of its own.
+    #[command(hide = true)]
+    PromoteNightly {
+        /// A GitHub releases-API response to judge, or `-` for standard input
+        #[arg(long, default_value = "-")]
+        releases: PathBuf,
+
+        /// The promotion pointer to read, and to write with --write
+        #[arg(long, default_value = promote::POINTER_PATH)]
+        pointer: PathBuf,
+
+        /// Write the decision to the pointer file
+        #[arg(long)]
+        write: bool,
+
+        /// Emit the decision as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Judge against this instant, in Unix seconds, instead of the clock
+        #[arg(long)]
+        now: Option<i64>,
     },
     /// Verify observable world-owned waits without operator involvement.
     #[command(hide = true)]
@@ -710,6 +739,28 @@ fn main() {
                 }
             }
         },
+        Commands::PromoteNightly {
+            releases,
+            pointer,
+            write,
+            json,
+            now,
+        } => {
+            let args = promote::PromoteArgs {
+                releases,
+                pointer,
+                write,
+                json,
+                now,
+            };
+            match promote::run_promote(args) {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Version => {
             // Keep the release-pinned runtime manifest in every platform build.
             // Without this OS-neutral reference, fat LTO can remove the Linux-only
