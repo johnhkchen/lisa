@@ -1,0 +1,16 @@
+{
+  "disposition": "block",
+  "reason": "The arrangement is built, tested and rehearsed for real (guard, rollback, soak hold), but the Mac mini cannot be put on nightly yet: no published release carries `lisa upgrade` or `lisa nightly` — both exist only on main — so the mini cannot install the arrangement or read as level with the nightly channel, and a read-only look at johns-mac-mini.local found no lisa, no zellij and no board on it at all. Three criteria need the machine and a release first: the mini actually on nightly, its next run recorded, and a rollback performed there.",
+  "remedy_owner": "operator",
+  "ask": "Publish a Lisa release with this work in it, then set the Mac mini up on it and save what it reports into docs/knowledge/mac-mini-nightly-record.json in this repo.",
+  "steps": [
+    "Cut a release from main so `lisa upgrade` and `lisa nightly` are published (see docs/knowledge/release-checklist.md).",
+    "On the mini: brew install zellij",
+    "On the mini: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh",
+    "On the mini, give it a board to work and check releases against, then: lisa nightly install --project <that board> --alert '<the command that reaches you>'",
+    "On the mini: lisa nightly run    (one cycle now, rather than waiting for 04:30)",
+    "Save the answer into this repo: lisa nightly status --json > docs/knowledge/mac-mini-nightly-record.json",
+    "Prove the way back on the mini itself: lisa upgrade --tag <the previous tag>, confirm the board still runs, then lisa upgrade to come forward again."
+  ],
+  "check": "python3 -c \"import json,sys;d=json.load(open('docs/knowledge/mac-mini-nightly-record.json'))['data'];sys.exit(0 if d.get('channel')=='nightly' and d.get('state')=='ok' and d.get('last_cycle') else 1)\""
+}

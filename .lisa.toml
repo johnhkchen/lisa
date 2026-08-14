@@ -1,6 +1,6 @@
 # Lisa project configuration
 
-version = "0.4.4"
+version = "0.5.0-rc.2"
 [dirs]
 tickets = "docs/active/tickets"
 stories = "docs/active/stories"
