@@ -114,6 +114,20 @@ to edit when 24 hours is the wrong wait. (A project's `.lisa.toml` also has a
 `version` field. That records the Lisa that set the *project* up and has nothing
 to do with channels.)
 
+**To find out where a machine stands, run `lisa doctor`.** It reports Lisa itself
+as one row — the channel this box is on, the version installed, and the version
+that channel resolves to right now — and when the two differ it names the command
+that settles the gap. A machine that is level says so once and stays quiet, a
+machine that has never picked a channel is reported as *unset* rather than
+silently counted as stable, and a machine that cannot reach the release list says
+that instead of claiming to be current. Being behind is something to know, not a
+refusal: `doctor` still exits the way it always did.
+
+```bash
+lisa doctor          # read it here
+lisa doctor --json   # collect it from every box: data.lisa.state is level, behind, ahead, waiting or unresolved
+```
+
 Two things `upgrade` deliberately does not do. With no network it stops, says it
 could not read the release list, and leaves the installed Lisa in place — it
 never guesses. And on a machine where Homebrew or apt owns `lisa`, it refuses to
@@ -504,8 +518,13 @@ including the exact fix when commit sealing is configured but unavailable. When
 Codex is selected, this also prepares directory trust for unattended
 `codex exec`.
 
+The first row is Lisa itself: which channel this machine is on, what it has
+installed, and what that channel resolves to. See
+[Keep Lisa current](#keep-lisa-current) for what the channels take.
+
 ```bash
 lisa doctor
+lisa doctor --json   # the same answer for a script; see `lisa json-guide`
 ```
 
 `lisa doctor` also says how this project differs from the Lisa you have

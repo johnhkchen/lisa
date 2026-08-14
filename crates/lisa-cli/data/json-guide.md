@@ -3,14 +3,15 @@
 Lisa runs coding agents through your ticket board, so you don't have to approve every step by hand.
 
 This guide is for a program, not a person: a status strip, a dashboard, a script. `lisa status`,
-`lisa validate` and `lisa file-ticket` already work out the whole answer and then write it as
-prose. Add `--json` and they hand you the answer itself instead.
+`lisa validate`, `lisa doctor` and `lisa file-ticket` already work out the whole answer and then
+write it as prose. Add `--json` and they hand you the answer itself instead.
 
     lisa status --json
     lisa validate --json
+    lisa doctor --json
     lisa file-ticket --story S-065-01 --json < draft.md
 
-Everything else is unchanged. Without `--json` all three print exactly the prose they always did,
+Everything else is unchanged. Without `--json` all four print exactly the prose they always did,
 and the exit status means exactly what it always meant.
 
 ## What you get
@@ -34,7 +35,7 @@ Every document has the same envelope:
 
 - `schema` and `schema_version` — the contract this document was written to.
 - `lisa_version` — which build answered.
-- `command` — `status`, `validate`, or `file-ticket`.
+- `command` — `status`, `validate`, `doctor`, or `file-ticket`.
 - `ok` — whether Lisa could work out an answer at all. **Not** whether the answer was good news.
 - `error` — `null` when `ok` is true; otherwise `{"message": "…"}` carrying the same sentence the
   prose would have printed.
@@ -52,6 +53,7 @@ contract; it never replaces it.
 | --- | --- | --- |
 | `lisa validate --json` | every check passed | problems were found, **or** Lisa could not answer |
 | `lisa status --json` | the board was reported | Lisa could not answer |
+| `lisa doctor --json` | every required tool is there and supported | one is missing or unsupported, **or** Lisa could not answer |
 | `lisa file-ticket --json` | the ticket is on the board | nothing was filed |
 
 `lisa validate --json` finding problems is an *answer*: `ok` is `true`, `error` is `null`,
@@ -263,6 +265,54 @@ you do not have to look, and `lisa release-seats` exists so you never have to re
 
 `path` names the file or place the problem is about; `message` is the reason, the same sentence the
 prose prints.
+
+## `lisa doctor --json`
+
+This is the one command here that answers about the *machine* rather than the board, which is what
+makes a fleet askable: run it on every box, collect the documents, and you can see which machines
+are behind without reading a terminal on each one in turn.
+
+`data` carries:
+
+| Field | What it is |
+| --- | --- |
+| `verdict` | `passed` or `failed` — the same verdict as the exit status. |
+| `client` | The agent this project runs: `claude` or `codex`. |
+| `lisa` | This machine's own Lisa: channel, version installed, and what that channel resolves to. See below. |
+| `completion_seal` | `commit` or `journal`, or `null` when the project could not resolve one. |
+| `completion_error` | Why it could not, or `null`. |
+| `checks[]` | `{name, required, status, detail, remedy}` — one entry per row of the report, in the order the report prints them. |
+
+`status` is one of `ok`, `missing`, `unsupported`, `behind`, or `skipped`. Only `missing` and
+`unsupported` on a `required` check make the verdict `failed`; `behind` and `skipped` never do.
+`remedy` is the command that settles the finding, or `null` when there is nothing to settle.
+
+`data.lisa` is the machine's own row, spelled out:
+
+| Field | What it is |
+| --- | --- |
+| `installed` | The version of Lisa answering, without the `v`. |
+| `channel` | The channel this machine recorded, or `null` when it has never chosen one. |
+| `effective_channel` | The channel actually applied — `stable` when nothing was chosen. |
+| `channel_error` | Why the machine's config could not be read, or `null`. |
+| `state` | `level`, `behind`, `ahead`, `waiting`, or `unresolved`. |
+| `resolved_tag` / `resolved_version` | The release the channel resolves to, or `null` when it resolves to none. |
+| `detail` | The same sentence the row prints. |
+| `remedy` | The command that moves this machine, or `null`. |
+
+`state` is the field to alert on:
+
+- `level` — the installed version is the one the channel resolves to.
+- `behind` — the channel names a newer release. `remedy` says how to take it.
+- `ahead` — this build is newer than its channel, which is what a machine that builds from source
+  looks like. Not drift.
+- `waiting` — the channel names no release this cycle. `nightly` mid-soak looks like this.
+- `unresolved` — the release list could not be read at all. **Not** the same as `level`: nothing was
+  checked, so nothing is being claimed. Treat a box stuck on `unresolved` as a box you cannot see.
+
+`lisa doctor --json` reports and does nothing else. The prose run tidies Zellij's plugin cache and
+prepares Codex's directory trust on its way past; the document does neither, so collecting it from
+every machine changes none of them.
 
 ## `lisa file-ticket --json`
 
