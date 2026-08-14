@@ -20,10 +20,26 @@ const ZELLIJ_INSTALL_REMEDY: &str =
 
 /// Result of checking a single dependency.
 enum CheckResult {
-    Found { version: String },
-    NotFound { install_hint: String },
-    Unsupported { description: String, remedy: String },
-    Skipped { reason: String },
+    Found {
+        version: String,
+    },
+    NotFound {
+        install_hint: String,
+    },
+    Unsupported {
+        description: String,
+        remedy: String,
+    },
+    /// The thing is here and out of date. Its own word, because "unsupported"
+    /// is a different claim: a Lisa one release behind its channel still runs,
+    /// and the row's job is to name the gap and the command that settles it.
+    Behind {
+        description: String,
+        remedy: String,
+    },
+    Skipped {
+        reason: String,
+    },
 }
 
 /// A dependency check: name, whether it's required, and a closure that performs the check.
@@ -60,6 +76,16 @@ impl fmt::Display for CheckReport {
                 write!(
                     f,
                     "  {:<12} unsupported\n    {}\n    Remedy: {}",
+                    self.name, description, remedy
+                )
+            }
+            CheckResult::Behind {
+                description,
+                remedy,
+            } => {
+                write!(
+                    f,
+                    "  {:<12} behind\n    {}\n    Remedy: {}",
                     self.name, description, remedy
                 )
             }
@@ -375,6 +401,16 @@ fn format_report(reports: &[CheckReport]) -> String {
     if has_failures(reports) {
         out.push_str(
             "Some required dependencies are unavailable or unsupported. Lisa requires supported versions of all required tools to run.",
+        );
+    } else if reports
+        .iter()
+        .any(|report| matches!(report.result, CheckResult::Behind { .. }))
+    {
+        // Nothing here stops a run, so the closing line still says so — and
+        // still says the gap is there, rather than letting "satisfied" be the
+        // last word an operator reads on a machine that is behind.
+        out.push_str(
+            "All dependencies satisfied. One check is behind, and its row names the command that settles it.",
         );
     } else {
         out.push_str("All dependencies satisfied.");
@@ -717,8 +753,80 @@ pub(crate) fn pregrant_codex_trust(work_tree: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Run the doctor command: check all dependencies and report.
-pub fn run_doctor(root: &Path) -> Result<(), String> {
+/// Ask this machine which Lisa it wants, and the published release list what
+/// that channel resolves to right now.
+///
+/// Every failure on the way is a reportable state rather than an error: an
+/// unreadable machine config, an unreachable release list, and a channel that
+/// is holding this cycle are all things an operator needs said out loud, and
+/// none of them is a reason for the rest of `doctor` not to run.
+fn look_at_lisa() -> Result<crate::freshness::Freshness, String> {
+    let installed = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|error| format!("this build's own version is unreadable: {error}"))?;
+    let machine = crate::channel::config_path().and_then(|path| crate::channel::load_from(&path));
+    let setting = crate::freshness::machine_setting(&machine);
+    let releases = crate::upgrade::fetch_releases_within(crate::upgrade::DOCTOR_LIST_TIMEOUT);
+
+    Ok(crate::freshness::assess(
+        installed,
+        setting,
+        &machine.unwrap_or_default(),
+        releases.as_deref().map_err(|error| error.clone()),
+        crate::channel::now_unix(),
+    ))
+}
+
+/// The `lisa` row itself, in the shape every other row uses.
+///
+/// Informational on purpose. A box one release behind its channel still runs,
+/// and a `doctor` that started failing on drift would fail on every machine in
+/// the fleet at once — including, every time a release is cut, the desk that
+/// built it. The row names the gap; moving is still a decision someone makes.
+fn lisa_report(check: &Result<crate::freshness::Freshness, String>) -> CheckReport {
+    use crate::freshness::State;
+
+    let result = match check {
+        Err(reason) => CheckResult::Skipped {
+            reason: reason.clone(),
+        },
+        Ok(freshness) => match (&freshness.state, freshness.remedy()) {
+            (State::Behind { .. }, Some(remedy)) => CheckResult::Behind {
+                description: freshness.summary(),
+                remedy,
+            },
+            (State::Unresolved { .. }, _) => CheckResult::Skipped {
+                reason: freshness.summary(),
+            },
+            _ => CheckResult::Found {
+                version: freshness.summary(),
+            },
+        },
+    };
+
+    CheckReport {
+        name: "lisa",
+        required: false,
+        result,
+    }
+}
+
+/// Everything `doctor` looked at, gathered once.
+///
+/// The prose report and the `--json` document are two renderings of this, so
+/// the two cannot disagree about what was found — a fleet asked by script and a
+/// fleet read on a terminal have to be the same fleet.
+struct Findings {
+    client: AgentClient,
+    announcement: &'static str,
+    completion: Result<crate::completion_seal::RunCompletionSeal, String>,
+    lisa: Result<crate::freshness::Freshness, String>,
+    /// The machine's rows: `lisa`, `zellij`, then the dependency checks.
+    reports: Vec<CheckReport>,
+    project: CheckReport,
+    has_project: bool,
+}
+
+fn gather(root: &Path) -> Result<Findings, String> {
     let validation = config::load_config(root)?;
     let resolved_config = config::resolve_config(&validation.config, None, None);
     let client = resolved_config.client;
@@ -730,23 +838,124 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
         Ok(resolved) => resolved.seal() == lisa_core::completion::CompletionSeal::Commit,
         Err(_) => true,
     };
-    let checks = build_checks(client, require_git);
-    let mut reports = vec![CheckReport {
-        name: "zellij",
-        required: true,
-        result: check_zellij_runtime(&resolved_config.zellij_runtime),
-    }];
-    reports.extend(run_checks(checks));
 
-    // Add project version check
-    let project_report = check_project_version(root);
-    let has_project = !matches!(project_report.result, CheckResult::Skipped { .. });
+    // Lisa itself comes first: the one version this report used to leave out is
+    // the one that decides what every row below it even means.
+    let lisa = look_at_lisa();
+    let mut reports = vec![
+        lisa_report(&lisa),
+        CheckReport {
+            name: "zellij",
+            required: true,
+            result: check_zellij_runtime(&resolved_config.zellij_runtime),
+        },
+    ];
+    reports.extend(run_checks(build_checks(client, require_git)));
 
-    let mut output = format!(
-        "{}\n\n{}",
-        resolved_config.client_announcement(),
-        format_report(&reports)
-    );
+    let project = check_project_version(root);
+    let has_project = !matches!(project.result, CheckResult::Skipped { .. });
+
+    Ok(Findings {
+        client,
+        announcement: resolved_config.client_announcement(),
+        completion,
+        lisa,
+        reports,
+        project,
+        has_project,
+    })
+}
+
+/// One check, as a script reads it.
+fn check_to_json(report: &CheckReport) -> serde_json::Value {
+    let (status, detail, remedy) = match &report.result {
+        CheckResult::Found { version } => ("ok", Some(version.clone()), None),
+        CheckResult::NotFound { install_hint } => ("missing", None, Some(install_hint.clone())),
+        CheckResult::Unsupported {
+            description,
+            remedy,
+        } => (
+            "unsupported",
+            Some(description.clone()),
+            Some(remedy.clone()),
+        ),
+        CheckResult::Behind {
+            description,
+            remedy,
+        } => ("behind", Some(description.clone()), Some(remedy.clone())),
+        CheckResult::Skipped { reason } => ("skipped", Some(reason.clone()), None),
+    };
+
+    serde_json::json!({
+        "name": report.name,
+        "required": report.required,
+        "status": status,
+        "detail": detail,
+        "remedy": remedy,
+    })
+}
+
+/// Run `lisa doctor --json`: the same findings, as one document.
+///
+/// Reporting only. The prose run cleans Zellij's plugin cache and seeds Codex
+/// trust on its way past; a document a script collects from every box in the
+/// fleet does neither.
+/// Emit the document and return the exit status that goes with it. The status
+/// keeps its existing meaning: `--json` adds a body, it does not replace the
+/// verdict.
+pub fn run_doctor_json(root: &Path) -> i32 {
+    match doctor_document(root) {
+        Ok((data, exit_code)) => crate::json_output::emit(
+            "doctor",
+            crate::json_output::Outcome::verdict(data, exit_code),
+        ),
+        Err(message) => {
+            crate::json_output::emit("doctor", crate::json_output::Outcome::Failure(message))
+        }
+    }
+}
+
+fn doctor_document(root: &Path) -> Result<(serde_json::Value, i32), String> {
+    let findings = gather(root)?;
+    let mut reports = findings.reports;
+    reports.push(findings.project);
+
+    let failed = has_failures(&reports) || findings.completion.is_err();
+
+    let data = serde_json::json!({
+        "verdict": if failed { "failed" } else { "passed" },
+        "client": findings.client.as_str(),
+        "lisa": match &findings.lisa {
+            Ok(freshness) => freshness.to_json(),
+            Err(error) => serde_json::json!({ "error": error }),
+        },
+        "completion_seal": match &findings.completion {
+            Ok(completion) => serde_json::json!(match completion.seal() {
+                lisa_core::completion::CompletionSeal::Commit => "commit",
+                lisa_core::completion::CompletionSeal::Journal => "journal",
+            }),
+            Err(_) => serde_json::Value::Null,
+        },
+        "completion_error": match &findings.completion {
+            Ok(_) => None,
+            Err(error) => Some(error.clone()),
+        },
+        "checks": reports.iter().map(check_to_json).collect::<Vec<_>>(),
+    });
+
+    Ok((data, i32::from(failed)))
+}
+
+/// Run the doctor command: check all dependencies and report.
+pub fn run_doctor(root: &Path) -> Result<(), String> {
+    let findings = gather(root)?;
+    let client = findings.client;
+    let completion = findings.completion;
+    let mut reports = findings.reports;
+    let project_report = findings.project;
+    let has_project = findings.has_project;
+
+    let mut output = format!("{}\n\n{}", findings.announcement, format_report(&reports));
 
     if has_project {
         output.push_str("\n\nChecking project...\n\n");
@@ -1860,6 +2069,113 @@ mod tests {
         let content = std::fs::read_to_string(&perms_path).unwrap();
         assert!(content.contains("lisa-plugin-old.wasm"));
         assert!(content.contains("lisa-plugin-new.wasm"));
+    }
+
+    // ---------------------------------------------------------------------
+    // The `lisa` row. The rules it reports are unit-tested in
+    // `src/freshness.rs`; what follows is how those states become a row an
+    // operator reads, and what that row does to doctor's verdict.
+    // ---------------------------------------------------------------------
+
+    fn freshness_at(installed: &str, setting: crate::freshness::Setting) -> CheckReport {
+        const NOW: i64 = 1_786_000_000;
+        let releases = [
+            crate::channel::Release::from_tag("v0.4.4", NOW - 26 * 86_400).unwrap(),
+            crate::channel::Release::from_tag("v0.5.0-rc.2", NOW - 5 * 86_400).unwrap(),
+        ];
+        lisa_report(&Ok(crate::freshness::assess(
+            semver::Version::parse(installed).unwrap(),
+            setting,
+            &crate::channel::MachineConfig::default(),
+            Ok(&releases),
+            NOW,
+        )))
+    }
+
+    #[test]
+    fn the_lisa_row_names_the_channel_the_version_and_what_the_channel_resolves_to() {
+        let row = freshness_at(
+            "0.4.4",
+            crate::freshness::Setting::Chosen(crate::channel::Channel::Stable),
+        )
+        .to_string();
+
+        assert!(
+            row.contains("  lisa "),
+            "the row is named like the rest: {row}"
+        );
+        assert!(row.contains("channel stable"), "{row}");
+        assert!(row.contains("installed 0.4.4"), "{row}");
+        assert!(row.contains("stable resolves to v0.4.4"), "{row}");
+        assert!(row.contains("OK"), "a level box is OK and quiet: {row}");
+    }
+
+    #[test]
+    fn a_lisa_behind_its_channel_is_a_named_row_that_carries_its_command() {
+        let report = freshness_at(
+            "0.4.3",
+            crate::freshness::Setting::Chosen(crate::channel::Channel::Stable),
+        );
+        let row = report.to_string();
+
+        assert!(row.contains("behind"), "{row}");
+        assert!(!row.contains("OK"), "a gap is not an OK row: {row}");
+        assert!(row.contains("Remedy: "), "{row}");
+        assert!(row.contains("lisa upgrade"), "{row}");
+
+        // Being behind is a thing to know, never a reason a run cannot start:
+        // every machine in the fleet is behind the moment a release is cut.
+        assert!(!has_failures(&[report]));
+    }
+
+    #[test]
+    fn an_unset_channel_is_reported_as_unset_and_asks_for_one() {
+        let row = freshness_at("0.4.3", crate::freshness::Setting::Unset).to_string();
+
+        assert!(row.contains("channel unset (treated as stable)"), "{row}");
+        assert!(row.contains("lisa upgrade --channel <name>"), "{row}");
+    }
+
+    /// Offline, the row says what it could not do and reports the installed
+    /// version. It must not read as OK: nothing checked whether this box is
+    /// level, and a green row would be a claim nobody made.
+    #[test]
+    fn with_no_release_list_the_row_says_so_instead_of_claiming_level() {
+        let report = lisa_report(&Ok(crate::freshness::assess(
+            semver::Version::parse("0.4.4").unwrap(),
+            crate::freshness::Setting::Chosen(crate::channel::Channel::Nightly),
+            &crate::channel::MachineConfig::default(),
+            Err("cannot read the release list at https://api.github.com/…: dns error".to_string()),
+            1_786_000_000,
+        )));
+        let row = report.to_string();
+
+        assert!(row.contains("skipped"), "{row}");
+        assert!(row.contains("installed 0.4.4"), "{row}");
+        assert!(row.contains("could not be resolved"), "{row}");
+        assert!(!row.contains("resolves to v"), "{row}");
+        assert!(!has_failures(&[report]));
+    }
+
+    #[test]
+    fn a_behind_row_still_says_every_dependency_is_satisfied_and_names_the_gap() {
+        let reports = vec![
+            freshness_at(
+                "0.4.3",
+                crate::freshness::Setting::Chosen(crate::channel::Channel::Stable),
+            ),
+            CheckReport {
+                name: "git",
+                required: true,
+                result: CheckResult::Found {
+                    version: "git version 2.39.5".to_string(),
+                },
+            },
+        ];
+        let output = format_report(&reports);
+
+        assert!(output.contains("All dependencies satisfied."), "{output}");
+        assert!(output.contains("One check is behind"), "{output}");
     }
 
     /// The tool section is the part of `lisa doctor` people already know, and

@@ -206,9 +206,12 @@ Usage: lisa doctor [OPTIONS]
 
 Options:
       --path <PATH>  Path to the project root (defaults to current directory) [default: .]
+      --json         Write one JSON document instead of the report
   -h, --help         Print help
 
 Example: lisa doctor --path ./my-project
+
+For another program to read: lisa doctor --json. What the fields mean and which ones you can rely on: lisa json-guide
 "#,
     },
     OperatorHelpSnapshot {

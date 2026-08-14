@@ -124,13 +124,28 @@ fn package_managed_refusal(method: &InstallMethod, exe: &Path) -> String {
     )
 }
 
+/// How long `upgrade` waits on the release list. It is about to download and
+/// run an installer, so it can afford to wait.
+const UPGRADE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long `doctor` waits on the same list. Shorter on purpose: `doctor` is
+/// one row in a report a person is reading, and an unreachable list is an
+/// answer it can give rather than a reason to sit there.
+pub(crate) const DOCTOR_LIST_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Read the published release list.
 pub(crate) fn fetch_releases() -> Result<Vec<Release>, String> {
+    fetch_releases_within(UPGRADE_LIST_TIMEOUT)
+}
+
+/// Read the published release list, waiting no longer than `read_timeout` for
+/// the body.
+pub(crate) fn fetch_releases_within(read_timeout: Duration) -> Result<Vec<Release>, String> {
     let url = std::env::var(RELEASES_URL_ENV).unwrap_or_else(|_| RELEASES_API.to_string());
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(10))
+        .timeout_connect(Duration::from_secs(10).min(read_timeout))
+        .timeout_read(read_timeout)
+        .timeout_write(Duration::from_secs(10).min(read_timeout))
         .redirects(5)
         .build();
 

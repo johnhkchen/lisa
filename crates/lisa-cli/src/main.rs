@@ -13,6 +13,7 @@ mod currency;
 mod detect;
 mod doctor;
 mod file_ticket;
+mod freshness;
 mod headless;
 mod heal_panes;
 mod hooks_guide;
@@ -376,12 +377,16 @@ enum Commands {
     /// Check that the tools Lisa needs are installed.
     #[command(
         display_order = 6,
-        after_help = "Example: lisa doctor --path ./my-project"
+        after_help = "Example: lisa doctor --path ./my-project\n\nFor another program to read: lisa doctor --json. What the fields mean and which ones you can rely on: lisa json-guide"
     )]
     Doctor {
         /// Path to the project root (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
+
+        /// Write one JSON document instead of the report
+        #[arg(long)]
+        json: bool,
     },
     /// Print Lisa's version.
     #[command(hide = true)]
@@ -585,8 +590,16 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Doctor { path } => {
+        Commands::Doctor { path, json } => {
             let path = resolve_path(&path);
+            if json {
+                std::process::exit(match lisa_project_gate(&path) {
+                    Ok(()) => doctor::run_doctor_json(&path),
+                    Err(message) => {
+                        json_output::emit("doctor", json_output::Outcome::Failure(message))
+                    }
+                });
+            }
             require_lisa_project(&path);
             if let Err(e) = doctor::run_doctor(&path) {
                 eprintln!("Error: {}", e);

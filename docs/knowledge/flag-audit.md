@@ -51,6 +51,7 @@ rows with the live command tree and config catalog.
 | `flag:lisa/already-done:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/proposal/apply:--path` | Choose the project folder for applying advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
 | `flag:lisa/proposal/dismiss:--path` | Choose the project folder for dismissing advice | working default | Default is `.`, the current folder. | `flag_audit_covers_live_cli_config_and_prompts` | — |
+| `flag:lisa/doctor:--json` | Print one JSON document for another program | working default | Default is off, so a person still reads the same report; the exit status means the same either way. | `the_json_document_carries_the_same_fields_as_the_row` | — |
 | `flag:lisa/doctor:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
 | `flag:lisa/clean:--dry-run` | Say out loud that this run only prints the list | working default | Default is off, and a bare run already prints the list; passing it refuses to be combined with `--remove`. | `a_bare_run_prints_the_plan_and_changes_not_one_byte` | — |
 | `flag:lisa/clean:--path` | Choose the project folder | working default | Default is `.`, the current folder. | `operator_help_matches_snapshots` | — |
