@@ -344,8 +344,13 @@ pub(crate) fn read(found: &[Install]) -> Option<Verdict> {
         )));
     }
 
+    // "this machine has N lisas" was a completeness claim this method cannot
+    // support: it looks in the install locations lisa knows about, plus whatever
+    // is running. `screen-design` found a fifth on a box this reported four on —
+    // a sibling build artifact nothing had invoked. Claiming only what was
+    // checked is the same discipline the rest of this check is for.
     let mut description = format!(
-        "this machine has {} lisa{}:",
+        "{} lisa{} where lisa looks, plus the one running this:",
         found.len(),
         if found.len() == 1 { "" } else { "s" }
     );
