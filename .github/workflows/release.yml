@@ -594,12 +594,15 @@ jobs:
             for formula in lisa lisa-nightly lisa-canary; do
               path="Formula/$formula.rb"
               [[ -e tap/$path ]] || continue
+              # Style first and ask git after, because `brew style --fix` rewrites
+              # the file: what is committed is the styled version, so a release
+              # that changes nothing really leaves no commit behind.
+              # We avoid reformatting user-provided data such as the app description and homepage.
+              brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "tap/$path" || true
               if [[ -z $(git -C tap status --porcelain -- "$path") ]]; then
                 continue
               fi
               version=$(awk -F'"' '/^  version "/ { print $2; exit }' "tap/$path")
-              # We avoid reformatting user-provided data such as the app description and homepage.
-              brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "tap/$path" || true
 
               git -C tap add "$path"
               git -C tap commit -m "${formula} ${version}"
