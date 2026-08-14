@@ -1,0 +1,187 @@
+# Promote a soaked release into the nightly channel (T-069-01-03).
+#
+# Soak used to be a rule every machine ran for itself, against the release list,
+# on its own clock. With channels as packages it belongs to the publisher: a
+# release lands in canary immediately and is promoted into nightly a day later
+# if nothing superseded it -- decided once, here, where the releases are. After
+# that `brew upgrade` and `apt-get upgrade` are correct on their own, with no
+# Lisa logic in the path.
+#
+# This is a schedule, not a release-time step. Soak is a wait, and nothing at
+# release time can wait for it.
+#
+# What it does, in order:
+#
+#   1. reads the release list as it stands right now -- not a snapshot from when
+#      the tag was cut, so a yanked release is simply not there to promote;
+#   2. asks `lisa promote-nightly`, which runs channel.rs's own nightly rule, so
+#      the window and the superseded rule are the ones a curl-installed box uses;
+#   3. writes packaging/apt/nightly-tag.txt when, and only when, the answer
+#      changed;
+#   4. republishes the tap and the apt archive from that pointer.
+#
+# A run with nothing to promote stops after step 2: no commit, no formula
+# rewrite, no re-signed suite.
+name: Promote nightly
+
+on:
+  schedule:
+    # Hourly, off the hour. The soak window is a day; checking every hour is
+    # what keeps "a day later" from meaning "a day and a half later".
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Decide and report, but write and publish nothing
+        type: boolean
+        default: false
+
+concurrency:
+  group: promote-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  decide:
+    name: Decide
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      target: ${{ steps.decide.outputs.target }}
+      canary: ${{ steps.decide.outputs.canary }}
+      note: ${{ steps.decide.outputs.note }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DRY_RUN: ${{ github.event.inputs.dry-run || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Read the release list
+        run: gh api --paginate "repos/$GITHUB_REPOSITORY/releases" > "$RUNNER_TEMP/releases.json"
+
+      - id: decide
+        name: Decide what nightly should carry
+        shell: bash
+        run: |
+          set -euo pipefail
+          write=(--write)
+          if [[ $DRY_RUN == true ]]; then
+            write=()
+          fi
+
+          cargo run -q -p lisa-cli -- promote-nightly \
+            --releases "$RUNNER_TEMP/releases.json" \
+            --pointer packaging/apt/nightly-tag.txt \
+            --json "${write[@]}" > "$RUNNER_TEMP/decision.json"
+
+          cat "$RUNNER_TEMP/decision.json"
+
+          read_field() { jq -r ".$1 // empty" "$RUNNER_TEMP/decision.json"; }
+          action=$(read_field action)
+          target=$(read_field target)
+          canary=$(read_field canary)
+          newest=$(read_field newest)
+          reason=$(read_field reason)
+          overdue=$(read_field overdue_hours)
+          soak=$(read_field soak_hours)
+
+          {
+            echo "action=$action"
+            echo "target=$target"
+            echo "canary=$canary"
+            echo "note<<LISA_EOF"
+            echo "$reason"
+            echo "LISA_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### nightly promotion"
+            echo
+            echo "- **action:** \`$action\`"
+            echo "- **nightly carries:** \`$target\`"
+            echo "- **canary carries:** \`$canary\`"
+            echo "- **soak window:** ${soak}h"
+            echo "- **why:** $reason"
+            if [[ $DRY_RUN == true ]]; then
+              echo "- **dry run:** nothing was written or published"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # A promotion job that quietly stops reads exactly like a healthy one
+          # from a machine's point of view, so say both ways it can be unwell.
+          if [[ ${overdue:-0} -gt 24 ]]; then
+            echo "::warning::$target was promotable ${overdue}h before this run took it;" \
+              "the promotion schedule is not keeping up"
+          fi
+          if [[ -n $newest && -n $canary && $newest != "$canary" ]]; then
+            echo "::warning::$newest is the newest release but does not carry a complete" \
+              "asset set, so no channel can point at it; nightly is held at $target"
+          fi
+
+      - name: Record the promotion on main
+        if: ${{ steps.decide.outputs.action != 'unchanged' && github.event.inputs.dry-run != 'true' }}
+        shell: bash
+        env:
+          ACTION: ${{ steps.decide.outputs.action }}
+          TARGET: ${{ steps.decide.outputs.target }}
+          NOTE: ${{ steps.decide.outputs.note }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # [skip ci] on purpose. This commit changes one word in one data file
+          # and no code, and a CI run on main is what auto-release.yml watches
+          # for -- a promotion must never cut a release.
+          git add packaging/apt/nightly-tag.txt
+          git commit --message "$ACTION lisa-nightly: $TARGET [skip ci]" \
+            --message "$NOTE" \
+            --message "Written by .github/workflows/promote-nightly.yml."
+
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+  publish-apt-repository:
+    name: Publish apt
+    needs: decide
+    if: ${{ needs.decide.outputs.action != 'unchanged' && github.event.inputs.dry-run != 'true' }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish-apt-repository.yml
+    with:
+      ref: main
+    secrets: inherit
+
+  publish-homebrew-tap:
+    name: Publish tap
+    needs: decide
+    if: ${{ needs.decide.outputs.action != 'unchanged' && github.event.inputs.dry-run != 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-homebrew-tap.yml
+    with:
+      ref: main
+      release-tag: ${{ needs.decide.outputs.canary }}
+      note: ${{ needs.decide.outputs.note }}
+    secrets: inherit

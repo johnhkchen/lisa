@@ -51,3 +51,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      # The soak promotion's shell half: which formula a promotion moves, and
+      # that a publish with nothing to say leaves no commit in the tap. The
+      # decision itself is Rust and runs above.
+      - name: Rehearse a nightly promotion
+        run: scripts/verify-nightly-promotion.sh
