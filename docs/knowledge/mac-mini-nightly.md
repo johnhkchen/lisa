@@ -48,6 +48,17 @@ and refuses if it is not — a job that quietly followed `stable` while calling
 itself nightly is the failure this catches. `lisa upgrade --channel nightly`
 moves it, by swapping formulae.
 
+**One mover per box.** A machine that already has a package-manager timer —
+something doing `brew upgrade` on a schedule — must lose it when it joins
+nightly. Not because the two fight: on a package-managed box `lisa nightly run`
+hands the swap to `brew` itself, so both end up running the same upgrade and
+Homebrew's per-formula lock makes even a true overlap serialise. The reason is
+bookkeeping. **Only one of them keeps a record.** `lisa nightly status` answers
+from `nightly/health.json`, so a move made by the other timer leaves it reporting
+`level` — a true statement about an event it never saw. Keep `lisa nightly` as
+the mover, because it is the one that writes down what happened, and let anything
+else report rather than move.
+
 ---
 
 ## Where the schedule lives
@@ -153,6 +164,21 @@ lisa nightly status --json   # data.state is "ok" or "finding"
 - the box has **skipped three cycles in a row** because it is always working, so
   it is not moving at all,
 - **nothing has ever run** here.
+
+**The check ships inside the thing it checks, and that is a permanent limit.**
+`lisa doctor` and `lisa nightly status` are part of Lisa, so a machine can only
+run the version of them its own Lisa carries. A box one release behind runs
+last release's checks — the Mac mini on `0.4.4` cannot run the install-shadowing
+check that landed in `0.5.0-rc.3`, so the fleet's one certified machine could not
+run the check that certifies it. That case is mild, because it is behind on
+purpose.
+
+**The bad case is the same property pointed the wrong way: a box that fell off
+its channel silently is running the oldest code in the fleet, which makes it the
+box least able to tell you so.** Never take a quiet `doctor` from a machine whose
+version you have not confirmed separately — ask what it is running first, then
+decide what its answer was worth. Every fleet check added from here inherits
+this; it is not a bug to fix, it is a thing to read output through.
 
 ---
 
