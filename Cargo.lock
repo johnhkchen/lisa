@@ -1601,7 +1601,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "lisa-cli"
-version = "0.5.0"
+version = "0.5.1-rc.1"
 dependencies = [
  "clap 4.5.57",
  "directories",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "lisa-core"
-version = "0.5.0"
+version = "0.5.1-rc.1"
 dependencies = [
  "proptest",
  "proptest-state-machine",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "lisa-plugin"
-version = "0.5.0"
+version = "0.5.1-rc.1"
 dependencies = [
  "ascii-dag",
  "libc",
