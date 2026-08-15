@@ -64,7 +64,7 @@ Commands:
   status         Show which tickets are ready to run and which are waiting, and why
   notes          Read or acknowledge updates from work that kept moving
   unblock        Verify what changed and let a waiting ticket run again
-  already-done   Finish a ticket whose work is already recorded in history
+  already-done   Finish a ticket whose work is done and whose record isn't
   doctor         Check that the tools Lisa needs are installed
   clean          Remove what an older Lisa left behind, once you have read the list
   proposal       Settle a first-responder proposal for a waiting ticket
@@ -186,16 +186,18 @@ Example: lisa unblock T-001 --path ./my-project
     },
     OperatorHelpSnapshot {
         command: "already-done",
-        expected: r#"Finish a ticket whose work is already recorded in history
+        expected: r#"Finish a ticket whose work is done and whose record isn't
 
 Usage: lisa already-done [OPTIONS] <TICKET_ID>
 
 Arguments:
-  <TICKET_ID>  Ticket whose work is already saved
+  <TICKET_ID>  Ticket Lisa could not finish
 
 Options:
       --path <PATH>  Path to the project root (defaults to current directory) [default: .]
   -h, --help         Print help
+
+Lisa finds the finishing commit if it is already in your history, and writes it if it isn't. It needs one or the other; it will not take your word for it.
 
 Example: lisa already-done T-001 --path ./my-project
 "#,

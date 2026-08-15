@@ -555,8 +555,14 @@ ticket parks under **Waiting on you** with one plain sentence naming what to do
 churn silently, and none leaves a state you can't recover from the dashboard or
 `lisa unblock`. And when the work itself did get committed but the finishing
 record didn't, Lisa stops retrying after a couple of tries and tells you to run
-`lisa already-done` — which checks history for that work before it settles
-anything.
+`lisa already-done` — which checks for that work before it settles anything, and
+writes the finishing record itself when that record is the only thing missing.
+
+Every rejection Lisa writes into the journal names the command that clears it,
+and a run that won't take a ready ticket says so in its Activity pane rather
+than sitting quietly beside it. `lisa status` agrees: a ticket nothing can
+schedule is counted as blocked and listed under **Tickets no run will take**,
+never as ready.
 
 Projects without history don't lose the seal — they get a different one. Where
 a repository exists, finished work is **commit-sealed** exactly as above. Where
@@ -911,14 +917,28 @@ unblock stays tellable apart from one that passed on its own.
 
 ### `lisa already-done`
 
-Finish a ticket whose work is already saved in your project's history. Now and
-then Lisa commits a ticket's work and then can't record the finishing touch —
-the ticket sits waiting while the work itself is safely in history. This settles
-it: Lisa looks for that work, and if it's really there, marks the ticket done
-and writes the record.
+Finish a ticket Lisa started to finish and couldn't. Now and then a ticket's
+work is done, reviewed, and safely saved — and the record that says so doesn't
+get written. The ticket sits waiting and no run will pick it up. This is the
+command that ends that.
 
-If Lisa can't find the work in history, nothing changes and it says so. Your
-word isn't enough — the commit has to be there.
+It settles it one of two ways, and tells you which:
+
+- **The record is there and nothing read it back.** Lisa finds the finishing
+  commit already in your history and marks the ticket done against it. Nothing
+  new is committed.
+- **The record was never written.** Lisa writes it now — the same finishing
+  commit the run itself would have made, carrying the ticket and its review.
+
+What Lisa looks for, in that order, is a commit carrying this ticket's
+`Lisa-Completion-Key:` line, and failing that, the ticket's published review in
+`docs/active/work/<ticket-id>/`. A commit that merely mentions the ticket in its
+subject is neither, which is why a ticket with five commits to its name can
+still have nothing here to settle. If neither is there, nothing changes and Lisa
+says exactly what it looked for. Your word isn't enough.
+
+A review that *blocked* the work is a different matter, and this command won't
+step over it — clear the block first.
 
 ```bash
 lisa already-done T-001-01

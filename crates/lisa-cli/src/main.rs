@@ -164,13 +164,13 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
-    /// Finish a ticket whose work is already recorded in history.
+    /// Finish a ticket whose work is done and whose record isn't.
     #[command(
         display_order = 5,
-        after_help = "Example: lisa already-done T-001 --path ./my-project"
+        after_help = "Lisa finds the finishing commit if it is already in your history, and writes it if it isn't. It needs one or the other; it will not take your word for it.\n\nExample: lisa already-done T-001 --path ./my-project"
     )]
     AlreadyDone {
-        /// Ticket whose work is already saved
+        /// Ticket Lisa could not finish
         ticket_id: String,
 
         /// Path to the project root (defaults to current directory)
