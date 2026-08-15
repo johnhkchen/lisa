@@ -24,12 +24,12 @@
       "took_a_release_untouched": {
         "at": "2026-08-14T18:09:00-07:00",
         "said": "moved 0.4.4 -> 0.5.0",
-        "how": "launchd fired the job; nobody ran brew. The schedule was shortened from 04:37 to 18:09 for the test and restored immediately after — the clock was touched, the mechanism was not.",
-      "on_formula": "lisa, not lisa-nightly. The mover's FORMULA line was changed to lisa-nightly at 18:42, after this move and before the 18:43 cycle. Same script, same job, same brew upgrade — the unattended move is proven, on the formula the box was on at the time.",
+        "how": "launchd fired the job; nobody ran brew. The schedule was shortened from 04:37 to 18:09 for the test and restored immediately after \u2014 the clock was touched, the mechanism was not.",
+        "on_formula": "lisa, not lisa-nightly. The mover's FORMULA line was changed to lisa-nightly at 18:42, after this move and before the 18:43 cycle. Same script, same job, same brew upgrade \u2014 the unattended move is proven, on the formula the box was on at the time.",
         "before_recorded": "brew list --versions lisa said 0.4.4, and zellij list-sessions was empty, both read BEFORE firing so the log line could not be confused with a no-op"
       },
-      "doctor_agrees": "channel nightly (from the Homebrew formula lisa-nightly), installed 0.5.0 — and `lisa install` reads one lisa, at /opt/homebrew/bin/lisa, and `lisa` runs it",
-      "decided_by": "the operator, 2026-08-14, in the inbox under the handle `what-the-mac-mini-is-for` — chose the canary over the safe one, then chose nightly over canary because canary is noisy and withdraws releases an hour later",
+      "doctor_agrees": "channel nightly (from the Homebrew formula lisa-nightly), installed 0.5.0 \u2014 and `lisa install` reads one lisa, at /opt/homebrew/bin/lisa, and `lisa` runs it",
+      "decided_by": "the operator, 2026-08-14, in the inbox under the handle `what-the-mac-mini-is-for` \u2014 chose the canary over the safe one, then chose nightly over canary because canary is noisy and withdraws releases an hour later",
       "reread_from_the_machine": {
         "at": "2026-08-14, T-068-01-03 Review, read-only over ssh",
         "doctor": "channel nightly (from the Homebrew formula lisa-nightly), installed 0.5.0, level; one lisa at /opt/homebrew/bin/lisa and `lisa` runs it; zellij 0.44.3 system, supported",
@@ -38,9 +38,23 @@
       }
     },
     "not_yet_true": [
-      "Nothing leaves this machine when a night goes wrong, and the log cannot tell a failed `brew upgrade` from a night with nothing to do — both print `current at <version>`.",
-      "Rollback has not been performed on this machine. It was rehearsed on the dev desk; `lisa upgrade --tag` on a Homebrew box leaves a second lisa in ~/.local/bin and that path is untested here."
+      "Rollback has not been performed on this machine. It was rehearsed on the dev desk; `lisa upgrade --tag` on a Homebrew box leaves a second lisa in ~/.local/bin and that path is untested here. It needs the mini idle \u2014 the renderer loop was live all evening and swapping the binary under it is the exact failure the held guard exists to prevent."
     ],
-    "why_this_machine": "It runs real work. renderer had 35 done and a live loop when this was written. A nightly box with nothing on it proves nothing and reports healthy while doing so."
+    "why_this_machine": "It runs real work. renderer had 35 done and a live loop when this was written. A nightly box with nothing on it proves nothing and reports healthy while doing so.",
+    "alert": {
+      "leaves_the_box": "A failed night writes ~/ergo-fleet/lisa-stay-current.alert on the mini \u2014 schema lisa.nightly-alert/v1, carrying the host, the formula, why it failed, whether any lisa is still installed, whether `lisa --version` still answers, and brew's own words. The laptop reads it over the reach desk.toml already spells (`ssh mini cat ~/ergo-fleet/lisa-stay-current.alert`). A success deletes the file, so a file sitting there always means the LAST attempt failed, not that one once did.",
+      "tells_failure_from_noop": true,
+      "how_it_used_to_lie": "brew upgrade's exit status was thrown away and the outcome was inferred from comparing the version before and after, so a failed upgrade logged `current at 0.5.0 on lisa-nightly` \u2014 the same words a healthy no-op prints. The status is now kept and there are four outcomes, each one word at the front of the line: held / current / moved / failed.",
+      "also_covered": "brew update failing is its own failure now. Without it, `current` would be a claim about a shelf the machine never managed to look at.",
+      "proved_it_shouts": {
+        "at": "2026-08-14T22:19:50-07:00",
+        "how": "A sandboxed copy of the real script \u2014 three edits only: a formula that cannot exist, temp log/alert paths, and the live-session guard raised so the rest of the script was reachable while renderer was looping. No package on this machine was touched.",
+        "logged": "failed \u2014 brew upgrade lisa-no-such-formula-20260814 exited 1 and NO lisa-no-such-formula-20260814 is installed",
+        "alert_said": "why=brew upgrade exited 1, lisa_still_runs=lisa 0.5.0 \u2014 so a reader learns the box is not dead in the same breath as learning the night failed",
+        "exit_code": 1,
+        "and_the_good_night": "The same copy with brew stubbed to succeed deleted the alert file and logged `current at`, exit 0. Both directions verified."
+      },
+      "why_a_pull_and_not_a_push": "The desk's rule is no-background: nothing on the mini opens a port, waits, or pushes to a third-party service the operator did not choose. Which off-box channel \u2014 a webhook, a push service, mail \u2014 is the operator's call and is asked in the 2026-08-14 night brief. screen-design T-025-03 is the ticket for making a fact filed on one machine reach the desk properly."
+    }
   }
 }
