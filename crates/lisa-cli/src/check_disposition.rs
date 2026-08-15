@@ -3,12 +3,14 @@
 use std::env;
 use std::path::{Component, Path, PathBuf};
 
+use clap::CommandFactory;
 use lisa_core::disposition::{check_review_disposition, ReviewDisposition};
 use lisa_core::parking::validate_block_ask;
 
 use crate::check_run::{
     budget_for, format_budget, run_check, sanitize_observation, CheckResult, CheckRun,
 };
+use crate::disposition_verbs::{unknown_verb_message, unknown_verbs_in_block, Vocabulary};
 
 const DISPOSITION_FILE: &str = "review-disposition.json";
 
@@ -26,13 +28,30 @@ pub fn run_check_disposition(project_root: &Path, ticket_id: &str) -> Result<Str
 
     let mut trailer = String::new();
     if let ReviewDisposition::Block {
+        reason,
         ask,
+        steps,
         check,
         check_timeout_secs,
         ..
     } = &disposition
     {
         validate_block_ask(ask).map_err(|error| fix(error.to_string()))?;
+        // Before the check is run, because a step is the half a person is
+        // handed and the one nothing else will ever exercise.
+        let unknown = unknown_verbs_in_block(
+            reason,
+            ask,
+            steps.as_deref(),
+            check.as_deref(),
+            &Vocabulary::from_command(&crate::Cli::command()),
+        );
+        if !unknown.is_empty() {
+            return Err(fix(unknown_verb_message(
+                &unknown,
+                env!("CARGO_PKG_VERSION"),
+            )));
+        }
         if let Some(check) = check {
             let run = run_check(project_root, check, budget_for(*check_timeout_secs))?;
             match run.result {

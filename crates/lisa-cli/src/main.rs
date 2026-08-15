@@ -12,6 +12,7 @@ mod completion_seal;
 mod config;
 mod currency;
 mod detect;
+mod disposition_verbs;
 mod doctor;
 mod file_ticket;
 mod freshness;

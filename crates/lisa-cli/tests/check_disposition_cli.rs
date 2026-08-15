@@ -197,6 +197,62 @@ fn a_check_that_can_never_run_is_refused_at_record_time() {
     }
 }
 
+/// The other field case: a step that told an operator to type a verb lisa does
+/// not have.
+///
+/// It reached them because nothing between the reviewer and the terminal knew
+/// what `lisa --help` says. `unrecognized subcommand` then reads as *my install
+/// is wrong*, which is the most expensive way to be wrong — so the objection
+/// happens here, one turn after it is written, naming the verb and the version.
+#[test]
+fn a_step_naming_a_verb_this_lisa_lacks_is_refused_at_record_time() {
+    let fixture = Fixture::new();
+    let document = serde_json::json!({
+        "disposition": "block",
+        "reason": "Rollback has never been performed on that box.",
+        "remedy_owner": "operator",
+        "ask": "Run the previous Lisa on the mini once, to prove you can go back.",
+        "steps": [
+            "Prove the way back, on the mini: lisa rollback --tag v0.4.4",
+            "Confirm the work still runs under it: lisa --version, then lisa status --path ~/board",
+        ],
+    });
+
+    let output = fixture.run_private(&serde_json::to_string(&document).unwrap());
+
+    assert_fix(output.clone(), "step 1 names `lisa rollback`");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("has no rollback subcommand"), "{stderr}");
+    assert!(
+        stderr.contains("Prove the way back, on the mini: lisa rollback --tag v0.4.4"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("`lisa --help` lists them"), "{stderr}");
+    // The step that names real verbs is not what the objection is about.
+    assert!(!stderr.contains("lisa status"), "{stderr}");
+}
+
+/// A remedy that names real verbs — including hidden and nested ones — is not
+/// slowed down by the check.
+#[test]
+fn a_step_naming_real_verbs_passes_untouched() {
+    let fixture = Fixture::new();
+    let document = serde_json::json!({
+        "disposition": "block",
+        "reason": "The mini has not run the board since it moved.",
+        "remedy_owner": "operator",
+        "ask": "Run the board once on the mini and confirm it comes back clean.",
+        "steps": [
+            "On the mini: lisa doctor, then lisa status --path ~/board",
+            "If a ticket is waiting on you: lisa unblock <ticket-id>",
+            "Check the schedule it keeps: lisa nightly status --json",
+        ],
+        "check": "test -f board-ran",
+    });
+
+    assert_success(fixture.run_private(&serde_json::to_string(&document).unwrap()));
+}
+
 /// A satisfiable check passes unchanged — including the ordinary case where it
 /// reports no, because nobody has performed the remedy yet.
 #[test]
