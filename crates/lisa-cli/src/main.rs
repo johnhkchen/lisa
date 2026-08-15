@@ -352,7 +352,12 @@ enum Commands {
                       machine, over the last day and the last week. Raw counts read from \
                       session transcripts, not a provider's own accounting — say what you have \
                       spent, not what you have left. A machine that cannot be reached is named, \
-                      never counted as zero.\n\nExample: lisa spend --path ./my-project"
+                      never counted as zero.\n\n--guard compares the week's total against \
+                      [scheduling].weekly_token_allowance and, only when this board is also \
+                      [scheduling].priority = \"low\", stops this board's own loop and tells \
+                      rail. Without an allowance configured, or with any machine unreachable, \
+                      --guard reports and does nothing.\n\nExample: lisa spend --path \
+                      ./my-project\nExample: lisa spend --guard --path ./my-project"
     )]
     Spend {
         /// Project to fall back to if the desk-wide machine list can't be learned
@@ -362,6 +367,11 @@ enum Commands {
         /// Seconds to wait for a remote machine before calling it unreachable
         #[arg(long, default_value_t = spend::DEFAULT_REACH_TIMEOUT)]
         reach_timeout_secs: u64,
+
+        /// Stop this board's own loop when it is low priority and over its
+        /// configured weekly token allowance (T-072-01-02)
+        #[arg(long)]
+        guard: bool,
     },
     /// Keep this machine on nightly on its own, and say how that is going.
     #[command(
@@ -731,9 +741,21 @@ fn main() {
         Commands::Spend {
             path,
             reach_timeout_secs,
+            guard,
         } => {
             let path = resolve_path(&path);
-            print!("{}", spend::run_spend(&path, reach_timeout_secs));
+            if guard {
+                let (text, action) = spend::run_guard(&path, reach_timeout_secs);
+                print!("{text}");
+                if let spend::GuardAction::Stop { spent, allowance } = action {
+                    if let Err(e) = spend::stop_for_guard(&path, spent, allowance) {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print!("{}", spend::run_spend(&path, reach_timeout_secs));
+            }
         }
         Commands::Nightly { action } => match action {
             NightlyCommands::Install {

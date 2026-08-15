@@ -166,7 +166,37 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         default: "{}",
         description: "Limits how many agents of each kind can work at once.",
     },
+    ConfigKey {
+        path: "scheduling.priority",
+        section: "scheduling",
+        key: "priority",
+        default: "\"medium\"",
+        description: "Sets how expendable this board's loop is when spend runs low; only a board marked low ever stops itself.",
+    },
+    ConfigKey {
+        path: "scheduling.weekly_token_allowance",
+        section: "scheduling",
+        key: "weekly_token_allowance",
+        default: "1000000",
+        description: "Sets the token budget lisa spend --guard compares this week's spend against; unset means the guard never acts.",
+    },
 ];
+
+/// Parses `[scheduling].priority` (T-072-01-02). A second small parser rather
+/// than reusing ticket frontmatter's private one — the vocabulary is the same
+/// four words, but this one surfaces through [`validate_config`]'s error
+/// shape, not [`lisa_core::ticket::TicketError`].
+fn parse_scheduling_priority(value: &str) -> Result<lisa_core::types::Priority, String> {
+    match value.to_lowercase().as_str() {
+        "low" => Ok(lisa_core::types::Priority::Low),
+        "medium" => Ok(lisa_core::types::Priority::Medium),
+        "high" => Ok(lisa_core::types::Priority::High),
+        "critical" => Ok(lisa_core::types::Priority::Critical),
+        _ => Err(format!(
+            "[scheduling].priority must be one of: low, medium, high, critical (got {value:?})"
+        )),
+    }
+}
 
 pub(crate) fn config_key(path: &str) -> Option<&'static ConfigKey> {
     CONFIG_KEYS.iter().find(|entry| entry.path == path)
@@ -268,6 +298,14 @@ pub struct SchedulingConfig {
     /// via [`validate_config`] rather than a raw serde failure, mirroring how
     /// `[agent].client` is handled.
     pub provider_caps: Option<std::collections::HashMap<String, usize>>,
+    /// How expendable this board's loop is when spend runs low (T-072-01-02).
+    /// Kept raw so an unknown value surfaces through [`validate_config`]
+    /// rather than a serde failure, mirroring `[agent].client`.
+    pub priority: Option<String>,
+    /// The token budget `lisa spend --guard` compares this week's desk-wide
+    /// spend against. Absent means the guard has nothing to act on and never
+    /// acts — an unconfigured number is not a low reading (T-072-01-02 AC).
+    pub weekly_token_allowance: Option<u64>,
 }
 
 /// Why the resolved agent client was selected for this process.
@@ -311,6 +349,13 @@ pub struct ResolvedConfig {
     pub provider_caps: std::collections::HashMap<String, usize>,
     pub triage_enabled: bool,
     pub triage_timeout_secs: u64,
+    /// This board's own priority for `lisa spend --guard` (T-072-01-02).
+    /// Defaults to [`lisa_core::types::Priority::Medium`] — a board that
+    /// never configured one is never the one Lisa stops on its own.
+    pub priority: lisa_core::types::Priority,
+    /// The configured weekly token budget, or `None` when unset (the guard
+    /// stays inert either way).
+    pub weekly_token_allowance: Option<u64>,
 }
 
 impl Default for ResolvedConfig {
@@ -335,6 +380,8 @@ impl Default for ResolvedConfig {
             provider_caps: std::collections::HashMap::new(),
             triage_enabled: PluginConfig::DEFAULT_TRIAGE_ENABLED,
             triage_timeout_secs: PluginConfig::DEFAULT_TRIAGE_TIMEOUT_SECS,
+            priority: lisa_core::types::Priority::default(),
+            weekly_token_allowance: None,
         }
     }
 }
@@ -496,6 +543,13 @@ fn resolve_config_with_availability(
             .triage
             .timeout_secs
             .unwrap_or(defaults.triage_timeout_secs),
+        priority: config
+            .scheduling
+            .priority
+            .as_deref()
+            .and_then(|value| parse_scheduling_priority(value).ok())
+            .unwrap_or(defaults.priority),
+        weekly_token_allowance: config.scheduling.weekly_token_allowance,
     }
 }
 
@@ -834,6 +888,19 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
             }
         }
     }
+    // A bad value here is refused at read time, the same as every other fixed
+    // vocabulary in this section — not discovered later, when `lisa spend
+    // --guard` silently falls back to the default and never stops a board the
+    // operator meant to mark low (T-072-01-02).
+    if let Some(priority) = config.scheduling.priority.as_deref() {
+        parse_scheduling_priority(priority)?;
+    }
+    if config.scheduling.weekly_token_allowance == Some(0) {
+        return Err(
+            "[scheduling].weekly_token_allowance must be at least 1, or left out entirely"
+                .to_string(),
+        );
+    }
 
     Ok(ConfigValidation { config, warnings })
 }
@@ -949,6 +1016,8 @@ max_threads = {}
 {}
 {}
 {}
+{}
+{}
 "#,
         key("version").description,
         key("version").default,
@@ -973,6 +1042,8 @@ max_threads = {}
         key("scheduling.assignment_ack_timeout_secs").commented_stub(),
         key("scheduling.phase_timeouts").commented_stub(),
         key("scheduling.provider_caps").commented_stub(),
+        key("scheduling.priority").commented_stub(),
+        key("scheduling.weekly_token_allowance").commented_stub(),
     )
 }
 
@@ -1013,6 +1084,8 @@ wind_down_secs = 5
 assignment_ack_timeout_secs = 2
 phase_timeouts = {}
 provider_caps = {}
+priority = "low"
+weekly_token_allowance = 500000
 "#;
 
     #[derive(Debug, PartialEq, Eq)]
@@ -2208,6 +2281,45 @@ codex = 6
         let config = LisaConfig::default();
         let resolved = resolve_config(&config, None, None);
         assert!(resolved.provider_caps.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_priority_defaults_to_medium_and_reads_configured_low() {
+        let default_resolved = resolve_config(&LisaConfig::default(), None, None);
+        assert_eq!(
+            default_resolved.priority,
+            lisa_core::types::Priority::Medium
+        );
+
+        let toml_str = "[scheduling]\npriority = \"low\"\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None, None);
+        assert_eq!(resolved.priority, lisa_core::types::Priority::Low);
+    }
+
+    #[test]
+    fn test_validate_unknown_priority_is_error() {
+        let toml_str = "[scheduling]\npriority = \"whenever\"\n";
+        let err = validate_config(toml_str).unwrap_err();
+        assert!(err.contains("[scheduling].priority"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_weekly_token_allowance_defaults_to_none() {
+        let resolved = resolve_config(&LisaConfig::default(), None, None);
+        assert_eq!(resolved.weekly_token_allowance, None);
+
+        let toml_str = "[scheduling]\nweekly_token_allowance = 42\n";
+        let config: LisaConfig = toml::from_str(toml_str).unwrap();
+        let resolved = resolve_config(&config, None, None);
+        assert_eq!(resolved.weekly_token_allowance, Some(42));
+    }
+
+    #[test]
+    fn test_validate_weekly_token_allowance_zero_is_error() {
+        let toml_str = "[scheduling]\nweekly_token_allowance = 0\n";
+        let err = validate_config(toml_str).unwrap_err();
+        assert!(err.contains("weekly_token_allowance"), "{err}");
     }
 
     #[test]

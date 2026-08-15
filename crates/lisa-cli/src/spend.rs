@@ -1,10 +1,18 @@
 //! `lisa spend` — what the desk has spent, read straight off its own captures.
 //!
-//! **This is the reading half of `S-072-01`; `T-072-01-02` is what to do about
-//! the number.** Nothing here decides anything or writes anything. It reads
+//! **The bare command is the reading half of `S-072-01`.** It reads
 //! `.lisa/<client>/captures.jsonl` on this machine and on every other machine
 //! `rail desk --hosts --json` names, sums what it finds by model and by
-//! machine, over the last day and the last week, and says so.
+//! machine, over the last day and the last week, and says so. It decides
+//! nothing and writes nothing.
+//!
+//! **`--guard` is `T-072-01-02`: what to do about the number, on this board
+//! alone.** It reuses the same reading, compares it against a
+//! `[scheduling].weekly_token_allowance` the operator configured, and —
+//! only when this board is also marked `[scheduling].priority = "low"` —
+//! stops this board's own loop and tells the operator through
+//! `rail tell --kind loop-degraded`. See
+//! `docs/knowledge/spend-autonomy.md` for the chosen position and why.
 //!
 //! ## Why raw totals, not a fraction of an allowance
 //!
@@ -476,12 +484,11 @@ fn discover_hosts(fallback_path: &Path) -> (Vec<DeskHost>, Option<String>) {
     )
 }
 
-/// Read every reachable machine's captures and render the answer.
-///
-/// `path` is the project this process was asked about; it is only used when
-/// the desk-wide machine list could not be learned, as the one project to
-/// fall back to.
-pub fn run_spend(path: &Path, reach_timeout_secs: u64) -> String {
+/// Read every reachable machine's captures, once, for both `run_spend` and
+/// `run_guard`. `path` is the project this process was asked about; it is
+/// only used when the desk-wide machine list could not be learned, as the one
+/// project to fall back to.
+fn compute_report(path: &Path, reach_timeout_secs: u64) -> (SpendReport, Option<String>) {
     let (hosts, discovery_note) = discover_hosts(path);
     let now = system_time_to_epoch(SystemTime::now());
     let timeout = Duration::from_secs(reach_timeout_secs);
@@ -498,12 +505,245 @@ pub fn run_spend(path: &Path, reach_timeout_secs: u64) -> String {
         })
         .collect();
 
-    let report = aggregate(now, &per_host);
+    (aggregate(now, &per_host), discovery_note)
+}
+
+/// Read every reachable machine's captures and render the answer.
+pub fn run_spend(path: &Path, reach_timeout_secs: u64) -> String {
+    let (report, discovery_note) = compute_report(path, reach_timeout_secs);
     render(&report, discovery_note.as_deref())
 }
 
 /// The default reach timeout, exposed for the CLI's `--reach-timeout-secs`.
 pub const DEFAULT_REACH_TIMEOUT: u64 = DEFAULT_REACH_TIMEOUT_SECS;
+
+/// `lisa spend --guard` — running low is a decision, not a crash (T-072-01-02).
+///
+/// **The position, chosen in [`docs/knowledge/spend-autonomy.md`]: it stops,
+/// but never starts or changes.** Running low ends this board's own loop when
+/// it opted itself in; it never swaps a model, never changes effort, and
+/// never touches a board it did not ask to stop. Stopping is the reversible
+/// direction — a stopped loop restarts with `lisa loop` — and it cannot
+/// produce the kind of surprising result a silent model swap can.
+///
+/// Fraction of the configured allowance a board must have spent, this week,
+/// before the guard will consider stopping its own loop. Not a rate limiter —
+/// spending 80% on Monday is legal (`S-072-01`) — this is the point past
+/// which "keep going and hope" stops being a decision and starts being an
+/// accident.
+const LOW_SPEND_STOP_PCT: u64 = 90;
+
+/// What `lisa spend --guard` decided, and why. Every variant renders to a
+/// sentence an operator reads without opening the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardAction {
+    /// No `[scheduling].weekly_token_allowance` is configured. There is
+    /// nothing to compare the spend against, so nothing acts — an
+    /// unconfigured number is not a low reading.
+    NoAllowanceConfigured,
+    /// One or more hosts could not be reached this pass. A desk-wide total
+    /// with a hole in it is not a low reading either, so the guard refuses to
+    /// act on it (T-072-01-02 AC: "nothing acts on a number it could not
+    /// read").
+    UnreadableSpend { unreachable: Vec<String> },
+    /// Spend is under the threshold. Frontloading is legal; this is
+    /// knowledge, not a rule to pace against.
+    BelowThreshold { spent: u64, allowance: u64 },
+    /// Spend is over the threshold, but this board never marked itself low.
+    /// The default priority (medium) protects a board that never configured
+    /// one — only a board explicitly marked low is ever a stop target
+    /// (T-072-01-02 AC).
+    NotEligible {
+        spent: u64,
+        allowance: u64,
+        priority: lisa_core::types::Priority,
+    },
+    /// Spend is over the threshold and this board is low priority: stop it.
+    Stop { spent: u64, allowance: u64 },
+}
+
+fn pct_spent(spent: u64, allowance: u64) -> u64 {
+    spent.saturating_mul(100) / allowance.max(1)
+}
+
+fn priority_word(priority: lisa_core::types::Priority) -> &'static str {
+    match priority {
+        lisa_core::types::Priority::Critical => "critical",
+        lisa_core::types::Priority::High => "high",
+        lisa_core::types::Priority::Medium => "medium",
+        lisa_core::types::Priority::Low => "low",
+    }
+}
+
+/// The guard's whole decision, as a pure function of what it read: the
+/// desk-wide spend, the configured allowance, and this board's own priority.
+/// Nothing here touches a scheduler or shells to `rail` — that half is
+/// [`stop_for_guard`], reached only when this returns [`GuardAction::Stop`].
+pub fn decide_guard_action(
+    report: &SpendReport,
+    allowance: Option<u64>,
+    priority: lisa_core::types::Priority,
+) -> GuardAction {
+    let Some(allowance) = allowance else {
+        return GuardAction::NoAllowanceConfigured;
+    };
+    if !report.unreachable.is_empty() {
+        return GuardAction::UnreadableSpend {
+            unreachable: report.unreachable.iter().map(|(h, _)| h.clone()).collect(),
+        };
+    }
+    let spent = report.week.total.input_tokens + report.week.total.output_tokens;
+    if spent * 100 < allowance * LOW_SPEND_STOP_PCT {
+        return GuardAction::BelowThreshold { spent, allowance };
+    }
+    if priority != lisa_core::types::Priority::Low {
+        return GuardAction::NotEligible {
+            spent,
+            allowance,
+            priority,
+        };
+    }
+    GuardAction::Stop { spent, allowance }
+}
+
+/// Render a [`GuardAction`] as the text `lisa spend --guard` prints under the
+/// ordinary spend report.
+pub fn render_guard_action(action: &GuardAction) -> String {
+    match action {
+        GuardAction::NoAllowanceConfigured => {
+            "Guard: [scheduling].weekly_token_allowance is not set, so there is nothing to \
+             compare this week's spend against. Not acting.\n"
+                .to_string()
+        }
+        GuardAction::UnreadableSpend { unreachable } => format!(
+            "Guard: {} machine{} could not be reached this pass, so this week's total has a \
+             hole in it. Not acting on a reading it could not fully take.\n",
+            unreachable.len(),
+            if unreachable.len() == 1 { "" } else { "s" },
+        ),
+        GuardAction::BelowThreshold { spent, allowance } => format!(
+            "Guard: {spent} of {allowance} tokens spent this week ({}%), under the \
+             {LOW_SPEND_STOP_PCT}% mark. Nothing to do — spending early is not an error.\n",
+            pct_spent(*spent, *allowance),
+        ),
+        GuardAction::NotEligible {
+            spent,
+            allowance,
+            priority,
+        } => format!(
+            "Guard: {spent} of {allowance} tokens spent this week ({}%), over the \
+             {LOW_SPEND_STOP_PCT}% mark, but this board's [scheduling].priority is {} — only a \
+             board marked low stops itself. Nothing to do.\n",
+            pct_spent(*spent, *allowance),
+            priority_word(*priority),
+        ),
+        GuardAction::Stop { spent, allowance } => format!(
+            "Guard: {spent} of {allowance} tokens spent this week ({}%), over the \
+             {LOW_SPEND_STOP_PCT}% mark, and this board is low priority. Stopping its loop.\n",
+            pct_spent(*spent, *allowance),
+        ),
+    }
+}
+
+/// Read every reachable machine's captures, decide what the guard should do
+/// about it, and render both. Returns the decision alongside the text so the
+/// caller can act on [`GuardAction::Stop`] with [`stop_for_guard`] — reading
+/// and deciding are pure; only the caller's next step touches the outside
+/// world.
+pub fn run_guard(path: &Path, reach_timeout_secs: u64) -> (String, GuardAction) {
+    let (report, discovery_note) = compute_report(path, reach_timeout_secs);
+
+    let resolved = match crate::config::load_config(path) {
+        Ok(validation) => crate::config::resolve_config(&validation.config, None, None),
+        Err(_) => crate::config::ResolvedConfig::default(),
+    };
+    let action = decide_guard_action(&report, resolved.weekly_token_allowance, resolved.priority);
+
+    let mut text = render(&report, discovery_note.as_deref());
+    text.push('\n');
+    text.push_str(&render_guard_action(&action));
+    (text, action)
+}
+
+/// Carries out a [`GuardAction::Stop`]: ends every live scheduler on this
+/// board through the same path `lisa schedulers --stop` uses, so a stopped
+/// run is exactly as restartable and exactly as describable by
+/// `lisa schedulers` afterward as one an operator stopped by hand
+/// (T-072-01-02 AC: "ended cleanly, not killed"). Then tells the operator
+/// through `rail tell --kind loop-degraded`, the closest existing fact to a
+/// loop that stopped itself.
+///
+/// `rail` is best-effort: a stop that already happened must still say so
+/// somewhere the operator will see it even when `rail` is absent or refuses,
+/// so its failure falls back to stdout rather than turning a successful stop
+/// into an `Err`.
+pub fn stop_for_guard(root: &Path, spent: u64, allowance: u64) -> Result<(), String> {
+    // Every recorded scheduler, not a pre-filtered "live" subset: `stop_one`
+    // (inside `run_schedulers`) already tells a genuinely running one from a
+    // stale record and cleans the stale one up rather than re-killing it, so
+    // a second filter here would only disagree with it about the same
+    // question and cost a second presence probe to do it.
+    let roster = lisa_core::schedulers::read_roster(root);
+    let ids: Vec<String> = roster
+        .iter()
+        .map(|record| record.scheduler_id.clone())
+        .collect();
+
+    if ids.is_empty() {
+        println!("No scheduler has recorded itself here; nothing to stop.");
+    } else {
+        for id in &ids {
+            crate::schedulers::run_schedulers(root, Some(id))?;
+        }
+    }
+
+    let what = format!(
+        "spent {spent} of its {allowance}-token weekly allowance ({}%) and is a low-priority \
+         board",
+        pct_spent(spent, allowance),
+    );
+    let do_ = if ids.is_empty() {
+        "Lisa found nothing running to stop; restart with `lisa loop` once the allowance \
+         resets or is raised."
+            .to_string()
+    } else {
+        format!(
+            "Lisa stopped {} recorded scheduler{} here; restart with `lisa loop` once the \
+             allowance resets or is raised.",
+            ids.len(),
+            if ids.len() == 1 { "" } else { "s" },
+        )
+    };
+    tell_rail(root, &what, &do_);
+    Ok(())
+}
+
+/// `rail tell --kind loop-degraded`, or a stdout line naming the same fact
+/// when `rail` cannot carry it — a stop that happened must never read as a
+/// stop that went unreported.
+fn tell_rail(root: &Path, what: &str, do_: &str) {
+    let result = Command::new("rail")
+        .args([
+            "tell",
+            "--kind",
+            "loop-degraded",
+            "--project",
+            &root.display().to_string(),
+            "--what",
+            what,
+            "--do",
+            do_,
+        ])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            println!("Told rail (loop-degraded): {what}");
+        }
+        _ => {
+            println!("Could not tell rail; saying so here instead: {what} — {do_}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -727,5 +967,121 @@ mod tests {
             projects: vec![],
         };
         assert_eq!(host.display_label(), "mini (ssh mini)");
+    }
+
+    use lisa_core::types::Priority;
+
+    fn report_with_week_total(input: u64, output: u64) -> SpendReport {
+        let mut report = SpendReport::default();
+        report.week.total.input_tokens = input;
+        report.week.total.output_tokens = output;
+        report
+    }
+
+    #[test]
+    fn no_allowance_configured_means_the_guard_never_acts() {
+        let report = report_with_week_total(1_000, 0);
+        let action = decide_guard_action(&report, None, Priority::Low);
+        assert_eq!(action, GuardAction::NoAllowanceConfigured);
+    }
+
+    #[test]
+    fn an_unreachable_host_refuses_to_act_even_over_threshold() {
+        let mut report = report_with_week_total(950, 0);
+        report
+            .unreachable
+            .push(("mini (ssh mini)".to_string(), "timed out".to_string()));
+        let action = decide_guard_action(&report, Some(1_000), Priority::Low);
+        assert_eq!(
+            action,
+            GuardAction::UnreadableSpend {
+                unreachable: vec!["mini (ssh mini)".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn frontloading_under_the_threshold_is_legal_and_does_nothing() {
+        // 80% spent, under the 90% mark — S-072-01 is explicit this is not an
+        // error, even on a low-priority board.
+        let report = report_with_week_total(800, 0);
+        let action = decide_guard_action(&report, Some(1_000), Priority::Low);
+        assert_eq!(
+            action,
+            GuardAction::BelowThreshold {
+                spent: 800,
+                allowance: 1_000
+            }
+        );
+    }
+
+    #[test]
+    fn a_board_with_no_configured_priority_is_never_the_one_that_stops() {
+        // Priority::default() is Medium — what an unconfigured board resolves
+        // to (T-072-01-02 AC: "a board with no priority must not become the
+        // one that gets stopped").
+        let report = report_with_week_total(950, 0);
+        let action = decide_guard_action(&report, Some(1_000), Priority::default());
+        assert_eq!(
+            action,
+            GuardAction::NotEligible {
+                spent: 950,
+                allowance: 1_000,
+                priority: Priority::Medium,
+            }
+        );
+    }
+
+    #[test]
+    fn a_low_priority_board_over_threshold_stops() {
+        let report = report_with_week_total(900, 50);
+        let action = decide_guard_action(&report, Some(1_000), Priority::Low);
+        assert_eq!(
+            action,
+            GuardAction::Stop {
+                spent: 950,
+                allowance: 1_000
+            }
+        );
+    }
+
+    #[test]
+    fn exactly_the_threshold_stops_a_low_priority_board() {
+        let report = report_with_week_total(900, 0);
+        let action = decide_guard_action(&report, Some(1_000), Priority::Low);
+        assert_eq!(
+            action,
+            GuardAction::Stop {
+                spent: 900,
+                allowance: 1_000
+            }
+        );
+    }
+
+    #[test]
+    fn render_guard_action_covers_every_variant_without_panicking() {
+        let variants = [
+            GuardAction::NoAllowanceConfigured,
+            GuardAction::UnreadableSpend {
+                unreachable: vec!["mini".to_string()],
+            },
+            GuardAction::BelowThreshold {
+                spent: 1,
+                allowance: 2,
+            },
+            GuardAction::NotEligible {
+                spent: 1,
+                allowance: 2,
+                priority: Priority::High,
+            },
+            GuardAction::Stop {
+                spent: 1,
+                allowance: 2,
+            },
+        ];
+        for action in variants {
+            let text = render_guard_action(&action);
+            assert!(text.starts_with("Guard:"));
+        }
     }
 }
