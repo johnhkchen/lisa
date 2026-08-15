@@ -30159,6 +30159,9 @@ owned\n\
                 captured_at: 1_150,
                 input_tokens: 120,
                 output_tokens: 34,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
         )
         .unwrap();
@@ -30210,6 +30213,9 @@ owned\n\
                 captured_at: 1_050,
                 input_tokens: 10,
                 output_tokens: 3,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
             // After A's ended_at but before B starts — A's rest capture.
             CaptureRecord {
@@ -30218,6 +30224,9 @@ owned\n\
                 captured_at: 1_500,
                 input_tokens: 20,
                 output_tokens: 7,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
             CaptureRecord {
                 pane_id: PANE_ID,
@@ -30225,6 +30234,9 @@ owned\n\
                 captured_at: 2_050,
                 input_tokens: 100,
                 output_tokens: 40,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
             CaptureRecord {
                 pane_id: PANE_ID,
@@ -30232,6 +30244,9 @@ owned\n\
                 captured_at: 2_100,
                 input_tokens: 200,
                 output_tokens: 60,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
         ] {
             append_capture_record(&captures, &capture).unwrap();
@@ -30329,6 +30344,9 @@ owned\n\
             captured_at: 50,
             input_tokens: 9_999,
             output_tokens: 888,
+            client: "claude".to_string(),
+            model: None,
+            effort: None,
         };
         let mut successful_diagnostics = Vec::new();
         write_stop(
@@ -30369,6 +30387,9 @@ owned\n\
                 captured_at,
                 input_tokens,
                 output_tokens,
+                client: "claude".to_string(),
+                model: None,
+                effort: None,
             });
             expected_usage.push(((*ticket_id).to_string(), input_tokens, output_tokens));
         }
@@ -30547,6 +30568,9 @@ owned\n\
             captured_at: 150,
             input_tokens: 999,
             output_tokens: 111,
+            client: "codex".to_string(),
+            model: None,
+            effort: None,
         };
         append_capture_record(&state.codex_dir.join("captures.jsonl"), &capture).unwrap();
 
@@ -30698,6 +30722,9 @@ owned\n\
                 captured_at: 1_150,
                 input_tokens: 167,
                 output_tokens: 37,
+                client: "claude".to_string(),
+                model: None,
+                effort: None,
             },
         )
         .unwrap();
@@ -30736,6 +30763,9 @@ owned\n\
                 captured_at: 1_150,
                 input_tokens: 42,
                 output_tokens: 7,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
         )
         .unwrap();
@@ -30775,6 +30805,9 @@ owned\n\
                 captured_at: 1_500,
                 input_tokens: 80,
                 output_tokens: 8,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
         )
         .unwrap();
@@ -30786,6 +30819,9 @@ owned\n\
                 captured_at: 50,
                 input_tokens: 5,
                 output_tokens: 1,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
         )
         .unwrap();
@@ -30891,6 +30927,9 @@ owned\n\
                 captured_at: 1_150,
                 input_tokens: 64,
                 output_tokens: 9,
+                client: "codex".to_string(),
+                model: None,
+                effort: None,
             },
         )
         .unwrap();

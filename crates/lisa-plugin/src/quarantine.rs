@@ -209,6 +209,9 @@ mod tests {
             captured_at: 1_752_345_600,
             input_tokens: 123,
             output_tokens: 45,
+            client: "codex".to_string(),
+            model: None,
+            effort: None,
         }
     }
 

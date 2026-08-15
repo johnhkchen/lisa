@@ -13,10 +13,15 @@
 //! Write-after and never-fabricate: Stop fires at *turn* boundaries (not per
 //! tool call — the heartbeat hook stays trivial). Each successful observation is
 //! appended to `.lisa/<client>/captures.jsonl` with its pane, provider session,
-//! capture time, and totals. An identified Stop with a missing, unreadable, or
-//! empty transcript appends its reason to `no-captures.jsonl` instead. Ticket
-//! attribution is deliberately deferred to the scheduler, which has the
-//! pane-ownership history the hook process lacks.
+//! capture time, totals, client, and — read straight from the same transcript,
+//! never from a pane's current config — the model and effort the turn ran
+//! under. Reading it from the transcript rather than joining it later means the
+//! record stays right even if the pane is reconfigured mid-run: it says what
+//! that turn actually ran, not what the pane runs now. A transcript that omits
+//! either leaves it `None`, not a guess. An identified Stop with a missing,
+//! unreadable, or empty transcript appends its reason to `no-captures.jsonl`
+//! instead. Ticket attribution is deliberately deferred to the scheduler, which
+//! has the pane-ownership history the hook process lacks.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -87,6 +92,94 @@ fn sum_claude_transcript_usage(jsonl: &str) -> UsageTotals {
         total.output_tokens += field("output_tokens");
     }
     total
+}
+
+/// What ran the turn, when the transcript says so. Never a guess: an absent
+/// field stays `None` rather than inheriting today's config.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ModelAttribution {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// Read the model and effort a Claude transcript's turn ran under.
+///
+/// Each assistant line carries `message.model` and a top-level `effort`
+/// alongside the usage this hook already sums. A turn's assistant lines all
+/// ran under the same model/effort in practice, so the latest non-empty
+/// sighting of each is taken — the same "last one wins" rule the usage sum
+/// and the Codex cumulative reader already use.
+fn claude_transcript_attribution(jsonl: &str) -> ModelAttribution {
+    let mut attribution = ModelAttribution::default();
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(model) = event
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            attribution.model = Some(model.to_string());
+        }
+        if let Some(effort) = event
+            .get("effort")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            attribution.effort = Some(effort.to_string());
+        }
+    }
+    attribution
+}
+
+/// Read the model and effort a Codex rollout's most recent turn ran under.
+///
+/// `turn_context` events carry `payload.model` and `payload.effort` (or, on
+/// clients that only nest it under collaboration mode,
+/// `payload.collaboration_mode.settings.reasoning_effort`). The rollout
+/// accumulates every turn in the session, so the latest `turn_context` is the
+/// one that describes the turn this Stop just observed.
+fn codex_transcript_attribution(jsonl: &str) -> ModelAttribution {
+    let mut attribution = ModelAttribution::default();
+    for line in jsonl.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("turn_context") {
+            continue;
+        }
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        if let Some(model) = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            attribution.model = Some(model.to_string());
+        }
+        let effort = payload
+            .get("effort")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                payload
+                    .pointer("/collaboration_mode/settings/reasoning_effort")
+                    .and_then(Value::as_str)
+            })
+            .filter(|s| !s.is_empty());
+        if let Some(effort) = effort {
+            attribution.effort = Some(effort.to_string());
+        }
+    }
+    attribution
 }
 
 /// Read the last cumulative token total from a Codex rollout transcript.
@@ -213,10 +306,16 @@ fn capture_usage_from(
             );
         }
     };
-    let usage = if is_codex {
-        codex_transcript_usage(&jsonl)
+    let (usage, attribution) = if is_codex {
+        (
+            codex_transcript_usage(&jsonl),
+            codex_transcript_attribution(&jsonl),
+        )
     } else {
-        sum_claude_transcript_usage(&jsonl)
+        (
+            sum_claude_transcript_usage(&jsonl),
+            claude_transcript_attribution(&jsonl),
+        )
     };
     // Nothing observed → record why no totals were written rather than
     // fabricating a measured zero or silently dropping the Stop.
@@ -238,6 +337,9 @@ fn capture_usage_from(
             captured_at,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            client: if is_codex { "codex" } else { "claude" }.to_string(),
+            model: attribution.model,
+            effort: attribution.effort,
         },
     )
 }
@@ -342,5 +444,72 @@ mod tests {
                 output_tokens: 7,
             }
         );
+    }
+
+    // --- model / effort attribution -----------------------------------------
+
+    #[test]
+    fn claude_reads_model_and_effort_from_the_assistant_line() {
+        let jsonl = r#"{"type":"assistant","effort":"high","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let a = claude_transcript_attribution(jsonl);
+        assert_eq!(a.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(a.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn claude_attribution_takes_the_latest_assistant_line() {
+        let jsonl = r#"{"type":"assistant","effort":"high","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":1}}}
+{"type":"assistant","effort":"medium","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let a = claude_transcript_attribution(jsonl);
+        assert_eq!(a.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(a.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn claude_attribution_is_unknown_never_guessed_when_absent() {
+        let jsonl = "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n";
+        let a = claude_transcript_attribution(jsonl);
+        assert_eq!(a.model, None);
+        assert_eq!(a.effort, None);
+        // Malformed/non-assistant lines are skipped like the usage reader.
+        assert_eq!(claude_transcript_attribution(""), ModelAttribution::default());
+        assert_eq!(
+            claude_transcript_attribution("not json\n{\"type\":\"user\"}\n"),
+            ModelAttribution::default()
+        );
+    }
+
+    #[test]
+    fn codex_reads_model_and_effort_from_turn_context() {
+        let jsonl = r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"xhigh"}}"#;
+        let a = codex_transcript_attribution(jsonl);
+        assert_eq!(a.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(a.effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn codex_effort_falls_back_to_collaboration_mode_reasoning_effort() {
+        let jsonl = r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol","collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}}"#;
+        let a = codex_transcript_attribution(jsonl);
+        assert_eq!(a.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(a.effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn codex_attribution_takes_the_latest_turn_context() {
+        let jsonl = r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"xhigh"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"ignored"}}
+{"type":"turn_context","payload":{"model":"gpt-5-mini","effort":"low"}}"#;
+        let a = codex_transcript_attribution(jsonl);
+        assert_eq!(a.model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(a.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn codex_attribution_is_unknown_never_guessed_when_absent() {
+        let jsonl = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1}}}}"#;
+        let a = codex_transcript_attribution(jsonl);
+        assert_eq!(a.model, None);
+        assert_eq!(a.effort, None);
     }
 }
