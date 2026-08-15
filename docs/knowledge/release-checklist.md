@@ -2,8 +2,8 @@
 
 This is the maintainer runbook for cutting a stable Lisa release. It is
 version-parameterized: set the block below once and every command derives from
-it. Current cut: **v0.5.0-rc.3** (prior prerelease v0.5.0-rc.2, published
-2026-08-09; prior stable v0.4.4).
+it. Current cut: **v0.5.0** — the stable that closes the 0.5.0 line (prior
+prerelease v0.5.0-rc.3, published 2026-08-14; prior stable v0.4.4, 2026-07-19).
 
 Only John authorizes publication. Preparing or reviewing this checklist is not
 authorization to tag, dispatch, publish, or update the Homebrew tap or apt
@@ -23,7 +23,7 @@ directory.
 ```bash
 set -euo pipefail
 REPO=johnhkchen/lisa
-VERSION=0.5.0-rc.3
+VERSION=0.5.0
 TAG="v$VERSION"
 PRIOR_STABLE=v0.4.4
 # Ancestry gates: each must be an ancestor of the release commit.
@@ -35,11 +35,18 @@ DELIVERY_GATE=f508031 # the pane-delivery fix (0.5.0-rc.2: wait for the provider
 CHANNEL_GATE=e44dee2 # the channel arrangement (0.5.0-rc.3: lisa upgrade, doctor drift, lisa nightly)
 ```
 
-`v0.5.0-rc.3` is the release `S-068-01` is blocked on: it is the first cut
-carrying `lisa upgrade`, `doctor`'s channel-drift row, and `lisa nightly`, so it
-is the first release that can put a machine on a channel at all. Until it
-exists, no box can be *level with nightly* except by hand-copying an unreleased
-binary, which is the failure that story exists to end.
+`v0.5.0` is a **stable** cut, so the prerelease notes below do not apply to it:
+`releases/latest` moves to `$TAG`, and `lisa.rb` in the tap takes it. Expect all
+three formulae to read `0.5.0` afterwards — `lisa-nightly` follows the newest
+soaked release through `packaging/apt/nightly-tag.txt`, and after a stable cut
+that is this release. *Nightly and stable are the same version* is correct until
+the next release candidate ships.
+
+`v0.5.0-rc.3` was the release `S-068-01` blocked on: the first cut carrying
+`lisa upgrade`, `doctor`'s channel-drift row, and `lisa nightly`, so the first
+that could put a machine on a channel at all. See
+[its cut record](release-0.5.0-rc.3-cut-record.md), which also records the two
+defects it surfaced and the stale-`lisa.rb` repair that followed.
 
 `v0.5.0-rc.1` was prepared under this checklist and never published — it was
 superseded by rc.2 before anyone tagged it. See
