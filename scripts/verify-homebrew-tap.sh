@@ -23,6 +23,13 @@ publisher="$repo_root/scripts/publish-tap-formulae.sh"
 # A version no real release can carry, so the routing assertions cannot pass by
 # accident when a formula was left alone.
 rehearsal_prerelease_version=999.0.0-rc.1
+# And its stable sibling. The rehearsals below need a formula that is NOT a
+# prerelease, and cargo-dist's own lisa.rb is only that during a stable cut:
+# on a prerelease cut it carries the candidate version, and handing it in as a
+# stable source is refused by the publisher — correctly — which failed the
+# v0.5.1-rc.1 cut at this job. A rehearsal must not depend on which kind of
+# release it happens to be running inside.
+rehearsal_stable_version=999.0.0
 
 fail() {
     echo "Homebrew tap verification failed: $*" >&2
@@ -83,6 +90,12 @@ sed "s/^  version \".*\"\$/  version \"$rehearsal_prerelease_version\"/" \
 [[ $(formula_version "$prerelease_formula") == "$rehearsal_prerelease_version" ]] ||
     fail "could not build the prerelease rehearsal formula"
 
+stable_formula_rehearsal="$work_dir/lisa-stable.rb"
+sed "s/^  version \".*\"\$/  version \"$rehearsal_stable_version\"/" \
+    "$dist_formula" >"$stable_formula_rehearsal"
+[[ $(formula_version "$stable_formula_rehearsal") == "$rehearsal_stable_version" ]] ||
+    fail "could not build the stable rehearsal formula"
+
 : >"$work_dir/routing.log"
 route() {
     local tap=$1 release_formula=$2 prerelease=$3 nightly_formula=$4 stable_formula=$5
@@ -95,12 +108,12 @@ route() {
 # anything has been promoted.
 release_tap="$work_dir/tap"
 mkdir -p "$release_tap"
-route "$release_tap" "$dist_formula" false "$dist_formula" "$dist_formula" >/dev/null
+route "$release_tap" "$stable_formula_rehearsal" false "$stable_formula_rehearsal" "$stable_formula_rehearsal" >/dev/null
 
 for name in lisa lisa-nightly lisa-canary; do
     [[ -s $release_tap/Formula/$name.rb ]] || fail "a stable release did not write Formula/$name.rb"
-    [[ $(formula_version "$release_tap/Formula/$name.rb") == "$release_version" ]] ||
-        fail "Formula/$name.rb did not land on $release_version"
+    [[ $(formula_version "$release_tap/Formula/$name.rb") == "$rehearsal_stable_version" ]] ||
+        fail "Formula/$name.rb did not land on $rehearsal_stable_version"
 done
 
 # The behaviour change this ticket is about: with a stable tap already in place,
@@ -110,13 +123,13 @@ done
 rc_tap="$work_dir/tap-after-rc"
 mkdir -p "$rc_tap/Formula"
 cp "$release_tap"/Formula/*.rb "$rc_tap/Formula/"
-rc_log=$(route "$rc_tap" "$prerelease_formula" true "$dist_formula" "$dist_formula")
+rc_log=$(route "$rc_tap" "$prerelease_formula" true "$stable_formula_rehearsal" "$stable_formula_rehearsal")
 
 [[ $(formula_version "$rc_tap/Formula/lisa-canary.rb") == "$rehearsal_prerelease_version" ]] ||
     fail "a release candidate did not reach lisa-canary"
-[[ $(formula_version "$rc_tap/Formula/lisa.rb") == "$release_version" ]] ||
-    fail "a release candidate moved lisa; stable must stay on $release_version"
-[[ $(formula_version "$rc_tap/Formula/lisa-nightly.rb") == "$release_version" ]] ||
+[[ $(formula_version "$rc_tap/Formula/lisa.rb") == "$rehearsal_stable_version" ]] ||
+    fail "a release candidate moved lisa; stable must stay on $rehearsal_stable_version"
+[[ $(formula_version "$rc_tap/Formula/lisa-nightly.rb") == "$rehearsal_stable_version" ]] ||
     fail "a release candidate moved lisa-nightly; only the soak promotion may move it"
 for name in lisa lisa-nightly; do
     grep -Fq "unchanged Formula/$name.rb" <<<"$rc_log" ||
@@ -131,11 +144,11 @@ stale_tap="$work_dir/tap-with-stale-stable"
 mkdir -p "$stale_tap/Formula"
 cp "$release_tap"/Formula/*.rb "$stale_tap/Formula/"
 cp "$prerelease_formula" "$stale_tap/Formula/lisa.rb"
-stale_log=$(route "$stale_tap" "$prerelease_formula" true "$dist_formula" "$dist_formula")
+stale_log=$(route "$stale_tap" "$prerelease_formula" true "$stable_formula_rehearsal" "$stable_formula_rehearsal")
 
-[[ $(formula_version "$stale_tap/Formula/lisa.rb") == "$release_version" ]] ||
-    fail "a release candidate left under Formula/lisa.rb survived a publish; stable must be corrected to $release_version"
-grep -Fq "wrote Formula/lisa.rb ($release_version)" <<<"$stale_log" ||
+[[ $(formula_version "$stale_tap/Formula/lisa.rb") == "$rehearsal_stable_version" ]] ||
+    fail "a release candidate left under Formula/lisa.rb survived a publish; stable must be corrected to $rehearsal_stable_version"
+grep -Fq "wrote Formula/lisa.rb ($rehearsal_stable_version)" <<<"$stale_log" ||
     fail "the publish did not say it corrected Formula/lisa.rb"
 
 # And the refusal that correction must not have cost: a candidate handed in as
