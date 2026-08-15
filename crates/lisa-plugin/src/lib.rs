@@ -3770,7 +3770,7 @@ impl State {
         class: CompletionFailureClass,
         retry_progress: Option<(u8, u8)>,
     ) -> bool {
-        let (prior_phase, ticket_file) = match (
+        let (prior_phase, ticket_file, generations_before) = match (
             self.completion_aggregates.get(ticket_id),
             self.dag.get_ticket(&ticket_id.to_string()),
         ) {
@@ -3778,15 +3778,31 @@ impl State {
                 if aggregate.completion_key() == &completion_key
                     && !ticket.file_path.as_os_str().is_empty() =>
             {
-                (aggregate.prior_phase(), ticket.file_path.clone())
+                (
+                    aggregate.prior_phase(),
+                    ticket.file_path.clone(),
+                    aggregate.action_required_generations(),
+                )
             }
             _ => return false,
         };
+        // This park is the generation being spent, so the bound is read from
+        // the counter it is about to become. Computing the ask *before* the
+        // append is what lets the journal row carry it: `action-required` is
+        // the field that decides a person must intervene, and a person reading
+        // that row is owed the sentence naming what to do — the field operator
+        // read `retryability: action-required` off a rejected row and had five
+        // documented commands to guess between, none of which applied.
+        let ask = completion_failure_ask_at_bound(
+            class,
+            ticket_id,
+            generations_before.saturating_add(1) >= MAX_ACTION_REQUIRED_GENERATIONS,
+        );
         if let Err(error) =
             self.journal_completion_transition(CompletionJournalTransition::Rejected {
                 key: completion_key.clone(),
                 correlation,
-                reason: technical_reason.clone(),
+                reason: format!("{technical_reason} — {ask}"),
                 retryability: Retryability::ActionRequired,
             })
         {
@@ -3797,15 +3813,6 @@ impl State {
             });
             return false;
         }
-
-        // The rejection was journaled a moment ago, so the counter this reads
-        // already includes this park — the generation that spends the last one
-        // is the generation whose ask names `already-done`.
-        let ask = completion_failure_ask_at_bound(
-            class,
-            ticket_id,
-            self.recovery_generations_exhausted(ticket_id),
-        );
         let disposition = serde_json::json!({
             "disposition": "block",
             "origin": "internal-command",
