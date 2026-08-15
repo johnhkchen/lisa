@@ -142,7 +142,8 @@ mod tests {
     fn a_pre_attribution_record_deserializes_with_unknown_client_model_and_effort() {
         // The exact shape capture_usage.rs wrote before this ticket landed —
         // never retroactively labelled with today's client, model, or effort.
-        let pre_existing = r#"{"pane_id":0,"session_id":"s","captured_at":1,"input_tokens":2,"output_tokens":3}"#;
+        let pre_existing =
+            r#"{"pane_id":0,"session_id":"s","captured_at":1,"input_tokens":2,"output_tokens":3}"#;
         let record: CaptureRecord = serde_json::from_str(pre_existing).unwrap();
         assert_eq!(record.client, "");
         assert_eq!(record.model, None);
