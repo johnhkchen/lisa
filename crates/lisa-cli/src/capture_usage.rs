@@ -472,7 +472,10 @@ mod tests {
         assert_eq!(a.model, None);
         assert_eq!(a.effort, None);
         // Malformed/non-assistant lines are skipped like the usage reader.
-        assert_eq!(claude_transcript_attribution(""), ModelAttribution::default());
+        assert_eq!(
+            claude_transcript_attribution(""),
+            ModelAttribution::default()
+        );
         assert_eq!(
             claude_transcript_attribution("not json\n{\"type\":\"user\"}\n"),
             ModelAttribution::default()
