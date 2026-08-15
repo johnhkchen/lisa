@@ -229,7 +229,13 @@ fn now_secs() -> Option<u64> {
         .map(|since| since.as_secs())
 }
 
-/// The schedulers that look like they are running on this board.
+/// The schedulers that are running on this board.
+///
+/// A stamp and a process, both, for the reason every other reader now asks for
+/// both: this sentence is read by somebody whose panes did not come back, and
+/// telling them a run they cannot find is here — because a dead one's last
+/// note is fresh — sends them looking for something to stop instead of
+/// starting a loop (S-070-01).
 fn live_schedulers(root: &Path) -> Vec<String> {
     let Some(now) = now_secs() else {
         return Vec::new();
@@ -237,9 +243,13 @@ fn live_schedulers(root: &Path) -> Vec<String> {
     let wind_down = config::load_config(root)
         .map(|validation| config::resolve_config(&validation.config, None, None).wind_down_secs)
         .unwrap_or_default();
+    let machine = crate::presence::Machine::read(root);
     schedulers::read_roster(root)
         .into_iter()
-        .filter(|record| record.is_live(now, record.live_window_secs(wind_down)))
+        .filter(|record| {
+            record.is_live(now, record.live_window_secs(wind_down))
+                && !machine.look(record, now).is_gone()
+        })
         .map(|record| record.label())
         .collect()
 }
