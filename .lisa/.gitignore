@@ -5,3 +5,4 @@ attempts/
 run-events.jsonl
 run-baseline.json
 scheduler.alive
+schedulers/
