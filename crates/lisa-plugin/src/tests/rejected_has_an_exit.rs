@@ -546,6 +546,88 @@ fn a_completion_whose_commit_never_landed_is_finished_by_one_command() {
     ));
 }
 
+/// A run that will not take a ready ticket says so, once, where it is read.
+///
+/// The board said `1 ready` and `Ready to schedule: T-004-01` beside a live
+/// run with four idle slots, for ten minutes. Every pass declined the ticket
+/// and every decline was recorded rather than said, so the only place the
+/// answer existed was a state dump nobody had a reason to open.
+#[test]
+fn a_run_says_why_it_will_not_take_a_ready_ticket() {
+    let mut field = Field::new();
+    let sealing_key = CompletionGenerationId::new(
+        CompletionId::new(TICKET),
+        AttemptId::new(field.lease.attempt_id.to_string()),
+        1,
+    );
+    let correlation = CorrelationId::new(sealing_key.to_string());
+    for transition in [
+        CompletionJournalTransition::Requested {
+            key: sealing_key.clone(),
+            prior_phase: Phase::Review,
+            prior_status: TicketStatus::Open,
+            note: None,
+        },
+        CompletionJournalTransition::CommandInFlight {
+            key: sealing_key,
+            correlation: correlation.clone(),
+            deadline: CompletionDeadline::from_unix_millis(1),
+        },
+    ] {
+        completion_journal::append_with_seal(
+            &field.state.completion_journal_path,
+            CompletionSeal::Commit,
+            transition,
+        )
+        .unwrap();
+    }
+    field.state.restore_completion_journal();
+    assert!(field.state.expire_in_flight_completion(
+        TICKET,
+        correlation,
+        CompletionDeadline::from_unix_millis(1),
+    ));
+
+    // The operator clears the block, which is what puts the ticket back on the
+    // board as ready — and what a run then quietly refuses.
+    let ticket_file = field.board_ticket().file_path;
+    lisa_core::ticket::update_ticket_status(&ticket_file, TicketStatus::Open).unwrap();
+    field.state.rebuild_dag();
+    field.state.permissions_granted = true;
+    field.state.slots_discovered = true;
+    assert_eq!(field.state.dag.get_ready_tickets(), vec![TICKET.to_string()]);
+
+    field.state.schedule_ready_tickets();
+
+    assert!(
+        !field.state.threads.contains_key(TICKET),
+        "a masked completion is still never scheduled"
+    );
+    let said: Vec<&str> = field
+        .state
+        .activity_log
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            ActivityEvent::Warning { message } => Some(message.as_str()),
+            _ => None,
+        })
+        .filter(|message| message.contains(TICKET))
+        .collect();
+    assert_eq!(said.len(), 1, "exactly one line, in the feed: {said:?}");
+    assert!(
+        said[0].contains(&format!("{ALREADY_DONE_COMMAND} {TICKET}")),
+        "the line must name the command that ends it: {}",
+        said[0]
+    );
+
+    // And it stays one line: this decline recurs on every pass, and a pass
+    // runs on nearly every event.
+    let entries = field.state.activity_log.len();
+    field.state.schedule_ready_tickets();
+    field.state.schedule_ready_tickets();
+    assert_eq!(field.state.activity_log.len(), entries);
+}
+
 fn porcelain(root: &Path, pathspec: &str) -> String {
     let output = Command::new("git")
         .arg("-C")

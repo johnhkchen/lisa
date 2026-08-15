@@ -957,6 +957,10 @@ struct LoggedActivity {
 enum DeclineReason {
     /// A durable Done record masks this ticket's ready state.
     DurableDoneMasked,
+    /// This ticket's completion was rejected action-required and never
+    /// sealed. Unlike every other reason here it does not clear on its own,
+    /// which is why it is also said out loud once in the activity feed.
+    CompletionUnsealed,
     /// A live thread already owns this ticket. Until T-052-02-01 this was an
     /// Info in the activity feed: "Skipping {}: thread already exists".
     ThreadAlreadyRunning,
@@ -982,6 +986,9 @@ impl DeclineReason {
     fn describe(&self) -> String {
         match self {
             Self::DurableDoneMasked => "durable Done record masks ready state".to_string(),
+            Self::CompletionUnsealed => {
+                format!("finished work was never recorded; `{ALREADY_DONE_COMMAND} <ticket>` finishes it")
+            }
             Self::ThreadAlreadyRunning => "thread already running".to_string(),
             Self::GlobalCapReached { running, max } => {
                 format!("global thread cap reached ({}/{})", running, max)
@@ -1083,6 +1090,14 @@ pub struct State {
     /// Durable scheduling authority remains ticket `status: blocked`; this map
     /// only decides when another open Review attempt is allowed.
     agent_block_retries: HashMap<TicketId, u8>,
+
+    /// Tickets whose unsealed completion has already been said out loud.
+    ///
+    /// A scheduling pass runs on nearly every event, and this decline recurs
+    /// on all of them until a person acts, so the feed gets the fact once per
+    /// time the ticket enters the state. Cleared when the ticket comes back
+    /// round schedulable, which is the only way out of it.
+    unsealed_ready_reported: HashSet<TicketId>,
 
     /// Safety-order trace used only by native scheduler tests.
     #[cfg(test)]
@@ -6983,16 +6998,45 @@ impl State {
         };
 
         for ticket_id in ready {
-            if self
+            if let Some(aggregate) = self
                 .completion_aggregates
                 .get(&ticket_id)
-                .map(CompletionJournalAggregate::masks_durable_done)
-                .unwrap_or(false)
+                .filter(|aggregate| aggregate.masks_durable_done())
             {
-                pass.declined
-                    .push((ticket_id.clone(), DeclineReason::DurableDoneMasked));
+                // A completion that ended action-required is the one masked
+                // state that never clears itself, and the board goes on
+                // calling the ticket ready while every pass declines it. That
+                // silence is what cost an hour on 2026-08-15: four idle slots
+                // and `Ready to schedule: T-004-01`, with the answer only in a
+                // Shift+D dump nobody had a reason to open. Every other
+                // decline is transient and stays recorded rather than logged.
+                let unsealed = matches!(
+                    aggregate.state(),
+                    CompletionState::Rejected {
+                        retryability: Retryability::ActionRequired,
+                        ..
+                    }
+                );
+                if unsealed && self.unsealed_ready_reported.insert(ticket_id.clone()) {
+                    self.log_activity(ActivityEvent::Warning {
+                        message: format!(
+                            "{ticket_id} reads ready and Lisa will not start it: its finished \
+                             work was never recorded. Run `{ALREADY_DONE_COMMAND} {ticket_id}`."
+                        ),
+                    });
+                }
+                pass.declined.push((
+                    ticket_id.clone(),
+                    if unsealed {
+                        DeclineReason::CompletionUnsealed
+                    } else {
+                        DeclineReason::DurableDoneMasked
+                    },
+                ));
                 continue;
             }
+            // Settled, so the next time it sticks is news again.
+            self.unsealed_ready_reported.remove(&ticket_id);
 
             // Skip tickets that already have an active thread.
             // Defensive: if a stale Completed thread exists, remove it and proceed.
