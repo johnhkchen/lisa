@@ -794,6 +794,27 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     if let Some(effort) = config.agent.effort.as_deref() {
         lisa_core::effort::Effort::parse(effort).map_err(|e| format!("[agent].effort: {e}"))?;
     }
+    // `Effort`'s vocabulary (low/medium/high/xhigh/max) is Claude's own
+    // `--effort` flag values, not a Lisa-invented equivalence any client can
+    // wear (T-071-01-03 AC). Codex has no flag lisa can drive with them today
+    // — `CodexAdapter` only ever threads `model` through, never `effort` — so a
+    // codex board naming one would silently spend nothing rather than doing
+    // what it asked. Refuse it here, at the moment the config is read, instead
+    // of at the far end of a run that already believed it worked.
+    if config.agent.effort.is_some()
+        && config
+            .agent
+            .client
+            .as_deref()
+            .is_some_and(|c| matches!(AgentClient::parse(c), Ok(AgentClient::Codex)))
+    {
+        return Err(
+            "[agent].effort has no mapping onto codex yet; codex's own reasoning-effort control \
+             is not exposed as a flag lisa can drive, so leave [agent].effort unset on a codex \
+             board (T-071-01-03)"
+                .to_string(),
+        );
+    }
     if let Some(zellij) = config.runtime.zellij.as_deref() {
         if !matches!(zellij, "managed" | "system") && !Path::new(zellij).is_absolute() {
             return Err(format!(
@@ -973,7 +994,7 @@ work = "work"
 zellij = "managed"
 
 [agent]
-client = "codex"
+client = "claude"
 model = "gpt-5-mini"
 effort = "high"
 
@@ -1540,6 +1561,32 @@ max_threads = 6
                 Some(*level)
             );
         }
+    }
+
+    #[test]
+    fn test_codex_client_refuses_a_configured_effort() {
+        let error =
+            validate_config("[agent]\nclient = \"codex\"\neffort = \"high\"\n").unwrap_err();
+        assert!(error.contains("[agent].effort"), "{error}");
+        assert!(error.contains("codex"), "{error}");
+    }
+
+    #[test]
+    fn test_codex_client_accepts_a_configured_model_with_no_effort() {
+        let validated =
+            validate_config("[agent]\nclient = \"codex\"\nmodel = \"gpt-5\"\n").unwrap();
+        assert!(validated.warnings.is_empty());
+        let resolved = resolve_config(&validated.config, None, None);
+        assert_eq!(resolved.client, AgentClient::Codex);
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn test_claude_client_still_accepts_a_configured_effort() {
+        // The refusal is codex-specific; claude (explicit or default) keeps
+        // taking effort exactly as before.
+        assert!(validate_config("[agent]\nclient = \"claude\"\neffort = \"high\"\n").is_ok());
+        assert!(validate_config("[agent]\neffort = \"high\"\n").is_ok());
     }
 
     #[test]

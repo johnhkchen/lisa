@@ -480,6 +480,11 @@ lisa loop --client codex
 
 Precedence is `--client` > `.lisa.toml [agent].client` > default (`claude`).
 
+`agent.model` carries over to a codex board unchanged. `agent.effort` does not:
+codex has no flag lisa can drive with Claude's effort vocabulary, so a codex
+board naming one is refused at `.lisa.toml` read time rather than silently
+spending nothing (T-071-01-03).
+
 ### Prerequisites
 
 - The `codex` binary on `PATH`:
