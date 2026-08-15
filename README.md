@@ -450,6 +450,8 @@ max_threads = 2
 | `scheduling.assignment_ack_timeout_secs` | `30` | Limits how long Lisa waits for an agent to accept assigned work. |
 | `scheduling.phase_timeouts` | `{}` | Limits how long each kind of work can run. |
 | `scheduling.provider_caps` | `{}` | Limits how many agents of each kind can work at once. |
+| `scheduling.priority` | `medium` | Sets how expendable this board's loop is when spend runs low; only a board marked low ever stops itself. |
+| `scheduling.weekly_token_allowance` | `1000000` | Sets the token budget lisa spend --guard compares this week's spend against; unset means the guard never acts. |
 
 ## Codex client
 
