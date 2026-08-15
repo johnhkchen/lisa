@@ -238,8 +238,21 @@ fn second_scheduler_refusal_on(
             count => format!("There are {count} runs"),
         }
     );
+    // What each name says about itself. A refusal names sessions and nothing
+    // else about them, and "this one is from a previous day" is the difference
+    // between a run somebody is watching and a run that died on Thursday — the
+    // judgement that took twenty minutes in S-070-01.
+    let today = crate::session_name::today();
     for holder in &holders {
         message.push_str(&format!("\n  {}", holder.line));
+        if let Some(note) = holder
+            .session
+            .as_deref()
+            .zip(today)
+            .and_then(|(session, today)| crate::session_name::previous_day_note(session, today))
+        {
+            message.push_str(&format!("\n    {note}"));
+        }
         match &holder.session {
             Some(session) => message.push_str(&format!(
                 "\n    look at it with: zellij attach {session}\
@@ -1123,6 +1136,45 @@ mod tests {
                               terminal is in"
             ),
             "the session the operator is sitting in says so: {refusal}"
+        );
+    }
+
+    /// The refusal holds nothing but names, so the names have to carry it. A
+    /// session from a previous day still holding the board is the run that died
+    /// on Thursday; today's is the one somebody is watching, and telling them
+    /// apart took twenty minutes on 2026-08-14 (S-070-01).
+    #[test]
+    fn a_refusal_says_which_of_the_sessions_holding_the_board_are_from_a_previous_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::seats::now_secs().unwrap();
+        let yesterday = crate::session_name::day_at(now - 86_400).unwrap().stamp();
+        let today = crate::session_name::day_at(now).unwrap().stamp();
+
+        let refusal = second_scheduler_refusal_on(
+            dir.path(),
+            &[
+                format!("renderer-{yesterday}-3"),
+                format!("renderer-{today}"),
+            ],
+            None,
+            &unasked(),
+        )
+        .expect("two running sessions refuse");
+
+        assert!(
+            refusal.contains(&format!(
+                "its name says it started on {}-{}",
+                &yesterday[..2],
+                &yesterday[2..]
+            )),
+            "the previous day's session was not called one: {refusal}"
+        );
+        assert_eq!(
+            refusal
+                .matches("this session is from a previous day")
+                .count(),
+            1,
+            "today's own session must not be called stale: {refusal}"
         );
     }
 

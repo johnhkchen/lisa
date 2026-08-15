@@ -196,6 +196,20 @@ fn describe(
         }
     )];
 
+    // What the name says about itself, when it says the run started before
+    // today. `started 19h ago` is the same fact off the record; this one is off
+    // the *name*, which is what `zellij list-sessions` shows, what the tab
+    // shows, and what an operator types — so a stale session reads as stale
+    // wherever they meet it, not only here.
+    if let Some(note) = record
+        .session_name
+        .as_deref()
+        .zip(crate::session_name::day_at(now))
+        .and_then(|(session, today)| crate::session_name::previous_day_note(session, today))
+    {
+        lines.push(format!("    {note}"));
+    }
+
     // What this machine was asked and what it said, whenever asking settled it.
     // `stopped stamping 87s ago` and `pid 15340 is not a process on this
     // machine any more` are the same verdict with very different standing, and
@@ -591,6 +605,45 @@ mod tests {
         assert!(printed.contains("zellij kill-session inventive-triceratops"));
         assert!(printed.contains("started 17h ago, last seen 5s ago, zellij server pid 9450"));
         assert!(printed.contains("Stop all but one"));
+    }
+
+    /// The staleness check, read off the session name rather than off the
+    /// record: `renderer-0814-3` seen on the 15th is a run from a previous day,
+    /// and the listing says so in those words.
+    #[test]
+    fn a_session_named_for_a_previous_day_is_called_one() {
+        let dir = project();
+        let now = 1_786_000_000;
+        let yesterday = crate::session_name::day_at(now - 86_400).unwrap().stamp();
+        let today = crate::session_name::day_at(now).unwrap().stamp();
+        register(
+            dir.path(),
+            "renderer-49ded6ab",
+            Some(&format!("renderer-{yesterday}-3")),
+            now - 20 * 3600,
+            now - 17 * 3600,
+        );
+        register(
+            dir.path(),
+            "renderer-c1133916",
+            Some(&format!("renderer-{today}")),
+            now - 600,
+            now - 2,
+        );
+
+        let printed = listed(dir.path(), now);
+
+        assert!(
+            printed.contains("this session is from a previous day"),
+            "the previous day's session was not called one:\n{printed}"
+        );
+        assert_eq!(
+            printed
+                .matches("this session is from a previous day")
+                .count(),
+            1,
+            "today's own run must not be called stale:\n{printed}"
+        );
     }
 
     /// One scheduler is the ordinary case, and it gets no scolding.
