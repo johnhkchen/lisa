@@ -37,6 +37,7 @@ mod schedulers;
 mod seats;
 mod session_name;
 mod setup_guide;
+mod spend;
 mod status;
 mod templates;
 mod triage_agent;
@@ -342,6 +343,25 @@ enum Commands {
         /// Move even though this machine has a run on it
         #[arg(long)]
         anyway: bool,
+    },
+    /// Say what this desk has spent, on this machine and every other one.
+    #[command(
+        display_order = 17,
+        after_help = "Reads .lisa/<client>/captures.jsonl here and on every machine `rail desk \
+                      --hosts --json` names, and sums the tokens it finds by model and by \
+                      machine, over the last day and the last week. Raw counts read from \
+                      session transcripts, not a provider's own accounting — say what you have \
+                      spent, not what you have left. A machine that cannot be reached is named, \
+                      never counted as zero.\n\nExample: lisa spend --path ./my-project"
+    )]
+    Spend {
+        /// Project to fall back to if the desk-wide machine list can't be learned
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Seconds to wait for a remote machine before calling it unreachable
+        #[arg(long, default_value_t = spend::DEFAULT_REACH_TIMEOUT)]
+        reach_timeout_secs: u64,
     },
     /// Keep this machine on nightly on its own, and say how that is going.
     #[command(
@@ -707,6 +727,13 @@ fn main() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
+        }
+        Commands::Spend {
+            path,
+            reach_timeout_secs,
+        } => {
+            let path = resolve_path(&path);
+            print!("{}", spend::run_spend(&path, reach_timeout_secs));
         }
         Commands::Nightly { action } => match action {
             NightlyCommands::Install {

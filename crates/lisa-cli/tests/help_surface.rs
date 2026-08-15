@@ -76,6 +76,7 @@ Commands:
   file-ticket    Put a new ticket on the board, from a draft you pipe in
   upgrade        Move this machine to the Lisa its channel asks for
   nightly        Keep this machine on nightly on its own, and say how that is going
+  spend          Say what this desk has spent, on this machine and every other one
   help           Print this message or the help of the given subcommand(s)
 
 Options:
