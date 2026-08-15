@@ -15,6 +15,41 @@ each night, what it refuses to do, how it shouts, and how to put it back.
 
 ---
 
+## What the mini actually runs today
+
+**Read this before the rest of the page.** The mini did not take `lisa nightly`.
+It already had a mover — a launchd job the `screen-design` desk keeps — and it
+kept it, because the channel is now the formula name and a box that pulls its
+formula needs nothing else to decide with. Everything below this section
+describes `lisa nightly`, which is the arrangement for a machine that has no
+mover yet. The mini is the other case.
+
+Read off the machine on 2026-08-14:
+
+| | the mini |
+| --- | --- |
+| how it has Lisa | `brew install johnhkchen/lisa/lisa-nightly`, linked at `/opt/homebrew/bin/lisa` |
+| what puts it on nightly | the formula name — `doctor` reads *channel nightly (from the Homebrew formula lisa-nightly), installed 0.5.0* |
+| the schedule | `~/Library/LaunchAgents/dev.b28.lisa-stay-current.plist`, 04:37 daily |
+| what the job runs | `~/ergo-fleet/lisa-stay-current`, whose one meaningful line is `FORMULA=lisa-nightly` |
+| what it refuses | any live Zellij session — it logs `held` and moves nothing |
+| where it writes | `~/ergo-fleet/lisa-stay-current.log`, one line per night |
+| who owns it | the `screen-design` desk, not this repo |
+
+The machine's own answer is copied into this repo at
+[`mac-mini-nightly-record.json`](mac-mini-nightly-record.json). That file, not
+this page, is the thing to trust about what the mini is on.
+
+**What this choice costs, stated plainly.** The mover keeps a log line, not
+`nightly/health.json`, so `lisa nightly status` knows nothing about this box —
+and the log cannot tell a failed `brew upgrade` from a night with nothing to do,
+because both leave the installed version where it was and both print `current at
+<version>`. Nothing leaves the machine either way. Until that is fixed, the
+mini's signal is a file on a box nobody is sitting at, which is the one thing
+this ticket's criteria said not to settle for.
+
+---
+
 ## Setting it up (two commands on the mini)
 
 ```bash
@@ -55,9 +90,15 @@ hands the swap to `brew` itself, so both end up running the same upgrade and
 Homebrew's per-formula lock makes even a true overlap serialise. The reason is
 bookkeeping. **Only one of them keeps a record.** `lisa nightly status` answers
 from `nightly/health.json`, so a move made by the other timer leaves it reporting
-`level` — a true statement about an event it never saw. Keep `lisa nightly` as
-the mover, because it is the one that writes down what happened, and let anything
-else report rather than move.
+`level` — a true statement about an event it never saw. Pick one mover and let
+anything else report rather than move.
+
+Which one to keep depends on what the box already has. A machine with no mover
+should take `lisa nightly`, because it writes down what happened. The mini went
+the other way and kept its package-manager timer, which is a defensible choice
+on a box whose channel is a formula name — but it inherits the bookkeeping cost
+named above, and that cost is real: see
+[what the mini actually runs today](#what-the-mini-actually-runs-today).
 
 ---
 
@@ -307,6 +348,13 @@ it. From the mini, after the first cycle has run:
 ```bash
 lisa nightly status --json > docs/knowledge/mac-mini-nightly-record.json   # in this repo
 ```
+
+On the mini that command has nothing to read, because `lisa nightly` is not its
+mover. Its record is hand-assembled from what the machine says — `lisa doctor`,
+`brew list --versions`, the launch agent, and the last lines of
+`~/ergo-fleet/lisa-stay-current.log` — in the same file, under the same three
+keys (`channel`, `state`, `last_cycle`) so one reader answers for either kind of
+box.
 
 That file is what says the arrangement is real rather than described: it carries
 the channel the machine is on, the last cycle it ran, and when. Refresh it after

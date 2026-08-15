@@ -1,0 +1,46 @@
+{
+  "schema": "lisa.nightly-record/v1",
+  "schema_version": 1,
+  "note": "What the Mac mini is on, read off the machine rather than intended. T-068-01-03's unblock check reads data.channel, data.state and data.last_cycle.",
+  "data": {
+    "host": "Johns-Mac-mini",
+    "reach": "ssh mini",
+    "channel": "nightly",
+    "state": "ok",
+    "formula": "lisa-nightly",
+    "version": "0.5.0",
+    "runs": "/opt/homebrew/bin/lisa",
+    "installs_on_path": 1,
+    "last_cycle": "2026-08-14T18:43:00-07:00",
+    "last_cycle_said": "current at 0.5.0 on lisa-nightly",
+    "timer": {
+      "label": "dev.b28.lisa-stay-current",
+      "at": "04:37 local",
+      "runs": "brew upgrade lisa-nightly",
+      "holds_under": "any live zellij session",
+      "log": "~/ergo-fleet/lisa-stay-current.log"
+    },
+    "evidence": {
+      "took_a_release_untouched": {
+        "at": "2026-08-14T18:09:00-07:00",
+        "said": "moved 0.4.4 -> 0.5.0",
+        "how": "launchd fired the job; nobody ran brew. The schedule was shortened from 04:37 to 18:09 for the test and restored immediately after — the clock was touched, the mechanism was not.",
+      "on_formula": "lisa, not lisa-nightly. The mover's FORMULA line was changed to lisa-nightly at 18:42, after this move and before the 18:43 cycle. Same script, same job, same brew upgrade — the unattended move is proven, on the formula the box was on at the time.",
+        "before_recorded": "brew list --versions lisa said 0.4.4, and zellij list-sessions was empty, both read BEFORE firing so the log line could not be confused with a no-op"
+      },
+      "doctor_agrees": "channel nightly (from the Homebrew formula lisa-nightly), installed 0.5.0 — and `lisa install` reads one lisa, at /opt/homebrew/bin/lisa, and `lisa` runs it",
+      "decided_by": "the operator, 2026-08-14, in the inbox under the handle `what-the-mac-mini-is-for` — chose the canary over the safe one, then chose nightly over canary because canary is noisy and withdraws releases an hour later",
+      "reread_from_the_machine": {
+        "at": "2026-08-14, T-068-01-03 Review, read-only over ssh",
+        "doctor": "channel nightly (from the Homebrew formula lisa-nightly), installed 0.5.0, level; one lisa at /opt/homebrew/bin/lisa and `lisa` runs it; zellij 0.44.3 system, supported",
+        "read_it_with_the_job's_PATH": "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin, the same one the launch agent sets. A plain non-login ssh has none of Homebrew on PATH, and doctor run that way reports `lisa install unsupported` and `zellij unsupported` about a machine that is fine. Set the PATH or you will read a healthy box as broken.",
+        "guard_seen_live": "a live zellij session (`overseer`, running `claude --continue`) was up during this read, so tonight's 04:37 run will log `held` rather than move"
+      }
+    },
+    "not_yet_true": [
+      "Nothing leaves this machine when a night goes wrong, and the log cannot tell a failed `brew upgrade` from a night with nothing to do — both print `current at <version>`.",
+      "Rollback has not been performed on this machine. It was rehearsed on the dev desk; `lisa upgrade --tag` on a Homebrew box leaves a second lisa in ~/.local/bin and that path is untested here."
+    ],
+    "why_this_machine": "It runs real work. renderer had 35 done and a live loop when this was written. A nightly box with nothing on it proves nothing and reports healthy while doing so."
+  }
+}
