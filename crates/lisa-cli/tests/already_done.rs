@@ -95,7 +95,11 @@ fn stderr(output: &Output) -> String {
 fn publish_review(root: &Path, ticket_id: &str, disposition: &str) -> PathBuf {
     let dir = root.join("docs/active/work").join(ticket_id);
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("review.md"), "# Review\n\nAll five commits landed.\n").unwrap();
+    fs::write(
+        dir.join("review.md"),
+        "# Review\n\nAll five commits landed.\n",
+    )
+    .unwrap();
     fs::write(dir.join("review-disposition.json"), disposition).unwrap();
     dir
 }
@@ -118,11 +122,18 @@ fn head_message(root: &Path) -> String {
 fn a_rejection_whose_seal_never_landed_is_sealed_by_the_command() {
     let (_temp, root) = project();
     let ticket = write_ticket(&root, "T-UNSEALED", "blocked");
-    publish_review(&root, "T-UNSEALED", "{\"disposition\":\"pass\",\"reason\":null}");
+    publish_review(
+        &root,
+        "T-UNSEALED",
+        "{\"disposition\":\"pass\",\"reason\":null}",
+    );
     write_journal(&root, "T-UNSEALED", "rejected");
     fs::write(root.join("src.txt"), "the work itself\n").unwrap();
     git(&root, &["add", "docs", "src.txt"]);
-    git(&root, &["commit", "-m", "T-UNSEALED: the work, with no seal"]);
+    git(
+        &root,
+        &["commit", "-m", "T-UNSEALED: the work, with no seal"],
+    );
 
     let output = already_done(&root, "T-UNSEALED");
 

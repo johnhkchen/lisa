@@ -779,3 +779,109 @@ fn the_guide_names_where_the_run_is() {
         assert!(guide.contains(marker), "json-guide is missing {marker:?}");
     }
 }
+
+/// The field board, read back: a ticket nothing can schedule stops being
+/// counted as ready.
+///
+/// On 2026-08-15 `lisa status` said `1 ready, 0 blocked` and `Ready to
+/// schedule: T-004-01` about a ticket whose completion had been rejected
+/// action-required, beside a run with four idle slots that would not take it.
+/// Every word of that was wrong, and the prose and the JSON were wrong
+/// together.
+#[test]
+fn a_ticket_no_run_will_take_is_counted_blocked_and_named() {
+    let (_temp, root) = project();
+    fs::write(
+        root.join(".lisa/completion-journal.jsonl"),
+        concat!(
+            r#"{"schema_version":5,"seal":"commit","state":"requested","completion_id":"T-001","attempt_id":"1","generation":1,"prior_phase":"review","prior_status":"open"}"#,
+            "\n",
+            r#"{"schema_version":5,"seal":"commit","state":"command-in-flight","completion_id":"T-001","attempt_id":"1","generation":1,"correlation_id":"c1","reconciliation_deadline_unix_ms":42}"#,
+            "\n",
+            r#"{"schema_version":5,"seal":"commit","state":"rejected","completion_id":"T-001","attempt_id":"1","generation":1,"correlation_id":"c1","reason":"completion reconciliation deadline 42 exceeded","retryability":"action-required"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let prose = stdout_of(&lisa(&root, &["status"]));
+    assert!(
+        prose.contains("Status: 0 done, 0 in progress, 0 ready, 2 blocked"),
+        "the counts must stop calling it ready:\n{prose}"
+    );
+    assert!(
+        prose.contains("No tickets ready to schedule."),
+        "and so must the line that lists them:\n{prose}"
+    );
+    assert!(
+        prose.contains("Tickets no run will take") && prose.contains("lisa already-done T-001"),
+        "with the ticket named and the command beside it:\n{prose}"
+    );
+
+    let data = document(&lisa(&root, &["status", "--json"]))["data"].clone();
+    assert_eq!(data["counts"]["ready"], 0, "{data}");
+    assert_eq!(data["counts"]["blocked"], 2, "{data}");
+    assert_eq!(strings(&data["ready"]), Vec::<String>::new(), "{data}");
+    assert!(data["completion_journal_error"].is_null(), "{data}");
+    let held = &data["unschedulable"];
+    assert_eq!(held[0]["ticket_id"], "T-001", "{data}");
+    assert_eq!(held[0]["command"], "lisa already-done T-001", "{data}");
+    assert!(held[1].is_null(), "only the one ticket: {data}");
+}
+
+/// A journal Lisa cannot fold does not silence the board it describes.
+///
+/// `status` is what an operator types when something is already wrong, and a
+/// journal that will not replay is one of the things that goes wrong: it
+/// fences the plugin's scheduling outright. So it is a line in the report —
+/// never the reason there is no report.
+#[test]
+fn a_journal_that_cannot_be_read_is_reported_rather_than_fatal() {
+    let (_temp, root) = project();
+    fs::write(
+        root.join(".lisa/completion-journal.jsonl"),
+        // Parses row by row and folds to nothing: a completion cannot go in
+        // flight before it was ever requested.
+        concat!(
+            r#"{"schema_version":5,"seal":"commit","state":"command-in-flight","completion_id":"T-001","attempt_id":"1","generation":1,"correlation_id":"c1","reconciliation_deadline_unix_ms":42}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let output = lisa(&root, &["status"]);
+    let prose = stdout_of(&output);
+    assert!(output.status.success(), "{prose}");
+    assert!(
+        prose.contains("Status: 0 done, 0 in progress, 1 ready, 1 blocked"),
+        "the board is still described:\n{prose}"
+    );
+    assert!(
+        prose.contains("could not read this board's completion journal"),
+        "and the gap in it is stated:\n{prose}"
+    );
+
+    let data = document(&lisa(&root, &["status", "--json"]))["data"].clone();
+    assert!(
+        data["completion_journal_error"].is_string(),
+        "the same fact, for a reader that is not a person: {data}"
+    );
+}
+
+/// A shape nobody can find is not an interface.
+#[test]
+fn the_guide_names_the_tickets_no_run_will_take() {
+    let guide = stdout_of(
+        &Command::new(env!("CARGO_BIN_EXE_lisa"))
+            .arg("json-guide")
+            .output()
+            .unwrap(),
+    );
+    for marker in [
+        "unschedulable",
+        "completion_journal_error",
+        "lisa already-done",
+    ] {
+        assert!(guide.contains(marker), "json-guide is missing {marker:?}");
+    }
+}

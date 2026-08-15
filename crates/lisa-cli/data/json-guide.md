@@ -75,11 +75,13 @@ only want to know "could a run start here", read the exit status and ignore the 
 | `edge_count` | How many dependency links the board has. |
 | `tickets[]` | `{id, title, status, phase, depends_on[], blocks[]}` for every ticket. |
 | `waves[]` | `{index, depends_on_wave, ticket_ids[]}`. `depends_on_wave` is `null` for the first wave. |
-| `ready[]` | Ticket ids that could start now, sorted. |
+| `ready[]` | Ticket ids that could start now, sorted. Tickets no run will take are not here — see `unschedulable`. |
 | `notes[]` | `{ticket_id, attempt_id, generation, summary, criterion_quote, evidence_citation}` for each unread note. |
 | `waiting_on_you[]` | Each waiting ticket: `{ticket_id, remedy_owner, ask, reason, steps[], check, check_timeout_secs, origin, proposal}`. |
 | `attempts[]` | `{pane_id, ticket_id, attempt_id, ticket_phase, superseded, abandoned, abandoned_reason}` — see below. |
 | `stranded[]` | `{ticket_id, phase, attempt_id, evidence}` — tickets the board says are under way that no seat holds. See below. |
+| `unschedulable[]` | `{ticket_id, reason, command}` — tickets whose dependencies are met that no run will take. See below. |
+| `completion_journal_error` | `null` normally; a sentence when the completion journal could not be read, in which case `unschedulable` may be short. |
 | `run_location` | `{state, session, sessions[], attach_command}` — where the run is. See below. |
 | `schedulers[]` | `{id, session_name, zellij_pid, started_at, stamped_at, stop_command}`, one per scheduler stamping this board. See below. |
 | `token_usage` | `{tickets[], tickets_joined, tokens_in, tokens_out, not_yet_joined[], lost_with_the_seat[]}`. |
@@ -90,10 +92,10 @@ only want to know "could a run start here", read the exit status and ignore the 
 `blocked`, `review`, `done`, `cancelled` for status; `ready`, `implement`, `review`, `done` for
 phase.
 
-Two fields sound alike and are not. `counts.blocked` counts tickets whose dependencies are not
-finished yet — nobody is waiting on a person. A ticket that is waiting on *you* is in
-`waiting_on_you`, one entry per ticket, with the ask and the reason. If you want "how many things
-need me", count `waiting_on_you`.
+Two fields sound alike and are not. `counts.blocked` counts tickets that cannot start — mostly ones
+whose dependencies are not finished yet, plus any listed in `unschedulable`. A ticket that is
+waiting on *you* is in `waiting_on_you`, one entry per ticket, with the ask and the reason. If you
+want "how many things need me", count `waiting_on_you`.
 
 ### What `config` says about what runs the board
 
@@ -246,6 +248,23 @@ there was nothing an operator could read about it.
 
 `stranded` describes tickets, not panes, so it does not overlap `attempts`: a ticket appears in one
 or the other, never both. `lisa reset-ticket <id> --apply` hands one back to the board.
+
+### Ready and yet not ready: `unschedulable`
+
+A ticket whose dependencies are all finished is ready by the DAG, and a run still will not take it
+if Lisa recorded a completion for it that never settled. Before this field the board said
+`1 ready, 0 blocked` beside a run with four idle slots that took nothing for ten minutes, and both
+halves of that sentence were false.
+
+Entries are removed from `ready[]` and counted in `counts.blocked` instead, so the counts and the
+list agree. Each one carries:
+
+- `reason` — one sentence saying what is holding it.
+- `command` — the command that ends it, usually `lisa already-done <id>`, or `null` when the only
+  thing to do is wait for a completion that is in flight right now.
+
+The condition is the scheduler's own, so this field and the run cannot disagree about which tickets
+those are.
 
 Do not read `.lisa/signals/` yourself — and do not delete anything in it either. Those files are
 single-consumer and the plugin deletes them as it reads them; a second reader loses that race by

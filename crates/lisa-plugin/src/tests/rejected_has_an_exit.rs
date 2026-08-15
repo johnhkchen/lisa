@@ -595,7 +595,10 @@ fn a_run_says_why_it_will_not_take_a_ready_ticket() {
     field.state.rebuild_dag();
     field.state.permissions_granted = true;
     field.state.slots_discovered = true;
-    assert_eq!(field.state.dag.get_ready_tickets(), vec![TICKET.to_string()]);
+    assert_eq!(
+        field.state.dag.get_ready_tickets(),
+        vec![TICKET.to_string()]
+    );
 
     field.state.schedule_ready_tickets();
 

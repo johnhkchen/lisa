@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::config;
 use crate::json_output::{BoardCounts, ConfigView};
-use lisa_core::completion::CompletionSeal;
+use lisa_core::completion::{CompletionSeal, CompletionState};
+use lisa_core::completion_journal::{CompletionJournalAggregate, COMPLETION_JOURNAL_RELATIVE_PATH};
 use lisa_core::dag::{CycleDetectionResult, Dag, DagError, DagStats};
 use lisa_core::disposition::RemedyOwner;
 use lisa_core::notes::{collect_notes, QueuedNote};
@@ -388,6 +389,84 @@ fn print_stranded_tickets(data: &StatusData) {
     println!();
 }
 
+/// A ticket the board calls ready that no run will take.
+///
+/// The scheduler declines a ready ticket whose completion is still masking its
+/// durable Done, and until this existed the board went on counting that ticket
+/// as ready anyway: `1 ready, 0 blocked` beside a live run with four idle
+/// slots, taking nothing, for ten minutes. Both halves of that sentence were
+/// false. The condition here is the scheduler's own, so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct UnschedulableTicket {
+    ticket_id: String,
+    /// What is holding it, in one sentence.
+    reason: String,
+    /// The command that ends it, or `null` when only waiting does.
+    command: Option<String>,
+}
+
+/// Every ticket the DAG calls ready whose completion is not settled.
+fn unschedulable_tickets(
+    ready: &[String],
+    aggregates: &HashMap<String, CompletionJournalAggregate>,
+) -> Vec<UnschedulableTicket> {
+    ready
+        .iter()
+        .filter_map(|ticket_id| {
+            let aggregate = aggregates.get(ticket_id)?;
+            if !aggregate.masks_durable_done() {
+                return None;
+            }
+            let (reason, command) = match aggregate.state() {
+                CompletionState::Rejected { .. } => (
+                    "Lisa could not record its finished work, and nothing has settled that yet."
+                        .to_string(),
+                    Some(format!("lisa already-done {ticket_id}")),
+                ),
+                _ => (
+                    "Lisa is recording its finished work right now.".to_string(),
+                    None,
+                ),
+            };
+            Some(UnschedulableTicket {
+                ticket_id: ticket_id.clone(),
+                reason,
+                command,
+            })
+        })
+        .collect()
+}
+
+/// Silent when there are none, like every other fault report here.
+fn unschedulable_ticket_lines(unschedulable: &[UnschedulableTicket]) -> Vec<String> {
+    if unschedulable.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Tickets no run will take".to_string()];
+    for ticket in unschedulable {
+        lines.push(format!("  {:<12} {}", ticket.ticket_id, ticket.reason));
+        if let Some(command) = &ticket.command {
+            lines.push(format!("               To finish it: {command}"));
+        }
+    }
+    lines.push(
+        "  These are counted as blocked above: a ticket nothing can schedule is not ready."
+            .to_string(),
+    );
+    lines
+}
+
+fn print_unschedulable_tickets(data: &StatusData) {
+    let lines = unschedulable_ticket_lines(&data.unschedulable);
+    if lines.is_empty() {
+        return;
+    }
+    for line in lines {
+        println!("{line}");
+    }
+    println!();
+}
+
 /// The seats a run left behind, if there are any.
 ///
 /// Silent otherwise. This is a fault report, and a project where nothing is
@@ -630,6 +709,14 @@ struct StatusData {
     attempts: Vec<SeatAttempt>,
     /// Tickets the board says are under way that no seat holds.
     stranded: Vec<StrandedTicket>,
+    /// Tickets the DAG calls ready that no run will take.
+    unschedulable: Vec<UnschedulableTicket>,
+    /// Why the completion journal could not be folded, when it could not be.
+    ///
+    /// `status` is the command an operator reaches for when the board is
+    /// wrong, so a journal it cannot read is a line in the report rather than
+    /// a reason to print nothing at all.
+    journal_error: Option<String>,
     /// What Lisa can say about the run that placed those seats.
     run: crate::seats::RunReport,
     /// `None` when the ticket directory holds no tickets: there is no board to
@@ -722,6 +809,29 @@ fn collect_status(root: &Path) -> Result<StatusData, String> {
         })
     };
 
+    let (aggregates, journal_error) =
+        match lisa_core::completion_journal::load(&root.join(COMPLETION_JOURNAL_RELATIVE_PATH)) {
+            Ok(aggregates) => (aggregates, None),
+            Err(error) => (HashMap::new(), Some(error)),
+        };
+    let unschedulable = board
+        .as_ref()
+        .map(|board| unschedulable_tickets(&board.ready, &aggregates))
+        .unwrap_or_default();
+    // A ticket nothing can schedule is not ready, and the counts have to say
+    // the same thing the section below them says.
+    let board = board.map(|mut board| {
+        board.ready.retain(|ticket_id| {
+            !unschedulable
+                .iter()
+                .any(|held| &held.ticket_id == ticket_id)
+        });
+        let held = unschedulable.len();
+        board.stats.ready_tickets = board.stats.ready_tickets.saturating_sub(held);
+        board.stats.blocked_tickets = board.stats.blocked_tickets.saturating_add(held);
+        board
+    });
+
     let run_summary =
         crate::run_summary::collect_run_summary(root, &tickets, Path::new(&work_dir_rel));
 
@@ -739,6 +849,8 @@ fn collect_status(root: &Path) -> Result<StatusData, String> {
         ledger,
         attempts,
         stranded,
+        unschedulable,
+        journal_error,
         run,
         board,
         run_summary,
@@ -787,6 +899,16 @@ fn print_status(data: &StatusData) -> Result<(), String> {
     // outliving its run; this is a ticket outliving its marker, which is what a
     // scheduler that fenced a live pane leaves behind.
     print_stranded_tickets(data);
+
+    // And the third way those counts can lie: a ticket the DAG calls ready
+    // that every scheduling pass declines.
+    print_unschedulable_tickets(data);
+    if let Some(error) = &data.journal_error {
+        println!("Lisa could not read this board's completion journal: {error}");
+        println!("  Until that is fixed, the counts above cannot account for finished work Lisa");
+        println!("  has not managed to record. Run: lisa doctor");
+        println!();
+    }
 
     // And beside it, the other way those counts can lie: a board being worked
     // by more schedulers than anybody started.
@@ -1042,6 +1164,12 @@ fn status_payload(data: &StatusData) -> serde_json::Value {
         // The complement of `attempts`: tickets the board says are under way
         // that no entry in `attempts` names. Empty on a healthy board.
         "stranded": data.stranded,
+        // Tickets removed from `ready` and counted as blocked because no run
+        // will take them. Empty on a healthy board.
+        "unschedulable": data.unschedulable,
+        // Present only when the completion journal could not be folded, in
+        // which case `unschedulable` cannot be trusted to be complete.
+        "completion_journal_error": data.journal_error,
         // One entry per scheduler stamping this board. A reader counting these
         // is asking the question the shared heartbeat could never answer, so
         // the array is present even when it holds one — and empty on a board
