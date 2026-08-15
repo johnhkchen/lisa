@@ -27,7 +27,7 @@ apt_stable: 0.5.0-1
 apt_nightly: 0.5.0-1
 apt_canary: 0.5.0-1                 # present in the pool alongside every prior candidate
 channel_skew: eliminated            # this is the stable cut rc.2's record named as its resolution
-mac_mini_took_it_untouched: PENDING # expected 04:37 local, 2026-08-15 — see below
+mac_mini_took_it_untouched: moved, schedule shortened   # 2026-08-14 18:09 local — see below
 ```
 
 ## What this release is
@@ -65,16 +65,39 @@ Print every version in the stanza and read them, or ask a specific question
 (`grep -qx "0.5.0-1"`). A partial read of a correct index is indistinguishable
 from a correct read of a broken one.
 
-## The thing this release exists to prove has not happened yet
+## The thing this release exists to prove: it happened
 
-`mac_mini_took_it_untouched: PENDING`. The Mac mini is on Homebrew `lisa`, its
-pin is off, and `dev.b28.lisa-stay-current` runs at 04:37 local. If the
-arrangement works, that timer moves it `0.4.4 -> 0.5.0` with nobody touching the
-machine, and the `screen-design` desk ticks the last box on
-`the-mac-mini-joins-a-channel.md` with the timer's own log line as evidence.
+The Mac mini took `v0.5.0` on its own. From the machine's own log
+(`~/ergo-fleet/lisa-stay-current.log`), read by the `screen-design` desk:
 
-Until that happens this is a plan that has never run. Fill this value in from the
-machine, not from the tap.
+```
+2026-08-14 16:28  current at 0.4.4
+2026-08-14 18:09  moved 0.4.4 -> 0.5.0
+```
+
+Afterwards `brew list --versions lisa` reads `0.5.0`, `lisa --version` reads
+`0.5.0`, and `brew outdated` is silent.
+
+**The clock was shortened; the mechanism was not touched.**
+`StartCalendarInterval` was moved from 04:37 to 18:09, the job reloaded, and it
+fired on the wall clock four minutes later; the schedule was restored to 04:37
+immediately after and confirmed loaded. No `brew` and no `launchctl kickstart`
+was run against the binary — the timer did the upgrade, unattended, exactly as it
+will at 04:37 every night. Recorded as *moved, schedule shortened* rather than
+*moved*, because the difference is the whole claim.
+
+**Two values were read off the machine before firing, not after**, and one of
+them is why the log line means anything:
+
+- `brew list --versions lisa` → `0.4.4`. Without that recorded first, a genuine
+  move and a healthy no-op both read as `current at 0.5.0` to anyone looking the
+  next morning.
+- `zellij list-sessions` → none. In fact nothing at all was running on the box:
+  no Zellij, no WezTerm, no `claude`. The operator's description that "the Mac
+  mini agents are all waiting" meant *queued work on boards*, not processes
+  holding the binary. **Waiting-on-a-board and waiting-in-a-session are
+  indistinguishable from the desk and completely different from the machine** —
+  the second would have made the cycle log `held` and moved nothing.
 
 ## A checklist gap this cut found, unfixed
 
