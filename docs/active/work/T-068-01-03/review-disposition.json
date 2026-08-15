@@ -1,16 +1,16 @@
 {
   "disposition": "block",
-  "reason": "The arrangement is built, tested and rehearsed for real (guard, rollback, soak hold), but the Mac mini cannot be put on nightly yet: no published release carries `lisa upgrade` or `lisa nightly` — both exist only on main — so the mini cannot install the arrangement or read as level with the nightly channel, and a read-only look at johns-mac-mini.local found no lisa, no zellij and no board on it at all. Three criteria need the machine and a release first: the mini actually on nightly, its next run recorded, and a rollback performed there.",
+  "reason": "The mini is on nightly and moved itself onto v0.5.0 unattended — verified off the machine today, and the runbook now describes the job it actually runs. Two criteria still need a person at the machine. First, nothing leaves the box when a night goes wrong: the mover writes one line to ~/ergo-fleet/lisa-stay-current.log, and because it compares the installed version before and after, a failed `brew upgrade` logs `current at 0.5.0 on lisa-nightly` — the same words a healthy no-op prints. Second, rollback has never been performed on this box; it was rehearsed on the dev desk, but on Homebrew the way back is `lisa upgrade --tag`, which leaves a second lisa in ~/.local/bin shadowing the formula one, and that interaction is untested here.",
   "remedy_owner": "operator",
-  "ask": "Publish a Lisa release with this work in it, then set the Mac mini up on it and save what it reports into docs/knowledge/mac-mini-nightly-record.json in this repo.",
+  "ask": "On the Mac mini, give it a way to tell you when a night goes wrong, put it back on the previous Lisa once to prove you can, then write both into docs/knowledge/mac-mini-nightly-record.json in this repo.",
   "steps": [
-    "Cut a release from main so `lisa upgrade` and `lisa nightly` are published (see docs/knowledge/release-checklist.md).",
-    "On the mini: brew install zellij",
-    "On the mini: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/johnhkchen/lisa/releases/latest/download/lisa-cli-installer.sh | sh",
-    "On the mini, give it a board to work and check releases against, then: lisa nightly install --project <that board> --alert '<the command that reaches you>'",
-    "On the mini: lisa nightly run    (one cycle now, rather than waiting for 04:30)",
-    "Save the answer into this repo: lisa nightly status --json > docs/knowledge/mac-mini-nightly-record.json",
-    "Prove the way back on the mini itself: lisa upgrade --tag <the previous tag>, confirm the board still runs, then lisa upgrade to come forward again."
+    "On the mini, in ~/ergo-fleet/lisa-stay-current: check whether `brew upgrade` actually succeeded instead of inferring it from the version, log `failed` when it did not, and send that line somewhere off the machine (a webhook, a mail command, a push service).",
+    "Prove it shouts: make it fail once on purpose (an unreachable brew, a bad formula name) and confirm the message reaches you.",
+    "Prove the way back, on the mini: lisa upgrade --tag v0.4.4",
+    "Confirm the work still runs under it: lisa --version, then lisa status --path <a board on that box>",
+    "Come back: rm ~/.local/bin/lisa && brew upgrade lisa-nightly, and confirm `lisa doctor` reads one lisa at /opt/homebrew/bin/lisa, channel nightly.",
+    "Record both in docs/knowledge/mac-mini-nightly-record.json: add data.alert = {\"leaves_the_box\": \"<what you set up>\", \"tells_failure_from_noop\": true}, add data.evidence.rolled_back_here = {\"at\": \"<when>\", \"from\": \"<version>\", \"to\": \"<tag>\", \"workloads_ran\": \"<what you ran and what it said>\"}, and drop the data.not_yet_true entries the two steps above have made false.",
+    "Run lisa doctor on the mini with PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin — a plain non-login ssh has no Homebrew on PATH and reports a healthy machine as unsupported."
   ],
-  "check": "python3 -c \"import json,sys;d=json.load(open('docs/knowledge/mac-mini-nightly-record.json'))['data'];sys.exit(0 if d.get('channel')=='nightly' and d.get('state')=='ok' and d.get('last_cycle') else 1)\""
+  "check": "python3 -c \"import json,sys;d=json.load(open('docs/knowledge/mac-mini-nightly-record.json'))['data'];a=d.get('alert') or {};r=(d.get('evidence') or {}).get('rolled_back_here') or {};sys.exit(0 if d.get('channel')=='nightly' and a.get('leaves_the_box') and a.get('tells_failure_from_noop') is True and all(r.get(k) for k in ('at','from','to','workloads_ran')) else 1)\""
 }

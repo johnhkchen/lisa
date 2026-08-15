@@ -1,187 +1,140 @@
 # T-068-01-03 — the Mac mini runs nightly and can be put back
 
-The arrangement is built, tested, and rehearsed for real against the live
-release list. **It is not on the Mac mini**, and it cannot be yet: no published
-release carries `lisa upgrade` or `lisa nightly` — both were written this story
-and exist only on `main` — and the mini turns out to have no Lisa and no Zellij
-on it at all. That is the block; the details and the exact way out are at the
-bottom.
+The first attempt blocked on two things that were not this desk's to do:
+no published release carried `lisa upgrade` or `lisa nightly`, and the mini
+was not a Lisa machine. **Both are now done.** v0.5.0 shipped on 2026-08-14
+carrying all of it, and the mini is on nightly and moved itself onto v0.5.0
+without anyone touching it.
 
-## What changed
+This attempt did not redo that work. It went and looked at the machine, found
+one real gap between what this repo says and what the box does, fixed it, and
+is blocking on the two criteria that still need a person at the machine.
 
-**New: `crates/lisa-cli/src/busy.rs`** — is any Zellij session still running on
-this machine? Deliberately blunt: not "is it one of Lisa's", because a
-machine-level command has no project to compare against and the two mistakes do
-not cost the same. Refusing an upgrade over an unrelated Zellij costs a skipped
-cycle; upgrading into a live run costs the run. Both Zellijs a Lisa box can have
-are asked — the one on `PATH` and the Debian package's pinned
-`/usr/libexec/lisa/zellij`.
+## What changed this attempt
 
-**New: `crates/lisa-cli/src/nightly.rs`** — `lisa nightly install | run | status
-| uninstall`.
+One commit, `5e71ff1`, both files docs.
 
-- `install` records `channel = "nightly"`, the board to check against
-  (`nightly_project`) and the alarm that leaves the machine (`alert_command`),
-  writes `~/Library/LaunchAgents/io.johnhkchen.lisa.nightly.plist`, and loads it
-  with `launchctl bootstrap gui/<uid>`. `--dry-run` prints the job and changes
-  nothing. It refuses a brew/apt-managed Lisa, and refuses a `--project` that is
-  not a board — an alarm that fires every morning about a directory `doctor`
-  cannot answer for is worse than no alarm.
-- `run` is one cycle: skip while the machine is working → fail loudly if the
-  release list is unreachable → hold if the newest tag has not soaked → do
-  nothing if already level → otherwise install, then **check the new release
-  against this machine's own board** with the newly installed binary's
-  `--version` and `doctor --json`. Every outcome is written to
-  `nightly/health.json` and appended to `nightly/history.jsonl`, next to the
-  channel.
-- `status` is the question you ask a box you are not sitting at, prose or
-  `--json`, and it exits non-zero on three different silences: the last cycle
-  failed, the record is more than 36 hours old (so the schedule itself has
-  stopped), or the machine has been too busy to move three nights running.
-- `uninstall` removes the job and keeps the channel and the record.
+**`docs/knowledge/mac-mini-nightly.md`** — the page described an arrangement the
+mini does not have. It prescribed `lisa nightly install`, a launch agent named
+`io.johnhkchen.lisa.nightly`, and runs at 04:30/05:30/06:30. The mini has none
+of those. It kept the mover the `screen-design` desk already had: one launch
+agent, `dev.b28.lisa-stay-current`, at 04:37, running a script whose one
+meaningful line is `FORMULA=lisa-nightly`. A person following the page would
+have gone looking for a job that is not there — which is the criterion *write it
+down somewhere a person can find it later* failing quietly.
 
-**Changed: `crates/lisa-cli/src/upgrade.rs`** — two things.
+The page now opens with what the box actually runs, and the `One mover per box`
+section no longer reads as a rule the certified machine breaks: one mover still
+holds, but which mover to keep depends on what the box already has, and the cost
+of the mini's choice is named where the choice is made.
 
-1. **The guard.** `lisa upgrade` now refuses while any Zellij session is up,
-   names the sessions, and offers `--anyway`. The refusal happens after the plan
-   is printed and before anything is downloaded, so a `--dry-run` still reports
-   (and says a real run would stop).
-2. **`installed_lisa()`** — an upgrade is about the lisa in `~/.local/bin`, not
-   about the process asking. On a box where the running `lisa` came from
-   somewhere else, comparing against the *runner's* version made `--tag` decide
-   the machine was already where it needed to be and move nothing. That is the
-   rollback path, so it is the worst place to get this wrong. Found by the
-   rehearsal below, not by reading.
+**`docs/knowledge/mac-mini-nightly-record.json`** — the machine's own answer,
+which was sitting untracked in the working tree. Committed, and corrected in two
+places:
 
-**Changed: `crates/lisa-cli/src/channel.rs`** — `nightly_project` and
-`alert_command` in the machine config, rendered as commented-out examples when
-unset and preserved when `lisa upgrade --channel` rewrites the file (a channel
-change silently dropping the alarm would be a quiet way to go deaf). Plus
-`format_rfc3339_utc`, the inverse of the parser already there, so a record a
-person opens carries a time and not a number.
+1. The unattended move ran with `FORMULA=lisa`. The script's formula line was
+   changed to `lisa-nightly` at 18:42, *after* the 18:09 move. Same job, same
+   script, same `brew upgrade` — the mechanism is proven — but the record read
+   as though the move happened on the nightly formula, and it did not. On a
+   ticket about freshness being install history rather than intent, that
+   distinction is the whole point.
+2. A `not_yet_true` list, so the record carries its own gaps instead of leaving
+   them to a review nobody re-reads.
 
-**Changed: `crates/lisa-cli/src/session_name.rs`** — `running_session_names()`,
-so the `EXITED` grammar has one reader shared with the loop.
+## What the machine says, read off it during this review
 
-**Changed: `crates/lisa-cli/src/main.rs`** — the `nightly` command group and
-`upgrade --anyway`.
+Read-only over ssh, 2026-08-14, with `PATH=/opt/homebrew/bin:...` — the same
+PATH the launch agent sets:
 
-**Docs:** `docs/knowledge/mac-mini-nightly.md` (new) is the runbook — the two
-setup commands, where the schedule lives and what is in it, what a cycle does
-and refuses to do, the four ways a failure reaches us, rolling back, and what to
-record as it runs. README gains *A machine that upgrades itself*; `lisa
-json-guide` gains `lisa nightly status --json`; `docs/knowledge/flag-audit.md`
-gains the five new flag rows the audit test requires.
+```
+lisa         channel nightly (from the Homebrew formula lisa-nightly),
+             installed 0.5.0, nightly is not moving this cycle: v0.5.0 is the
+             newest release and has 19h of its 24h soak window left   OK
+lisa install one lisa, at /opt/homebrew/bin/lisa (Homebrew's lisa-nightly)
+             — and `lisa` runs it                                     OK
+zellij       mode system, version 0.44.3, supported >= 0.43.0         OK
+```
 
-## How it is tested
+`/opt/homebrew/bin/lisa` → `../Cellar/lisa-nightly/0.5.0/bin/lisa`. No
+`~/.local/bin/lisa`. The log reads three lines and no more:
 
-`just check` is green end to end (exit 0): wasm check, `cargo fmt --all --check`,
-clippy `-D warnings` on all three crates, `cargo test --workspace`.
+```
+2026-08-14 16:28  current at 0.4.4
+2026-08-14 18:09  moved 0.4.4 -> 0.5.0
+2026-08-14 18:43  current at 0.5.0 on lisa-nightly
+```
 
-**Automated** — 19 unit tests in `nightly.rs`, 4 in `busy.rs`, 4 added to
-`channel.rs`, 12 black-box tests in `tests/nightly_cli.rs`, 1 added to
-`tests/upgrade_cli.rs`. The CLI tests run the real binary against a local
-stand-in for the releases API, a throwaway `HOME` and machine config, and a
-stand-in `zellij` that reports whatever the case needs, so nothing reaches the
-network, installs an artifact, or touches this machine's own channel or launch
-agents.
+A live Zellij session (`overseer`, running `claude --continue`) was up while I
+looked, so tonight's 04:37 run will log `held` and move nothing. The guard is
+not theoretical on this box.
 
-| what | test |
+**One trap worth writing down, because it nearly cost this review its verdict.**
+A plain non-login `ssh mini` has no Homebrew on `PATH`. Run `lisa doctor` that
+way and it reports `lisa install unsupported`, `zellij unsupported`, and
+`nothing named lisa is on this PATH` — about a machine that is fine. The first
+read of this box said it had no Zellij and could not run Lisa at all; `ps`
+showed a Zellij server running from `/opt/homebrew/bin` at the same moment. Ask
+a remote box its health with the PATH its scheduler uses, or you will read a
+healthy machine as broken. This is now in the record.
+
+## Criteria, honestly
+
+| criterion | where it stands |
 | --- | --- |
-| an upgrade refuses under a live run, names it, and names `--anyway` | `an_upgrade_does_not_land_under_a_live_run` |
-| a cycle skips a working machine and touches nothing | `a_cycle_never_lands_under_a_live_run` |
-| a tag too new to trust is seen and not taken | `a_tag_that_has_not_soaked_is_seen_and_not_taken` |
-| an unreachable release list fails loudly, moves nothing, and the alarm carries the record | `a_cycle_that_cannot_read_the_release_list_fails_loudly_and_moves_nothing` |
-| a release that did not actually land is not called a move | `a_release_that_did_not_actually_land_is_caught_before_it_is_called_a_move` |
-| a Zellij the new release cannot use fails the cycle by name | `a_zellij_the_new_release_cannot_use_fails_the_cycle_by_name` |
-| three skipped nights stop reading as healthy | `a_machine_that_is_always_working_stops_reading_as_healthy` |
-| a stale record says the schedule is not running | `a_record_older_than_a_night_says_the_schedule_is_not_running` |
-| the alarm with nowhere to go says so instead of reading as sent | `an_alarm_with_nowhere_to_go_says_so_rather_than_reading_as_sent` |
-| the job's shape: absolute lisa, three tries, its own PATH, never at load | `the_job_runs_lisa_by_absolute_path_and_carries_a_path_of_its_own` |
-| install writes the job and uninstall keeps what the box knows (macOS) | `install_puts_the_machine_on_nightly_and_uninstall_leaves_what_it_knows` |
-| the settings the arrangement needs survive a channel change | `what_the_nightly_arrangement_records_survives_the_next_channel_change` |
+| upgrades unattended on nightly, schedule written down | **met** — 04:37 launch agent, `brew upgrade lisa-nightly`; written down in the runbook and the record, as of this commit |
+| never lands mid-run | **met** — the mover holds on any live Zellij session; held state observed live today |
+| a failed upgrade leaves the working version | **met** — `brew upgrade` either lands a new keg or leaves the old one linked |
+| a broken nightly reaches us the same morning | **not met** — see below |
+| the mini is on nightly and level, next run recorded | **met** — `doctor` above; 18:43 cycle recorded |
+| the soak window exercised at least once | **met** — rehearsed against a synthetic release list in attempt 1 (`waiting`, nothing taken); the mini now inherits the publisher-side soak, and `doctor` shows it holding v0.5.0's remaining 19h |
+| rollback one command, tested for real on the mini | **not met** — see below |
 
-**Rehearsed for real**, against the live GitHub release list, inside a throwaway
-`HOME` on this desk (script and full transcript: `rehearsal.sh`,
-`rehearsal.txt`, in this work directory). This machine had two live Zellij
-sessions throughout, which is what made steps 1b and 2 real rather than staged:
+## Why this is blocked
 
-1. **The guard, live.** `lisa upgrade --tag v0.4.4` exited 1 with *not moving
-   lisa while this machine is working: 2 Zellij sessions are still running on
-   this machine: overseer, lisa-6* and `lisa 0.5.0-rc.2 … is unchanged`.
-2. **A real move.** `--tag v0.4.4 --anyway` downloaded and ran v0.4.4's own
-   installer; the sandbox `lisa --version` reported `0.4.4`.
-3. **The rollback, for real and in one command.** `lisa upgrade --tag
-   v0.5.0-rc.2` moved it back — *Moving lisa 0.4.4 → 0.5.0-rc.2* — and the
-   workload ran again under it: `lisa status --path <this repo>` printed the
-   board (215 tickets, 217 edges) from the rolled-back binary.
-4. **The soak window, exercised.** A release list served with a tag published 60
-   seconds earlier: the cycle recorded `waiting` — *v0.9.9 is the newest release
-   and has 23h of its 24h soak window left; every older release has been
-   superseded by it* — and moved nothing.
-5. **A whole cycle against the live list**, on a machine reported idle: `level`,
-   recorded, and `lisa nightly status` / `--json` read it back the same way.
+**Nothing leaves the machine when a night goes wrong.** The mover writes one
+line to `~/ergo-fleet/lisa-stay-current.log` and that is all. Worse, that line
+cannot tell a failure from a quiet night: the script compares the installed
+version before and after, and a `brew upgrade` that *fails* leaves them equal,
+so it logs `current at 0.5.0 on lisa-nightly` — the same words a healthy no-op
+prints. `$out` is captured and discarded on that path, and there is no `set -e`.
+So the one place the mini records its health reports a broken night as a fine
+one. The criterion says in as many words: *do not leave this as "we'll notice."*
 
-## Why this is blocked, and on what
+**Rollback has not been done on this machine.** Attempt 1 rehearsed it for real
+on the dev desk — v0.5.0-rc.2 → v0.4.4 → back, with a board running under the
+rolled-back binary — and that is worth something, but the criterion names the
+mini, and the mini is the box where the way back is different: `brew switch` is
+gone, so `lisa upgrade --tag` writes a pin into `~/.local/bin/lisa` that shadows
+the Homebrew one. Two lisas on the box, PATH order deciding which runs, and the
+launch agent's own PATH puts `/opt/homebrew/bin` first — meaning the pin would
+be what your shell runs while the timer keeps upgrading the other one. That
+interaction is documented and untested. It is exactly the kind of thing that is
+cheap to find on a Tuesday and expensive to find during an incident.
 
-Two facts, both checked rather than assumed:
-
-**No published release has these commands.** `lisa upgrade` (T-068-01-01) and
-`lisa nightly` (this ticket) exist only on `main`. The newest tags are
-v0.5.0-rc.2 (2026-08-09) and v0.4.4 (2026-07-19); neither has `upgrade`, so
-neither can put a machine on a channel. Until a release carries this work, the
-mini cannot install the arrangement, and it cannot be *level with nightly* in
-`lisa doctor` either — the nearest thing available would be a hand-copied
-unreleased binary, which `doctor` would honestly report as `ahead`, and which is
-the exact "freshness is a property of install history, not of intent" failure
-this story exists to end.
-
-**The mini is not a Lisa machine yet.** `johns-mac-mini.local` (192.168.4.33,
-macOS 26.6.1, arm64) answers, and a read-only look at it found: no `lisa`, no
-`zellij`, no `brew`, no Lisa machine config, no launch agent, and `claude` in
-`~/.local/bin`. It has been up 7 days with a load average around 1.6, so it is
-doing background work — but not Lisa's, and there is no board on it for a
-nightly cycle to check a release against.
-
-So the three criteria that need the machine — the mini actually on nightly and
-level, its next run recorded, and a rollback performed on the mini itself —
-cannot be met from here, in this order. Everything else is done: the schedule,
-the mid-run guard, the failed-upgrade safety, the signal, a rollback tested for
-real, and the soak window exercised.
-
-The way out is in the disposition and is two steps: publish a release with this
-work in it, then run the one-command install and `lisa nightly install` on the
-mini and save what it reports into `docs/knowledge/mac-mini-nightly-record.json`.
-The runbook (`docs/knowledge/mac-mini-nightly.md`) is written for exactly that.
+Both need a person at the machine, which the `screen-design` desk owns. The
+disposition names the steps and what to write back.
 
 ## What still concerns me
 
-1. **The alarm is only as loud as `alert_command`.** Unset, a failure reaches
-   stderr, the system log and a desktop notification — all of them on the mini
-   itself, which is a box nobody is sitting at. The record says so in as many
-   words (*nothing left this machine*), and `lisa nightly status` fails from the
-   dev desk when the box goes quiet, but the "reaches us the same morning"
-   criterion genuinely depends on the operator naming a destination at install
-   time. I could not pick one for you.
-2. **Busy means "any Zellij session", including one that is nothing to do with
-   Lisa.** On the mini that is right. On a box where someone keeps a personal
-   Zellij open for weeks, the nightly cycle would skip forever — which `status`
-   reports after three nights, and which the operator then has to clear by hand.
-   The safe direction, but not a free one.
-3. **The post-move check needs a board.** With no `nightly_project`, a cycle
-   verifies only that the version landed and says so plainly rather than
-   implying more. The Zellij-range check the ticket asks about only happens with
-   a board named.
-4. **`--anyway` exists.** It has to — an operator who knows the running session
-   is idle needs a way past — but it is a foot-gun on a shared box, and nothing
-   stops a future script from reaching for it.
-5. **Rollback across a version that predates `upgrade`.** Step 3 of the
-   rehearsal was driven by the built binary, because v0.4.4 has no `upgrade`
-   subcommand to roll itself forward with. On the mini this will not arise once
-   the arrangement ships (every release from here has `upgrade`), but a machine
-   that rolls back *past* the first release carrying `upgrade` will need the
-   one-command install to come back, not `lisa upgrade`.
-6. **The three run times are a guess.** 04:30, 05:30, 06:30 fits "before anyone
-   looks" on this desk's clock. If the mini's real work runs overnight, all
-   three may land on a busy machine and the box will skip; `status` will say so
-   after three nights, and the times are a one-line change in `RUN_TIMES`.
+1. **The mini's mover is not Lisa's.** That is a defensible call — the channel
+   is the formula name now, so a box that pulls its formula needs no client-side
+   logic — but it means `lisa nightly status`, the pull-side check this ticket
+   built and tested, answers for every kind of box except the one machine the
+   fleet actually certifies on. The gap gets papered over by a hand-assembled
+   JSON file that someone has to remember to refresh.
+2. **The record is a snapshot, not a signal.** `mac-mini-nightly-record.json`
+   says what was true when someone last looked. Nothing in this repo goes stale
+   or turns red when the mini goes quiet for a week.
+3. **The guard depends on `zellij` being findable.** The mover's check is
+   `zellij list-sessions | grep -cv EXITED` with `PATH=/opt/homebrew/bin:...`.
+   If Homebrew's zellij ever moves, the command vanishes, the count reads zero,
+   and the box upgrades under a live run while logging nothing unusual. Failing
+   open is the wrong direction for that check.
+4. **`claude` is not on the launch agent's PATH.** It lives in `~/.local/bin`,
+   which the plist does not include. Harmless today because the job only runs
+   `brew` — but anything added to that job that wants `doctor`'s full answer will
+   get `claude not found` and a machine that reads as unsupported.
+5. **Nothing has caught a bad release yet.** One move, and it was a stable cut
+   the box would have taken anyway. The ticket asks us to record how often
+   nightly actually catches something; the honest count so far is zero out of
+   one, which is too few to conclude anything about the soak window.
