@@ -145,6 +145,21 @@ fn second_scheduler_refusal(
     running_here: &[String],
     current_session: Option<&str>,
 ) -> Option<String> {
+    second_scheduler_refusal_on(
+        root,
+        running_here,
+        current_session,
+        &crate::presence::Machine::read(root),
+    )
+}
+
+/// The same refusal, against a stated machine.
+fn second_scheduler_refusal_on(
+    root: &Path,
+    running_here: &[String],
+    current_session: Option<&str>,
+    machine: &crate::presence::Machine,
+) -> Option<String> {
     let now = crate::seats::now_secs()?;
     let roster = lisa_core::schedulers::read_roster(root);
     let mut holders: Vec<BoardHolder> = Vec::new();
@@ -155,6 +170,15 @@ fn second_scheduler_refusal(
             now,
             lisa_core::schedulers::live_window_secs(record.poll_interval_secs, 0),
         ) {
+            continue;
+        }
+        // A fresh stamp from a run whose Zellij server this machine cannot
+        // find is not a run. Refusing on it is how a board with a ready ticket
+        // sat for forty-five minutes while every retry read the same dead
+        // record (S-070-01). The session listing below is unaffected: a
+        // session that is genuinely still up refuses on its own, which is what
+        // keeps this from letting a second scheduler onto a live board.
+        if machine.look(record, now).is_gone() {
             continue;
         }
         if let Some(session) = record.session_name.as_deref() {
@@ -1026,8 +1050,8 @@ mod tests {
         )
         .unwrap();
 
-        let refusal =
-            second_scheduler_refusal(dir.path(), &[], None).expect("a live scheduler refuses");
+        let refusal = second_scheduler_refusal_on(dir.path(), &[], None, &unasked())
+            .expect("a live scheduler refuses");
         assert!(refusal.contains("There is a run already running on this board"));
         assert!(refusal.contains("fascinating-drum (drum)"));
         assert!(refusal.contains("zellij kill-session fascinating-drum"));
@@ -1058,10 +1082,11 @@ mod tests {
         .unwrap();
 
         // The stamp is 25 minutes cold, so the roster alone refuses nothing.
-        assert!(second_scheduler_refusal(dir.path(), &[], None).is_none());
+        assert!(second_scheduler_refusal_on(dir.path(), &[], None, &unasked()).is_none());
 
-        let refusal = second_scheduler_refusal(dir.path(), &["lisa".to_string()], None)
-            .expect("a session still running on this board refuses");
+        let refusal =
+            second_scheduler_refusal_on(dir.path(), &["lisa".to_string()], None, &unasked())
+                .expect("a session still running on this board refuses");
         assert!(refusal.contains("There is a run already running on this board"));
         assert!(refusal.contains("lisa — a Zellij session still open on this board"));
         assert!(
@@ -1080,10 +1105,11 @@ mod tests {
     fn a_running_session_refuses_even_with_nothing_in_the_registry() {
         let dir = tempfile::tempdir().unwrap();
 
-        let refusal = second_scheduler_refusal(
+        let refusal = second_scheduler_refusal_on(
             dir.path(),
             &["lisa".to_string(), "lisa-2".to_string()],
             Some("lisa-2"),
+            &unasked(),
         )
         .expect("a running session refuses on its own");
         assert!(refusal.contains("There are 2 runs already running on this board"));
@@ -1120,9 +1146,133 @@ mod tests {
         )
         .unwrap();
 
-        let refusal = second_scheduler_refusal(dir.path(), &["lisa".to_string()], None).unwrap();
+        let refusal =
+            second_scheduler_refusal_on(dir.path(), &["lisa".to_string()], None, &unasked())
+                .unwrap();
         assert!(refusal.contains("There is a run already running on this board"));
         assert_eq!(refusal.matches("zellij kill-session lisa").count(), 1);
+    }
+
+    /// A machine that answers nothing about processes: every record is judged
+    /// by its stamp alone, which is how this refusal read the board before it
+    /// learned to ask.
+    fn unasked() -> crate::presence::Machine {
+        crate::presence::Machine::unknown()
+    }
+
+    /// The deadlock, from the side that made it permanent. `renderer-3`
+    /// stamped 87 seconds ago and its Zellij server is gone, so there is
+    /// nothing on this board to be a second scheduler *to* — and a start that
+    /// refuses here is a start that can never be retried into working.
+    #[test]
+    fn a_record_whose_zellij_server_is_gone_does_not_refuse_the_next_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::seats::now_secs().unwrap();
+        lisa_core::schedulers::write_record(
+            &lisa_core::schedulers::roster_dir(dir.path()),
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "renderer-3-49ded6ab",
+                Some("renderer-3".to_string()),
+                Some(15340),
+                now - 45 * 60,
+                // Inside the minute this refusal allows a stamp: the same
+                // record thirty seconds earlier in the incident, when a retry
+                // was still being told a run was here.
+                now - 30,
+                5,
+            ),
+        )
+        .unwrap();
+        let without_the_server =
+            crate::presence::Machine::fixed(Some(Vec::new()), |_| crate::presence::Server::Missing);
+
+        assert!(
+            second_scheduler_refusal_on(dir.path(), &[], None, &unasked()).is_some(),
+            "the stamp alone still refuses on a machine that cannot be asked"
+        );
+        assert!(
+            second_scheduler_refusal_on(dir.path(), &[], None, &without_the_server).is_none(),
+            "a run whose server is gone is not a run"
+        );
+        // And the protection that must survive it: a session still listed
+        // under this board's name refuses whatever the pid says.
+        assert!(
+            second_scheduler_refusal_on(
+                dir.path(),
+                &["renderer-3".to_string()],
+                None,
+                &without_the_server
+            )
+            .is_some(),
+            "a session still running on this board refuses on its own"
+        );
+    }
+
+    /// A `lisa loop` that declines to start must leave the lock exactly as it
+    /// found it. Every retry on the day renewed something, so each attempt to
+    /// recover the board pushed the refusal further out — the one failure shape
+    /// an operator cannot work around by trying again.
+    #[test]
+    fn a_refused_loop_writes_nothing_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::seats::now_secs().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lisa")).unwrap();
+        lisa_core::schedulers::write_record(
+            &lisa_core::schedulers::roster_dir(dir.path()),
+            &lisa_core::schedulers::SchedulerRecord::new(
+                "renderer-3-49ded6ab",
+                Some("renderer-3".to_string()),
+                Some(15340),
+                now - 45 * 60,
+                now - 3,
+                5,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(lisa_core::liveness::SCHEDULER_ALIVE_FILE),
+            serde_json::to_vec(&lisa_core::liveness::SchedulerAlive::new(now - 3, 5)).unwrap(),
+        )
+        .unwrap();
+
+        let before = snapshot(&dir.path().join(".lisa"));
+        assert!(second_scheduler_refusal_on(
+            dir.path(),
+            &["renderer-3".to_string()],
+            None,
+            &unasked()
+        )
+        .is_some());
+
+        assert_eq!(
+            snapshot(&dir.path().join(".lisa")),
+            before,
+            "a refusal that renews the lock it refuses on cannot be retried out of"
+        );
+    }
+
+    /// Every file under a directory, with what is in it and when it was last
+    /// written — enough to catch a stamp rewritten with identical bytes.
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(snapshot(&path));
+            } else {
+                let meta = entry.metadata().expect("metadata");
+                found.push((
+                    path.clone(),
+                    std::fs::read(&path).expect("read"),
+                    meta.modified().expect("mtime"),
+                ));
+            }
+        }
+        found.sort_by(|left, right| left.0.cmp(&right.0));
+        found
     }
 
     /// A record from a run that stopped must not lock the operator out of
@@ -1144,9 +1294,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(second_scheduler_refusal(dir.path(), &[], None).is_none());
+        assert!(second_scheduler_refusal_on(dir.path(), &[], None, &unasked()).is_none());
         assert!(
-            second_scheduler_refusal(tempfile::tempdir().unwrap().path(), &[], None).is_none(),
+            second_scheduler_refusal_on(tempfile::tempdir().unwrap().path(), &[], None, &unasked())
+                .is_none(),
             "a board no scheduler has written on refuses nothing"
         );
     }

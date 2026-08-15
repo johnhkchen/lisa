@@ -128,7 +128,10 @@ impl Machine {
         }
     }
 
-    /// A machine that answers nothing, for a caller with no reason to ask.
+    /// A machine that answers nothing: every record is judged by its stamp
+    /// alone, which is the world every reader here described before it learned
+    /// to ask, and the one a test states when the question is not the point.
+    #[cfg(test)]
     pub(crate) fn unknown() -> Self {
         Self {
             candidates: Vec::new(),
@@ -198,25 +201,24 @@ impl Machine {
             },
             // No pid to ask about, or a machine that would not answer: the
             // session listing is what is left.
-            Some((_, Server::Unknown)) | None => match (
-                session,
-                session.and_then(|name| self.session_running(name)),
-            ) {
-                (Some(name), Some(true)) => Presence::Running(format!(
-                    "its Zellij session {name} is still running on this machine"
-                )),
-                (Some(name), Some(false)) => Presence::Gone(format!(
-                    "no Zellij session called {name} is running on this machine"
-                )),
-                (None, _) => Presence::Unknown(
-                    "this record names neither a Zellij session nor a server pid, so there is \
+            Some((_, Server::Unknown)) | None => {
+                match (session, session.and_then(|name| self.session_running(name))) {
+                    (Some(name), Some(true)) => Presence::Running(format!(
+                        "its Zellij session {name} is still running on this machine"
+                    )),
+                    (Some(name), Some(false)) => Presence::Gone(format!(
+                        "no Zellij session called {name} is running on this machine"
+                    )),
+                    (None, _) => Presence::Unknown(
+                        "this record names neither a Zellij session nor a server pid, so there is \
                      nothing to ask about"
-                        .to_string(),
-                ),
-                (Some(_), None) => Presence::Unknown(
-                    "no Zellij on this machine could be asked what it is running".to_string(),
-                ),
-            },
+                            .to_string(),
+                    ),
+                    (Some(_), None) => Presence::Unknown(
+                        "no Zellij on this machine could be asked what it is running".to_string(),
+                    ),
+                }
+            }
         }
     }
 }
@@ -364,7 +366,9 @@ fn parse_etime(elapsed: &str) -> Option<u64> {
     };
     let mut secs = 0u64;
     for part in clock.split(':') {
-        secs = secs.checked_mul(60)?.checked_add(part.parse::<u64>().ok()?)?;
+        secs = secs
+            .checked_mul(60)?
+            .checked_add(part.parse::<u64>().ok()?)?;
     }
     Some(days * 86_400 + secs)
 }
@@ -438,7 +442,7 @@ mod tests {
         )
         .look(&renderer_3(), NOW);
 
-        assert_eq!(presence.is_gone(), false, "{presence:?}");
+        assert!(!presence.is_gone(), "{presence:?}");
         assert!(matches!(presence, Presence::Running(_)));
     }
 
@@ -481,7 +485,9 @@ mod tests {
 
         let gone = machine(Some(&["something-else"]), Server::Unknown).look(&record, NOW);
         assert!(gone.is_gone(), "{gone:?}");
-        assert!(gone.because().contains("no Zellij session called renderer-3"));
+        assert!(gone
+            .because()
+            .contains("no Zellij session called renderer-3"));
 
         let running = machine(Some(&["renderer-3"]), Server::Unknown).look(&record, NOW);
         assert!(matches!(running, Presence::Running(_)), "{running:?}");

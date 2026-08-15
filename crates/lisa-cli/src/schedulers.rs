@@ -57,7 +57,15 @@ pub fn run_schedulers(root: &Path, stop: Option<&str>) -> Result<(), String> {
                 .to_string(),
         );
     };
-    run_schedulers_with(root, stop, &mut out, now, &current_session(), &kill_session)
+    run_schedulers_with(
+        root,
+        stop,
+        &mut out,
+        now,
+        &current_session(),
+        &kill_session,
+        &crate::presence::Machine::read(root),
+    )
 }
 
 /// The Zellij session this process is sitting in, when it is in one.
@@ -101,6 +109,7 @@ fn write_line(out: &mut impl Write, args: fmt::Arguments<'_>) -> Result<(), Stri
 
 /// The whole command, as a function of the tree, one clock reading, and the two
 /// pieces of the outside world it touches.
+#[allow(clippy::too_many_arguments)]
 fn run_schedulers_with(
     root: &Path,
     stop: Option<&str>,
@@ -108,6 +117,7 @@ fn run_schedulers_with(
     now: u64,
     current_session: &Option<String>,
     stopper: &dyn Fn(&Path, &str) -> Result<(), String>,
+    machine: &crate::presence::Machine,
 ) -> Result<(), String> {
     if !root.exists() {
         return Err(format!("Path does not exist: {}", root.display()));
@@ -128,14 +138,28 @@ fn run_schedulers_with(
             &resolved,
             current_session,
             stopper,
+            machine,
         ),
-        None => list(root, &roster, out, now, &resolved),
+        None => list(root, &roster, out, now, &resolved, machine),
     }
 }
 
 /// Whether this record counts as a scheduler that is here now.
-fn is_live(record: &SchedulerRecord, now: u64, resolved: &config::ResolvedConfig) -> bool {
+///
+/// Two questions, and the second one is the one this command was missing. A
+/// fresh stamp says the process was alive when it wrote; [`crate::presence`]
+/// asks this machine whether it is alive now, and a record whose Zellij server
+/// is provably gone is not a running scheduler however recently it stamped.
+/// A machine that cannot be asked answers nothing, and the stamp stands alone
+/// exactly as it always did.
+fn is_live(
+    record: &SchedulerRecord,
+    now: u64,
+    resolved: &config::ResolvedConfig,
+    machine: &crate::presence::Machine,
+) -> bool {
     record.is_live(now, record.live_window_secs(resolved.wind_down_secs))
+        && !machine.look(record, now).is_gone()
 }
 
 /// One scheduler, as an operator reads it.
@@ -144,8 +168,11 @@ fn describe(
     record: &SchedulerRecord,
     now: u64,
     resolved: &config::ResolvedConfig,
+    machine: &crate::presence::Machine,
 ) -> Vec<String> {
-    let live = is_live(record, now, resolved);
+    let presence = machine.look(record, now);
+    let live = record.is_live(now, record.live_window_secs(resolved.wind_down_secs))
+        && !presence.is_gone();
     let seen = match record.age_secs(now) {
         Some(age) if live => format!("last seen {} ago", humanize(age)),
         Some(age) => format!("stopped stamping {} ago", humanize(age)),
@@ -169,13 +196,29 @@ fn describe(
         }
     )];
 
-    match record.stop_command() {
-        Some(command) => lines.push(format!("    stop it with: {command}")),
-        None => lines.push(
+    // What this machine was asked and what it said, whenever asking settled it.
+    // `stopped stamping 87s ago` and `pid 15340 is not a process on this
+    // machine any more` are the same verdict with very different standing, and
+    // the second is the one that ends an argument about whether to wait.
+    if presence.is_gone() {
+        lines.push(format!("    {}", presence.because()));
+    }
+
+    match (live, record.stop_command()) {
+        // A remedy that can work. `zellij kill-session` is right while the
+        // session is there and is the whole trap once it is not, so the run
+        // that has already ended is offered the command that retires its
+        // record instead (S-070-01).
+        (true, Some(command)) => lines.push(format!("    stop it with: {command}")),
+        (true, None) => lines.push(
             "    Lisa was never told this one's session name; find it with `zellij \
              list-sessions`"
                 .to_string(),
         ),
+        (false, _) => lines.push(format!(
+            "    nothing to stop; clear its record with: lisa schedulers --stop {}",
+            record.scheduler_id
+        )),
     }
 
     if let Some(taken) = recent_receipts(root, &record.scheduler_id, now) {
@@ -221,11 +264,12 @@ fn reading_order<'a>(
     roster: &'a [SchedulerRecord],
     now: u64,
     resolved: &config::ResolvedConfig,
+    machine: &crate::presence::Machine,
 ) -> Vec<&'a SchedulerRecord> {
     let mut ordered: Vec<&SchedulerRecord> = roster.iter().collect();
     ordered.sort_by_key(|record| {
         (
-            !is_live(record, now, resolved),
+            !is_live(record, now, resolved, machine),
             std::cmp::Reverse(record.stamped_at),
         )
     });
@@ -261,6 +305,7 @@ fn list(
     out: &mut impl Write,
     now: u64,
     resolved: &config::ResolvedConfig,
+    machine: &crate::presence::Machine,
 ) -> Result<(), String> {
     if roster.is_empty() {
         write_line(
@@ -275,13 +320,13 @@ fn list(
 
     let live: Vec<&SchedulerRecord> = roster
         .iter()
-        .filter(|record| is_live(record, now, resolved))
+        .filter(|record| is_live(record, now, resolved, machine))
         .collect();
     let headline = headline(live.len(), roster.len());
     write_line(out, format_args!("{headline}"))?;
     write_line(out, format_args!(""))?;
-    for record in reading_order(roster, now, resolved) {
-        for line in describe(root, record, now, resolved) {
+    for record in reading_order(roster, now, resolved, machine) {
+        for line in describe(root, record, now, resolved, machine) {
             write_line(out, format_args!("{line}"))?;
         }
         write_line(out, format_args!(""))?;
@@ -311,6 +356,7 @@ fn stop_one(
     resolved: &config::ResolvedConfig,
     current_session: &Option<String>,
     stopper: &dyn Fn(&Path, &str) -> Result<(), String>,
+    machine: &crate::presence::Machine,
 ) -> Result<(), String> {
     let matches: Vec<&SchedulerRecord> = roster
         .iter()
@@ -351,34 +397,117 @@ fn stop_one(
         ));
     }
 
-    if !is_live(record, now, resolved) {
-        stopper(root, &session).ok();
+    // Ending a run that has already ended is the ordinary case after a crash,
+    // not an error: it is what an operator is doing at the moment they need
+    // this command most. So Lisa says what it found and what it cleaned, and
+    // whether `zellij kill-session` had anything left to do is a detail of the
+    // report rather than the difference between success and refusal.
+    let presence = machine.look(record, now);
+    let stamping = record.is_live(now, record.live_window_secs(resolved.wind_down_secs));
+    if !stamping || presence.is_gone() {
+        let found = if presence.is_gone() {
+            presence.because().to_string()
+        } else {
+            match record.age_secs(now) {
+                Some(age) => format!("it stopped stamping {} ago", humanize(age)),
+                None => "its last stamp is dated ahead of this machine's clock".to_string(),
+            }
+        };
+        // Asked anyway, and its answer is not the verdict: a session that is
+        // somehow still there is worth ending, and one that is not costs
+        // nothing to try.
+        let killed = stopper(root, &session).is_ok();
         schedulers::forget(&schedulers::roster_dir(root), &record.scheduler_id);
+        let stamp = retire_orphan_stamp(root, roster, &record.scheduler_id, now, resolved, machine);
         write_line(
             out,
             format_args!(
-                "{} was not running any more. Lisa forgot its record; nothing else changed.",
-                record.label()
+                "{} was not running any more: {found}.\n\nCleaned: its record in {}/{}\
+                 .alive{}{}. Its seats stay where they are — run `lisa release-seats` to see them.",
+                record.label(),
+                schedulers::SCHEDULER_DIR,
+                record.scheduler_id,
+                if killed {
+                    format!(", and the session {session}, which was still there")
+                } else {
+                    String::new()
+                },
+                match stamp {
+                    Some(path) => format!(", and {path}, which only that run could have written"),
+                    None => String::new(),
+                }
             ),
         )?;
         return Ok(());
     }
 
-    stopper(root, &session)
-        .map_err(|error| format!("{}\n\nNothing was stopped and nothing was changed.", error))?;
+    if let Err(error) = stopper(root, &session) {
+        // The remedy Lisa prints and the remedy Lisa runs used to be one
+        // failing command with nothing after it. A kill that fails while this
+        // machine still says the run is here is a real failure and still
+        // stops; anything else has already been handled above.
+        return Err(format!(
+            "{error}\n\nNothing was stopped and nothing was changed. Lisa still reads {} as \
+             running here: {}. If that is wrong — the session ended without its scheduler \
+             noticing — `lisa schedulers` will say so once the stamp goes cold.",
+            record.label(),
+            presence.because()
+        ));
+    }
     // The scheduler cannot withdraw its own record — a run that has just been
     // stopped is exactly the run that cannot — so the caller who established it
     // is gone does it here.
     schedulers::forget(&schedulers::roster_dir(root), &record.scheduler_id);
+    let stamp = retire_orphan_stamp(root, roster, &record.scheduler_id, now, resolved, machine);
     write_line(
         out,
         format_args!(
-            "Stopped {} with `zellij kill-session {session}`. Its seats stay where they are — \
-             run `lisa release-seats` to see them.",
-            record.label()
+            "Stopped {} with `zellij kill-session {session}`.\n\nCleaned: its record in {}/{}\
+             .alive{}. Its seats stay where they are — run `lisa release-seats` to see them.",
+            record.label(),
+            schedulers::SCHEDULER_DIR,
+            record.scheduler_id,
+            match stamp {
+                Some(path) => format!(", and {path}, which no scheduler is left to rewrite"),
+                None => String::new(),
+            }
         ),
     )?;
     Ok(())
+}
+
+/// Retire the board's shared stamp once the run just ended was the last thing
+/// that could have written it.
+///
+/// `.lisa/scheduler.alive` has one name and as many writers as there are
+/// schedulers, so nobody can withdraw it and a dead run's last word keeps
+/// reading as *a scheduler is here* — the half of the S-070-01 deadlock that
+/// survived clearing the registry, and the reason a board was recovered by
+/// moving files by hand. Left alone whenever any other scheduler is still
+/// running, because that one is rewriting it every few seconds and its stamp is
+/// telling the truth.
+fn retire_orphan_stamp(
+    root: &Path,
+    roster: &[SchedulerRecord],
+    stopped: &str,
+    now: u64,
+    resolved: &config::ResolvedConfig,
+    machine: &crate::presence::Machine,
+) -> Option<String> {
+    let others_running = roster
+        .iter()
+        .filter(|record| record.scheduler_id != stopped)
+        .any(|record| is_live(record, now, resolved, machine));
+    if others_running {
+        return None;
+    }
+    let stamp = root.join(lisa_core::liveness::SCHEDULER_ALIVE_FILE);
+    if !stamp.exists() {
+        return None;
+    }
+    std::fs::remove_file(&stamp)
+        .ok()
+        .map(|()| lisa_core::liveness::SCHEDULER_ALIVE_FILE.to_string())
 }
 
 #[cfg(test)]
@@ -410,9 +539,21 @@ mod tests {
         |_, session| panic!("nothing should have stopped {session}")
     }
 
+    /// A machine nobody could ask — every record is judged by its stamp alone,
+    /// exactly as it was before this command learned to ask.
+    fn unasked() -> crate::presence::Machine {
+        crate::presence::Machine::unknown()
+    }
+
+    /// A machine that says the recorded pid is not a process any more, and no
+    /// session by that name is running either.
+    fn without_the_server() -> crate::presence::Machine {
+        crate::presence::Machine::fixed(Some(Vec::new()), |_| crate::presence::Server::Missing)
+    }
+
     fn listed(root: &Path, now: u64) -> String {
         let mut out = Vec::new();
-        run_schedulers_with(root, None, &mut out, now, &None, &never_stops()).unwrap();
+        run_schedulers_with(root, None, &mut out, now, &None, &never_stops(), &unasked()).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -654,6 +795,7 @@ mod tests {
                 stopped.borrow_mut().push(session.to_string());
                 Ok(())
             },
+            &unasked(),
         )
         .unwrap();
 
@@ -686,6 +828,7 @@ mod tests {
             now,
             &None,
             &|_, _| Ok(()),
+            &unasked(),
         )
         .unwrap();
 
@@ -707,6 +850,7 @@ mod tests {
             now,
             &Some("lisa".to_string()),
             &never_stops(),
+            &unasked(),
         )
         .unwrap_err();
 
@@ -733,6 +877,7 @@ mod tests {
             now,
             &None,
             &|_, _| Err("`zellij kill-session fascinating-drum` said: no such session".to_string()),
+            &unasked(),
         )
         .unwrap_err();
 
@@ -757,6 +902,7 @@ mod tests {
             1_786_000_000,
             &None,
             &never_stops(),
+            &unasked(),
         )
         .unwrap_err();
 
@@ -778,15 +924,237 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        run_schedulers_with(dir.path(), Some("gone"), &mut out, now, &None, &|_, _| {
-            Err("no such session".to_string())
-        })
+        run_schedulers_with(
+            dir.path(),
+            Some("gone"),
+            &mut out,
+            now,
+            &None,
+            &|_, _| Err("no such session".to_string()),
+            &unasked(),
+        )
         .unwrap();
 
         assert!(String::from_utf8(out)
             .unwrap()
             .contains("was not running any more"));
         assert!(schedulers::read_roster(dir.path()).is_empty());
+    }
+
+    /// The command that could not succeed. `renderer-3` stamped 87 seconds
+    /// ago, its Zellij server is gone, and `--stop` used to be implemented as
+    /// the one sentence that fails on exactly this board.
+    #[test]
+    fn stopping_a_scheduler_whose_session_is_already_gone_succeeds_and_says_what_it_cleaned() {
+        let dir = project();
+        let now = 1_786_000_000;
+        register(
+            dir.path(),
+            "renderer-3-49ded6ab",
+            Some("renderer-3"),
+            now - 45 * 60,
+            now - 87,
+        );
+        std::fs::create_dir_all(dir.path().join(".lisa")).unwrap();
+        std::fs::write(
+            dir.path().join(lisa_core::liveness::SCHEDULER_ALIVE_FILE),
+            serde_json::to_vec(&lisa_core::liveness::SchedulerAlive::new(now - 87, 5)).unwrap(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        run_schedulers_with(
+            dir.path(),
+            Some("renderer-3-49ded6ab"),
+            &mut out,
+            now,
+            &None,
+            &|_, session| {
+                Err(format!(
+                    "`zellij kill-session {session}` exited exit status: 1"
+                ))
+            },
+            &without_the_server(),
+        )
+        .unwrap();
+        let printed = String::from_utf8(out).unwrap();
+
+        assert!(
+            printed.contains("was not running any more: the Zellij server it recorded, pid 9450"),
+            "it has to say what it found: {printed}"
+        );
+        assert!(
+            printed.contains(".lisa/schedulers/renderer-3-49ded6ab.alive"),
+            "and what it cleaned: {printed}"
+        );
+        assert!(
+            printed.contains(".lisa/scheduler.alive"),
+            "including the shared stamp only that run could have written: {printed}"
+        );
+        assert!(schedulers::read_roster(dir.path()).is_empty());
+        assert!(
+            !dir.path()
+                .join(lisa_core::liveness::SCHEDULER_ALIVE_FILE)
+                .exists(),
+            "the board was recovered by moving this file by hand; that is the bug"
+        );
+    }
+
+    /// The listing has to say the same thing the recovery does, and offer the
+    /// command that can work rather than the one that cannot.
+    #[test]
+    fn a_scheduler_whose_server_is_gone_is_listed_as_not_running_with_the_reason() {
+        let dir = project();
+        let now = 1_786_000_000;
+        register(
+            dir.path(),
+            "renderer-3-49ded6ab",
+            Some("renderer-3"),
+            now - 45 * 60,
+            now - 87,
+        );
+
+        let mut out = Vec::new();
+        run_schedulers_with(
+            dir.path(),
+            None,
+            &mut out,
+            now,
+            &None,
+            &never_stops(),
+            &without_the_server(),
+        )
+        .unwrap();
+        let printed = String::from_utf8(out).unwrap();
+
+        assert!(
+            printed.starts_with("No scheduler is running on this board."),
+            "{printed}"
+        );
+        assert!(!printed.contains("— running"), "{printed}");
+        assert!(
+            printed.contains("pid 9450, is not a process on this machine any more"),
+            "the pid it recorded is the proof: {printed}"
+        );
+        assert!(
+            printed.contains("clear its record with: lisa schedulers --stop renderer-3-49ded6ab"),
+            "a remedy that can work: {printed}"
+        );
+        assert!(
+            !printed.contains("stop it with: zellij kill-session"),
+            "the command that cannot succeed is not offered: {printed}"
+        );
+    }
+
+    /// The guard this must not weaken. A run whose server answers keeps every
+    /// protection it had, and stopping it is still the command that ends its
+    /// session.
+    #[test]
+    fn a_scheduler_whose_server_is_still_up_is_still_running_and_still_protected() {
+        let dir = project();
+        let now = 1_786_000_000;
+        register(
+            dir.path(),
+            "renderer-3-49ded6ab",
+            Some("renderer-3"),
+            now - 45 * 60,
+            now - 87,
+        );
+        let live = crate::presence::Machine::fixed(Some(vec!["renderer-3".to_string()]), |_| {
+            crate::presence::Server::Zellij {
+                up_secs: Some(3 * 3600),
+            }
+        });
+
+        let mut out = Vec::new();
+        run_schedulers_with(
+            dir.path(),
+            None,
+            &mut out,
+            now,
+            &None,
+            &never_stops(),
+            &live,
+        )
+        .unwrap();
+        let printed = String::from_utf8(out).unwrap();
+
+        assert!(printed.starts_with("1 scheduler is running on this board."));
+        assert!(printed.contains("  — running"));
+        assert!(printed.contains("stop it with: zellij kill-session renderer-3"));
+
+        // And a kill that fails while the machine still says it is here is a
+        // real failure, not a cleanup.
+        let error = run_schedulers_with(
+            dir.path(),
+            Some("renderer-3-49ded6ab"),
+            &mut Vec::new(),
+            now,
+            &None,
+            &|_, _| Err("no such session".to_string()),
+            &live,
+        )
+        .unwrap_err();
+        assert!(error.contains("Nothing was stopped"));
+        assert_eq!(schedulers::read_roster(dir.path()).len(), 1);
+    }
+
+    /// A stamp another scheduler is still rewriting is not litter, and the
+    /// clean-up after one dead run must not take it.
+    #[test]
+    fn the_shared_stamp_survives_while_any_other_scheduler_is_still_running() {
+        let dir = project();
+        let now = 1_786_000_000;
+        register(dir.path(), "gone", Some("renderer-3"), now - 3600, now - 87);
+        schedulers::write_record(
+            &schedulers::roster_dir(dir.path()),
+            &SchedulerRecord::new(
+                "here",
+                Some("renderer-4".to_string()),
+                Some(9451),
+                now - 600,
+                now - 3,
+                5,
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".lisa")).unwrap();
+        std::fs::write(
+            dir.path().join(lisa_core::liveness::SCHEDULER_ALIVE_FILE),
+            serde_json::to_vec(&lisa_core::liveness::SchedulerAlive::new(now - 3, 5)).unwrap(),
+        )
+        .unwrap();
+        // The dead one's pid is gone; the live one's session is listed.
+        let mixed = crate::presence::Machine::fixed(Some(vec!["renderer-4".to_string()]), |pid| {
+            if pid == 9450 {
+                crate::presence::Server::Missing
+            } else {
+                crate::presence::Server::Zellij { up_secs: None }
+            }
+        });
+
+        let mut out = Vec::new();
+        run_schedulers_with(
+            dir.path(),
+            Some("gone"),
+            &mut out,
+            now,
+            &None,
+            &|_, _| Err("no such session".to_string()),
+            &mixed,
+        )
+        .unwrap();
+
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("was not running any more"));
+        assert!(
+            dir.path()
+                .join(lisa_core::liveness::SCHEDULER_ALIVE_FILE)
+                .exists(),
+            "renderer-4 is still rewriting it every few seconds"
+        );
+        assert_eq!(schedulers::read_roster(dir.path()).len(), 1);
     }
 
     /// The listing is where the id is read from, so every id it prints has to
@@ -812,9 +1180,15 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        run_schedulers_with(dir.path(), Some("dead"), &mut out, now, &None, &|_, _| {
-            Err("no such session".to_string())
-        })
+        run_schedulers_with(
+            dir.path(),
+            Some("dead"),
+            &mut out,
+            now,
+            &None,
+            &|_, _| Err("no such session".to_string()),
+            &unasked(),
+        )
         .unwrap();
 
         assert!(String::from_utf8(out)

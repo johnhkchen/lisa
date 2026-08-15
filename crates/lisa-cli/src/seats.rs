@@ -736,7 +736,13 @@ pub fn run_release_seats(root: &Path, release: bool) -> Result<(), String> {
                 .to_string(),
         );
     };
-    run_release_seats_with_writer(root, release, &mut out, now, &crate::presence::Machine::read(root))
+    run_release_seats_with_writer(
+        root,
+        release,
+        &mut out,
+        now,
+        &crate::presence::Machine::read(root),
+    )
 }
 
 /// Print the plan, and carry it out only when `release` is true.
@@ -1216,7 +1222,14 @@ mod tests {
         register(dir.path(), "drum", "fascinating-drum", now, 4);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
+        run_release_seats_with_writer(
+            dir.path(),
+            true,
+            &mut out,
+            now,
+            &crate::presence::Machine::unknown(),
+        )
+        .unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("a scheduler is holding these seats"));
@@ -1232,7 +1245,14 @@ mod tests {
         stamp(dir.path(), now, 86_400);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), false, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
+        run_release_seats_with_writer(
+            dir.path(),
+            false,
+            &mut out,
+            now,
+            &crate::presence::Machine::unknown(),
+        )
+        .unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("2 markers to release"));
@@ -1253,7 +1273,14 @@ mod tests {
         stamp(dir.path(), now, 86_400);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
+        run_release_seats_with_writer(
+            dir.path(),
+            true,
+            &mut out,
+            now,
+            &crate::presence::Machine::unknown(),
+        )
+        .unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("Released 3 markers"));
@@ -1283,7 +1310,14 @@ mod tests {
         stamp(dir.path(), now, 2);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
+        run_release_seats_with_writer(
+            dir.path(),
+            true,
+            &mut out,
+            now,
+            &crate::presence::Machine::unknown(),
+        )
+        .unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("Nothing to release"));
@@ -1298,7 +1332,14 @@ mod tests {
         fs::write(dir.path().join(".lisa.toml"), "").unwrap();
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, later(0), &crate::presence::Machine::unknown()).unwrap();
+        run_release_seats_with_writer(
+            dir.path(),
+            true,
+            &mut out,
+            later(0),
+            &crate::presence::Machine::unknown(),
+        )
+        .unwrap();
         assert!(String::from_utf8(out)
             .unwrap()
             .contains("No seats are held here."));

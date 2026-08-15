@@ -8,6 +8,7 @@
 //! a test that reads both can catch that.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -17,10 +18,18 @@ const READY_TICKET: &str = "---\nid: T-001\ntitle: first-thing\ntype: task\nstat
 const BLOCKED_TICKET: &str = "---\nid: T-002\ntitle: second-thing\ntype: task\nstatus: open\npriority: high\nphase: ready\ndepends_on: [T-001]\n---\n\n## Acceptance Criteria\n\n- It works\n";
 
 fn lisa(root: &Path, args: &[&str]) -> Output {
+    // The stub Zellij these fixtures write leads the path when there is one,
+    // so "which sessions are running" is a fact the test states rather than
+    // one the developer's own desk answers.
+    let path = match std::env::var("PATH") {
+        Ok(inherited) => format!("{}:{inherited}", root.join(".stub-bin").display()),
+        Err(_) => root.join(".stub-bin").display().to_string(),
+    };
     Command::new(env!("CARGO_BIN_EXE_lisa"))
         .args(args)
         .arg("--path")
         .arg(root)
+        .env("PATH", path)
         .output()
         .unwrap_or_else(|error| panic!("failed to spawn lisa {args:?}: {error}"))
 }
@@ -563,11 +572,14 @@ fn scheduler_on(root: &Path, id: &str, session: Option<&str>) {
     let now = seconds_since_epoch();
     let dir = root.join(".lisa/schedulers");
     fs::create_dir_all(&dir).unwrap();
+    // No `zellij_pid`: since T-070-01-01 a recorded pid is a question Lisa
+    // asks this machine, and a number invented by a fixture is a process that
+    // is not there. A record without one is judged by its session and its
+    // stamp, which is what these fixtures are about.
     let record = serde_json::json!({
         "schema_version": 1,
         "scheduler_id": id,
         "session_name": session,
-        "zellij_pid": 9450,
         "started_at": now.saturating_sub(3600),
         "stamped_at": now,
         "poll_interval_secs": 5,
@@ -577,6 +589,34 @@ fn scheduler_on(root: &Path, id: &str, session: Option<&str>) {
         serde_json::to_vec(&record).unwrap(),
     )
     .unwrap();
+    if let Some(session) = session {
+        hold_session(root, session);
+    }
+}
+
+/// Make this board's machine report `session` as a running Zellij session.
+///
+/// A scheduler record is a claim; `zellij list-sessions` is where Lisa checks
+/// it. These fixtures describe boards with runs on them, so the machine they
+/// describe has to be holding the sessions those runs name.
+fn hold_session(root: &Path, session: &str) {
+    let dir = root.join(".stub-bin");
+    fs::create_dir_all(&dir).unwrap();
+    let listing = root.join(".stub-bin/sessions.txt");
+    let mut held = fs::read_to_string(&listing).unwrap_or_default();
+    held.push_str(&format!("{session} [Created 6m 18s ago] (current)\n"));
+    fs::write(&listing, &held).unwrap();
+    let stub = dir.join("zellij");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\ncase \"${{1:-}}\" in\n  --version) printf '%s\\n' 'zellij 0.44.3' ;;\n               list-sessions) cat {listing:?} ;;\n  *) exit 1 ;;\nesac\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub, permissions).unwrap();
 }
 
 /// Age `.lisa/signals/` so nothing reads as having moved in it.

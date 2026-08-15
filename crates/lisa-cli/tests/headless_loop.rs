@@ -84,7 +84,14 @@ fn fixture() -> Fixture {
         r#"#!/bin/sh
 case "${1:-}" in
     --version) printf '%s\n' 'zellij 0.44.3'; exit 0 ;;
-    list-sessions) exit 1 ;;
+    # What this machine is holding, stated by whoever ran the test. Lisa asks
+    # twice — once to name this run's session, once to find out whether the
+    # scheduler a record names still exists — and both answers come from here.
+    list-sessions)
+        if [ -n "${LISA_STUB_SESSIONS:-}" ]; then
+            printf '%s\n' "$LISA_STUB_SESSIONS"; exit 0
+        fi
+        exit 1 ;;
 esac
 # Asked before the redirect below replaces this shell's stdout, which would
 # otherwise answer for the file rather than for what Lisa handed the client.
@@ -117,10 +124,16 @@ exit 0
 
 impl Fixture {
     fn run_loop(&self, extra: &[&str]) -> Output {
+        self.run_loop_holding(extra, "")
+    }
+
+    /// A run started while the stubbed Zellij reports these sessions.
+    fn run_loop_holding(&self, extra: &[&str], sessions: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_lisa"))
             .arg("loop")
             .args(extra)
             .args(["--path", self.root.to_str().unwrap()])
+            .env("LISA_STUB_SESSIONS", sessions)
             // The stubs lead, so they are what Lisa finds; the system paths
             // follow only so the stubbed Zellij can ask `tty` and `stty` what
             // it was handed.
@@ -235,7 +248,10 @@ fn a_headless_run_still_refuses_to_be_the_second_scheduler_on_a_board() {
     )
     .unwrap();
 
-    let output = fixture.run_loop(&["--headless"]);
+    // The session that record names is still up, which is what makes it a
+    // scheduler rather than a record: since T-070-01-01 a run whose Zellij
+    // server this machine cannot find no longer holds a board.
+    let output = fixture.run_loop_holding(&["--headless"], "lisa [Created 6m 18s ago] (current)");
     let stderr = String::from_utf8(output.stderr).unwrap();
 
     assert!(!output.status.success(), "a second scheduler started");
