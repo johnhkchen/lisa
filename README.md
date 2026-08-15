@@ -843,7 +843,11 @@ lisa schedulers --stop fascinating-drum      # end that one
 ```
 
 Each line names the run, when it started, when it last checked in, its Zellij
-server, and the exact command that stops it. `--stop` runs that command for you.
+server, and the exact command that stops it. Whatever is running comes first and
+says so — `— running` — and the runs that ended follow it, most recent first. The
+first line counts both, `1 of 4 schedulers on this board is running`, so reading
+the top of the output is enough to know what is holding the board. `--stop` runs
+that command for you, and takes any run on the list, ended or not.
 It ends the whole session, agent panes included, so you always name which one —
 and Lisa refuses the session your own terminal is sitting in, because a command
 that closes the window it is printing to can't tell you what it did.

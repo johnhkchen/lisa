@@ -158,7 +158,11 @@ fn describe(
     let mut lines = vec![format!(
         "  {}{}\n    {started}, {seen}{}",
         record.label(),
-        if live { "" } else { "  — not running" },
+        // The live one carries the word. A run that ended is described by what
+        // it did — `stopped stamping 52m ago` — rather than by a label, because
+        // a listing where the only running scheduler is the one *without* a
+        // marker asks the reader to notice an absence.
+        if live { "  — running" } else { "" },
         match record.zellij_pid {
             Some(pid) => format!(", zellij server pid {pid}"),
             None => String::new(),
@@ -205,7 +209,52 @@ fn recent_receipts(root: &Path, scheduler_id: &str, now: u64) -> Option<String> 
     })
 }
 
-/// Print the board's schedulers, newest run last.
+/// The order an operator reads them in: whatever is running first, then the
+/// runs that ended, most recently stopped first.
+///
+/// This command is reached for when something is holding the board, and the
+/// answer is the live run. A listing that ends with it is a listing that
+/// `head` truncates into history — measured on the `renderer` board, where the
+/// first eight lines were two dead schedulers and a count that disagreed with
+/// them.
+fn reading_order<'a>(
+    roster: &'a [SchedulerRecord],
+    now: u64,
+    resolved: &config::ResolvedConfig,
+) -> Vec<&'a SchedulerRecord> {
+    let mut ordered: Vec<&SchedulerRecord> = roster.iter().collect();
+    ordered.sort_by_key(|record| {
+        (
+            !is_live(record, now, resolved),
+            std::cmp::Reverse(record.stamped_at),
+        )
+    });
+    ordered
+}
+
+/// The first line, written to survive being read on its own.
+///
+/// A bare count is the bug: `1 scheduler is running` above four records is a
+/// contradiction to anybody who reads the first line and the next two. Every
+/// shape here either names both numbers or says outright that the records
+/// below are history.
+fn headline(live: usize, total: usize) -> String {
+    match (live, total) {
+        (0, 1) => "No scheduler is running on this board. The 1 record below is a run that ended."
+            .to_string(),
+        (0, total) => format!(
+            "No scheduler is running on this board. All {total} records below are runs that ended."
+        ),
+        (_, 1) => "1 scheduler is running on this board.".to_string(),
+        (live, total) if live == total => {
+            format!("All {total} schedulers on this board are running.")
+        }
+        (1, total) => format!("1 of {total} schedulers on this board is running."),
+        (live, total) => format!("{live} of {total} schedulers on this board are running."),
+    }
+}
+
+/// Print the board's schedulers, whatever is running first.
 fn list(
     root: &Path,
     roster: &[SchedulerRecord],
@@ -228,19 +277,10 @@ fn list(
         .iter()
         .filter(|record| is_live(record, now, resolved))
         .collect();
-    write_line(
-        out,
-        format_args!(
-            "{} on this board.",
-            match live.len() {
-                0 => "No scheduler is running".to_string(),
-                1 => "1 scheduler is running".to_string(),
-                count => format!("{count} schedulers are running"),
-            }
-        ),
-    )?;
+    let headline = headline(live.len(), roster.len());
+    write_line(out, format_args!("{headline}"))?;
     write_line(out, format_args!(""))?;
-    for record in roster {
+    for record in reading_order(roster, now, resolved) {
         for line in describe(root, record, now, resolved) {
             write_line(out, format_args!("{line}"))?;
         }
@@ -405,8 +445,8 @@ mod tests {
 
         let printed = listed(dir.path(), now);
 
-        assert!(printed.starts_with("3 schedulers are running on this board."));
-        assert!(printed.contains("blossoming-cymbal (cymbal)"));
+        assert!(printed.starts_with("All 3 schedulers on this board are running."));
+        assert!(printed.contains("blossoming-cymbal (cymbal)  — running"));
         assert!(printed.contains("zellij kill-session inventive-triceratops"));
         assert!(printed.contains("started 17h ago, last seen 5s ago, zellij server pid 9450"));
         assert!(printed.contains("Stop all but one"));
@@ -422,13 +462,15 @@ mod tests {
         let printed = listed(dir.path(), now);
 
         assert!(printed.starts_with("1 scheduler is running on this board."));
+        assert!(printed.contains("lisa (lisa-1)  — running"));
         assert!(!printed.contains("Stop all but one"));
     }
 
     /// A record whose scheduler stopped is history, not a running scheduler,
-    /// and the listing has to say which it is.
+    /// and the listing has to say which it is — in the count as well as on the
+    /// line, and without asking anyone to read a missing word.
     #[test]
-    fn a_record_left_by_a_run_that_ended_is_shown_as_not_running() {
+    fn a_record_left_by_a_run_that_ended_is_shown_as_history() {
         let dir = project();
         let now = 1_786_000_000;
         register(
@@ -441,9 +483,111 @@ mod tests {
 
         let printed = listed(dir.path(), now);
 
-        assert!(printed.starts_with("No scheduler is running on this board."));
-        assert!(printed.contains("— not running"));
+        assert!(printed.starts_with(
+            "No scheduler is running on this board. The 1 record below is a run that ended."
+        ));
         assert!(printed.contains("stopped stamping 17h ago"));
+        assert!(
+            !printed.contains("— running"),
+            "nothing here is running: {printed}"
+        );
+    }
+
+    /// The `renderer` board of 2026-08-14, which said `1 scheduler is running`
+    /// over four records and put the live one last. The eight lines an operator
+    /// actually reads have to be true and enough on their own.
+    #[test]
+    fn the_first_eight_lines_answer_which_run_is_holding_the_board() {
+        let dir = project();
+        let now = 1_786_000_000;
+        register(
+            dir.path(),
+            "renderer-4cd787ad",
+            Some("renderer"),
+            now - 4 * 3600,
+            now - 4 * 3600,
+        );
+        register(
+            dir.path(),
+            "renderer-0933474d",
+            Some("renderer"),
+            now - 4 * 3600,
+            now - 4 * 3600,
+        );
+        register(
+            dir.path(),
+            "renderer-2-93ea8bf4",
+            Some("renderer-2"),
+            now - 4 * 3600,
+            now - 52 * 60,
+        );
+        register(
+            dir.path(),
+            "renderer-3-49ded6ab",
+            Some("renderer-3"),
+            now - 45 * 60,
+            now - 87,
+        );
+
+        let printed = listed(dir.path(), now);
+        let head: Vec<&str> = printed.lines().take(8).collect();
+        let head = head.join("\n");
+
+        assert!(
+            head.starts_with("1 of 4 schedulers on this board is running."),
+            "the count has to name both numbers: {head}"
+        );
+        assert!(
+            head.contains("renderer-3 (renderer-3-49ded6ab)  — running"),
+            "the live run has to be inside the truncation: {head}"
+        );
+        assert!(
+            head.contains("started 45m ago, last seen 87s ago"),
+            "and its detail with it: {head}"
+        );
+        assert!(
+            head.contains("stop it with: zellij kill-session renderer-3"),
+            "and what to do about it: {head}"
+        );
+        assert!(
+            !head.contains("stopped stamping 4h ago"),
+            "the oldest history is what `head` is allowed to cut: {head}"
+        );
+
+        // The rest is history, most recently stopped first.
+        let order: Vec<usize> = ["renderer-3-49ded6ab", "renderer-2-93ea8bf4"]
+            .iter()
+            .map(|id| printed.find(id).expect("every record is listed"))
+            .collect();
+        assert!(order[0] < order[1], "{printed}");
+        assert!(printed.contains("stopped stamping 52m ago"));
+        assert!(printed.contains("stopped stamping 4h ago"));
+    }
+
+    /// Each shape of the first line, read with nothing under it.
+    #[test]
+    fn the_count_says_what_it_is_counting() {
+        assert_eq!(headline(1, 1), "1 scheduler is running on this board.");
+        assert_eq!(
+            headline(1, 4),
+            "1 of 4 schedulers on this board is running."
+        );
+        assert_eq!(
+            headline(2, 4),
+            "2 of 4 schedulers on this board are running."
+        );
+        assert_eq!(
+            headline(3, 3),
+            "All 3 schedulers on this board are running."
+        );
+        assert_eq!(
+            headline(0, 1),
+            "No scheduler is running on this board. The 1 record below is a run that ended."
+        );
+        assert_eq!(
+            headline(0, 3),
+            "No scheduler is running on this board. All 3 records below are runs that ended."
+        );
     }
 
     #[test]
@@ -643,5 +787,41 @@ mod tests {
             .unwrap()
             .contains("was not running any more"));
         assert!(schedulers::read_roster(dir.path()).is_empty());
+    }
+
+    /// The listing is where the id is read from, so every id it prints has to
+    /// be one `--stop` takes — including the dead ones now that the listing no
+    /// longer leads with them.
+    #[test]
+    fn a_dead_record_can_be_stopped_while_a_live_scheduler_holds_the_board() {
+        let dir = project();
+        let now = 1_786_000_000;
+        register(
+            dir.path(),
+            "live",
+            Some("renderer-3"),
+            now - 45 * 60,
+            now - 87,
+        );
+        register(
+            dir.path(),
+            "dead",
+            Some("renderer"),
+            now - 4 * 3600,
+            now - 4 * 3600,
+        );
+
+        let mut out = Vec::new();
+        run_schedulers_with(dir.path(), Some("dead"), &mut out, now, &None, &|_, _| {
+            Err("no such session".to_string())
+        })
+        .unwrap();
+
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("was not running any more"));
+        let left = schedulers::read_roster(dir.path());
+        assert_eq!(left.len(), 1, "the live run is untouched");
+        assert_eq!(left[0].scheduler_id, "live");
     }
 }
