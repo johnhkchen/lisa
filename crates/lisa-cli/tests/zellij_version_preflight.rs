@@ -208,8 +208,8 @@ fn loop_reports_a_session_named_after_the_project() {
 
     assert!(output.status.success(), "loop failed: {stderr}");
     assert!(
-        stdout.contains("Session: project"),
-        "startup report did not name the session after the project:\n{stdout}"
+        stdout.contains(&format!("Session: project-{}", today())),
+        "startup report did not name the session after the project and the day:\n{stdout}"
     );
 }
 
@@ -357,9 +357,16 @@ fn loop_refuses_a_board_whose_session_is_still_running() {
     );
 }
 
+/// Today, the way a session name spells it.
+fn today() -> String {
+    let output = Command::new("date").arg("+%m%d").output().unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 /// The other half of the same fact: a session that only *exited* under this
 /// board's name is a crashed run, not a second scheduler. It costs the start a
-/// number, exactly as it always did.
+/// number, exactly as it always did — a number scoped to the day now, so it is
+/// this project's second run *today*.
 #[test]
 fn loop_starts_past_an_exited_session_of_the_same_name() {
     let temp = tempfile::tempdir().unwrap();
@@ -382,15 +389,18 @@ fn loop_starts_past_an_exited_session_of_the_same_name() {
         ),
     )
     .unwrap();
+    let today = today();
     write_executable(
         &bin.join("zellij"),
-        "#!/bin/sh\n\
-         if [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; exit 0; fi\n\
-         if [ \"${1:-}\" = \"list-sessions\" ]; then\n\
-         printf '%s\\n' 'project [Created 19h ago] (EXITED - attach to resurrect)'\n\
-         exit 0\n\
-         fi\n\
-         exit 0\n",
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"${{1:-}}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; exit 0; fi\n\
+             if [ \"${{1:-}}\" = \"list-sessions\" ]; then\n\
+             printf '%s\\n' 'project-{today} [Created 3h ago] (EXITED - attach to resurrect)'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n"
+        ),
     );
     write_executable(
         &bin.join("claude"),
@@ -412,7 +422,104 @@ fn loop_starts_past_an_exited_session_of_the_same_name() {
 
     assert!(output.status.success(), "loop must start: {stderr}");
     assert!(
-        stdout.contains("Session: project-2"),
+        stdout.contains(&format!("Session: project-{today}-2")),
         "a dead session still costs a number and not the start:\n{stdout}"
+    );
+}
+
+/// The ticket's own reproduction, through the real binary: two runs of one
+/// project on one day. Both names say the day they started, and they are
+/// different names.
+///
+/// The stub Zellij is the desk: it lists back every session it has been asked
+/// to start, so the second `lisa loop` sees exactly what the first one left.
+#[test]
+fn two_runs_of_one_project_on_one_day_both_say_the_day_and_can_be_told_apart() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    let listing = temp.path().join("sessions");
+    fs::create_dir_all(root.join("docs/active/tickets")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&listing, "").unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        "{\"bypassPermissionsModeAccepted\": true}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".lisa.toml"),
+        format!(
+            "version = {:?}\n\n[runtime]\nzellij = \"system\"\n\n[agent]\nclient = \"claude\"\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+
+    // Every started session is remembered as `EXITED`, which is what a run that
+    // has ended leaves behind and what the next `lisa loop` has to name around.
+    // Shell builtins only: the fixture's PATH is the stub directory and nothing
+    // else, so there is no `cat` on it.
+    write_executable(
+        &bin.join("zellij"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"${{1:-}}\" = \"--version\" ]; then printf '%s\\n' 'zellij 0.44.3'; exit 0; fi\n\
+             if [ \"${{1:-}}\" = \"list-sessions\" ]; then\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\"; done < {listing}\n\
+             exit 0\n\
+             fi\n\
+             if [ \"${{1:-}}\" = \"--session\" ]; then\n\
+             printf '%s [Created 1s ago] (EXITED - attach to resurrect)\\n' \"$2\" >> {listing}\n\
+             fi\n\
+             exit 0\n",
+            listing = listing.to_str().unwrap()
+        ),
+    );
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '%s\\n' 'claude 1.0.0'; fi\nexit 0\n",
+    );
+
+    let run = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_lisa"))
+            .arg("loop")
+            .arg("--headless")
+            .args(["--path", root.to_str().unwrap()])
+            .env("PATH", &bin)
+            .env("HOME", &home)
+            .env_remove("ZELLIJ_SESSION_NAME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "loop must start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let today = today();
+    let first = run();
+    let second = run();
+
+    assert!(
+        first.contains(&format!("Session: project-{today}\n")),
+        "the first run of the day is the project and the day:\n{first}"
+    );
+    assert!(
+        second.contains(&format!("Session: project-{today}-2 ")),
+        "the second run of the day has to be a different name that still says the day:\n{second}"
+    );
+    assert_eq!(
+        fs::read_to_string(&listing)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect::<Vec<_>>(),
+        vec![format!("project-{today}"), format!("project-{today}-2")],
+        "Zellij was asked for two distinct dated names"
     );
 }

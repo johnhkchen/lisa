@@ -868,6 +868,21 @@ It ends the whole session, agent panes included, so you always name which one �
 and Lisa refuses the session your own terminal is sitting in, because a command
 that closes the window it is printing to can't tell you what it did.
 
+**A session's name says when it started.** A run is named after its project and
+the day it began — `renderer-0815` — and a second run of the same project that
+day is `renderer-0815-2`. The name is what the terminal tab shows, what `zellij
+list-sessions` prints, and what `zellij kill-session` takes, so it is where the
+answer to *is this one still worth having* belongs. `lisa schedulers` reads it
+back: a session whose name says a day that is not today is called out as one
+from a previous day, and so is a session that refuses a second `lisa loop`.
+
+The project comes first and the date rides behind it, because a narrow tab
+truncates from the right and losing the date costs you a column `zellij
+list-sessions` still has — losing the project name costs you the reason the name
+exists. Sessions named by older versions of Lisa (`renderer`, `renderer-3`) are
+still recognised as that board's, so an upgrade never lets a second scheduler
+onto a board a running one already holds.
+
 **A run is running when its process is.** Lisa asks this machine about the
 Zellij server the run wrote down — is that pid still held, and is what holds it
 still that Zellij — rather than trusting the run's own last "I'm here" note. A
