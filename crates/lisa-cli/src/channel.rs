@@ -501,7 +501,7 @@ pub(crate) fn format_rfc3339_utc(epoch: i64) -> String {
 
 /// The civil date a count of days since 1970-01-01 lands on, by Howard
 /// Hinnant's `civil_from_days` — the exact inverse of [`days_from_civil`].
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let days = days + 719_468;
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
     let day_of_era = days - era * 146_097;
