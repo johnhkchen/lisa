@@ -233,14 +233,20 @@ pub(crate) fn build_claude_command(
     pane_id: u32,
     attempt_id: u64,
     model: Option<&str>,
+    effort: Option<&str>,
     lisa_bin: Option<&str>,
     project_root: &Path,
 ) -> String {
-    // The Claude adapter owns the model→flag mapping (`--model`). When no model
-    // is routed the flag is omitted, preserving the provider invocation while
-    // the dynamic values remain uniformly shell-quoted.
+    // The Claude adapter owns the model/effort→flag mapping (`--model`,
+    // `--effort`). When neither is routed both flags are omitted, preserving
+    // the provider invocation while the dynamic values remain uniformly
+    // shell-quoted.
     let model_flag = match model {
         Some(m) => format!(" --model {}", shell_quote(m)),
+        None => String::new(),
+    };
+    let effort_flag = match effort {
+        Some(e) => format!(" --effort {}", shell_quote(e)),
         None => String::new(),
     };
     let lisa_bin_env = match lisa_bin.filter(|s| !s.is_empty()) {
@@ -248,13 +254,14 @@ pub(crate) fn build_claude_command(
         None => String::new(),
     };
     format!(
-        "{}LISA_PROJECT={} LISA_PANE_ID={} LISA_TICKET_ID={} LISA_ATTEMPT_ID={} claude --dangerously-skip-permissions{}",
+        "{}LISA_PROJECT={} LISA_PANE_ID={} LISA_TICKET_ID={} LISA_ATTEMPT_ID={} claude --dangerously-skip-permissions{}{}",
         lisa_bin_env,
         shell_quote(&project_root.to_string_lossy()),
         pane_id,
         shell_quote(ticket_id),
         attempt_id,
         model_flag,
+        effort_flag,
     )
 }
 
@@ -2570,6 +2577,7 @@ impl State {
                 self.dag.get_ticket(&remedy.ticket_id),
                 self.config.client,
                 self.config.model.as_deref(),
+                self.config.effort.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
             let running = self
@@ -5233,6 +5241,7 @@ impl State {
             self.dag.get_ticket(&ticket_id),
             self.config.client,
             self.config.model.as_deref(),
+            self.config.effort.as_deref(),
             self.config.lisa_bin.as_deref(),
         );
         let ctx = SpawnContext {
@@ -5814,6 +5823,7 @@ impl State {
             None,
             resident_client,
             self.config.model.as_deref(),
+            self.config.effort.as_deref(),
             self.config.lisa_bin.as_deref(),
         );
         let exit_command = resident_adapter.exit_command();
@@ -6111,6 +6121,7 @@ impl State {
             self.dag.get_ticket(&ticket_id),
             self.config.client,
             self.config.model.as_deref(),
+            self.config.effort.as_deref(),
             self.config.lisa_bin.as_deref(),
         );
         let ctx = SpawnContext {
@@ -6435,6 +6446,7 @@ impl State {
             None,
             AgentClient::Codex,
             self.config.model.as_deref(),
+            self.config.effort.as_deref(),
             self.config.lisa_bin.as_deref(),
         );
         self.send_line_to_pane(adapter.exit_command(), PaneId::Terminal(pane_id));
@@ -6936,6 +6948,7 @@ impl State {
                     None,
                     resident,
                     self.config.model.as_deref(),
+                    self.config.effort.as_deref(),
                     self.config.lisa_bin.as_deref(),
                 );
                 (adapter.reset_strategy() == ResetStrategy::ExitThenFresh
@@ -7069,6 +7082,7 @@ impl State {
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
                 self.config.model.as_deref(),
+                self.config.effort.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
 
@@ -7303,6 +7317,7 @@ impl State {
                     None,
                     resident_client,
                     self.config.model.as_deref(),
+                    self.config.effort.as_deref(),
                     self.config.lisa_bin.as_deref(),
                 );
                 let exit_command = resident_adapter.exit_command();
@@ -7611,6 +7626,7 @@ impl State {
                 None,
                 client,
                 self.config.model.as_deref(),
+                self.config.effort.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
             if adapter.completion_exit() != CompletionExit::AfterRest {
@@ -9702,6 +9718,7 @@ impl State {
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
                 self.config.model.as_deref(),
+                self.config.effort.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
             if recovering && route.agent != AgentClient::Codex {
@@ -9961,6 +9978,7 @@ impl State {
                 self.dag.get_ticket(&ticket_id),
                 self.config.client,
                 self.config.model.as_deref(),
+                self.config.effort.as_deref(),
                 self.config.lisa_bin.as_deref(),
             );
             let follow_up = adapter.follow_up(&FollowUpContext {
@@ -15125,7 +15143,15 @@ mod tests {
 
     #[test]
     fn test_build_claude_command() {
-        let cmd = build_claude_command("T-042-01", 7, 1, None, None, Path::new("/projects/steer"));
+        let cmd = build_claude_command(
+            "T-042-01",
+            7,
+            1,
+            None,
+            None,
+            None,
+            Path::new("/projects/steer"),
+        );
 
         assert!(cmd.starts_with(
             "LISA_PROJECT='/projects/steer' LISA_PANE_ID=7 LISA_TICKET_ID='T-042-01' LISA_ATTEMPT_ID=1 claude --dangerously-skip-permissions"
@@ -15134,6 +15160,8 @@ mod tests {
         assert!(!cmd.contains("CLAUDE.md"));
         // No routed model → no --model flag.
         assert!(!cmd.contains("--model"));
+        // No routed effort → no --effort flag.
+        assert!(!cmd.contains("--effort"));
         assert!(
             !cmd.ends_with('\r'),
             "Enter is now sent as a raw byte, not embedded in text"
@@ -15148,6 +15176,7 @@ mod tests {
             1,
             Some("opus"),
             None,
+            None,
             Path::new("/projects/steer"),
         );
         assert!(
@@ -15157,8 +15186,33 @@ mod tests {
     }
 
     #[test]
+    fn test_build_claude_command_with_effort() {
+        let cmd = build_claude_command(
+            "T-042-01",
+            7,
+            1,
+            Some("opus"),
+            Some("high"),
+            None,
+            Path::new("/projects/steer"),
+        );
+        assert!(
+            cmd.ends_with("--dangerously-skip-permissions --model 'opus' --effort 'high'"),
+            "got: {cmd}"
+        );
+    }
+
+    #[test]
     fn test_build_claude_command_includes_env_vars() {
-        let cmd = build_claude_command("T-042-01", 42, 9, None, None, Path::new("/projects/steer"));
+        let cmd = build_claude_command(
+            "T-042-01",
+            42,
+            9,
+            None,
+            None,
+            None,
+            Path::new("/projects/steer"),
+        );
 
         assert!(
             cmd.starts_with(
@@ -15171,7 +15225,15 @@ mod tests {
 
     #[test]
     fn test_build_claude_command_excludes_assignment_reference() {
-        let cmd = build_claude_command("T-001", 1, 1, None, None, Path::new("/projects/steer"));
+        let cmd = build_claude_command(
+            "T-001",
+            1,
+            1,
+            None,
+            None,
+            None,
+            Path::new("/projects/steer"),
+        );
         assert!(!cmd.contains("docs/knowledge/lisa-workflow.md"));
         assert!(!cmd.contains("assignment.md"));
     }
@@ -29592,7 +29654,7 @@ owned\n\
         // (b) the delivered value is the bare finish-up prompt for the composer.
         let work_dir = Path::new("docs/active/work");
         let (adapter, _route) =
-            resolve_adapter_or_native(None, AgentClient::Codex, None, Some("/abs/lisa"));
+            resolve_adapter_or_native(None, AgentClient::Codex, None, None, Some("/abs/lisa"));
         let follow_up = adapter.follow_up(&FollowUpContext {
             work_dir,
             ticket_id: "T-CDX-01",

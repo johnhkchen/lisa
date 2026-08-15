@@ -41,7 +41,7 @@
 use std::path::Path;
 
 use lisa_core::client::AgentClient;
-use lisa_core::route::{resolve_route_with_default_model, ResolvedRoute};
+use lisa_core::route::{resolve_route_with_defaults, ResolvedRoute};
 use lisa_core::types::Ticket;
 
 use crate::codex_ack::{tag_codex_assignment, CodexAssignmentRef};
@@ -275,10 +275,12 @@ pub(crate) trait AgentAdapter {
 /// scheduler (the no-op proof).
 ///
 /// `model` is the routed model for this pane (T-026-01), mapped to Claude's
-/// `--model` flag; `None` runs Claude's default model.
+/// `--model` flag; `None` runs Claude's default model. `effort` is the routed
+/// effort (T-071-01-01), mapped to Claude's `--effort` flag the same way.
 #[derive(Default)]
 pub(crate) struct ClaudeCodeAdapter {
     model: Option<String>,
+    effort: Option<String>,
     /// Absolute `lisa` path (plugin config) exported as `LISA_BIN` on the launch
     /// line so the Stop hook's `capture-usage` is reachable (T-027-02). `None`
     /// omits the var (PATH fallback), keeping the pre-capture launch line.
@@ -286,13 +288,14 @@ pub(crate) struct ClaudeCodeAdapter {
 }
 
 impl ClaudeCodeAdapter {
-    /// Build a Claude adapter for the given routed model (`None` = provider
-    /// default) and `lisa` binary path (`None` = PATH fallback). The default
-    /// `ClaudeCodeAdapter` (via [`Default`]) carries neither, matching the
-    /// pre-routing/pre-capture behaviour.
-    pub(crate) fn new(model: Option<&str>, lisa_bin: Option<&str>) -> Self {
+    /// Build a Claude adapter for the given routed model and effort (`None` =
+    /// provider default for either) and `lisa` binary path (`None` = PATH
+    /// fallback). The default `ClaudeCodeAdapter` (via [`Default`]) carries
+    /// none of them, matching the pre-routing/pre-capture behaviour.
+    pub(crate) fn new(model: Option<&str>, effort: Option<&str>, lisa_bin: Option<&str>) -> Self {
         Self {
             model: model.map(|s| s.to_string()),
+            effort: effort.map(|s| s.to_string()),
             lisa_bin: lisa_bin.filter(|s| !s.is_empty()).map(|s| s.to_string()),
         }
     }
@@ -305,6 +308,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             ctx.pane_id,
             ctx.attempt_id,
             self.model.as_deref(),
+            self.effort.as_deref(),
             self.lisa_bin.as_deref(),
             ctx.project_root,
         )
@@ -496,28 +500,34 @@ impl AgentAdapter for CodexAdapter {
 fn adapter_for_route(route: &ResolvedRoute, lisa_bin: Option<&str>) -> Box<dyn AgentAdapter> {
     let model = route.model.as_deref();
     match route.agent {
-        AgentClient::Claude => Box::new(ClaudeCodeAdapter::new(model, lisa_bin)),
+        AgentClient::Claude => Box::new(ClaudeCodeAdapter::new(
+            model,
+            route.effort.as_deref(),
+            lisa_bin,
+        )),
         AgentClient::Codex => Box::new(CodexAdapter::new(lisa_bin, model)),
     }
 }
 
 /// Resolve the adapter **and the route** for a ticket at spawn time, given the
-/// loop-level default client and the absolute `lisa` binary path (Codex leg).
+/// loop-level default client, model, and effort, and the absolute `lisa`
+/// binary path (Codex leg).
 ///
-/// This is the per-pane routing seam (S-026 / T-026-01): the ticket's
-/// `(agent, model)` frontmatter is resolved against the loop default via
-/// [`resolve_route`], and the resulting [`ResolvedRoute`] is returned alongside
-/// the adapter so the caller can surface a substituted fallback (log +
-/// dashboard) and record requested-vs-actual in provenance. With no routing
-/// hint and a Claude default this resolves byte-for-byte to the pre-routing
-/// native path.
+/// This is the per-pane routing seam (S-026 / T-026-01, extended by
+/// T-071-01-01 for effort): the ticket's `(agent, model, effort)` frontmatter
+/// is resolved against the loop default via [`resolve_route_with_defaults`],
+/// and the resulting [`ResolvedRoute`] is returned alongside the adapter so
+/// the caller can surface a substituted fallback (log + dashboard) and record
+/// requested-vs-actual in provenance. With no routing hint and a Claude
+/// default this resolves byte-for-byte to the pre-routing native path.
 pub(crate) fn resolve_adapter(
     ticket: &Ticket,
     default_client: AgentClient,
     default_model: Option<&str>,
+    default_effort: Option<&str>,
     lisa_bin: Option<&str>,
 ) -> (Box<dyn AgentAdapter>, ResolvedRoute) {
-    let route = resolve_route_with_default_model(ticket, default_client, default_model);
+    let route = resolve_route_with_defaults(ticket, default_client, default_model, default_effort);
     let adapter = adapter_for_route(&route, lisa_bin);
     (adapter, route)
 }
@@ -530,14 +540,16 @@ pub(crate) fn resolve_adapter_or_native(
     ticket: Option<&Ticket>,
     default_client: AgentClient,
     default_model: Option<&str>,
+    default_effort: Option<&str>,
     lisa_bin: Option<&str>,
 ) -> (Box<dyn AgentAdapter>, ResolvedRoute) {
     match ticket {
-        Some(t) => resolve_adapter(t, default_client, default_model, lisa_bin),
+        Some(t) => resolve_adapter(t, default_client, default_model, default_effort, lisa_bin),
         None => {
             let route = ResolvedRoute {
                 agent: default_client,
                 model: default_model.map(str::to_string),
+                effort: default_effort.map(str::to_string),
                 requested_agent: None,
                 substituted: false,
                 note: None,
@@ -575,7 +587,7 @@ mod tests {
         let ctx = spawn_ctx(dir, "T-042-01", 7);
         assert_eq!(
             ClaudeCodeAdapter::default().launch_command(&ctx, Path::new(ASSIGNMENT_PATH)),
-            build_claude_command("T-042-01", 7, 1, None, None, Path::new(PROJECT_ROOT))
+            build_claude_command("T-042-01", 7, 1, None, None, None, Path::new(PROJECT_ROOT))
         );
     }
 
@@ -583,7 +595,7 @@ mod tests {
     fn native_launch_with_model_maps_flag() {
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
-        let cmd = ClaudeCodeAdapter::new(Some("opus"), None)
+        let cmd = ClaudeCodeAdapter::new(Some("opus"), None, None)
             .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(cmd.contains("--model 'opus'"), "got: {cmd}");
         assert_eq!(
@@ -593,6 +605,28 @@ mod tests {
                 7,
                 1,
                 Some("opus"),
+                None,
+                None,
+                Path::new(PROJECT_ROOT)
+            )
+        );
+    }
+
+    #[test]
+    fn native_launch_with_effort_maps_flag() {
+        let dir = Path::new("docs/active/tickets");
+        let ctx = spawn_ctx(dir, "T-042-01", 7);
+        let cmd = ClaudeCodeAdapter::new(Some("opus"), Some("high"), None)
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
+        assert!(cmd.contains("--model 'opus' --effort 'high'"), "got: {cmd}");
+        assert_eq!(
+            cmd,
+            build_claude_command(
+                "T-042-01",
+                7,
+                1,
+                Some("opus"),
+                Some("high"),
                 None,
                 Path::new(PROJECT_ROOT)
             )
@@ -605,15 +639,15 @@ mod tests {
         // capture-usage is reachable; without one the launch line is unchanged.
         let dir = Path::new("docs/active/tickets");
         let ctx = spawn_ctx(dir, "T-042-01", 7);
-        let with_bin = ClaudeCodeAdapter::new(None, Some("/abs/lisa"))
+        let with_bin = ClaudeCodeAdapter::new(None, None, Some("/abs/lisa"))
             .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(
             with_bin
                 .starts_with("LISA_BIN='/abs/lisa' LISA_PROJECT='/projects/steer' LISA_PANE_ID=7"),
             "got: {with_bin}"
         );
-        let without =
-            ClaudeCodeAdapter::new(None, None).launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
+        let without = ClaudeCodeAdapter::new(None, None, None)
+            .launch_command(&ctx, Path::new(ASSIGNMENT_PATH));
         assert!(!without.contains("LISA_BIN="), "got: {without}");
         assert!(
             without.starts_with("LISA_PROJECT='/projects/steer' LISA_PANE_ID=7"),
@@ -694,7 +728,7 @@ mod tests {
     #[test]
     fn resolver_returns_claude_default_for_unrouted_ticket() {
         let ticket = Ticket::new("T-001", "example");
-        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, None, None);
+        let (adapter, route) = resolve_adapter(&ticket, AgentClient::Claude, None, None, None);
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(adapter.readiness_mode(), ReadinessMode::SessionStart);
         assert_eq!(route.agent, AgentClient::Claude);
@@ -703,7 +737,8 @@ mod tests {
 
     #[test]
     fn resolver_or_native_handles_missing_ticket() {
-        let (adapter, route) = resolve_adapter_or_native(None, AgentClient::Claude, None, None);
+        let (adapter, route) =
+            resolve_adapter_or_native(None, AgentClient::Claude, None, None, None);
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(adapter.readiness_mode(), ReadinessMode::SessionStart);
         assert_eq!(route.agent, AgentClient::Claude);
@@ -716,13 +751,13 @@ mod tests {
         // version-sensitive interactive /clear hook.
         let ticket = Ticket::new("T-002", "codex-example");
         assert_eq!(
-            resolve_adapter(&ticket, AgentClient::Codex, None, Some("/abs/lisa"))
+            resolve_adapter(&ticket, AgentClient::Codex, None, None, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
             ResetStrategy::ExitThenFresh
         );
         assert_eq!(
-            resolve_adapter_or_native(None, AgentClient::Codex, None, Some("/abs/lisa"))
+            resolve_adapter_or_native(None, AgentClient::Codex, None, None, Some("/abs/lisa"))
                 .0
                 .reset_strategy(),
             ResetStrategy::ExitThenFresh
@@ -737,7 +772,7 @@ mod tests {
         let mut ticket = Ticket::new("T-003", "routed-codex");
         ticket.agent = Some("codex".to_string());
         let (adapter, route) =
-            resolve_adapter(&ticket, AgentClient::Claude, None, Some("/abs/lisa"));
+            resolve_adapter(&ticket, AgentClient::Claude, None, None, Some("/abs/lisa"));
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert!(adapter
             .launch_command(
@@ -755,7 +790,7 @@ mod tests {
         let mut ticket = Ticket::new("T-004", "bad-route");
         ticket.agent = Some("gpt".to_string());
         let (adapter, route) =
-            resolve_adapter(&ticket, AgentClient::Codex, None, Some("/abs/lisa"));
+            resolve_adapter(&ticket, AgentClient::Codex, None, None, Some("/abs/lisa"));
         assert_eq!(adapter.reset_strategy(), ResetStrategy::ExitThenFresh);
         assert_eq!(route.agent, AgentClient::Codex);
         assert!(route.substituted);
@@ -772,9 +807,9 @@ mod tests {
         let b = Ticket::new("T-006", "on-default"); // no hint → default
 
         let (adapter_a, route_a) =
-            resolve_adapter(&a, AgentClient::Claude, None, Some("/abs/lisa"));
+            resolve_adapter(&a, AgentClient::Claude, None, None, Some("/abs/lisa"));
         let (adapter_b, route_b) =
-            resolve_adapter(&b, AgentClient::Claude, None, Some("/abs/lisa"));
+            resolve_adapter(&b, AgentClient::Claude, None, None, Some("/abs/lisa"));
 
         // Both native clients share the per-ticket process boundary; the
         // heterogeneity shows in readiness mode and the launched command.

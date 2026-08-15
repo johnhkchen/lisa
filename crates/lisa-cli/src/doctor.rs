@@ -897,12 +897,22 @@ struct Findings {
     reports: Vec<CheckReport>,
     project: CheckReport,
     has_project: bool,
+    /// Every outstanding ticket's resolved `(agent, model, effort)` route
+    /// (T-071-01-01 AC: "`lisa doctor` says what each pane will run").
+    pane_routes: Result<Vec<PaneRoute>, String>,
+}
+
+/// One outstanding ticket's resolved route, as `doctor` previews it.
+struct PaneRoute {
+    ticket_id: String,
+    route: lisa_core::route::ResolvedRoute,
 }
 
 fn gather(root: &Path) -> Result<Findings, String> {
     let validation = config::load_config(root)?;
     let resolved_config = config::resolve_config(&validation.config, None, None);
     let client = resolved_config.client;
+    let pane_routes = pane_routes(root, &resolved_config);
     let completion = crate::completion_seal::resolve_for_run(root, resolved_config.completion_mode);
 
     // Journal tier: git is informational, not required. An unresolvable
@@ -941,7 +951,68 @@ fn gather(root: &Path) -> Result<Findings, String> {
         reports,
         project,
         has_project,
+        pane_routes,
     })
+}
+
+/// Resolve every outstanding (not-`Done`) ticket's route against the board's
+/// defaults, sorted by ticket id. A missing ticket directory or scan failure
+/// is informational, not a doctor failure — the same leniency
+/// `format_project_currency` gives a project that cannot be inspected.
+fn pane_routes(root: &Path, resolved: &config::ResolvedConfig) -> Result<Vec<PaneRoute>, String> {
+    let ticket_dir = root.join(&resolved.ticket_dir);
+    if !ticket_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let tickets = lisa_core::ticket::scan_tickets(&ticket_dir)
+        .map_err(|e| format!("failed to scan tickets: {e}"))?;
+    let mut routes: Vec<PaneRoute> = tickets
+        .into_iter()
+        .filter(|t| t.phase != lisa_core::types::Phase::Done)
+        .map(|t| {
+            let route = lisa_core::route::resolve_route_with_defaults(
+                &t,
+                resolved.client,
+                resolved.model.as_deref(),
+                resolved.effort.as_deref(),
+            );
+            PaneRoute {
+                ticket_id: t.id,
+                route,
+            }
+        })
+        .collect();
+    routes.sort_by(|a, b| a.ticket_id.cmp(&b.ticket_id));
+    Ok(routes)
+}
+
+/// Render the pane-routes preview as a doctor section: one line per
+/// outstanding ticket, capped like the other doctor listings so a board with
+/// hundreds of tickets does not turn `doctor` into a wall of text.
+fn format_pane_routes(routes: &Result<Vec<PaneRoute>, String>) -> String {
+    let mut out = String::from("\n\nChecking pane routes...\n\n");
+    match routes {
+        Err(error) => {
+            out.push_str(&format!("  Could not preview pane routes: {error}\n"));
+        }
+        Ok(routes) if routes.is_empty() => {
+            out.push_str("  No outstanding tickets to preview.\n");
+        }
+        Ok(routes) => {
+            let cap = MAX_LISTED_PER_KIND * 2;
+            for pane_route in routes.iter().take(cap) {
+                out.push_str(&format!(
+                    "  {:<16} {}\n",
+                    pane_route.ticket_id,
+                    pane_route.route.display_cell()
+                ));
+            }
+            if routes.len() > cap {
+                out.push_str(&format!("  ... and {} more\n", routes.len() - cap));
+            }
+        }
+    }
+    out
 }
 
 /// One check, as a script reads it.
@@ -1023,6 +1094,23 @@ fn doctor_document(root: &Path) -> Result<(serde_json::Value, i32), String> {
         // sees every lisa a person reading the row sees, not a sentence about
         // them.
         "lisa_installs": installs::to_json(&findings.installs),
+        // What each outstanding ticket will run (T-071-01-01 AC): a fleet asked
+        // by script sees the same per-ticket routes a person reading the prose
+        // report sees.
+        "pane_routes": match &findings.pane_routes {
+            Ok(routes) => serde_json::Value::Array(
+                routes
+                    .iter()
+                    .map(|pane_route| {
+                        serde_json::json!({
+                            "ticket_id": pane_route.ticket_id,
+                            "route": pane_route.route,
+                        })
+                    })
+                    .collect(),
+            ),
+            Err(error) => serde_json::json!({ "error": error }),
+        },
     });
 
     Ok((data, i32::from(failed)))
@@ -1049,6 +1137,8 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     }
     append_completion_seal_report(&mut output, &completion);
     reports.push(project_report);
+
+    output.push_str(&format_pane_routes(&findings.pane_routes));
 
     output.push_str("\n\nChecking the environment agents will start in...\n\n");
     output.push_str(&format_inherited_session_markers(
@@ -2375,5 +2465,93 @@ mod tests {
         let section = format_project_currency(&crate::currency::inventory(dir.path()));
         assert!(section.contains("Set up before Lisa recorded a version"));
         assert!(section.contains("run `lisa init`"));
+    }
+
+    // --- Pane routes preview (T-071-01-01 AC) -------------------------------
+
+    fn write_ticket(dir: &Path, id: &str, phase: &str, extra_frontmatter: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "---\nid: {id}\ntitle: t\ntype: task\nstatus: open\npriority: medium\nphase: {phase}\n{extra_frontmatter}---\n\nBody\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pane_routes_previews_outstanding_tickets_with_the_board_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("docs/active/tickets");
+        write_ticket(&ticket_dir, "T-001", "implement", "");
+        write_ticket(
+            &ticket_dir,
+            "T-002",
+            "review",
+            "model: sonnet\neffort: low\n",
+        );
+        write_ticket(&ticket_dir, "T-003", "done", "");
+
+        let resolved = config::ResolvedConfig {
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+            ..config::ResolvedConfig::default()
+        };
+
+        let routes = pane_routes(dir.path(), &resolved).unwrap();
+        // The done ticket is excluded; the other two are previewed, sorted.
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].ticket_id, "T-001");
+        assert_eq!(routes[0].route.display_cell(), "claude/opus@high");
+        assert_eq!(routes[1].ticket_id, "T-002");
+        // A ticket's own model/effort outranks the board default.
+        assert_eq!(routes[1].route.display_cell(), "claude/sonnet@low");
+    }
+
+    #[test]
+    fn pane_routes_missing_ticket_dir_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = config::ResolvedConfig::default();
+        assert_eq!(pane_routes(dir.path(), &resolved).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn format_pane_routes_lists_each_outstanding_ticket() {
+        let routes = Ok(vec![
+            PaneRoute {
+                ticket_id: "T-001".to_string(),
+                route: lisa_core::route::ResolvedRoute {
+                    agent: AgentClient::Claude,
+                    model: Some("opus".to_string()),
+                    effort: Some("high".to_string()),
+                    requested_agent: None,
+                    substituted: false,
+                    note: None,
+                },
+            },
+            PaneRoute {
+                ticket_id: "T-002".to_string(),
+                route: lisa_core::route::ResolvedRoute {
+                    agent: AgentClient::Claude,
+                    model: None,
+                    effort: None,
+                    requested_agent: None,
+                    substituted: false,
+                    note: None,
+                },
+            },
+        ]);
+        let section = format_pane_routes(&routes);
+        assert!(section.contains("Checking pane routes..."));
+        assert!(section.contains("T-001"));
+        assert!(section.contains("claude/opus@high"));
+        assert!(section.contains("T-002"));
+    }
+
+    #[test]
+    fn format_pane_routes_says_when_nothing_is_outstanding() {
+        let section = format_pane_routes(&Ok(Vec::new()));
+        assert!(section.contains("No outstanding tickets to preview."));
     }
 }

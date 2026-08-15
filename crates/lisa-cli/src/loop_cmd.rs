@@ -770,6 +770,17 @@ fn generate_layout(
         None => String::new(),
     };
 
+    // The effort this board runs within its client, when it names one
+    // (T-071-01-01). Same absent-key contract as `model_line`: no key → the
+    // plugin leaves the choice to the client's own default.
+    let effort_line = match config.effort.as_deref() {
+        Some(effort) => format!(
+            "                effort \"{}\"\n",
+            effort.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        None => String::new(),
+    };
+
     // Per-provider concurrency caps (T-026-02), emitted as `provider_cap_<name>`
     // keys the plugin parses back into PluginConfig.provider_caps. Sorted for
     // deterministic layout output. Empty map → no lines → layout byte-for-byte
@@ -810,7 +821,7 @@ fn generate_layout(
                 triage_enabled "{triage_enabled}"
                 triage_timeout_secs "{triage_timeout_secs}"
                 client "{client}"
-{agent_pane_count_line}{model_line}{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
+{agent_pane_count_line}{model_line}{effort_line}{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
         }}
     }}
 }}
@@ -823,6 +834,7 @@ fn generate_layout(
         lisa_bin_line = lisa_bin_line,
         session_name_line = session_name_line,
         model_line = model_line,
+        effort_line = effort_line,
         provider_cap_lines = provider_cap_lines,
         ticket_dir = config.ticket_dir,
         story_dir = config.story_dir,
@@ -1547,6 +1559,26 @@ mod tests {
                 .lines()
                 .any(|line| line.trim().starts_with("model ")),
             "an unnamed model must emit no key:\n{unnamed}"
+        );
+    }
+
+    /// Same contract as model, for effort (T-071-01-01): named → carried,
+    /// absent → no key, so the client keeps choosing its own default.
+    #[test]
+    fn test_generate_layout_carries_the_configured_effort_or_no_key() {
+        let wasm_path = PathBuf::from("/tmp/lisa-plugin.wasm");
+        let named = ResolvedConfig {
+            effort: Some("high".to_string()),
+            ..default_config()
+        };
+        assert!(test_layout(&wasm_path, None, &named).contains("effort \"high\""));
+
+        let unnamed = test_layout(&wasm_path, None, &default_config());
+        assert!(
+            !unnamed
+                .lines()
+                .any(|line| line.trim().starts_with("effort ")),
+            "an unnamed effort must emit no key:\n{unnamed}"
         );
     }
 

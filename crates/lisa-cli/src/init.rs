@@ -1759,6 +1759,7 @@ fn validate_payload(
             phase_timeouts,
             client: resolved.client.as_str(),
             model: resolved.model.clone(),
+            effort: resolved.effort.clone(),
         },
     })
 }

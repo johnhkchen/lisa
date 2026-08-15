@@ -48,6 +48,12 @@ pub struct ResolvedRoute {
     /// provider's own default. Opaque; the adapter maps it to a flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How hard the agent should think, or `None` for the provider's own
+    /// default. Opaque here — validated against a fixed vocabulary at
+    /// `.lisa.toml` read time ([`crate::effort::Effort::parse`]) — and mapped
+    /// to a flag by the adapter, mirroring `model` (T-071-01-01).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// The raw `agent:` value requested by the ticket, as written, or `None` if
     /// the ticket named no agent. Preserved even when invalid so the requested
     /// vs. actual route is visible in the dashboard and provenance.
@@ -68,7 +74,7 @@ impl ResolvedRoute {
     ///
     /// See the [module docs](self) for precedence and fallback semantics.
     pub fn resolve(ticket: &Ticket, default_agent: AgentClient) -> Self {
-        Self::resolve_with_default_model(ticket, default_agent, None)
+        Self::resolve_with_defaults(ticket, default_agent, None, None)
     }
 
     /// Resolve a ticket's routing hint against the loop-level default agent and
@@ -83,15 +89,37 @@ impl ResolvedRoute {
         default_agent: AgentClient,
         default_model: Option<&str>,
     ) -> Self {
+        Self::resolve_with_defaults(ticket, default_agent, default_model, None)
+    }
+
+    /// Resolve a ticket's routing hint against the loop-level default agent, the
+    /// board's default model, and the board's default effort (`[agent].model` /
+    /// `[agent].effort` in `.lisa.toml`, T-071-01-01).
+    ///
+    /// Effort precedence mirrors model's: `ticket effort → board default → the
+    /// provider's own default`. Like model, effort rides a substituted agent
+    /// unchanged — a fallback changes which client runs, not how hard it was
+    /// asked to think.
+    pub fn resolve_with_defaults(
+        ticket: &Ticket,
+        default_agent: AgentClient,
+        default_model: Option<&str>,
+        default_effort: Option<&str>,
+    ) -> Self {
         let model = ticket
             .model
             .clone()
             .or_else(|| default_model.map(str::to_string));
+        let effort = ticket
+            .effort
+            .clone()
+            .or_else(|| default_effort.map(str::to_string));
         match ticket.agent.as_deref() {
             // No hint → the loop default. Identical to the pre-routing path.
             None => Self {
                 agent: default_agent,
                 model,
+                effort,
                 requested_agent: None,
                 substituted: false,
                 note: None,
@@ -100,6 +128,7 @@ impl ResolvedRoute {
                 Ok(agent) => Self {
                     agent,
                     model,
+                    effort,
                     requested_agent: Some(raw.to_string()),
                     substituted: false,
                     note: None,
@@ -108,6 +137,7 @@ impl ResolvedRoute {
                 Err(err) => Self {
                     agent: default_agent,
                     model,
+                    effort,
                     requested_agent: Some(raw.to_string()),
                     substituted: true,
                     note: Some(format!(
@@ -120,12 +150,17 @@ impl ResolvedRoute {
     }
 
     /// A compact cell for the dashboard thread table: `claude`, `codex/gpt-5`,
-    /// or `codex/gpt-5*` when the route was a substituted fallback.
+    /// `claude@high` (effort, no model), `codex/gpt-5@high`, or
+    /// `codex/gpt-5@high*` when the route was a substituted fallback.
     pub fn display_cell(&self) -> String {
         let mut s = match &self.model {
             Some(m) => format!("{}/{}", self.agent, m),
             None => self.agent.to_string(),
         };
+        if let Some(e) = &self.effort {
+            s.push('@');
+            s.push_str(e);
+        }
         if self.substituted {
             s.push('*');
         }
@@ -146,6 +181,16 @@ pub fn resolve_route_with_default_model(
     default_model: Option<&str>,
 ) -> ResolvedRoute {
     ResolvedRoute::resolve_with_default_model(ticket, default_agent, default_model)
+}
+
+/// Free-function alias for [`ResolvedRoute::resolve_with_defaults`].
+pub fn resolve_route_with_defaults(
+    ticket: &Ticket,
+    default_agent: AgentClient,
+    default_model: Option<&str>,
+    default_effort: Option<&str>,
+) -> ResolvedRoute {
+    ResolvedRoute::resolve_with_defaults(ticket, default_agent, default_model, default_effort)
 }
 
 #[cfg(test)]
@@ -257,5 +302,75 @@ mod tests {
         );
         // Fell back to claude, but model still rides; trailing * marks the fallback.
         assert_eq!(substituted.display_cell(), "claude/gpt-5*");
+    }
+
+    fn ticket_with_effort(
+        agent: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Ticket {
+        let mut t = ticket_with(agent, model);
+        t.effort = effort.map(|s| s.to_string());
+        t
+    }
+
+    #[test]
+    fn effort_passes_through_untouched() {
+        let t = ticket_with_effort(Some("claude"), None, Some("high"));
+        let r = resolve_route_with_defaults(&t, AgentClient::Claude, None, None);
+        assert_eq!(r.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn board_default_effort_fills_in_for_an_unrouted_ticket() {
+        let t = ticket_with(None, None);
+        let r = resolve_route_with_defaults(&t, AgentClient::Claude, None, Some("medium"));
+        assert_eq!(r.effort.as_deref(), Some("medium"));
+        assert!(!r.substituted);
+    }
+
+    #[test]
+    fn a_ticket_effort_outranks_the_board_default() {
+        let t = ticket_with_effort(Some("claude"), None, Some("high"));
+        let r = resolve_route_with_defaults(&t, AgentClient::Claude, None, Some("low"));
+        assert_eq!(r.effort.as_deref(), Some("high"));
+
+        // A board naming no effort leaves the provider's own default alone.
+        let plain =
+            resolve_route_with_defaults(&ticket_with(None, None), AgentClient::Claude, None, None);
+        assert_eq!(plain.effort, None);
+    }
+
+    #[test]
+    fn effort_rides_a_substituted_agent_unchanged() {
+        let t = ticket_with_effort(Some("gpt"), None, Some("high"));
+        let r = resolve_route_with_defaults(&t, AgentClient::Claude, None, None);
+        assert!(r.substituted);
+        assert_eq!(r.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn display_cell_with_effort() {
+        let t = ticket_with_effort(Some("claude"), Some("opus"), Some("high"));
+        let r = resolve_route_with_defaults(&t, AgentClient::Claude, None, None);
+        assert_eq!(r.display_cell(), "claude/opus@high");
+
+        // Effort with no model still renders.
+        let effort_only = resolve_route_with_defaults(
+            &ticket_with_effort(Some("claude"), None, Some("high")),
+            AgentClient::Claude,
+            None,
+            None,
+        );
+        assert_eq!(effort_only.display_cell(), "claude@high");
+
+        // Substitution marker still lands last.
+        let substituted = resolve_route_with_defaults(
+            &ticket_with_effort(Some("gpt"), Some("gpt-5"), Some("high")),
+            AgentClient::Claude,
+            None,
+            None,
+        );
+        assert_eq!(substituted.display_cell(), "claude/gpt-5@high*");
     }
 }

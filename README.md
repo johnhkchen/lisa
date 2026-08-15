@@ -439,6 +439,7 @@ max_threads = 2
 | `runtime.zellij` | `managed` | Chooses how Lisa starts Zellij. |
 | `agent.client` | `claude` | Chooses which coding agent Lisa drives. Omit it to detect agents on PATH; claude is the default when both are installed. |
 | `agent.model` | `opus` | Chooses which model that agent runs. Omit it to use whatever the agent runs by default. |
+| `agent.effort` | `medium` | Chooses how hard that agent thinks (low, medium, high, xhigh, max). Omit it to use whatever the agent runs by default. |
 | `guards.completion` | `auto` | Controls how finished work is sealed. auto picks the strongest your project supports. |
 | `triage.enabled` | `true` | Lets Lisa inspect work that needs you before asking for help. |
 | `triage.timeout_secs` | `120` | Limits how long Lisa can inspect work that needs you. |

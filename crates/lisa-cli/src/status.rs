@@ -1204,6 +1204,7 @@ fn status_payload(data: &StatusData) -> serde_json::Value {
             phase_timeouts,
             client: data.resolved.client.as_str(),
             model: data.resolved.model.clone(),
+            effort: data.resolved.effort.clone(),
         },
     })
 }

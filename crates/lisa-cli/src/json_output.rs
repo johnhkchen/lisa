@@ -83,6 +83,10 @@ pub struct ConfigView {
     /// that to the client's own default. Board-level intent, answerable before
     /// anything has ever run here; a ticket may still route itself elsewhere.
     pub model: Option<String>,
+    /// The effort that board runs within its client, or `null` when it leaves
+    /// that to the client's own default (T-071-01-01). Same board-level intent
+    /// as `model`; a ticket may still route itself elsewhere.
+    pub effort: Option<String>,
 }
 
 /// Where the run on this board is, when there is one.

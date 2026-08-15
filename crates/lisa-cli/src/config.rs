@@ -88,6 +88,14 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
             "Chooses which model that agent runs. Omit it to use whatever the agent runs by default.",
     },
     ConfigKey {
+        path: "agent.effort",
+        section: "agent",
+        key: "effort",
+        default: "\"medium\"",
+        description:
+            "Chooses how hard that agent thinks (low, medium, high, xhigh, max). Omit it to use whatever the agent runs by default.",
+    },
+    ConfigKey {
         path: "guards.completion",
         section: "guards",
         key: "completion",
@@ -229,6 +237,12 @@ pub struct AgentConfig {
     /// vocabulary lives with the provider — so it is passed through as written
     /// and only checked for being a non-empty name.
     pub model: Option<String>,
+    /// How hard this board's agent thinks by default, or `None` to leave the
+    /// choice to the client's own default (T-071-01-01). Unlike `model` this is
+    /// *not* opaque: it is a fixed, Lisa-known vocabulary
+    /// ([`lisa_core::effort::Effort`]), so [`validate_config`] refuses an
+    /// unknown value outright rather than only checking it is non-empty.
+    pub effort: Option<String>,
 }
 
 /// Directory configuration section.
@@ -283,6 +297,10 @@ pub struct ResolvedConfig {
     /// when it leaves that to the client's default. A ticket's own `model:`
     /// frontmatter still outranks it at spawn.
     pub model: Option<String>,
+    /// The effort the board is configured to run within that client, or `None`
+    /// when it leaves that to the client's default (T-071-01-01). A ticket's
+    /// own `effort:` frontmatter still outranks it at spawn, mirroring `model`.
+    pub effort: Option<String>,
     pub(crate) client_resolution: ClientResolution,
     pub zellij_runtime: ZellijRuntimeRequest,
     /// Configured completion intent. A real loop pins this against its startup
@@ -310,6 +328,7 @@ impl Default for ResolvedConfig {
             phase_timeouts: std::collections::HashMap::new(),
             client: AgentClient::default(),
             model: None,
+            effort: None,
             client_resolution: ClientResolution::Detected(AgentAvailability::Both),
             zellij_runtime: crate::runtime::default_runtime_request(),
             completion_mode: CompletionSealMode::Auto,
@@ -427,6 +446,13 @@ fn resolve_config_with_availability(
             .as_deref()
             .map(str::trim)
             .filter(|model| !model.is_empty())
+            .map(str::to_string),
+        effort: config
+            .agent
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
             .map(str::to_string),
         client_resolution,
         zellij_runtime: match config.runtime.zellij.as_deref() {
@@ -761,6 +787,13 @@ pub fn validate_config(content: &str) -> Result<ConfigValidation, String> {
     {
         return Err("[agent].model must name a model, or be left out entirely".to_string());
     }
+    // Unlike model, effort is *not* provider vocabulary — it is a small, fixed
+    // set Lisa itself defines — so a bad value is refused right here, naming
+    // the key, rather than surfacing at the far end of a run that has already
+    // started four panes (T-071-01-01 AC).
+    if let Some(effort) = config.agent.effort.as_deref() {
+        lisa_core::effort::Effort::parse(effort).map_err(|e| format!("[agent].effort: {e}"))?;
+    }
     if let Some(zellij) = config.runtime.zellij.as_deref() {
         if !matches!(zellij, "managed" | "system") && !Path::new(zellij).is_absolute() {
             return Err(format!(
@@ -877,6 +910,7 @@ work = {}
 [agent]
 {}
 {}
+{}
 
 [guards]
 {}
@@ -906,6 +940,7 @@ max_threads = {}
         key("runtime.zellij").commented_stub(),
         key("agent.client").commented_stub(),
         key("agent.model").commented_stub(),
+        key("agent.effort").commented_stub(),
         key("guards.completion").commented_stub(),
         key("triage.enabled").commented_stub(),
         key("triage.timeout_secs").commented_stub(),
@@ -940,6 +975,7 @@ zellij = "managed"
 [agent]
 client = "codex"
 model = "gpt-5-mini"
+effort = "high"
 
 [guards]
 completion = "journal"
@@ -1466,6 +1502,44 @@ max_threads = 6
     fn test_agent_model_must_name_something() {
         let error = validate_config("[agent]\nmodel = \"  \"\n").unwrap_err();
         assert!(error.contains("[agent].model"), "{error}");
+    }
+
+    #[test]
+    fn test_agent_effort_resolves_as_written_or_stays_absent() {
+        assert_eq!(
+            resolve_config(&LisaConfig::default(), None, None).effort,
+            None
+        );
+
+        let named = validate_config("[agent]\nmodel = \"opus\"\neffort = \"high\"\n").unwrap();
+        assert!(named.warnings.is_empty());
+        assert_eq!(
+            resolve_config(&named.config, None, None).effort.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn test_agent_effort_rejects_unknown_levels_naming_the_key() {
+        let error = validate_config("[agent]\neffort = \"extreme\"\n").unwrap_err();
+        assert!(error.contains("[agent].effort"), "{error}");
+        assert!(error.contains("extreme"), "{error}");
+        assert!(error.contains("low"), "{error}");
+        assert!(error.contains("max"), "{error}");
+    }
+
+    #[test]
+    fn test_agent_effort_accepts_every_valid_level() {
+        for level in lisa_core::effort::Effort::VALID {
+            let validated = validate_config(&format!("[agent]\neffort = \"{level}\"\n")).unwrap();
+            assert!(validated.warnings.is_empty());
+            assert_eq!(
+                resolve_config(&validated.config, None, None)
+                    .effort
+                    .as_deref(),
+                Some(*level)
+            );
+        }
     }
 
     #[test]

@@ -373,6 +373,15 @@ pub struct Ticket {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Optional routing hint: how hard the agent should think, within the
+    /// selected agent's provider (T-071-01-01). `None` → the board default, or
+    /// the provider's own default when the board names none either. Validated
+    /// against a fixed vocabulary ([`crate::effort::Effort::parse`]) at
+    /// `.lisa.toml` read time; resolution lives in
+    /// [`crate::route::resolve_route_with_defaults`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+
     /// Path to the ticket file on disk
     #[serde(skip)]
     pub file_path: PathBuf,
@@ -398,6 +407,7 @@ impl Ticket {
             blocks: Vec::new(),
             agent: None,
             model: None,
+            effort: None,
             file_path: PathBuf::new(),
             content: String::new(),
         }
@@ -709,6 +719,13 @@ pub struct PluginConfig {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// How hard the client should think, or `None` for the client's own
+    /// default (T-071-01-01). Opaque here — the adapter maps it to the
+    /// provider's `--effort` flag — and outranked by a ticket's own `effort:`
+    /// frontmatter. Mirrors `model`'s plumbing exactly.
+    #[serde(default)]
+    pub effort: Option<String>,
+
     /// Absolute path to the `lisa` binary, captured at `lisa loop` time via
     /// `current_exe()` and passed through the layout. Native adapters export it as
     /// `LISA_BIN` so lifecycle hooks can invoke `lisa capture-usage` without a
@@ -807,6 +824,7 @@ impl PluginConfig {
             assignment_ack_timeout_secs: Self::DEFAULT_ASSIGNMENT_ACK_TIMEOUT_SECS,
             client: AgentClient::default(),
             model: None,
+            effort: None,
             lisa_bin: None,
             provider_caps: HashMap::new(),
             session_name: None,
@@ -915,6 +933,16 @@ impl PluginConfig {
             let model = model.trim();
             if !model.is_empty() {
                 result.model = Some(model.to_string());
+            }
+        }
+
+        if let Some(effort) = config.get("effort") {
+            // Same leniency as `model` above: `lisa validate` is the gate that
+            // enforces the fixed effort vocabulary, so the plugin must never
+            // panic or refuse to start parsing its own config map.
+            let effort = effort.trim();
+            if !effort.is_empty() {
+                result.effort = Some(effort.to_string());
             }
         }
 
@@ -1362,6 +1390,7 @@ mod tests {
         t2.route = Some(ResolvedRoute {
             agent: AgentClient::Codex,
             model: Some("gpt-5".to_string()),
+            effort: None,
             requested_agent: Some("codex".to_string()),
             substituted: false,
             note: None,

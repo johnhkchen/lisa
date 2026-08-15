@@ -167,6 +167,7 @@ fn parse_frontmatter_into_ticket(
     let mut blocks: Vec<String> = Vec::new();
     let mut agent: Option<String> = None;
     let mut model: Option<String> = None;
+    let mut effort: Option<String> = None;
 
     // Track which list field we're accumulating multiline items for.
     // YAML allows both inline `depends_on: [A, B]` and multiline:
@@ -237,6 +238,13 @@ fn parse_frontmatter_into_ticket(
                 "model" if !value.is_empty() => {
                     model = Some(value.to_string());
                 }
+                // Same routing-hint contract as `model` (T-071-01-01): raw and
+                // unvalidated here — an unknown effort is a `.lisa.toml` /
+                // `lisa validate` concern, not a reason to fail parsing a
+                // ticket that has run for months against an older vocabulary.
+                "effort" if !value.is_empty() => {
+                    effort = Some(value.to_string());
+                }
                 _ => {
                     // Ignore unknown fields for forward compatibility
                 }
@@ -264,6 +272,7 @@ fn parse_frontmatter_into_ticket(
         blocks,
         agent,
         model,
+        effort,
         content,
         file_path: path.to_path_buf(),
     })
@@ -1212,21 +1221,42 @@ This ticket has no blocks field at all.
 
     #[test]
     fn test_parse_routing_fields_inline() {
-        let content = "---\nid: T-026-01\ntitle: routed\ntype: feature\nstatus: open\npriority: medium\nphase: ready\nagent: codex\nmodel: gpt-5\n---\nBody\n";
+        let content = "---\nid: T-026-01\ntitle: routed\ntype: feature\nstatus: open\npriority: medium\nphase: ready\nagent: codex\nmodel: gpt-5\neffort: high\n---\nBody\n";
         let path = Path::new("/test/ticket.md");
         let ticket = parse_ticket_content(content, path).unwrap();
         assert_eq!(ticket.agent.as_deref(), Some("codex"));
         assert_eq!(ticket.model.as_deref(), Some("gpt-5"));
+        assert_eq!(ticket.effort.as_deref(), Some("high"));
     }
 
     #[test]
     fn test_parse_routing_fields_absent() {
-        // A ticket with no routing hints parses with both fields None.
+        // A ticket with no routing hints parses with all fields None.
         let content = "---\nid: T-001\ntitle: unrouted\ntype: task\nstatus: open\npriority: high\nphase: ready\n---\nBody\n";
         let path = Path::new("/test/ticket.md");
         let ticket = parse_ticket_content(content, path).unwrap();
         assert_eq!(ticket.agent, None);
         assert_eq!(ticket.model, None);
+        assert_eq!(ticket.effort, None);
+    }
+
+    #[test]
+    fn test_parse_empty_effort_treated_as_absent() {
+        let content = "---\nid: T-001\ntitle: bare\ntype: task\nstatus: open\npriority: high\nphase: ready\neffort:\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert_eq!(ticket.effort, None);
+    }
+
+    #[test]
+    fn test_parse_invalid_effort_still_parses_raw() {
+        // Same "never fail the ticket" contract as `agent`/`model`: the fixed
+        // effort vocabulary is enforced at `.lisa.toml` read time
+        // (Effort::parse), not while parsing a ticket file.
+        let content = "---\nid: T-001\ntitle: bad-effort\ntype: task\nstatus: open\npriority: high\nphase: ready\neffort: extreme\n---\nBody\n";
+        let path = Path::new("/test/ticket.md");
+        let ticket = parse_ticket_content(content, path).unwrap();
+        assert_eq!(ticket.effort.as_deref(), Some("extreme"));
     }
 
     #[test]

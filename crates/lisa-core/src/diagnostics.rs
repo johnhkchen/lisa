@@ -119,6 +119,7 @@ mod tests {
             blocks: Vec::new(),
             agent: None,
             model: None,
+            effort: None,
             file_path: PathBuf::new(),
             content: String::new(),
         }

@@ -616,6 +616,7 @@ mod tests {
             blocks: blocks.into_iter().map(|s| s.to_string()).collect(),
             agent: None,
             model: None,
+            effort: None,
             file_path: PathBuf::new(),
             content: String::new(),
         }
