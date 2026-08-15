@@ -224,7 +224,10 @@ fn write_missing_seal(
     let ticket_work_dir = request.work_dir.join(ticket_id);
     let review = ticket_work_dir.join("review.md");
     if head_is_unborn(request.project_root)? || !review.is_file() {
-        return Ok(Err(no_evidence_decline(ticket_id, &review)));
+        // Named the way the operator would type it, from the project they are
+        // standing in.
+        let named = repository_relative(request.project_root, &review).unwrap_or(review);
+        return Ok(Err(no_evidence_decline(ticket_id, &named)));
     }
     if let Some(refusal) = reviewer_block(ticket_id, &ticket_work_dir) {
         return Ok(Err(refusal));

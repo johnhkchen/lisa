@@ -826,9 +826,19 @@ fn collect_status(root: &Path) -> Result<StatusData, String> {
                 .iter()
                 .any(|held| &held.ticket_id == ticket_id)
         });
-        let held = unschedulable.len();
-        board.stats.ready_tickets = board.stats.ready_tickets.saturating_sub(held);
-        board.stats.blocked_tickets = board.stats.blocked_tickets.saturating_add(held);
+        board.stats.ready_tickets = board
+            .stats
+            .ready_tickets
+            .saturating_sub(unschedulable.len());
+        // Re-derived rather than incremented, by the same subtraction the DAG
+        // uses: blocked is whatever is left over, and a ticket already counted
+        // as under way must not be counted a second time as blocked.
+        board.stats.blocked_tickets = board
+            .stats
+            .total_tickets
+            .saturating_sub(board.stats.done_tickets)
+            .saturating_sub(board.stats.ready_tickets)
+            .saturating_sub(board.stats.in_progress_tickets);
         board
     });
 
