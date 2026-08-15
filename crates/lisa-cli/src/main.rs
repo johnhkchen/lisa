@@ -26,6 +26,7 @@ mod loop_cmd;
 mod nightly;
 mod notes;
 mod preownership_status;
+mod presence;
 mod promote;
 mod proposal;
 mod reset_ticket;

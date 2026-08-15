@@ -270,10 +270,22 @@ impl RunReport {
             .schedulers
             .iter()
             .map(|record| match record.stop_command() {
-                Some(command) => format!("{} — stop it with `{command}`", record.label()),
+                // Both commands, because the first one has a way of being
+                // unrunnable at exactly the moment it is needed: a session that
+                // ended without its scheduler noticing cannot be killed, and an
+                // operator standing at `(the session does not exist)` needs the
+                // next sentence to be here rather than in a story (S-070-01).
+                Some(command) => format!(
+                    "{} — stop it with `{command}`, or with `lisa schedulers --stop {}` if that \
+                     session is already gone",
+                    record.label(),
+                    record.scheduler_id
+                ),
                 None => format!(
-                    "{} — Lisa was never told its session name; `zellij list-sessions` has it",
-                    record.label()
+                    "{} — Lisa was never told its session name; `zellij list-sessions` has it, and \
+                     `lisa schedulers --stop {}` ends it either way",
+                    record.label(),
+                    record.scheduler_id
                 ),
             })
             .collect();
@@ -367,7 +379,22 @@ pub(crate) fn assess_run(root: &Path, resolved: &config::ResolvedConfig) -> RunR
 /// rewriting timestamps on disk — backdating files tests the test harness, and
 /// this is the judgement worth testing.
 pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now: u64) -> RunReport {
-    let live = live_schedulers(root, resolved, now);
+    assess_run_with(root, resolved, now, &crate::presence::Machine::read(root))
+}
+
+/// The same decision, against a stated machine.
+///
+/// The machine is a parameter for the same reason the clock is: "the process
+/// this record names is gone" is the judgement this file exists to make, and a
+/// test that has to arrange a real dead Zellij to state it is a test of the
+/// harness.
+pub(crate) fn assess_run_with(
+    root: &Path,
+    resolved: &config::ResolvedConfig,
+    now: u64,
+    machine: &crate::presence::Machine,
+) -> RunReport {
+    let Roll { live, gone } = roll_call(root, resolved, now, machine);
     let stamp = read_stamp(root);
     let (window, window_reason) = match &stamp {
         Some(stamp) => (
@@ -400,10 +427,21 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
     // report. Every branch below that returns early does so before reaching the
     // stamp, and a caller asking "is a scheduler here" needs the answer on all
     // of them.
-    let stamped = stamp
+    let stamp_is_fresh = stamp
         .as_ref()
         .and_then(|stamp| stamp.age_secs(now))
         .is_some_and(|age| age <= window);
+
+    // A fresh stamp written by a scheduler that is provably gone is not
+    // evidence that anything is here. `.lisa/scheduler.alive` has one name on
+    // it and as many writers as there are schedulers, so the only honest
+    // reading of a fresh one is "whoever wrote this was alive then" — and when
+    // every scheduler that could have written it has been asked about and
+    // answered *gone*, the board's own stamp is the last thing holding a lock
+    // nobody is behind. That was the second half of the S-070-01 deadlock: the
+    // registry was cleared by hand and the shared file still fenced the board.
+    let orphaned_stamp = live.is_empty() && !gone.is_empty();
+    let stamped = stamp_is_fresh && !orphaned_stamp;
 
     // Work first, because work is the fact that matters and the only one a
     // second scheduler cannot forge on another's behalf: whoever consumed it,
@@ -450,8 +488,11 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
         Some(stamp) => match stamp.age_secs(now) {
             // No registry entry, but the shared stamp is fresh: a scheduler
             // from a build that predates the registry. It is here, and that is
-            // all this file has ever been able to say about it.
-            Some(age) if age <= window => {
+            // all this file has ever been able to say about it — unless the
+            // registry named its writer and this machine says that writer is
+            // gone, in which case the stamp is a dead run's last word and the
+            // decision falls through to the evidence below.
+            Some(age) if age <= window && !orphaned_stamp => {
                 return RunReport::stamping(
                     format!(
                         "Lisa's scheduler said it was running {} ago.",
@@ -478,12 +519,25 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
         ));
     };
 
-    let seen = match stamp_age {
-        Some(age) => format!(
+    // What was asked, and what answered. A scheduler Lisa proved gone is named
+    // with the proof, because "the stamp is old enough" and "pid 15340 is not a
+    // process on this machine any more" are different sentences and only the
+    // second one ends an argument.
+    let seen = match (gone.first(), stamp_age) {
+        (Some(gone), _) => format!(
+            "{} stamped {}, and {}",
+            gone.label,
+            match gone.stamped_age {
+                Some(age) => format!("{} ago", humanize(age)),
+                None => "ahead of this machine's clock".to_string(),
+            },
+            gone.because
+        ),
+        (None, Some(age)) => format!(
             "Lisa's scheduler last said it was running {} ago",
             humanize(age)
         ),
-        None => "Lisa has no record of a scheduler running here".to_string(),
+        (None, None) => "Lisa has no record of a scheduler running here".to_string(),
     };
     RunReport {
         liveness: RunLiveness::Ended,
@@ -498,27 +552,73 @@ pub(crate) fn assess_run_at(root: &Path, resolved: &config::ResolvedConfig, now:
     }
 }
 
-/// The schedulers that have stamped their own record inside the window.
+/// A record whose stamp is fresh and whose process this machine says is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GoneScheduler {
+    /// The name an operator reads.
+    pub(crate) label: String,
+    /// The id `lisa schedulers --stop` takes.
+    pub(crate) scheduler_id: String,
+    /// How long ago it stamped, or `None` for a stamp ahead of the clock.
+    pub(crate) stamped_age: Option<u64>,
+    /// What this machine was asked and what it answered.
+    pub(crate) because: String,
+}
+
+/// The registry, read once and divided by what this machine says about it.
+pub(crate) struct Roll {
+    /// Stamping recently, and not provably gone. These hold the board.
+    pub(crate) live: Vec<lisa_core::schedulers::SchedulerRecord>,
+    /// Stamping recently, and provably gone. The state the whole ticket is
+    /// about: a record that reads alive and a process that is not there.
+    pub(crate) gone: Vec<GoneScheduler>,
+}
+
+/// Divide the roster into the runs that are here and the runs that only look
+/// it.
 ///
-/// Empty means the registry says nobody, which on a board whose scheduler
-/// predates it is not the same as nobody being here — hence the shared stamp
-/// staying in the decision below.
-fn live_schedulers(
+/// A fresh stamp is where this starts and no longer where it ends. **A stamp
+/// says a process was alive when it wrote; a pid is a question you can ask
+/// now** — so every record whose stamp is fresh is put to
+/// [`crate::presence`], and only the ones this machine cannot contradict count
+/// as holding the board. An empty `live` still does not mean nobody is here: a
+/// board whose scheduler predates the registry writes no record at all, which
+/// is why the shared stamp stays in the decision above.
+pub(crate) fn roll_call(
     root: &Path,
     resolved: &config::ResolvedConfig,
     now: u64,
-) -> Vec<lisa_core::schedulers::SchedulerRecord> {
-    lisa_core::schedulers::read_roster(root)
-        .into_iter()
-        .filter(|record| {
-            record.is_live(
-                now,
-                record
-                    .live_window_secs(resolved.wind_down_secs)
-                    .max(MIN_STAMPED_WINDOW_SECS),
-            )
-        })
-        .collect()
+    machine: &crate::presence::Machine,
+) -> Roll {
+    let mut roll = Roll {
+        live: Vec::new(),
+        gone: Vec::new(),
+    };
+    for record in lisa_core::schedulers::read_roster(root) {
+        if !record.is_live(
+            now,
+            record
+                .live_window_secs(resolved.wind_down_secs)
+                .max(MIN_STAMPED_WINDOW_SECS),
+        ) {
+            // A stale stamp was already an answer before this ticket, and it
+            // is the same answer now. Nothing is asked about its process:
+            // there is nothing left for the question to change.
+            continue;
+        }
+        let presence = machine.look(&record, now);
+        if presence.is_gone() {
+            roll.gone.push(GoneScheduler {
+                label: record.label(),
+                scheduler_id: record.scheduler_id.clone(),
+                stamped_age: record.age_secs(now),
+                because: presence.because().to_string(),
+            });
+        } else {
+            roll.live.push(record);
+        }
+    }
+    roll
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +736,7 @@ pub fn run_release_seats(root: &Path, release: bool) -> Result<(), String> {
                 .to_string(),
         );
     };
-    run_release_seats_with_writer(root, release, &mut out, now)
+    run_release_seats_with_writer(root, release, &mut out, now, &crate::presence::Machine::read(root))
 }
 
 /// Print the plan, and carry it out only when `release` is true.
@@ -650,6 +750,7 @@ fn run_release_seats_with_writer(
     release: bool,
     out: &mut impl Write,
     now: u64,
+    machine: &crate::presence::Machine,
 ) -> Result<(), String> {
     if !root.exists() {
         return Err(format!("Path does not exist: {}", root.display()));
@@ -659,7 +760,7 @@ fn run_release_seats_with_writer(
         Ok(validation) => config::resolve_config(&validation.config, None, None),
         Err(_) => config::ResolvedConfig::default(),
     };
-    let report = assess_run_at(root, &resolved, now);
+    let report = assess_run_with(root, &resolved, now, machine);
     let plan = plan_release(root, &report);
     let removals: Vec<&SeatAction> = plan.iter().filter(|action| action.remove).collect();
 
@@ -812,8 +913,15 @@ mod tests {
         .unwrap();
     }
 
+    /// The board as read on a machine that answers nothing about processes —
+    /// the world every test here described before this ticket, and the one a
+    /// reader falls back to when it cannot ask.
     fn assess(root: &Path, now: u64) -> RunReport {
-        assess_run_at(root, &config::ResolvedConfig::default(), now)
+        assess_on(root, now, crate::presence::Machine::unknown())
+    }
+
+    fn assess_on(root: &Path, now: u64, machine: crate::presence::Machine) -> RunReport {
+        assess_run_with(root, &config::ResolvedConfig::default(), now, &machine)
     }
 
     /// The whole point: a fresh stamp means a run is here, whatever the seats
@@ -921,7 +1029,13 @@ mod tests {
         };
 
         assert_eq!(
-            assess_run_at(dir.path(), &resolved, now).liveness,
+            assess_run_with(
+                dir.path(),
+                &resolved,
+                now,
+                &crate::presence::Machine::unknown()
+            )
+            .liveness,
             RunLiveness::Stamping,
             "45s is inside the {MIN_STAMPED_WINDOW_SECS}s floor"
         );
@@ -971,6 +1085,100 @@ mod tests {
         assert!(how.contains("lisa schedulers"));
     }
 
+    /// A machine that says the pid a record names is not a process any more.
+    fn without_that_process() -> crate::presence::Machine {
+        crate::presence::Machine::fixed(Some(Vec::new()), |_| crate::presence::Server::Missing)
+    }
+
+    /// The `renderer` board of 2026-08-14. The stamp is a minute old, the
+    /// Zellij server it names is gone, and the seats are free — which is the
+    /// answer every command on the day refused to give.
+    #[test]
+    fn a_fresh_stamp_from_a_scheduler_whose_server_is_gone_does_not_hold_the_seats() {
+        let dir = project();
+        let now = later(45 * 60);
+        stamp(dir.path(), now, 87);
+        register(dir.path(), "renderer-3-49ded6ab", "renderer-3", now, 87);
+
+        let report = assess_on(dir.path(), now, without_that_process());
+
+        assert_eq!(report.liveness, RunLiveness::Ended);
+        assert!(report.seats_are_abandoned(), "{}", report.evidence);
+        assert!(!report.holds_the_board());
+        assert!(
+            report.evidence.contains("renderer-3 (renderer-3-49ded6ab)"),
+            "{}",
+            report.evidence
+        );
+        assert!(
+            report.evidence.contains("pid 30186"),
+            "the proof is the pid, not the clock: {}",
+            report.evidence
+        );
+        assert!(
+            !report.stamped,
+            "the shared stamp was written by that same dead run"
+        );
+    }
+
+    /// The same board with the same stamp, on a machine that still holds the
+    /// process. Nothing here may make it easier to release a seat somebody is
+    /// working.
+    #[test]
+    fn the_same_stamp_with_the_server_still_up_keeps_every_seat() {
+        let dir = project();
+        let now = later(45 * 60);
+        stamp(dir.path(), now, 87);
+        register(dir.path(), "renderer-3-49ded6ab", "renderer-3", now, 87);
+
+        let report = assess_on(
+            dir.path(),
+            now,
+            crate::presence::Machine::fixed(Some(vec!["renderer-3".to_string()]), |_| {
+                crate::presence::Server::Zellij {
+                    up_secs: Some(20 * 3600),
+                }
+            }),
+        );
+
+        assert_eq!(report.liveness, RunLiveness::Stamping);
+        assert!(report.holds_the_board());
+        assert!(report.stamped);
+    }
+
+    /// A machine Lisa could not ask answers the way it always did: the stamp,
+    /// and nothing else. Doubt keeps the seat.
+    #[test]
+    fn a_machine_that_cannot_be_asked_still_reads_the_stamp_alone() {
+        let dir = project();
+        let now = later(45 * 60);
+        stamp(dir.path(), now, 87);
+        register(dir.path(), "renderer-3-49ded6ab", "renderer-3", now, 87);
+
+        let report = assess(dir.path(), now);
+
+        assert_eq!(report.liveness, RunLiveness::Stamping);
+        assert!(report.holds_the_board());
+    }
+
+    /// The refusal that used to be a dead end names both commands now, because
+    /// the first one is exactly the one that cannot work once a session has
+    /// ended without its scheduler noticing.
+    #[test]
+    fn the_refusal_names_a_remedy_that_still_works_when_the_session_is_gone() {
+        let dir = project();
+        let now = later(86_400);
+        register(dir.path(), "renderer-3-49ded6ab", "renderer-3", now, 4);
+
+        let how = assess(dir.path(), now)
+            .how_to_stop()
+            .expect("a named scheduler can be stopped");
+
+        assert!(how.contains("zellij kill-session renderer-3"));
+        assert!(how.contains("lisa schedulers --stop renderer-3-49ded6ab"));
+        assert!(how.contains("already gone"));
+    }
+
     /// The other half of the same distinction: panes writing means work, and
     /// work is not something a second scheduler can fake on another's behalf.
     #[test]
@@ -1008,7 +1216,7 @@ mod tests {
         register(dir.path(), "drum", "fascinating-drum", now, 4);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, now).unwrap();
+        run_release_seats_with_writer(dir.path(), true, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("a scheduler is holding these seats"));
@@ -1024,7 +1232,7 @@ mod tests {
         stamp(dir.path(), now, 86_400);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), false, &mut out, now).unwrap();
+        run_release_seats_with_writer(dir.path(), false, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("2 markers to release"));
@@ -1045,7 +1253,7 @@ mod tests {
         stamp(dir.path(), now, 86_400);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, now).unwrap();
+        run_release_seats_with_writer(dir.path(), true, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("Released 3 markers"));
@@ -1075,7 +1283,7 @@ mod tests {
         stamp(dir.path(), now, 2);
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, now).unwrap();
+        run_release_seats_with_writer(dir.path(), true, &mut out, now, &crate::presence::Machine::unknown()).unwrap();
         let printed = String::from_utf8(out).unwrap();
 
         assert!(printed.contains("Nothing to release"));
@@ -1090,7 +1298,7 @@ mod tests {
         fs::write(dir.path().join(".lisa.toml"), "").unwrap();
 
         let mut out = Vec::new();
-        run_release_seats_with_writer(dir.path(), true, &mut out, later(0)).unwrap();
+        run_release_seats_with_writer(dir.path(), true, &mut out, later(0), &crate::presence::Machine::unknown()).unwrap();
         assert!(String::from_utf8(out)
             .unwrap()
             .contains("No seats are held here."));
