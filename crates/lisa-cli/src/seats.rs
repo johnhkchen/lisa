@@ -523,30 +523,39 @@ pub(crate) fn assess_run_with(
     // with the proof, because "the stamp is old enough" and "pid 15340 is not a
     // process on this machine any more" are different sentences and only the
     // second one ends an argument.
-    let seen = match (gone.first(), stamp_age) {
-        (Some(gone), _) => format!(
-            "{} stamped {}, and {}",
+    // A scheduler this machine says is gone ends the argument on its own, so it
+    // is stated as a finding rather than as a stamp that outlasted a wait: how
+    // long Lisa would have waited is not the reason, and printing it as one
+    // invites an operator to wait longer.
+    let evidence = match gone.first() {
+        Some(gone) => format!(
+            "{} stamped {}, and {}. Nothing has changed in {SIGNAL_DIR}/ for {quiet_for} either, \
+             so no pane is working these seats.",
             gone.label,
             match gone.stamped_age {
                 Some(age) => format!("{} ago", humanize(age)),
                 None => "ahead of this machine's clock".to_string(),
             },
-            gone.because
+            gone.because,
+            quiet_for = humanize(quiet),
         ),
-        (None, Some(age)) => format!(
-            "Lisa's scheduler last said it was running {} ago",
-            humanize(age)
-        ),
-        (None, None) => "Lisa has no record of a scheduler running here".to_string(),
-    };
-    RunReport {
-        liveness: RunLiveness::Ended,
-        evidence: format!(
+        None => format!(
             "{seen}, and nothing has changed in {SIGNAL_DIR}/ for {quiet_for}. Lisa waits \
              {waited} before believing that, because {window_reason}.",
+            seen = match stamp_age {
+                Some(age) => format!(
+                    "Lisa's scheduler last said it was running {} ago",
+                    humanize(age)
+                ),
+                None => "Lisa has no record of a scheduler running here".to_string(),
+            },
             quiet_for = humanize(quiet),
             waited = humanize(window),
         ),
+    };
+    RunReport {
+        liveness: RunLiveness::Ended,
+        evidence,
         schedulers: Vec::new(),
         stamped,
     }

@@ -166,26 +166,11 @@ impl Machine {
     /// What this machine says about the process one record named.
     pub(crate) fn look(&self, record: &SchedulerRecord, now: u64) -> Presence {
         let session = record.session_name.as_deref();
-        let by_pid = record.zellij_pid.map(|pid| (pid, (self.server)(pid)));
-
-        match by_pid {
-            Some((pid, Server::Missing)) => {
-                // The incident. A pid nobody holds is the strongest thing this
-                // machine can say — unless its session is still listed, in
-                // which case Lisa has two answers and no way to choose.
-                if session.and_then(|name| self.session_running(name)) == Some(true) {
-                    return Presence::Unknown(format!(
-                        "the Zellij server it recorded, pid {pid}, is gone, but a session called \
-                         {} is still running here. Lisa cannot tell which is true, so nothing is \
-                         treated as free",
-                        session.unwrap_or("?")
-                    ));
-                }
-                Presence::Gone(format!(
-                    "the Zellij server it recorded, pid {pid}, is not a process on this machine \
-                     any more"
-                ))
-            }
+        let verdict = match record.zellij_pid.map(|pid| (pid, (self.server)(pid))) {
+            Some((pid, Server::Missing)) => Presence::Gone(format!(
+                "the Zellij server it recorded, pid {pid}, is not a process on this machine any \
+                 more"
+            )),
             Some((pid, Server::Other(command))) => Presence::Gone(format!(
                 "pid {pid} belongs to `{command}` now, not to the Zellij server this run wrote \
                  down — the number was reused"
@@ -219,7 +204,23 @@ impl Machine {
                     ),
                 }
             }
+        };
+
+        // The veto, and the reason there are two questions rather than one:
+        // whatever the pid says, a session Zellij still lists is a run this
+        // machine is holding. Measured on 2026-08-14 against a live loop, where
+        // `ps -o comm=` truncated `/opt/homebrew/Cellar/…/zellij` to sixteen
+        // characters and the pid read as a stranger's. Two answers that
+        // disagree are not an answer, and the seats stay.
+        if verdict.is_gone() && session.and_then(|name| self.session_running(name)) == Some(true) {
+            return Presence::Unknown(format!(
+                "{}, and yet a session called {} is still running here. Lisa cannot tell which is \
+                 true, so nothing is treated as free",
+                verdict.because(),
+                session.unwrap_or("?")
+            ));
         }
+        verdict
     }
 }
 
@@ -313,12 +314,17 @@ fn look_up_pid(_pid: u32) -> Server {
 }
 
 /// What `ps` says a live pid is, and how long it has been up.
+///
+/// `args` rather than `comm`, because `comm` is truncated: macOS cut
+/// `/opt/homebrew/Cellar/zellij/0.44.3/bin/zellij` to `/opt/homebrew/Ce`, and a
+/// live scheduler read as a stranger holding a reused pid. The whole command
+/// line is longer than any truncation and its first word is still the program.
 fn identify(pid: u32) -> Server {
     let Ok(output) = Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
         .arg("-o")
-        .arg("comm=,etime=")
+        .arg("args=,etime=")
         .output()
     else {
         return Server::Unknown;
@@ -335,20 +341,23 @@ fn identify(pid: u32) -> Server {
     read_ps_line(line)
 }
 
-/// Read one `ps -o comm=,etime=` line: a command, then an elapsed time.
+/// Read one `ps -o args=,etime=` line: a whole command line, then an elapsed
+/// time.
 ///
-/// The command comes first and may contain spaces — macOS prints the whole
-/// path — so the elapsed time is taken off the end rather than the command off
-/// the front.
+/// The command comes first and carries its own spaces, so the elapsed time is
+/// taken off the end rather than the command off the front. What names the
+/// program is the first word of it — a `zellij` in a later argument is a file
+/// somebody is editing, not the server this record was written by.
 fn read_ps_line(line: &str) -> Server {
     let Some((command, elapsed)) = line.rsplit_once(char::is_whitespace) else {
         return Server::Unknown;
     };
     let command = command.trim();
-    let is_zellij = Path::new(command)
+    let program = command.split_whitespace().next().unwrap_or(command);
+    let is_zellij = Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(command)
+        .unwrap_or(program)
         .contains("zellij");
     if !is_zellij {
         return Server::Other(command.to_string());
@@ -457,13 +466,24 @@ mod tests {
     }
 
     /// Two answers that disagree are not an answer. The seats stay.
+    ///
+    /// Every way the pid can read as gone is vetoed the same way, because the
+    /// first live loop this was tried against read as a stranger's pid rather
+    /// than a missing one — a truncated `ps` line — and a run with panes in it
+    /// would have had its seats freed.
     #[test]
-    fn a_dead_pid_under_a_running_session_is_reported_as_unknown() {
-        let presence = machine(Some(&["renderer-3"]), Server::Missing).look(&renderer_3(), NOW);
+    fn any_dead_pid_under_a_running_session_is_reported_as_unknown() {
+        for gone in [
+            Server::Missing,
+            Server::Other("/opt/homebrew/Ce".to_string()),
+            Server::Zellij { up_secs: Some(5) },
+        ] {
+            let presence = machine(Some(&["renderer-3"]), gone.clone()).look(&renderer_3(), NOW);
 
-        assert!(matches!(presence, Presence::Unknown(_)), "{presence:?}");
-        assert!(!presence.is_gone());
-        assert!(presence.because().contains("cannot tell which is true"));
+            assert!(matches!(presence, Presence::Unknown(_)), "{gone:?}");
+            assert!(!presence.is_gone(), "{gone:?}");
+            assert!(presence.because().contains("cannot tell which is true"));
+        }
     }
 
     /// A machine with no Zellij to ask has not said that nothing is running.
@@ -528,6 +548,27 @@ mod tests {
             Server::Other("/Applications/My Terminal.app/node".to_string())
         );
         assert_eq!(read_ps_line("zellij"), Server::Unknown);
+    }
+
+    /// The line this machine actually printed for a live scheduler on
+    /// 2026-08-14, with the arguments a Zellij server carries. Read from
+    /// `comm` it arrived truncated to `/opt/homebrew/Ce` and the run read as
+    /// dead; read from `args` the program is still the program.
+    #[test]
+    fn a_zellij_server_with_its_arguments_is_still_a_zellij_server() {
+        assert_eq!(
+            read_ps_line(
+                "/opt/homebrew/Cellar/zellij/0.44.3/bin/zellij --server \
+                 /Users/johnchen/Library/Caches/org.Zellij-Contributors.zellij/0.44.3/repro 00:19"
+            ),
+            Server::Zellij { up_secs: Some(19) }
+        );
+        // And the looseness that would let a full command line lie: what names
+        // the program is its first word.
+        assert_eq!(
+            read_ps_line("vim docs/zellij-notes.md 03:00"),
+            Server::Other("vim docs/zellij-notes.md".to_string())
+        );
     }
 
     #[test]

@@ -766,8 +766,18 @@ out a seat somebody is working is the mistake that costs you.
 The refusal tells you which of the two it is. *A run is working these seats*
 means your panes are writing and something is genuinely being done. *A scheduler
 is holding these seats* means a run exists but nothing has moved for a while —
-so the message names that run and the command that ends it, rather than leaving
-you with a sentence you can't act on.
+so the message names that run and both commands that end it: `zellij
+kill-session <name>` while the session is there, and `lisa schedulers --stop
+<id>` once it isn't.
+
+"A scheduler said it was running" is not the same as "a scheduler is running",
+and Lisa no longer treats it as such. Before a note holds your seats, Lisa asks
+this machine whether the Zellij server that wrote it still exists; a note left
+seconds ago by a process that is gone frees the seats, and so does the board's
+shared stamp when the only runs that could have written it are gone. A machine
+that cannot be asked — no Zellij to ask, a session still listed under that name
+— keeps every seat, because handing out a seat somebody is working is still the
+mistake that costs you.
 
 ### `lisa reset-ticket`
 
@@ -852,9 +862,28 @@ It ends the whole session, agent panes included, so you always name which one �
 and Lisa refuses the session your own terminal is sitting in, because a command
 that closes the window it is printing to can't tell you what it did.
 
+**A run is running when its process is.** Lisa asks this machine about the
+Zellij server the run wrote down — is that pid still held, and is what holds it
+still that Zellij — rather than trusting the run's own last "I'm here" note. A
+run whose server is gone reads as ended, with the pid as the reason, and is
+offered the command that clears it instead of a `zellij kill-session` that
+cannot succeed. When the two answers disagree — no such process, but a session
+of that name still listed — Lisa says so and changes nothing.
+
+```bash
+lisa schedulers --stop renderer-3-49ded6ab   # after a crash, when the session is already gone
+```
+
+Ending a run that has already ended is the ordinary case, not an error. Lisa
+says what it found and what it cleaned: the run's record, the session if one was
+still there to end, and the board's shared "a scheduler is here" stamp when the
+run it just retired was the last thing that could have written it.
+
 Starting a second run on a board that already has one is refused, with the first
 one named. That is the only thing standing between a quiet afternoon and two
-schedulers splitting your signals between them.
+schedulers splitting your signals between them. A record left by a run whose
+server is gone does not refuse anything — a board you cannot restart is worse
+than a board with a stale file on it.
 
 ### `lisa unblock`
 
