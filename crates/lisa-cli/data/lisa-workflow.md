@@ -38,6 +38,8 @@ Lisa runs your `check` under one fixed contract. Write the check against it — 
 
 `lisa check-disposition` runs your recorded check under exactly this contract and refuses one that can never pass — a check that could not look, or one that outlives its own budget.
 
+It also reads every `lisa` verb your block names, in `reason`, `ask`, `steps`, and `check`, against the binary you are running, and refuses one that binary does not have. The operator following a step is the one reader with no source beside them, and `unrecognized subcommand` reads to them as a broken install rather than a wrong instruction. Steps legitimately name `brew`, `ssh`, and things on other machines — the rule is only that a `lisa` verb is never invented. If the verb is real but newer than your `lisa`, say in the step which version it needs.
+
 Write the `ask` as one sentence addressed to a person who didn't do the work, naming the action rather than the subsystem. Do not write `no stable Pages artifact has been deployed`; write `Lisa needs the release published; run: just release. Lisa will notice on its own once it's live.`
 
 Write for a bystander: say plainly what they should do. Keep subsystem names, measurements, and other jargon in `reason` or `steps`, not the `ask`. This field disposition is a counter-example; never use it as the `ask`:
