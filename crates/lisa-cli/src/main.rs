@@ -1109,6 +1109,7 @@ fn main() {
             let request = already_done::AlreadyDoneRequest {
                 project_root: &path,
                 ticket_dir: &path.join(&resolved.ticket_dir),
+                work_dir: &path.join(&resolved.work_dir),
                 journal_path: &path
                     .join(lisa_core::completion_journal::COMPLETION_JOURNAL_RELATIVE_PATH),
             };
@@ -1117,9 +1118,18 @@ fn main() {
                     ticket_id,
                     commit_id,
                     ticket_file_rewritten,
+                    seal,
                 }) => {
                     let short: String = commit_id.chars().take(8).collect();
-                    println!("{ticket_id} is finished — its work was already saved in {short}.");
+                    match seal {
+                        already_done::SealSource::Adopted => println!(
+                            "{ticket_id} is finished — its work was already saved in {short}."
+                        ),
+                        already_done::SealSource::Written => println!(
+                            "{ticket_id} is finished — its work was here and the finishing record \
+                             wasn't, so I wrote it: {short}."
+                        ),
+                    }
                     if ticket_file_rewritten {
                         println!("Its ticket file now reads done, and is not committed yet.");
                     }

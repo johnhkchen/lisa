@@ -11,9 +11,22 @@
 //! requested from the adapter.
 //!
 //! **It is proved by the key, never by the absence of a diff.** A commit
-//! reachable from HEAD carrying this ticket's `Lisa-Completion-Key` is the only
-//! accepted evidence. No such commit, no recovery — an operator's word is not
-//! a receipt.
+//! reachable from HEAD carrying this ticket's `Lisa-Completion-Key` is the
+//! evidence that settles a completion without writing one. An operator's word
+//! is never a receipt.
+//!
+//! **When the seal is the only thing missing, it writes the seal.** The
+//! 2026-08-13 `renderer` board had five commits of finished work, published
+//! review artifacts, and a completion whose *commit* had failed — so there was
+//! no key anywhere and this command refused, on a ticket nothing else could
+//! finish either. Refusing there was reading "already recorded" as "already
+//! sealed". The seal is Lisa's own to write: the journal already holds Lisa's
+//! decision that this ticket was completable, the published review is the
+//! artifact it admitted, and the completion transaction is the same one the
+//! loop would have run. So a rejected completion with no seal in history and a
+//! published review is sealed here, through
+//! [`lisa_cli::commit_transaction::complete_ticket`](crate::commit_transaction::complete_ticket)
+//! — the identical transaction, under an `operator` generation key.
 //!
 //! **It writes a new generation, not a confirmation of the rejected one.** The
 //! reducer refuses `CommandSucceeded` from `Rejected`, and a hand-appended row
@@ -31,13 +44,16 @@ use std::process::Command;
 use lisa_core::completion::{
     completion_key_ticket_prefix, AttemptId, CompletionDeadline, CompletionGenerationId,
     CompletionId, CompletionSeal, CompletionSealReceipt, CompletionState, CorrelationId,
-    Retryability,
+    Retryability, COMPLETION_KEY_PREFIX,
 };
 use lisa_core::completion_journal::{
     append_with_seal_using, load, CompletionJournalAggregate, CompletionJournalTransition,
 };
+use lisa_core::disposition::{parse_review_disposition, DispositionOrigin, ReviewDisposition};
 use lisa_core::ticket;
 use lisa_core::types::{Phase, TicketStatus};
+
+use crate::commit_transaction::{complete_ticket, CompleteTicketRequest};
 
 /// Everything the command reads, resolved by the caller.
 ///
@@ -49,8 +65,22 @@ pub struct AlreadyDoneRequest<'a> {
     pub project_root: &'a Path,
     /// Directory holding the ticket board.
     pub ticket_dir: &'a Path,
+    /// Directory Lisa publishes admitted work artifacts into, one
+    /// subdirectory per ticket. The published review is what the missing seal
+    /// would commit.
+    pub work_dir: &'a Path,
     /// The project's completion journal.
     pub journal_path: &'a Path,
+}
+
+/// Where the commit that settles this completion came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealSource {
+    /// The seal was already in history; this command only recorded it.
+    Adopted,
+    /// The seal was missing and this command wrote it, through the same
+    /// completion transaction the loop uses.
+    Written,
 }
 
 /// What the command did.
@@ -61,8 +91,10 @@ pub enum AlreadyDoneOutcome {
         ticket_id: String,
         commit_id: String,
         /// True when the ticket file on disk had to be rewritten to Done, and
-        /// is therefore an uncommitted change the operator still owns.
+        /// is therefore an uncommitted change the operator still owns. False
+        /// for a written seal, whose transaction commits that rewrite.
         ticket_file_rewritten: bool,
+        seal: SealSource,
     },
     /// Nothing changed, for a reason a person can read.
     Declined(String),
@@ -91,16 +123,10 @@ pub fn run_already_done(
     };
 
     let completion_id = CompletionId::new(ticket_id);
-    let Some(commit_id) = find_sealed_commit(request.project_root, &completion_id)? else {
-        return Ok(declined(format!(
-            "I can't find {ticket_id}'s finished work in this repository's history. Nothing changed."
-        )));
-    };
-
     let (recovery_key, correlation) = match &start {
         RecoveryStart::Fresh => {
             let key = CompletionGenerationId::new(
-                completion_id,
+                completion_id.clone(),
                 AttemptId::new(OPERATOR_ATTEMPT),
                 aggregate.completion_key().generation().saturating_add(1),
             );
@@ -116,6 +142,17 @@ pub fn run_already_done(
                 .clone()
                 .unwrap_or_else(|| CorrelationId::new(aggregate.completion_key().to_string())),
         ),
+    };
+    // Adopt the seal if it is there, and write it if it is not. The commit
+    // comes first either way: a run killed between the commit and the journal
+    // rows leaves history holding the key, which is exactly the state the
+    // adopting arm was built to settle.
+    let (commit_id, seal) = match find_sealed_commit(request.project_root, &completion_id)? {
+        Some(commit_id) => (commit_id, SealSource::Adopted),
+        None => match write_missing_seal(&request, board_ticket, &recovery_key)? {
+            Ok(commit_id) => (commit_id, SealSource::Written),
+            Err(decline) => return Ok(declined(decline)),
+        },
     };
     let receipt = CompletionSealReceipt::commit(commit_id.clone())?;
     let prior_phase = aggregate.prior_phase();
@@ -152,8 +189,10 @@ pub fn run_already_done(
         )?;
     }
 
-    let ticket_file_rewritten =
-        board_ticket.phase != Phase::Done || board_ticket.status != TicketStatus::Done;
+    // A written seal committed the Done bytes itself, so there is nothing left
+    // on disk for the operator to own.
+    let ticket_file_rewritten = seal == SealSource::Adopted
+        && (board_ticket.phase != Phase::Done || board_ticket.status != TicketStatus::Done);
     if ticket_file_rewritten {
         ticket::update_ticket_done(&board_ticket.file_path)
             .map_err(|error| format!("Could not mark {ticket_id} done: {error}"))?;
@@ -163,7 +202,98 @@ pub fn run_already_done(
         ticket_id: ticket_id.to_string(),
         commit_id,
         ticket_file_rewritten,
+        seal,
     })
+}
+
+/// Write the completion commit Lisa failed to write, or say why not.
+///
+/// The outer `Result` is a real failure — the transaction ran and could not
+/// finish. The inner `Err` is a decline: there is nothing here to seal, said
+/// in the words of what was looked for.
+///
+/// Nothing is journaled before this succeeds. A transaction that fails here
+/// restores the ticket's own bytes and leaves the board exactly as it was, so
+/// a person can fix what it named and run the command again.
+fn write_missing_seal(
+    request: &AlreadyDoneRequest<'_>,
+    board_ticket: &lisa_core::types::Ticket,
+    recovery_key: &CompletionGenerationId,
+) -> Result<Result<String, String>, String> {
+    let ticket_id = board_ticket.id.as_str();
+    let ticket_work_dir = request.work_dir.join(ticket_id);
+    let review = ticket_work_dir.join("review.md");
+    if head_is_unborn(request.project_root)? || !review.is_file() {
+        return Ok(Err(no_evidence_decline(ticket_id, &review)));
+    }
+    if let Some(refusal) = reviewer_block(ticket_id, &ticket_work_dir) {
+        return Ok(Err(refusal));
+    }
+
+    let ticket_file = repository_relative(request.project_root, &board_ticket.file_path)?;
+    let work_dir = repository_relative(request.project_root, &ticket_work_dir)?;
+    match complete_ticket(CompleteTicketRequest {
+        repo_root: request.project_root.to_path_buf(),
+        ticket_id: ticket_id.to_string(),
+        message: format!("Complete {ticket_id}"),
+        ticket_file,
+        work_dir,
+        completion_key: recovery_key.clone(),
+    }) {
+        Ok(result) => Ok(Ok(result.commit_id)),
+        Err(error) => Err(format!(
+            "I could not write {ticket_id}'s completion commit, so nothing changed: {error}\n\
+             Fix what that names and run `lisa already-done {ticket_id}` again."
+        )),
+    }
+}
+
+/// The refusal that says what was looked for, because five commits naming the
+/// ticket in their subject lines are not what this command reads.
+fn no_evidence_decline(ticket_id: &str, review: &Path) -> String {
+    format!(
+        "I can't find {ticket_id}'s finished work, and there is nothing here for me to seal. \
+         Nothing changed.\n\
+         I look for two things, in order:\n  \
+         1. a commit in this repository's history whose message carries the line \
+         `{COMPLETION_KEY_PREFIX}v1:…` for {ticket_id} — the seal Lisa writes when it finishes a \
+         ticket. A commit that only names {ticket_id} in its subject is not this.\n  \
+         2. failing that, {ticket_id}'s published review at {}, which is what I would commit now \
+         to write that seal myself.\n\
+         Neither is here.",
+        review.display()
+    )
+}
+
+/// A reviewer's block is a judgement about the work and outranks this command.
+/// Lisa's own recording-failure block is not — it is the very state this
+/// command exists to clear.
+fn reviewer_block(ticket_id: &str, ticket_work_dir: &Path) -> Option<String> {
+    match parse_review_disposition(ticket_work_dir.join("review-disposition.json")) {
+        ReviewDisposition::Block {
+            origin: DispositionOrigin::Review,
+            reason,
+            ..
+        } => Some(format!(
+            "{ticket_id}'s review says its work is not finished, so I won't seal it: {reason}\n\
+             Clear that first — `lisa unblock {ticket_id}` once the ask is done — then run this \
+             again."
+        )),
+        _ => None,
+    }
+}
+
+/// Express a path the board reported as one the commit transaction accepts.
+fn repository_relative(project_root: &Path, path: &Path) -> Result<PathBuf, String> {
+    path.strip_prefix(project_root)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            format!(
+                "{} is outside the project at {}",
+                path.display(),
+                project_root.display()
+            )
+        })
 }
 
 /// The attempt identity a person's own settlement is recorded under.

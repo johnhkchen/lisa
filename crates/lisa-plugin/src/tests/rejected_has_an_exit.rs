@@ -12,9 +12,11 @@
 
 use super::*;
 
-use lisa_cli::already_done::{run_already_done, AlreadyDoneOutcome, AlreadyDoneRequest};
+use lisa_cli::already_done::{
+    run_already_done, AlreadyDoneOutcome, AlreadyDoneRequest, SealSource,
+};
 use lisa_cli::commit_transaction::{complete_ticket, CompleteTicketRequest};
-use lisa_core::completion::completion_key_marker;
+use lisa_core::completion::{completion_key_marker, COMPLETION_KEY_PREFIX};
 use lisa_core::completion_journal::MAX_ACTION_REQUIRED_GENERATIONS;
 use lisa_core::types::{Phase, Thread, TicketStatus};
 use std::ffi::OsStr;
@@ -151,6 +153,7 @@ impl Field {
             AlreadyDoneRequest {
                 project_root: &self.root,
                 ticket_dir: &self.state.config.ticket_dir,
+                work_dir: &self.state.config.work_dir,
                 journal_path: &self.state.completion_journal_path,
             },
             TICKET,
@@ -247,6 +250,15 @@ fn the_lost_race_that_could_not_be_recovered_now_can_be() {
         field.after_restart().action_required_generations(),
         MAX_ACTION_REQUIRED_GENERATIONS
     );
+    // The generation that spends the last one is the one whose row stops
+    // saying "let Lisa try again" and names the command that ends it.
+    assert!(
+        field
+            .journal_bytes()
+            .contains(&format!("`{ALREADY_DONE_COMMAND} {TICKET}`")),
+        "the rejection at the bound must name the action: {}",
+        field.journal_bytes()
+    );
 
     // 5. The old escape is closed off, and says what to run instead.
     let launched = field.state.launched_completion_effects.len();
@@ -269,6 +281,7 @@ fn the_lost_race_that_could_not_be_recovered_now_can_be() {
             ticket_id: TICKET.to_string(),
             commit_id: sealed.commit_id.clone(),
             ticket_file_rewritten: true,
+            seal: SealSource::Adopted,
         }
     );
     assert_eq!(commit_count(&field.root), commits_before);
@@ -405,6 +418,142 @@ fn an_interrupted_recovery_is_finished_by_running_it_again() {
         assert_eq!(field.after_restart().state(), &CompletionState::Confirmed);
         assert_eq!(field.board_ticket().status, TicketStatus::Done);
     }
+}
+
+/// The 2026-08-13 `renderer` sequence: the completion **commit itself** fails.
+///
+/// The lost race above at least left a sealed commit behind to be adopted.
+/// Here nothing carries the key, because the thing that failed is the thing
+/// that would have written it — and the ticket then sat on a board reporting
+/// it ready, beside a run that would not take it, for two days. Five
+/// documented recoveries were run against it and none applied.
+///
+/// The escape is one command, and it changes no file by hand.
+#[test]
+fn a_completion_whose_commit_never_landed_is_finished_by_one_command() {
+    let mut field = Field::new();
+    let sealing_key = CompletionGenerationId::new(
+        CompletionId::new(TICKET),
+        AttemptId::new(field.lease.attempt_id.to_string()),
+        1,
+    );
+    let correlation = CorrelationId::new(sealing_key.to_string());
+
+    // 1. The completion launches and goes in-flight, and its commit never
+    //    lands. No `complete_ticket` here: that is the whole difference.
+    for transition in [
+        CompletionJournalTransition::Requested {
+            key: sealing_key.clone(),
+            prior_phase: Phase::Review,
+            prior_status: TicketStatus::Open,
+            note: None,
+        },
+        CompletionJournalTransition::CommandInFlight {
+            key: sealing_key.clone(),
+            correlation: correlation.clone(),
+            deadline: CompletionDeadline::from_unix_millis(1),
+        },
+    ] {
+        completion_journal::append_with_seal(
+            &field.state.completion_journal_path,
+            CompletionSeal::Commit,
+            transition,
+        )
+        .unwrap();
+    }
+    field.state.restore_completion_journal();
+
+    // 2. The reconciliation deadline passes and the completion parks
+    //    action-required, with nothing in history to show for it.
+    assert!(field.state.expire_in_flight_completion(
+        TICKET,
+        correlation,
+        CompletionDeadline::from_unix_millis(1),
+    ));
+    assert!(matches!(
+        field.after_restart().state(),
+        CompletionState::Rejected {
+            retryability: Retryability::ActionRequired,
+            ..
+        }
+    ));
+    assert!(
+        !head_message(&field.root).contains(COMPLETION_KEY_PREFIX),
+        "the premise is that no commit carries this ticket's key"
+    );
+    // The rejection Lisa wrote down names the command that clears it.
+    // `action-required` is the field that says a person must act, and the row
+    // carrying it is where that person is standing.
+    assert!(
+        field
+            .journal_bytes()
+            .contains(&format!("run: `lisa unblock {TICKET}`")),
+        "an action-required rejection must name the action: {}",
+        field.journal_bytes()
+    );
+
+    // 3. One command. It writes the seal that failed rather than refusing for
+    //    want of one.
+    let commits_before = commit_count(&field.root);
+    let outcome = field.recover().unwrap();
+    let AlreadyDoneOutcome::Recovered {
+        commit_id,
+        ticket_file_rewritten,
+        seal,
+        ..
+    } = outcome
+    else {
+        panic!("the field case must be recoverable: {outcome:?}");
+    };
+    assert_eq!(seal, SealSource::Written);
+    assert_eq!(commit_count(&field.root), commits_before + 1);
+
+    // 4. The seal is a real completion commit, under the operator's own
+    //    generation, and it carries the Done bytes — so no file is left for a
+    //    person to commit by hand.
+    let recovery_key = CompletionGenerationId::new(
+        CompletionId::new(TICKET),
+        AttemptId::new("operator"),
+        sealing_key.generation() + 1,
+    );
+    assert!(head_message(&field.root).contains(&completion_key_marker(&recovery_key)));
+    assert!(!ticket_file_rewritten);
+    assert_eq!(field.board_ticket().phase, Phase::Done);
+    assert_eq!(field.board_ticket().status, TicketStatus::Done);
+    assert_eq!(
+        porcelain(&field.root, "docs/active/tickets"),
+        "",
+        "the seal must commit the ticket file it rewrote"
+    );
+
+    // 5. Terminal in the journal, replayable by a fresh plugin, and no longer
+    //    masking the board's Done — so nothing declines to schedule it.
+    let recovered = field.after_restart();
+    assert_eq!(recovered.state(), &CompletionState::Confirmed);
+    assert_eq!(recovered.confirmed_commit_id(), Some(commit_id.as_str()));
+    assert!(!recovered.masks_durable_done());
+    let mut restarted = State {
+        completion_journal_path: field.state.completion_journal_path.clone(),
+        ..State::default()
+    };
+    restarted.restore_completion_journal();
+    assert!(restarted.completion_journal_healthy);
+
+    // 6. And it is done: a second run has nothing left to settle.
+    assert!(matches!(
+        field.recover().unwrap(),
+        AlreadyDoneOutcome::Declined(message) if message.contains("already finished")
+    ));
+}
+
+fn porcelain(root: &Path, pathspec: &str) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "--", pathspec])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 fn commit_count(root: &Path) -> usize {

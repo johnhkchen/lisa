@@ -1,9 +1,11 @@
 //! Black-box fixtures for `lisa already-done`.
 //!
-//! The command's whole value is that it refuses on anything but keyed
-//! evidence, so most of this file is refusals. The one acceptance case lives
-//! in the plugin crate, where a real completion transaction can produce the
-//! commit that counts.
+//! The command settles a completion two ways — by adopting a seal already in
+//! history, or by writing the seal Lisa failed to write — and refuses on
+//! anything that is neither. Most of this file is those refusals. The adopting
+//! case lives in the plugin crate, where a real completion transaction can
+//! produce the commit that counts; the writing case is here, because the whole
+//! point of it is that no commit carries the key yet.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,6 +89,113 @@ fn already_done(root: &Path, ticket_id: &str) -> Output {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Publish the artifacts Lisa admits before it requests a completion.
+fn publish_review(root: &Path, ticket_id: &str, disposition: &str) -> PathBuf {
+    let dir = root.join("docs/active/work").join(ticket_id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("review.md"), "# Review\n\nAll five commits landed.\n").unwrap();
+    fs::write(dir.join("review-disposition.json"), disposition).unwrap();
+    dir
+}
+
+fn head_message(root: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// The field case from 2026-08-13: the work is committed, the review is
+/// published, and the *completion commit* is the thing that failed — so no
+/// commit anywhere carries the key. Before this the command refused here, on a
+/// ticket no other command could finish either.
+#[test]
+fn a_rejection_whose_seal_never_landed_is_sealed_by_the_command() {
+    let (_temp, root) = project();
+    let ticket = write_ticket(&root, "T-UNSEALED", "blocked");
+    publish_review(&root, "T-UNSEALED", "{\"disposition\":\"pass\",\"reason\":null}");
+    write_journal(&root, "T-UNSEALED", "rejected");
+    fs::write(root.join("src.txt"), "the work itself\n").unwrap();
+    git(&root, &["add", "docs", "src.txt"]);
+    git(&root, &["commit", "-m", "T-UNSEALED: the work, with no seal"]);
+
+    let output = already_done(&root, "T-UNSEALED");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr(&output)
+    );
+    // The ticket is done, and its Done bytes are committed rather than left
+    // for the operator to notice and commit by hand.
+    assert_ticket_status(&ticket, TicketStatus::Done);
+    assert!(head_message(&root).contains("Lisa-Completion-Key: "));
+    let porcelain = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["status", "--porcelain", "docs/active/tickets"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&porcelain.stdout).trim().is_empty(),
+        "the seal must commit the ticket file it rewrote"
+    );
+    // And the journal is terminal, so nothing re-attempts it.
+    let journal = fs::read_to_string(journal_path(&root)).unwrap();
+    assert!(journal.contains("\"state\":\"confirmed\""), "{journal}");
+
+    // Running it again finds its own seal and says the ticket is finished.
+    let again = already_done(&root, "T-UNSEALED");
+    assert!(!again.status.success());
+    assert!(
+        stderr(&again).contains("already finished"),
+        "{}",
+        stderr(&again)
+    );
+}
+
+/// A reviewer's block outranks this command; Lisa's own recording-failure
+/// block is the state it exists to clear.
+#[test]
+fn a_reviewers_block_is_refused_and_lisas_own_recording_block_is_not() {
+    let (_temp, root) = project();
+    write_ticket(&root, "T-REVIEWBLOCK", "blocked");
+    write_ticket(&root, "T-RECORDFAIL", "blocked");
+    publish_review(
+        &root,
+        "T-REVIEWBLOCK",
+        "{\"disposition\":\"block\",\"reason\":\"the tests do not pass\",\"remedy_owner\":\"agent\",\"ask\":\"Make the tests pass.\"}",
+    );
+    publish_review(
+        &root,
+        "T-RECORDFAIL",
+        "{\"disposition\":\"block\",\"origin\":\"internal-command\",\"reason\":\"Lisa could not record this work.\",\"remedy_owner\":\"operator\",\"ask\":\"Run lisa already-done T-RECORDFAIL.\"}",
+    );
+    write_journal(&root, "T-REVIEWBLOCK", "rejected");
+    git(&root, &["add", "docs"]);
+    git(&root, &["commit", "-m", "two parked tickets"]);
+
+    let refused = already_done(&root, "T-REVIEWBLOCK");
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("the tests do not pass"),
+        "{}",
+        stderr(&refused)
+    );
+
+    write_journal(&root, "T-RECORDFAIL", "rejected");
+    let sealed = already_done(&root, "T-RECORDFAIL");
+    assert!(
+        sealed.status.success(),
+        "a recording failure is not a verdict on the work: {}",
+        stderr(&sealed)
+    );
 }
 
 /// The negative fixture. A rejected completion with nothing in history to show
