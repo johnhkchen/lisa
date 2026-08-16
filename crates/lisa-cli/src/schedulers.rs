@@ -210,6 +210,21 @@ fn describe(
         lines.push(format!("    {note}"));
     }
 
+    // The shell the run was started from. An operator asking *why did that run
+    // fail to push when the identical one yesterday did not* is asking about
+    // this line: a run that came in over ssh reaches no login keychain and
+    // usually has no agent, and nothing else on the board remembers which kind
+    // of run this was. A record that never observed it says so in those words
+    // rather than going quiet, because a missing line and a bare shell are
+    // different answers.
+    lines.push(format!(
+        "    started from: {}",
+        match record.launched_from {
+            Some(shell) => shell.describe(),
+            None => lisa_core::launch_shell::NOT_RECORDED.to_string(),
+        }
+    ));
+
     // What this machine was asked and what it said, whenever asking settled it.
     // `stopped stamping 87s ago` and `pid 15340 is not a process on this
     // machine any more` are the same verdict with very different standing, and
@@ -821,6 +836,101 @@ mod tests {
         assert!(
             !printed.contains("pane-0.started"),
             "an hour-old receipt is not what the operator is asking about"
+        );
+    }
+
+    /// The question this listing has to be able to answer the morning after:
+    /// *the same board, started two ways — which one was this?*
+    #[test]
+    fn the_listing_says_which_kind_of_shell_each_run_was_started_from() {
+        let dir = project();
+        let now = 1_786_000_000;
+        for (id, session, shell) in [
+            (
+                "desk",
+                "lisa",
+                lisa_core::launch_shell::LaunchShell {
+                    ssh_connection: false,
+                    ssh_agent: true,
+                    tty: true,
+                },
+            ),
+            (
+                "overnight",
+                "lisa-2",
+                lisa_core::launch_shell::LaunchShell {
+                    ssh_connection: true,
+                    ssh_agent: false,
+                    tty: false,
+                },
+            ),
+        ] {
+            schedulers::write_record(
+                &schedulers::roster_dir(dir.path()),
+                &SchedulerRecord::new(
+                    id,
+                    Some(session.to_string()),
+                    Some(9450),
+                    now - 600,
+                    now - 2,
+                    5,
+                )
+                .started_from(shell),
+            )
+            .unwrap();
+        }
+
+        let printed = listed(dir.path(), now);
+
+        assert!(
+            printed.contains("started from: not over ssh, with an ssh-agent, with a terminal"),
+            "the desk's run: {printed}"
+        );
+        assert!(
+            printed.contains("started from: over ssh, with no ssh-agent, with no terminal"),
+            "the overnight run: {printed}"
+        );
+        assert!(
+            !printed.contains("SSH_AUTH_SOCK") && !printed.contains("/private/tmp"),
+            "presence is the fact; the value is a secret: {printed}"
+        );
+    }
+
+    /// A run nobody observed and a run observed to have nothing must not read
+    /// the same, or every record from before this existed quietly acquires the
+    /// answer.
+    #[test]
+    fn a_run_whose_shell_was_never_observed_says_so_rather_than_going_quiet() {
+        let dir = project();
+        let now = 1_786_000_000;
+        register(dir.path(), "old", Some("lisa"), now - 600, now - 2);
+        schedulers::write_record(
+            &schedulers::roster_dir(dir.path()),
+            &SchedulerRecord::new(
+                "bare",
+                Some("lisa-2".to_string()),
+                Some(9450),
+                now - 600,
+                now - 2,
+                5,
+            )
+            .started_from(lisa_core::launch_shell::LaunchShell {
+                ssh_connection: false,
+                ssh_agent: false,
+                tty: false,
+            }),
+        )
+        .unwrap();
+
+        let printed = listed(dir.path(), now);
+
+        assert!(
+            printed.contains("started from: not recorded (an older Lisa started this run)"),
+            "the run nobody looked at: {printed}"
+        );
+        assert!(
+            printed.contains("started from: not over ssh, with no ssh-agent, with no terminal"),
+            "the run measured to have nothing: {printed}"
         );
     }
 
