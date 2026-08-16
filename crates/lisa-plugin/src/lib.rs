@@ -2100,6 +2100,13 @@ impl State {
             now,
             POLL_INTERVAL_SECS.round() as u64,
         );
+        // What the loop saw of the shell it was started from, when it saw
+        // anything. A layout that carried none leaves the field absent, which
+        // is a different statement than a shell with nothing in it.
+        let record = match self.config.launch_shell {
+            Some(shell) => record.started_from(shell),
+            None => record,
+        };
         let _ = lisa_core::schedulers::write_record(&self.scheduler_dir, &record);
     }
 
@@ -15392,6 +15399,45 @@ mod tests {
             temp.path().join(".lisa/scheduler.alive").exists(),
             "the shared stamp keeps being written for readers that only know it"
         );
+    }
+
+    /// What `lisa loop` measured on the host has to survive the layout and land
+    /// in the record, because the plugin inside the Zellij server cannot see
+    /// the shell the run was started from and never will.
+    #[test]
+    fn the_shell_the_loop_was_started_from_reaches_the_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut overnight = registered_scheduler(temp.path(), "lisa", "lisa-overnight");
+        overnight.config = PluginConfig::from_config_map(&BTreeMap::from([
+            ("session_name".to_string(), "lisa".to_string()),
+            (
+                "launch_shell".to_string(),
+                "ssh=yes,agent=no,tty=no".to_string(),
+            ),
+        ]));
+        overnight.stamp_scheduler_alive();
+
+        let recorded = lisa_core::schedulers::read_roster(temp.path())
+            .into_iter()
+            .find(|record| record.scheduler_id == "lisa-overnight")
+            .unwrap();
+        assert_eq!(
+            recorded.launched_from,
+            Some(lisa_core::launch_shell::LaunchShell {
+                ssh_connection: true,
+                ssh_agent: false,
+                tty: false,
+            })
+        );
+
+        // And a layout that carried no observation leaves an absence rather
+        // than a shell somebody is going to read as measured.
+        registered_scheduler(temp.path(), "lisa", "lisa-unobserved").stamp_scheduler_alive();
+        let unobserved = lisa_core::schedulers::read_roster(temp.path())
+            .into_iter()
+            .find(|record| record.scheduler_id == "lisa-unobserved")
+            .unwrap();
+        assert_eq!(unobserved.launched_from, None);
     }
 
     /// The dashboard is where the operator already is, so that is where a

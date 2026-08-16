@@ -441,6 +441,14 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, request: LoopRequest) -> R
     // is on the pane shell's PATH. current_exe() failure degrades to bare `lisa`.
     let lisa_bin = std::env::current_exe().ok();
 
+    // Which shell this run was asked for from, measured before anything is
+    // spawned. Nothing below this line can tell: the panes get the environment
+    // Lisa hands them, and a headless run opens a terminal of its own. The
+    // question a record has to answer hours later is what the *operator's*
+    // shell was, so it is read here or not at all.
+    let launch_shell =
+        lisa_core::launch_shell::LaunchShell::observe(std::io::stdin().is_terminal());
+
     // Generate KDL layout
     let naming = sessions.naming();
     let layout = generate_layout(
@@ -449,6 +457,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, request: LoopRequest) -> R
         &git_root,
         completion.seal(),
         naming.name(),
+        launch_shell,
         config,
     );
     let layout_path = root.join(".lisa-layout.kdl");
@@ -465,6 +474,7 @@ pub fn run_loop(root: &Path, config: &ResolvedConfig, request: LoopRequest) -> R
     println!("  WASM plugin: {}", wasm_path.display());
     println!("  Layout: {}", layout_path.display());
     println!("  Session: {}", naming.describe());
+    println!("  Started from: {}", launch_shell.describe());
     println!("  Zellij mode: {}", zellij_runtime.mode);
     println!("  Zellij version: {}", zellij_runtime.version);
     println!("  Zellij path: {}", zellij_runtime.path.display());
@@ -620,13 +630,16 @@ fn run_dry(root: &Path, config: &ResolvedConfig) -> Result<(), String> {
         .explicit_seal()
         .unwrap_or(CompletionSeal::Commit);
     // A dry run starts nothing, so it names no session: the layout it prints is
-    // the shape, not the run.
+    // the shape, not the run. The shell is the one exception — it is this
+    // shell, the one the operator is standing in, and printing what a real run
+    // would record is how they can see it without starting one.
     let layout = generate_layout(
         &wasm_path,
         lisa_bin.as_deref(),
         &git_root,
         completion_seal,
         None,
+        lisa_core::launch_shell::LaunchShell::observe(std::io::stdin().is_terminal()),
         config,
     );
     println!();
@@ -721,6 +734,7 @@ fn generate_layout(
     git_root: &Path,
     completion_seal: CompletionSeal,
     session_name: Option<&str>,
+    launch_shell: lisa_core::launch_shell::LaunchShell,
     config: &ResolvedConfig,
 ) -> String {
     // Create 2x max_threads pane slots so transitions don't block scheduling.
@@ -757,6 +771,16 @@ fn generate_layout(
         Some(name) => format!("                session_name \"{name}\"\n"),
         None => String::new(),
     };
+
+    // What kind of shell this run was started from. Observed here on the host,
+    // because the plugin runs inside a Zellij server that may have been started
+    // by somebody else and cannot see the shell that asked for this run. Three
+    // booleans and no values: `SSH_AUTH_SOCK`'s value is a live socket path and
+    // this line ends up in a record that gets read aloud.
+    let launch_shell_line = format!(
+        "                launch_shell \"{}\"\n",
+        launch_shell.encode()
+    );
 
     // The model this board runs within its client, when it names one. Absent
     // key → the plugin leaves the choice to the client's own default, which is
@@ -821,7 +845,7 @@ fn generate_layout(
                 triage_enabled "{triage_enabled}"
                 triage_timeout_secs "{triage_timeout_secs}"
                 client "{client}"
-{agent_pane_count_line}{model_line}{effort_line}{provider_cap_lines}{lisa_bin_line}{session_name_line}            }}
+{agent_pane_count_line}{model_line}{effort_line}{provider_cap_lines}{lisa_bin_line}{session_name_line}{launch_shell_line}            }}
         }}
     }}
 }}
@@ -833,6 +857,7 @@ fn generate_layout(
         completion_seal = completion_seal,
         lisa_bin_line = lisa_bin_line,
         session_name_line = session_name_line,
+        launch_shell_line = launch_shell_line,
         model_line = model_line,
         effort_line = effort_line,
         provider_cap_lines = provider_cap_lines,
@@ -942,6 +967,16 @@ mod tests {
         ResolvedConfig::default()
     }
 
+    /// The shell a test layout is generated from, when the test is about
+    /// something else.
+    fn a_desk_shell() -> lisa_core::launch_shell::LaunchShell {
+        lisa_core::launch_shell::LaunchShell {
+            ssh_connection: false,
+            ssh_agent: true,
+            tty: true,
+        }
+    }
+
     fn test_layout(wasm_path: &Path, lisa_bin: Option<&Path>, config: &ResolvedConfig) -> String {
         generate_layout(
             wasm_path,
@@ -949,8 +984,54 @@ mod tests {
             Path::new("/repo"),
             CompletionSeal::Commit,
             Some("lisa"),
+            a_desk_shell(),
             config,
         )
+    }
+
+    /// The observation is made on the host and read inside the Zellij server,
+    /// so the layout is the only road between them — and what travels is three
+    /// booleans, never the value of anything.
+    #[test]
+    fn the_layout_carries_the_shell_the_loop_was_started_from() {
+        let desk = test_layout(Path::new("/tmp/lisa-plugin.wasm"), None, &default_config());
+        assert!(
+            desk.contains("launch_shell \"ssh=no,agent=yes,tty=yes\""),
+            "{desk}"
+        );
+
+        let overnight = generate_layout(
+            Path::new("/tmp/lisa-plugin.wasm"),
+            None,
+            Path::new("/repo"),
+            CompletionSeal::Commit,
+            Some("lisa"),
+            lisa_core::launch_shell::LaunchShell {
+                ssh_connection: true,
+                ssh_agent: false,
+                tty: false,
+            },
+            &default_config(),
+        );
+        assert!(
+            overnight.contains("launch_shell \"ssh=yes,agent=no,tty=no\""),
+            "{overnight}"
+        );
+
+        // And what the plugin reads back out of it is what the loop measured.
+        let parsed =
+            lisa_core::types::PluginConfig::from_config_map(&std::collections::BTreeMap::from([(
+                "launch_shell".to_string(),
+                "ssh=yes,agent=no,tty=no".to_string(),
+            )]));
+        assert_eq!(
+            parsed.launch_shell,
+            Some(lisa_core::launch_shell::LaunchShell {
+                ssh_connection: true,
+                ssh_agent: false,
+                tty: false,
+            })
+        );
     }
 
     /// The plugin cannot ask Zellij which session it is in, so the layout is
@@ -967,6 +1048,7 @@ mod tests {
             Path::new("/repo"),
             CompletionSeal::Commit,
             None,
+            a_desk_shell(),
             &default_config(),
         );
         assert!(
@@ -1429,6 +1511,7 @@ mod tests {
             Path::new("/project"),
             CompletionSeal::Journal,
             Some("lisa"),
+            a_desk_shell(),
             &default_config(),
         );
 
