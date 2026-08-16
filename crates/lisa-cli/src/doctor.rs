@@ -42,6 +42,19 @@ enum CheckResult {
     Skipped {
         reason: String,
     },
+    /// The thing was asked and said no. Its own word, because "not found" and
+    /// "unsupported" are claims about this machine's software, and this is a
+    /// claim about what an answer came back saying.
+    Unreachable {
+        description: String,
+        remedy: String,
+    },
+    /// The thing was asked and no answer came back. Deliberately distinct from
+    /// [`CheckResult::Unreachable`]: no network is not a broken credential, and
+    /// a check that reports one as the other is a check nobody can trust.
+    CannotTell {
+        description: String,
+    },
 }
 
 /// A dependency check: name, whether it's required, and a closure that performs the check.
@@ -93,6 +106,19 @@ impl fmt::Display for CheckReport {
             }
             CheckResult::Skipped { reason } => {
                 write!(f, "  {:<12} skipped ({})", self.name, reason)
+            }
+            CheckResult::Unreachable {
+                description,
+                remedy,
+            } => {
+                write!(
+                    f,
+                    "  {:<12} no\n    {}\n    Remedy: {}",
+                    self.name, description, remedy
+                )
+            }
+            CheckResult::CannotTell { description } => {
+                write!(f, "  {:<12} cannot tell\n    {}", self.name, description)
             }
         }
     }
@@ -900,6 +926,9 @@ struct Findings {
     /// Every outstanding ticket's resolved `(agent, model, effort)` route
     /// (T-071-01-01 AC: "`lisa doctor` says what each pane will run").
     pane_routes: Result<Vec<PaneRoute>, String>,
+    /// Whether a commit made on this board could reach the remote it would
+    /// land on (T-073-01-01). Measured once, read by both renderings.
+    remote: crate::remote_reach::Reach,
 }
 
 /// One outstanding ticket's resolved route, as `doctor` previews it.
@@ -952,7 +981,67 @@ fn gather(root: &Path) -> Result<Findings, String> {
         project,
         has_project,
         pane_routes,
+        remote: crate::remote_reach::look(root),
     })
+}
+
+/// The road out, as one row.
+///
+/// Never required, so it can never fail a run: this is `doctor`, which
+/// reports, and a loop that refused to start because a remote was unreachable
+/// would be a worse failure than one that commits locally and waits.
+fn remote_reach_report(reach: &crate::remote_reach::Reach) -> CheckReport {
+    use crate::remote_reach::Reach;
+
+    let result = match reach {
+        Reach::NoRepository | Reach::NoRemote { .. } => CheckResult::Skipped {
+            reason: reach.detail(),
+        },
+        Reach::Reachable { protocol, .. } => CheckResult::Found {
+            version: format!("push over {}", protocol.label()),
+        },
+        Reach::Refused { .. } => CheckResult::Unreachable {
+            description: reach.detail(),
+            remedy: reach
+                .remedy()
+                .expect("a refused push always carries a remedy"),
+        },
+        Reach::Unclear { .. } => CheckResult::CannotTell {
+            description: reach.detail(),
+        },
+    };
+
+    CheckReport {
+        name: "remote",
+        required: false,
+        result,
+    }
+}
+
+/// What the probe measured, said once, under every outcome that measured
+/// anything: which command, that it wrote nothing, and — the part that decides
+/// whether any of this means anything — which shell it ran in.
+const REMOTE_REACH_FOOTER: &str = "
+    Measured in this shell with `git push --dry-run`: nothing was sent, no branch
+    was created, and no credential was read, stored or changed. The pane a run
+    starts may not carry this shell's ssh agent or unlocked keychain, so this
+    answers for here, not for that pane.
+";
+
+fn format_remote_reach(reach: &crate::remote_reach::Reach, report: &CheckReport) -> String {
+    use crate::remote_reach::Reach;
+
+    let mut out = String::from("\n\nChecking whether work made here can reach its remote...\n\n");
+    out.push_str(&format!("{report}\n"));
+    // A row that passed says only `push over ssh  OK`; the sentence under it is
+    // where the branch, the remote and its URL are named.
+    if matches!(report.result, CheckResult::Found { .. }) {
+        out.push_str(&format!("    {}\n", reach.detail()));
+    }
+    if !matches!(reach, Reach::NoRepository | Reach::NoRemote { .. }) {
+        out.push_str(REMOTE_REACH_FOOTER);
+    }
+    out
 }
 
 /// Resolve every outstanding (not-`Done`) ticket's route against the board's
@@ -1033,6 +1122,15 @@ fn check_to_json(report: &CheckReport) -> serde_json::Value {
             remedy,
         } => ("behind", Some(description.clone()), Some(remedy.clone())),
         CheckResult::Skipped { reason } => ("skipped", Some(reason.clone()), None),
+        CheckResult::Unreachable {
+            description,
+            remedy,
+        } => (
+            "unreachable",
+            Some(description.clone()),
+            Some(remedy.clone()),
+        ),
+        CheckResult::CannotTell { description } => ("unknown", Some(description.clone()), None),
     };
 
     serde_json::json!({
@@ -1068,6 +1166,7 @@ fn doctor_document(root: &Path) -> Result<(serde_json::Value, i32), String> {
     let findings = gather(root)?;
     let mut reports = findings.reports;
     reports.push(findings.project);
+    reports.push(remote_reach_report(&findings.remote));
 
     let failed = has_failures(&reports) || findings.completion.is_err();
 
@@ -1137,6 +1236,12 @@ pub fn run_doctor(root: &Path) -> Result<(), String> {
     }
     append_completion_seal_report(&mut output, &completion);
     reports.push(project_report);
+
+    // Right after the seal: that section says finished work lands as history,
+    // and this one says whether that history has a road out of here.
+    let remote = remote_reach_report(&findings.remote);
+    output.push_str(&format_remote_reach(&findings.remote, &remote));
+    reports.push(remote);
 
     output.push_str(&format_pane_routes(&findings.pane_routes));
 

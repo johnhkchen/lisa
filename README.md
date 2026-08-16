@@ -243,6 +243,19 @@ lisa doctor          # read it here
 lisa doctor --json   # collect it from every box: data.lisa.state is level, behind, ahead, waiting or unresolved
 ```
 
+**`lisa doctor` also says whether work made here can reach its remote.** A run's
+whole output is commits, so the row asks the one question that decides where they
+end up: it runs `git push --dry-run` for the current branch — one round trip, and
+it sends nothing, creates no branch and touches no credential — and reports
+whether the *push* landed, over *ssh* or *https* by name. Reading a remote is not
+writing to one, so a read-only key or a fetch-only token is a `no` here rather
+than a green light. Three answers, kept apart on purpose: `OK`, `no` when the
+remote answered and the answer was no, and `cannot tell` when nothing answered at
+all. A board with no remote is fine and is not flagged, and none of it blocks a
+run — `doctor` reports, you decide. One caveat the row prints itself: it measures
+*this shell*. The pane an overnight run spawns may not carry your ssh agent or an
+unlocked keychain, and this check cannot get inside that pane.
+
 **On a package-managed box, `lisa upgrade` hands the move to the package
 manager.** It reads the channel off the formula or the suite, says what it is
 about to run, refuses while a run is live, then runs `brew update && brew upgrade
