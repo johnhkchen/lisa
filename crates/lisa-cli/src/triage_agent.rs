@@ -294,16 +294,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_runner_returns_valid_proposal_and_surfaces_failure() {
+        // This test is about parsing the runner's decision, not about timing —
+        // the bound below only needs to be larger than "a subprocess can start
+        // and exit," so it is set generously instead of tight. The deadline
+        // itself is exercised deterministically by
+        // bounded_runner_kills_timeout_near_the_configured_deadline, which
+        // proves TimedOut fires via error identity plus a load-immune lower
+        // bound, not an upper wall-clock ceiling. A real regression here still
+        // fails loudly: a runner that always times out fails the `.unwrap()`
+        // below, and one that never times out but mis-parses fails the
+        // content assertion.
+        const GENEROUS_BOUND_SECS: u64 = 30;
         let proposal = r#"{"summary":"The criterion conflicts with the evidence.","recommendation":"Amend it.","prepared_steps":[{"kind":"command","description":"Apply it.","command":"true"}]}"#;
         let (dir, agent) = executable_script(&format!(
             "printf '%s\\n' '{{\"result\":{}}}'",
             serde_json::to_string(proposal).unwrap()
         ));
-        let output = run_triage_agent(&args(dir.path().to_path_buf(), agent, 2)).unwrap();
+        let output =
+            run_triage_agent(&args(dir.path().to_path_buf(), agent, GENEROUS_BOUND_SECS))
+                .unwrap();
         assert!(output.contains("criterion conflicts"));
 
         let (dir, agent) = executable_script("echo provider-down >&2; exit 9");
-        let error = run_triage_agent(&args(dir.path().to_path_buf(), agent, 2)).unwrap_err();
+        let error =
+            run_triage_agent(&args(dir.path().to_path_buf(), agent, GENEROUS_BOUND_SECS))
+                .unwrap_err();
         assert_eq!(error, TriageAgentError::Failed("provider-down".to_string()));
     }
 
