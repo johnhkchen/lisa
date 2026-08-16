@@ -8,6 +8,7 @@ pub mod dag;
 pub mod diagnostics;
 pub mod disposition;
 pub mod effort;
+pub mod launch_shell;
 pub mod liveness;
 pub mod notes;
 pub mod operator_override;

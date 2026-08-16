@@ -756,6 +756,17 @@ pub struct PluginConfig {
     #[serde(default)]
     pub session_name: Option<String>,
 
+    /// What kind of shell `lisa loop` was started from, observed on the host
+    /// and passed through the layout.
+    ///
+    /// The plugin cannot see it for itself: it runs inside the Zellij server,
+    /// which may have been started by somebody else entirely and does not hand
+    /// its environment back. So the observation is made where the run really
+    /// began, and travels with everything else. `None` means the layout carried
+    /// none — never *a shell with nothing in it*.
+    #[serde(default)]
+    pub launch_shell: Option<crate::launch_shell::LaunchShell>,
+
     /// Whether parked operator blocks receive one bounded first-responder pass.
     #[serde(default = "PluginConfig::default_triage_enabled")]
     pub triage_enabled: bool,
@@ -828,6 +839,7 @@ impl PluginConfig {
             lisa_bin: None,
             provider_caps: HashMap::new(),
             session_name: None,
+            launch_shell: None,
             triage_enabled: Self::DEFAULT_TRIAGE_ENABLED,
             triage_timeout_secs: Self::DEFAULT_TRIAGE_TIMEOUT_SECS,
         }
@@ -961,6 +973,13 @@ impl PluginConfig {
             if !session_name.is_empty() {
                 result.session_name = Some(session_name.clone());
             }
+        }
+
+        if let Some(launch_shell) = config.get("launch_shell") {
+            // A token this build cannot read leaves the field absent rather
+            // than half-set: a record that says *no agent* is supposed to mean
+            // somebody looked and found none.
+            result.launch_shell = crate::launch_shell::LaunchShell::parse(launch_shell);
         }
 
         // Parse phase_timeout_{phase} keys

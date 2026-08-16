@@ -26,6 +26,11 @@
 //! plugin lives inside the server that owns both — so the scheduler writes them
 //! down while it can.
 //!
+//! It also carries what kind of shell the run was started from — see
+//! [`crate::launch_shell`] — for the same reason: a run started over `ssh` and
+//! a run started at the desk can push, sign, and unlock different things, and
+//! afterwards nothing else on the board remembers which one this was.
+//!
 //! ## The consumption ledger
 //!
 //! `.lisa/signals/` is single-consumer by design and that contract is not
@@ -90,6 +95,16 @@ pub struct SchedulerRecord {
     /// How often it intends to stamp, so a reader can tell a late stamp from a
     /// stopped one without hard-coding Lisa's poll cadence.
     pub poll_interval_secs: u64,
+    /// What kind of shell the run was started from, observed by `lisa loop` on
+    /// the host and carried in through the layout.
+    ///
+    /// `None` is *not observed* — a record written by a Lisa that never looked
+    /// — and is deliberately distinct from a `Some` whose every field is false,
+    /// which is a shell somebody measured and found bare. A reader that
+    /// collapsed the two would quietly read every old record as the new
+    /// default.
+    #[serde(default)]
+    pub launched_from: Option<crate::launch_shell::LaunchShell>,
 }
 
 impl SchedulerRecord {
@@ -113,7 +128,19 @@ impl SchedulerRecord {
             started_at,
             stamped_at,
             poll_interval_secs,
+            launched_from: None,
         }
+    }
+
+    /// Record the shell this run was started from.
+    ///
+    /// Separate from [`SchedulerRecord::new`] rather than another positional
+    /// argument to it: a scheduler that was told nothing about its shell writes
+    /// exactly the record it always did, and the absence stays an absence
+    /// rather than a defaulted `false`.
+    pub fn started_from(mut self, shell: crate::launch_shell::LaunchShell) -> Self {
+        self.launched_from = Some(shell);
+        self
     }
 
     /// How long ago this scheduler stamped, or `None` for a stamp dated ahead
@@ -415,6 +442,69 @@ mod tests {
             record
         );
         assert!(encoded.contains("\"session_name\":\"lisa\""));
+    }
+
+    /// The reproduction, in the shape a reader meets it: the same board
+    /// started twice, and the two records differ in the expected way.
+    #[test]
+    fn the_same_board_started_from_two_shells_writes_two_different_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::launch_shell::LaunchShell {
+            ssh_connection: false,
+            ssh_agent: true,
+            tty: true,
+        };
+        let overnight = crate::launch_shell::LaunchShell {
+            ssh_connection: true,
+            ssh_agent: false,
+            tty: false,
+        };
+        write_record(dir.path(), &record("desk", 1_000, 2_000).started_from(desk)).unwrap();
+        write_record(
+            dir.path(),
+            &record("overnight", 1_001, 2_000).started_from(overnight),
+        )
+        .unwrap();
+
+        let roster = read_roster_dir(dir.path());
+        assert_eq!(roster[0].launched_from, Some(desk));
+        assert_eq!(roster[1].launched_from, Some(overnight));
+        assert_ne!(roster[0].launched_from, roster[1].launched_from);
+    }
+
+    /// A record from before Lisa looked, and a record that looked and found a
+    /// bare shell, are different statements. Reading them the same is how a
+    /// board silently acquires a default nobody measured.
+    #[test]
+    fn a_record_that_never_looked_is_not_a_record_that_found_nothing() {
+        let never_looked = record("old", 1_000, 2_000);
+        let found_nothing =
+            record("new", 1_000, 2_000).started_from(crate::launch_shell::LaunchShell {
+                ssh_connection: false,
+                ssh_agent: false,
+                tty: false,
+            });
+        assert_eq!(never_looked.launched_from, None);
+        assert_ne!(never_looked.launched_from, found_nothing.launched_from);
+
+        // And on disk, in both directions: a file written before this field
+        // existed still reads, and reads as an absence.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            record_path(dir.path(), "prehistoric"),
+            "{\"schema_version\":1,\"scheduler_id\":\"prehistoric\",\"session_name\":\"lisa\",\
+             \"zellij_pid\":9450,\"started_at\":1000,\"stamped_at\":2000,\"poll_interval_secs\":5}",
+        )
+        .unwrap();
+        write_record(dir.path(), &found_nothing).unwrap();
+
+        let roster = read_roster_dir(dir.path());
+        assert_eq!(roster.len(), 2);
+        assert!(roster.iter().any(|r| r.launched_from.is_none()));
+        assert!(roster
+            .iter()
+            .any(|r| r.launched_from == found_nothing.launched_from));
     }
 
     /// The whole point: three schedulers are three files, and the count is
