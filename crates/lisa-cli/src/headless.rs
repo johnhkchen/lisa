@@ -175,7 +175,17 @@ mod unix {
             .map_err(|error| format!("Failed waiting on Zellij: {error}"))?;
         CLIENT_PID.store(0, Ordering::SeqCst);
 
-        let head = head.lock().map(|bytes| bytes.clone()).unwrap_or_default();
+        // The child has exited, so whatever it wrote is already sitting in
+        // the kernel's pty buffer — but the drain thread above is a second
+        // thread, and nothing guarantees it has been scheduled to read that
+        // buffer into `head` yet. Sampling `head` right here raced that
+        // scheduling and lost under CI load: the child's last write hadn't
+        // landed when this thread looked. Waiting for two consecutive
+        // unchanged reads confirms the drain thread has caught up rather
+        // than just being between reads; the deadline keeps this bounded so
+        // a client that hands its pty to a lingering server (which never
+        // gives the drain thread end-of-file) does not turn into a hang.
+        let head = stabilized_head(&head);
         Ok(PtyRun {
             status,
             interrupted: STOPPED.load(Ordering::SeqCst),
@@ -257,6 +267,31 @@ mod unix {
             // SAFETY: installing a handler that only stores an atomic and
             // calls kill(2).
             unsafe { libc::signal(signal, stop_client as *const () as libc::sighandler_t) };
+        }
+    }
+
+    /// Wait for the drain thread to catch up before reading `head`, rather
+    /// than sampling it once. The child that fed this pty has already
+    /// exited by the time this is called, so no more bytes are coming; this
+    /// only waits out the drain thread's own scheduling lag. Two
+    /// consecutive polls with no growth call it caught up. A half-second
+    /// budget bounds the wait so a pty a lingering process is still holding
+    /// open — which would starve the drain thread of end-of-file forever —
+    /// cannot turn this into a hang; whatever arrived by the deadline is
+    /// what gets returned.
+    fn stabilized_head(head: &Mutex<Vec<u8>>) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut previous_len = None;
+        loop {
+            let snapshot = head.lock().map(|bytes| bytes.clone()).unwrap_or_default();
+            if previous_len == Some(snapshot.len()) {
+                return snapshot;
+            }
+            if std::time::Instant::now() >= deadline {
+                return snapshot;
+            }
+            previous_len = Some(snapshot.len());
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -420,6 +455,13 @@ mod tests {
 
     /// The client's window is sized before it starts, because Zellij lays panes
     /// out against it and an unconfigured pty is 0×0.
+    ///
+    /// This used to sample `transcript_head()` once, immediately after
+    /// `run_on_pty` returned — racing the drain thread's own scheduling lag
+    /// against the child's already-buffered `stty size` output. Under CI
+    /// load that race was lost: `run_on_pty` itself now waits for the drain
+    /// thread to catch up (`stabilized_head`) before handing back `head`, so
+    /// this assertion is a single read again, just no longer a racing one.
     #[cfg(unix)]
     #[test]
     fn the_terminal_lisa_opens_has_a_plausible_size() {
